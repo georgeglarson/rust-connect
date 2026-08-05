@@ -9,7 +9,7 @@ use crate::utils::errors::Error;
 
 #[utoipa::path(
     get,
-    path = "/api/v1/devices/{device_id}/sms",
+    path = "/api/v1/devices/{device_id}/sms/threads",
     tag = "sms",
     params(
         ("device_id" = String, Path, description = "Device unique identifier"),
@@ -118,7 +118,7 @@ mod conversations_request_tests {
 
 #[utoipa::path(
     get,
-    path = "/api/v1/devices/{device_id}/sms/{thread_id}",
+    path = "/api/v1/devices/{device_id}/sms/threads/{thread_id}",
     tag = "sms",
     params(
         ("device_id" = String, Path, description = "Device unique identifier"),

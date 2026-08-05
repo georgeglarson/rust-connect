@@ -474,9 +474,7 @@ async fn test_clipboard_request_route_exists() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(
-                    "/api/v1/devices/test-phoneaaaaaaaaaaaaaaaaaaaaaa/clipboard/request",
-                )
+                .uri("/api/v1/devices/test-phoneaaaaaaaaaaaaaaaaaaaaaa/clipboard/request")
                 .header("X-API-Key", &api_key)
                 .body(Body::empty())
                 .unwrap(),

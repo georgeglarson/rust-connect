@@ -13,6 +13,16 @@ use crate::plugins::share::ReceivedFile;
 use crate::protocol::types::Packet;
 use crate::utils::errors::Error;
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/share/files",
+    tag = "share",
+    responses(
+        (status = 200, description = "List shared files received from devices", body = ApiResponse),
+        (status = 401, description = "Invalid or missing API key", body = ApiError),
+    ),
+    security(("api_key" = []))
+)]
 pub async fn list_share_files(
     State(state): State<Arc<AppState>>,
 ) -> Result<

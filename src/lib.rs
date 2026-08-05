@@ -23,7 +23,7 @@
 //! ## Discovery
 //!
 //! ```no_run
-//! use rust_connect::protocol::{DiscoveryService, Identity};
+//! use rust_connect::protocol::{DiscoveryService, Identity, types::DEFAULT_UDP_PORT};
 //! use rust_connect::device::DeviceType;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -35,7 +35,7 @@
 //!     vec!["kdeconnect.ping".to_string()],
 //! );
 //!
-//! let service = DiscoveryService::new(identity, 5, rust_connect::protocol::types::DEFAULT_UDP_PORT).await?;
+//! let service = DiscoveryService::new(identity, 5, DEFAULT_UDP_PORT).await?;
 //! service.broadcast().await?;
 //! # Ok(())
 //! # }

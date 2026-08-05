@@ -18,6 +18,16 @@ use std::sync::Arc;
 
 use crate::app::AppState;
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/health",
+    tag = "health",
+    responses(
+        (status = 200, description = "Service liveness probe", body = serde_json::Value),
+    )
+    // intentionally no `security(("api_key" = []))` — health is mounted
+    // outside the auth middleware in src/api/router.rs.
+)]
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",

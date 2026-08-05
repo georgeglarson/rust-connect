@@ -8,9 +8,14 @@ use crate::device::types::{Device, DeviceState, DeviceType};
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        handlers::health,
         handlers::list_devices,
         handlers::get_device,
         handlers::get_device_state,
+        handlers::list_connected_devices,
+        handlers::delete_device,
+        handlers::connect_device,
+        handlers::disconnect_device,
         handlers::pair_device,
         handlers::unpair_device,
         handlers::send_ping,
@@ -18,6 +23,7 @@ use crate::device::types::{Device, DeviceState, DeviceType};
         handlers::trigger_remotecommand,
         handlers::send_remotekeyboard_keypress,
         handlers::list_plugins,
+        handlers::get_capabilities,
         handlers::list_tools,
         handlers::get_device_battery,
         handlers::request_device_battery,
@@ -27,6 +33,7 @@ use crate::device::types::{Device, DeviceState, DeviceType};
         handlers::send_sms,
         handlers::get_clipboard,
         handlers::set_clipboard,
+        handlers::request_clipboard,
         handlers::get_device_mpris,
         handlers::get_local_players,
         handlers::request_mpris,
@@ -48,6 +55,7 @@ use crate::device::types::{Device, DeviceState, DeviceType};
         handlers::send_file_to_device,
         handlers::send_text_to_device,
         handlers::send_url_to_device,
+        handlers::list_share_files,
     ),
     components(schemas(
         ApiError,

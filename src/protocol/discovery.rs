@@ -42,7 +42,7 @@ impl DiscoveryService {
     ///
     /// ```no_run
     /// use rust_connect::protocol::discovery::DiscoveryService;
-    /// use rust_connect::protocol::types::Identity;
+    /// use rust_connect::protocol::types::{Identity, DEFAULT_UDP_PORT};
     /// use rust_connect::device::types::DeviceType;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -54,7 +54,7 @@ impl DiscoveryService {
     ///     vec![],
     /// );
     ///
-    /// let service = DiscoveryService::new(identity, 5, crate::protocol::types::DEFAULT_UDP_PORT).await?;
+    /// let service = DiscoveryService::new(identity, 5, DEFAULT_UDP_PORT).await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -215,7 +215,7 @@ impl DiscoveryService {
     ///
     /// ```no_run
     /// # use rust_connect::protocol::discovery::DiscoveryService;
-    /// # use rust_connect::protocol::types::Identity;
+    /// # use rust_connect::protocol::types::{Identity, DEFAULT_UDP_PORT};
     /// # use rust_connect::device::types::DeviceType;
     /// # use tokio_util::sync::CancellationToken;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -226,7 +226,7 @@ impl DiscoveryService {
     /// #     vec![],
     /// #     vec![],
     /// # );
-    /// # let service = DiscoveryService::new(identity, 5, crate::protocol::types::DEFAULT_UDP_PORT).await?;
+    /// # let service = DiscoveryService::new(identity, 5, DEFAULT_UDP_PORT).await?;
     /// // Start broadcasting in background
     /// let cancel = CancellationToken::new();
     /// tokio::spawn(async move {
@@ -285,7 +285,7 @@ impl DiscoveryService {
     ///
     /// ```no_run
     /// # use rust_connect::protocol::discovery::DiscoveryService;
-    /// # use rust_connect::protocol::types::Identity;
+    /// # use rust_connect::protocol::types::{Identity, DEFAULT_UDP_PORT};
     /// # use rust_connect::device::types::DeviceType;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// # let identity = Identity::new(
@@ -295,7 +295,7 @@ impl DiscoveryService {
     /// #     vec![],
     /// #     vec![],
     /// # );
-    /// # let service = DiscoveryService::new(identity, 5, crate::protocol::types::DEFAULT_UDP_PORT).await?;
+    /// # let service = DiscoveryService::new(identity, 5, DEFAULT_UDP_PORT).await?;
     /// // Start listening in background
     /// tokio::spawn(async move {
     ///     service.start_listening(|identity, addr| {
@@ -494,7 +494,11 @@ mod tests {
             .expect("Value expected to be present");
 
         assert_eq!(
-            service.socket.local_addr().expect("Value expected to be present").port(),
+            service
+                .socket
+                .local_addr()
+                .expect("Value expected to be present")
+                .port(),
             configured_port,
             "DiscoveryService must bind to the configured UDP port"
         );

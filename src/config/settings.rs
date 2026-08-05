@@ -446,11 +446,8 @@ mod tests {
     fn test_load_ignores_legacy_protocol_version_field() {
         let temp = tempfile::TempDir::new().expect("Value expected to be present");
         let path = temp.path().join("legacy.toml");
-        std::fs::write(
-            &path,
-            "device_name = \"legacy\"\nprotocol_version = 7\n",
-        )
-        .expect("Value expected to be present");
+        std::fs::write(&path, "device_name = \"legacy\"\nprotocol_version = 7\n")
+            .expect("Value expected to be present");
 
         let settings = AppSettings::load_from_file(&path).expect("Value expected to be present");
         assert_eq!(settings.device_name, "legacy");
