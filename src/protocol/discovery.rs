@@ -14,7 +14,7 @@ use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::protocol::packet::PacketSerializer;
-use crate::protocol::types::{Identity, DEFAULT_UDP_PORT, MAX_PORT, MIN_PORT};
+use crate::protocol::types::{Identity, MAX_PORT, MIN_PORT};
 use crate::utils::errors::{Error, Result};
 
 /// Discovery service
@@ -54,12 +54,16 @@ impl DiscoveryService {
     ///     vec![],
     /// );
     ///
-    /// let service = DiscoveryService::new(identity, 5).await?;
+    /// let service = DiscoveryService::new(identity, 5, crate::protocol::types::DEFAULT_UDP_PORT).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn new(identity: Identity, broadcast_interval_secs: u64) -> Result<Self> {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_UDP_PORT);
+    pub async fn new(
+        identity: Identity,
+        broadcast_interval_secs: u64,
+        udp_port: u16,
+    ) -> Result<Self> {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), udp_port);
 
         let socket = Socket::new(Domain::IPV4, SockType::DGRAM, Some(Protocol::UDP))
             .map_err(|e| Error::DiscoveryError(format!("Failed to create UDP socket: {}", e)))?;
@@ -85,7 +89,7 @@ impl DiscoveryService {
             .map_err(|e| Error::DiscoveryError(format!("Failed to enable broadcast: {}", e)))?;
 
         info!(
-            port = DEFAULT_UDP_PORT,
+            port = udp_port,
             interval_secs = broadcast_interval_secs,
             event = "discovery_service_created",
             "Discovery service initialized"
@@ -94,7 +98,7 @@ impl DiscoveryService {
         Ok(Self {
             socket,
             identity,
-            broadcast_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), DEFAULT_UDP_PORT),
+            broadcast_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), udp_port),
             broadcast_interval: Duration::from_secs(broadcast_interval_secs),
         })
     }
@@ -222,7 +226,7 @@ impl DiscoveryService {
     /// #     vec![],
     /// #     vec![],
     /// # );
-    /// # let service = DiscoveryService::new(identity, 5).await?;
+    /// # let service = DiscoveryService::new(identity, 5, crate::protocol::types::DEFAULT_UDP_PORT).await?;
     /// // Start broadcasting in background
     /// let cancel = CancellationToken::new();
     /// tokio::spawn(async move {
@@ -291,7 +295,7 @@ impl DiscoveryService {
     /// #     vec![],
     /// #     vec![],
     /// # );
-    /// # let service = DiscoveryService::new(identity, 5).await?;
+    /// # let service = DiscoveryService::new(identity, 5, crate::protocol::types::DEFAULT_UDP_PORT).await?;
     /// // Start listening in background
     /// tokio::spawn(async move {
     ///     service.start_listening(|identity, addr| {
@@ -475,6 +479,30 @@ mod tests {
             }
             Err(_) => {}
         }
+    }
+
+    #[tokio::test]
+    async fn test_new_binds_and_broadcasts_on_configured_port() {
+        // settings.udp_port (and the --port CLI flag) flow through here;
+        // the bind socket AND broadcast address must use the configured
+        // port, not the protocol-default constant.
+        let identity = create_test_identity("Port Test");
+        let configured_port = find_unused_port().await;
+
+        let service = DiscoveryService::new(identity, 5, configured_port)
+            .await
+            .expect("Value expected to be present");
+
+        assert_eq!(
+            service.socket.local_addr().expect("Value expected to be present").port(),
+            configured_port,
+            "DiscoveryService must bind to the configured UDP port"
+        );
+        assert_eq!(
+            service.broadcast_addr.port(),
+            configured_port,
+            "DiscoveryService must broadcast on the configured UDP port"
+        );
     }
 
     #[tokio::test]

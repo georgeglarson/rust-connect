@@ -91,7 +91,12 @@ async fn start_discovery(
     shutdown: CancellationToken,
 ) -> Result<DiscoveryHandles> {
     let discovery = Arc::new(
-        DiscoveryService::new(identity.clone(), state.settings.broadcast_interval_secs).await?,
+        DiscoveryService::new(
+            identity.clone(),
+            state.settings.broadcast_interval_secs,
+            state.settings.udp_port,
+        )
+        .await?,
     );
 
     info!(event = "discovery_ready", "Discovery service initialized");
