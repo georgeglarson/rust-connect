@@ -122,7 +122,21 @@ pub async fn run_packet_loop(
                                         "Pairing accepted by remote device"
                                     );
 
-                                    state.send_plugin_init_packets(device_id).await;
+                                    // Spawn the advertisement off the loop: it
+                                    // now waits briefly for a live link, so
+                                    // awaiting it inline would stop this loop
+                                    // from reading further packets for the
+                                    // device during the wait. Same shape as the
+                                    // connect-time path in the listener.
+                                    let state_clone = state.clone();
+                                    let device_id_clone = device_id.to_string();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_millis(500))
+                                            .await;
+                                        state_clone
+                                            .send_plugin_init_packets(&device_id_clone)
+                                            .await;
+                                    });
                                 } else {
                                     // NotPaired / RequestedByPeer / Paired.
                                     // Paired: Android semantics — a pair request
@@ -197,7 +211,22 @@ pub async fn run_packet_loop(
                                             // connect-time notify never fired
                                             // — plugins get their init
                                             // packets here or never.
-                                            state.send_plugin_init_packets(device_id).await;
+                                            //
+                                            // Spawned off the loop for the same
+                                            // reason as the pair-accepted arm
+                                            // above: the advertisement path now
+                                            // waits briefly for a live link.
+                                            let state_clone = state.clone();
+                                            let device_id_clone = device_id.to_string();
+                                            tokio::spawn(async move {
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_millis(500),
+                                                )
+                                                .await;
+                                                state_clone
+                                                    .send_plugin_init_packets(&device_id_clone)
+                                                    .await;
+                                            });
                                         }
                                     } else {
                                         info!(
