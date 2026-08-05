@@ -51,6 +51,7 @@
         .badge { display: inline-block; padding: 0.2rem 0.4rem; border-radius: 4px; font-size: 0.7rem; background: #333; color: #eee; margin-right: 0.25rem; }
         .badge.paired { background: rgba(0, 255, 136, 0.2); color: #00ff88; }
         .badge.connected { background: rgba(0, 212, 255, 0.2); color: #00d4ff; }
+        .badge.pairreq { background: rgba(255, 200, 0, 0.2); color: #ffc800; }
         
         .setup { background: #16213e; border-radius: 8px; padding: 2rem; text-align: center; max-width: 500px; margin: 4rem auto; }
         .setup p { color: #888; margin-bottom: 1rem; line-height: 1.6; font-size: 0.875rem; }
@@ -97,12 +98,19 @@
                         <div id="pane-core" class="tab-pane active card">
                             <h3>Device Management</h3>
                             <div class="row">
-                                <button onclick="action('pair')">Pair</button>
+                                <button id="pair-button" onclick="action('pair')">Pair</button>
                                 <button onclick="action('unpair')" class="danger">Unpair</button>
                                 <button onclick="action('connect')" class="secondary">Connect</button>
                                 <button onclick="action('disconnect')" class="secondary">Disconnect</button>
                                 <button onclick="action('ping')" class="secondary">Ping</button>
                                 <button onclick="action('lock')" class="secondary">Lock Screen</button>
+                            </div>
+                            <div id="sas-display" style="display:none; margin:1rem 0; padding:1rem; background:rgba(255,200,0,0.1); border-left:4px solid #ffc800; border-radius:4px;">
+                                <h4 style="margin:0 0 0.5rem 0; color:#ffc800;">Pairing Request Pending</h4>
+                                <div style="font-size:1.1rem;">
+                                    Verification key: <code id="sas-key" style="background:#0a0a15; padding:0.2rem 0.5rem; border-radius:3px; color:#00ff88;"></code>
+                                </div>
+                                <div style="color:#888; margin-top:0.5rem;">Compare this code with the one shown on your phone</div>
                             </div>
                             <h3>State Output</h3>
                             <pre id="core-state-json" style="background:#0a0a15; padding:1rem; border-radius:4px; font-size:0.8rem; overflow-x:auto;"></pre>
@@ -323,6 +331,10 @@
                 let html = '';
                 for (const d of devices) {
                     const activeClass = d.id === currentDeviceId ? 'active' : '';
+                    const pairLabel = d.pair_state === 'requested_by_peer' ? 'Accept' : 'Pair';
+                    const sasLine = (d.pair_state === 'requested_by_peer' && d.verification_key)
+                        ? `<div style="margin:0.5rem 0; color:#ffc800;">Verification key: <code>${d.verification_key}</code> — compare with the phone</div>`
+                        : '';
                     html += `
                         <div class="device-item ${activeClass}" onclick="selectDevice('${d.id}')">
                             <h3>${escapeHtml(d.name || d.id)}</h3>
@@ -330,7 +342,9 @@
                             <div class="meta" style="margin-top:0.2rem;">
                                 <span class="badge" style="background:transparent; padding:0; color:#888;">${d.device_type}</span>
                                 <span class="badge ${d.state.toLowerCase()}">${d.state}</span>
+                                ${d.pair_state === 'requested_by_peer' ? '<span class="badge pairreq">Pair request</span>' : ''}
                             </div>
+                            ${sasLine}
                         </div>
                     `;
                 }
@@ -387,11 +401,26 @@
         function renderDeviceDetails(d) {
             if (!d) return;
             document.getElementById('selected-device-name').textContent = d.name || d.id;
-            
+
             let badges = '';
             if (d.state === 'Paired' || d.state === 'Connected') badges += '<span class="badge paired">Paired</span>';
             if (d.state === 'Connected') badges += '<span class="badge connected">Connected</span>';
+            if (d.pair_state === 'requested_by_peer') badges += '<span class="badge pairreq">Pair request</span>';
             document.getElementById('selected-device-badges').innerHTML = badges;
+
+            const pairButton = document.getElementById('pair-button');
+            if (pairButton) {
+                pairButton.textContent = d.pair_state === 'requested_by_peer' ? 'Accept' : 'Pair';
+            }
+
+            const sasDisplay = document.getElementById('sas-display');
+            if (d.pair_state === 'requested_by_peer' && d.verification_key) {
+                sasDisplay.style.display = 'block';
+                document.getElementById('sas-key').textContent = d.verification_key;
+            } else {
+                sasDisplay.style.display = 'none';
+            }
+
             document.getElementById('core-state-json').textContent = JSON.stringify(d, null, 2);
         }
 
