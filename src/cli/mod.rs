@@ -489,7 +489,10 @@ fn cmd_pair(
                     writeln!(out, "Compare this code with the one shown on your phone.")?;
                 }
                 None => {
-                    writeln!(out, "Verification key unavailable — compare on the phone side.")?;
+                    writeln!(
+                        out,
+                        "Verification key unavailable — compare on the phone side."
+                    )?;
                 }
             }
         }
@@ -505,12 +508,15 @@ fn cmd_pair(
             write!(out, "Accept pairing? [y/N] ")?;
             out.flush()?;
             let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer).map_err(|e| {
-                CliError::Api(format!("failed to read confirmation: {e}"))
-            })?;
+            std::io::stdin()
+                .read_line(&mut answer)
+                .map_err(|e| CliError::Api(format!("failed to read confirmation: {e}")))?;
             let answer = answer.trim().to_ascii_lowercase();
             if answer != "y" && answer != "yes" {
-                writeln!(out, "Not accepted. The request expires on its own within ~25s.")?;
+                writeln!(
+                    out,
+                    "Not accepted. The request expires on its own within ~25s."
+                )?;
                 return Ok(());
             }
         }

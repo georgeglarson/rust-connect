@@ -353,11 +353,16 @@ fn test_pair_incoming_request_prints_sas_and_accepts_with_yes() {
     let output = String::from_utf8(out).expect("utf8");
 
     assert!(output.contains("00F8F3CE"), "SAS printed: {output}");
-    assert!(output.contains("Paired with dev-in."), "completion: {output}");
+    assert!(
+        output.contains("Paired with dev-in."),
+        "completion: {output}"
+    );
 
     let requests = server.recorded();
     assert!(
-        requests.iter().any(|r| r.starts_with("POST /api/v1/devices/dev-in/pair ")),
+        requests
+            .iter()
+            .any(|r| r.starts_with("POST /api/v1/devices/dev-in/pair ")),
         "accept POSTed: {requests:?}"
     );
 }
