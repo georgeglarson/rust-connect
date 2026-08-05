@@ -60,6 +60,43 @@ functionally complete.
 - Network namespaces for peer and fault-injection tests; root-only tests remain an
   explicit on-demand suite rather than silently skipped CI coverage.
 
+## Execution routing (2026-08-05 amendment)
+
+This plan is executed through a delegation stack: a strong model holds the
+knife — writes the briefs, owns the gates, integrates, and verifies — while
+flat-rate subscriptions execute the lanes. The task format above
+(Location / Dependencies / Acceptance / Validation) is the executor brief
+format; a seven-sprint cheaper-model execution in this repo's history ran
+clean and inspected faithful under exactly this shape.
+
+- **Big implementation lanes** — MiniMax M3, headless Claude Code on the
+  provider's Anthropic-compatible endpoint: Tasks 1.1, 1.2, 1.3, 1.4, 1.5,
+  1.6, 1.7, 2.1, 2.3. Well-specified builds with clear acceptance criteria.
+  One lane per task; no two concurrent lanes touch overlapping file sets.
+- **Bulk/mechanical lanes** — MiniMax M3 or MiMo: Task 0.1 inventory
+  fixtures, Task 0.4 self-referential test conversion (worklist is already in
+  the task), Task 4.2 device-matrix scripting support, Task 5.4 doc scrub.
+- **Adversarial/review lanes** — GLM-5.2: Task 0.5 black-box audit, the
+  independent semantic scan in Task 2.5, disputed ledger rows, Task 3.1
+  role classification. A reviewer must come from a different provider than
+  the lane under review.
+- **Rig work, not token work**: Sprint 4 environments, soaks, and Task 4.5
+  install walks are shell + supervision; they cost attention, not quota.
+- **Never delegated**: live-phone validation (A15 via scripted adb taps, S21
+  by hand), merges and pushes, Task 5.2 announcement wording, and the
+  AI-provenance decision.
+
+Standing executor discipline — earned lessons; restate in every brief:
+
+- The executor never pushes and never merges; the integrating session owns
+  git state, and push discipline is re-stated in every brief.
+- Briefs mandate red-before-green tests and upstream file:line citations;
+  fixtures come from upstream source, never from this repo's own structs.
+- The integrator verifies the tree, never the executor's summary.
+- One cargo build at a time, and never with target directories on tmpfs.
+- Live validation against the phones is the integrator's job; the phone is
+  the oracle.
+
 ## Sprint 0: Make completeness falsifiable
 
 **Goal:** Establish an exhaustive inventory and a gate that cannot declare success
