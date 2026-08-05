@@ -790,10 +790,18 @@ async fn test_connection_loop_pair_accept_sends_plugin_init_packets() {
     // Plugin init advertisements must arrive on the peer side of the link
     // after the pairing completed. Several plugins advertise; read until
     // runcommand's shows up.
+    //
+    // One generous deadline rather than per-window timeouts: the old 8x5s
+    // loop treated an empty window as a reason to stop, so under full-suite
+    // parallel load a single slow packet failed the test (measured at ~10%
+    // of full-suite runs). Drain until the deadline; only a link error stops
+    // the wait early.
     let mut saw_runcommand = false;
-    for _ in 0..8 {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
         match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            remaining.min(std::time::Duration::from_secs(5)),
             peer_cm.recv_packet(&"clientaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
         )
         .await
@@ -804,7 +812,7 @@ async fn test_connection_loop_pair_accept_sends_plugin_init_packets() {
             }
             Ok(Ok(_)) => continue,
             Ok(Err(_)) => break,
-            Err(_) => break,
+            Err(_) => continue,
         }
     }
     assert!(
