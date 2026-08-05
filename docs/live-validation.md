@@ -59,6 +59,29 @@ miss. Have the KDE Connect app open before starting the test.
   Downloads afterwards. Worth stating separately, because the test itself only
   proves the payload was sent, not that the phone wrote it.
 
+### Phone-initiated pairing: SAS verified identical on both devices
+
+Run against the fixed build after the accept-side SAS work landed.
+
+- Phone sent a pair request; the daemon surfaced it as `requested_by_peer`
+  with a verification key, and reading the device over the REST API did **not**
+  consume or accept the request.
+- **The desktop and the phone displayed the same key**: `65D58104` on the API
+  and CLI, and `65D58104` in the Android app's "Pair requested" screen,
+  captured from the device screen rather than transcribed by hand.
+- The daemon journal carried the same value under `pair_request_sas`.
+- An earlier accept in the same session completed the pairing with its key
+  (`589FCFC9`) shown before the accept, so the display is on the path that
+  actually pairs, not a side channel.
+
+This is the assertion the SAS exists for: not that a key is displayed, but
+that it is the *same* key both sides derived. Before the fix, the accepting
+side displayed nothing at all on this path.
+
+Also observed: the incoming request's ~25 s window is genuinely short. Letting
+it lapse made the CLI fall through to a fresh outgoing request and report a
+timeout — correctly, rather than reporting a success that did not happen.
+
 ### Pairing
 
 - Phone-initiated pairing completed against the packaged daemon.
