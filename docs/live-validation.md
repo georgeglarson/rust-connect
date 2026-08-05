@@ -55,6 +55,9 @@ miss. Have the KDE Connect app open before starting the test.
 - Phone dialed the host, inbound handshake and encrypted identity exchange
   completed, pairing confirmed.
 - 1 MiB payload sent over TLS on port 1739 and accepted by the phone.
+- Receipt confirmed on the device: the file was present in the phone's
+  Downloads afterwards. Worth stating separately, because the test itself only
+  proves the payload was sent, not that the phone wrote it.
 
 ### Pairing
 
