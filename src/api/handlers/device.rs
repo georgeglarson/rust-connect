@@ -177,7 +177,16 @@ pub async fn pair_device(
         // at connect time, so no connect-time plugin notify ever fired —
         // send the init advertisements (runcommand list, …) now or the
         // phone sees nothing until reconnect.
-        state.send_plugin_init_packets(&device_id).await;
+        //
+        // Spawned, like every other caller: the advertisement path waits
+        // briefly for a live link, and holding the HTTP response open for
+        // that wait would be reporting a pairing that is already complete.
+        let state_clone = state.clone();
+        let device_id_clone = device_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            state_clone.send_plugin_init_packets(&device_id_clone).await;
+        });
 
         Ok(Json(ApiResponse::ok(PairResponse {
             device_id,
