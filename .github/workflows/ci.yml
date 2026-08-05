@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Weekly so new RustSec advisories are caught between commits.
+  schedule:
+    - cron: '47 6 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install system dependencies
+        # libssl-dev is only needed for dev-dependencies (openssl in test fixtures);
+        # the production binary no longer uses openssl.
+        # libdbus-1-dev is needed for zbus (MPRIS, notifications).
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libdbus-1-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@c676846f29d98ff6b0106d3608c7ffd4048af17b # v2.9.0
+
+      - name: Build (production features only)
+        # Plain build without --all-features: the dev-dependency on the
+        # crate's own test-helpers feature unifies it into every `cargo
+        # test` build, which let a production-only compile break (cfg-gated
+        # import used by production code) pass all gates on 2026-07-30.
+        run: cargo build --locked
+
+      - name: Test
+        run: cargo test --all-features --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Format
+        run: cargo fmt --check
+
+  msrv:
+    # Enforces the rust-version floor declared in Cargo.toml. Bumping the
+    # floor should be a deliberate edit to that field, not something that
+    # drifts in when a dependency raises its own.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libdbus-1-dev
+
+      - name: Install Rust toolchain (MSRV)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.91'
+
+      - uses: Swatinem/rust-cache@e172ef532f714507ca8b9ce7978a442736438fc1 # v2.9.0
+
+      - name: Check on MSRV
+        run: cargo check --locked
+
+  audit:
+    runs-on: ubuntu-latest
+    # Scoped to this job, not the workflow: rustsec/audit-check publishes its
+    # results as a check-run, which the default read-only GITHUB_TOKEN cannot
+    # create ("Resource not accessible by integration"). Nothing else here
+    # needs write access.
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Security audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # deny.toml: wildcards deny, multiple-versions warn. The duplicate
+      # crates are transitive and not resolvable from our manifest; see the
+      # comment in deny.toml for the measurement behind that choice.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2

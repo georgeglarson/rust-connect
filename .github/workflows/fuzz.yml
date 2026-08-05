@@ -1,0 +1,64 @@
+name: Fuzz
+
+on:
+  # Short smoke run on PRs that touch the wire parser or the fuzz harness.
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/protocol/**'
+      - 'src/api/handlers/share.rs'
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+  # Weekly deep run (10 min per target).
+  schedule:
+    - cron: '23 4 * * 3'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust toolchain
+        # cargo-fuzz requires nightly (-Zsanitizer, sancov coverage flags).
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: nightly
+
+      - uses: Swatinem/rust-cache@e172ef532f714507ca8b9ce7978a442736438fc1 # v2.9.0
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz packet_deserialize
+        working-directory: fuzz
+        run: >-
+          cargo fuzz run packet_deserialize --
+          -max_total_time=${{ github.event_name == 'schedule' && 600 || 60 }}
+
+      - name: Fuzz identity_packet
+        working-directory: fuzz
+        run: >-
+          cargo fuzz run identity_packet --
+          -max_total_time=${{ github.event_name == 'schedule' && 600 || 60 }}
+
+      - name: Fuzz share_multipart
+        working-directory: fuzz
+        run: >-
+          cargo fuzz run share_multipart --
+          -max_total_time=${{ github.event_name == 'schedule' && 600 || 60 }}
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-crash-artifacts
+          path: fuzz/artifacts/

@@ -1,0 +1,4 @@
+# cargo-fuzz needs nightly (-Zsanitizer and sancov flags); this pins the
+# toolchain for anything run inside fuzz/ without touching the repo default.
+[toolchain]
+channel = "nightly"

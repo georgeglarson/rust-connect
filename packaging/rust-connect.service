@@ -1,0 +1,56 @@
+[Unit]
+Description=Rust Connect - KDE Connect compatible daemon
+Documentation=https://github.com/georgeglarson/rust-connect
+After=graphical-session.target network-online.target
+Wants=network-online.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/rust-connect
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rust-connect
+
+# Security hardening, session-compatible.
+#
+# This is a USER unit (systemd --user), not a system unit. It must be, because
+# three things the daemon does are only reachable from inside the desktop
+# session:
+#   - plugins/notification.rs gates the desktop popup on DISPLAY/WAYLAND_DISPLAY
+#     and raises it through notify-rust, which needs the session DBus.
+#   - config/settings.rs resolves the data dir to ~/.local/share/rust-connect,
+#     holding own.crt, own.key, device_id and paired.json. Losing sight of it
+#     means minting a fresh identity on every boot and dropping every pairing.
+#   - plugins/share.rs writes received files to dirs::download_dir(), ~/Downloads.
+#
+# ProtectHome is therefore deliberately ABSENT. Do not add it back: it would
+# hide the identity and the download dir, and the daemon would silently
+# re-pair from scratch on every start.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=%h/.local/share/rust-connect %h/Downloads
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# The mousepad plugin injects input through /dev/uinput (evdev). This permits
+# the device under systemd's policy; the user still needs filesystem access to
+# it (input group or a udev rule) or the plugin fails to open it at runtime.
+DeviceAllow=/dev/uinput rw
+
+[Install]
+WantedBy=default.target

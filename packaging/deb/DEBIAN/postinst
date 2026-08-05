@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+# rust-connect runs as a USER service, not a system service: it needs the
+# session DBus (desktop notifications), $HOME (identity + paired.json), and
+# ~/Downloads (received files). See packaging/rust-connect.service.
+#
+# The unit ships to /usr/lib/systemd/user/. Enabling it for every existing and
+# future user is a --global operation; it takes effect at each user's next
+# login. A user who wants it now runs:
+#     systemctl --user enable --now rust-connect.service
+systemctl daemon-reload || true
+systemctl --global enable rust-connect.service || true

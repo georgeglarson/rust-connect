@@ -1,0 +1,15 @@
+Package: rust-connect
+Version: 0.1.0
+Section: net
+Priority: optional
+Architecture: amd64
+Depends: libc6 (>= 2.17)
+Maintainer: George Larson <georgeglarson@users.noreply.github.com>
+Homepage: https://github.com/georgeglarson/rust-connect
+Description: A modern, API-first reimplementation of KDE Connect in Rust
+ Rust Connect provides device discovery, pairing, and plugin-based
+ communication with KDE Connect-compatible Android devices. It exposes
+ a REST API and an SSE event stream for integration.
+ .
+ Protocol ports: TCP/UDP 1716
+ API port: TCP 9090

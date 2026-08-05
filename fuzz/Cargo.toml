@@ -1,0 +1,51 @@
+[package]
+name = "rust-connect-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace: keeps the fuzz crate out of the main package's
+# dependency tree and lockfile (the root Cargo.toml has no [workspace]
+# section, so no `exclude` entry is needed there).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rust-connect]
+path = ".."
+
+[[bin]]
+name = "packet_deserialize"
+path = "fuzz_targets/packet_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "identity_packet"
+path = "fuzz_targets/identity_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "share_multipart"
+path = "fuzz_targets/share_multipart.rs"
+test = false
+doc = false
+bench = false
+
+[dependencies.tempfile]
+version = "3"
+
+[dependencies.tokio]
+version = "1"
+features = ["full"]
+
+[dependencies.axum]
+version = "0.7"
+features = ["multipart"]
