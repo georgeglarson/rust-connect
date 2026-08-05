@@ -33,7 +33,7 @@ jobs:
         with:
           toolchain: nightly
 
-      - uses: Swatinem/rust-cache@e172ef532f714507ca8b9ce7978a442736438fc1 # v2.9.0
+      - uses: Swatinem/rust-cache@72d126e709cad40056a62344eee609d696d62d33 # v2.9.0
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked

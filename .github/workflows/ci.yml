@@ -34,7 +34,7 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@c676846f29d98ff6b0106d3608c7ffd4048af17b # v2.9.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Build (production features only)
         # Plain build without --all-features: the dev-dependency on the
@@ -68,7 +68,7 @@ jobs:
         with:
           toolchain: '1.91'
 
-      - uses: Swatinem/rust-cache@e172ef532f714507ca8b9ce7978a442736438fc1 # v2.9.0
+      - uses: Swatinem/rust-cache@72d126e709cad40056a62344eee609d696d62d33 # v2.9.0
 
       - name: Check on MSRV
         run: cargo check --locked
