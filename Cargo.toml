@@ -63,7 +63,7 @@ config = "0.14"
 toml = "0.8"
 
 # Error handling
-thiserror = "1"
+thiserror = "2"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
