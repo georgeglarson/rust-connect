@@ -521,14 +521,47 @@ fn cmd_pair(
             }
         }
 
-        let body = client
-            .post_empty(&format!("{}/pair", device_path(&device_id)))
-            .map_err(|e| {
-                CliError::Api(format!(
-                    "{e} — the request may have expired (25s window); ask the \
-                     phone to send it again, then re-run"
-                ))
-            })?;
+        // The confirmation is unbounded but the request is not: it expires
+        // after ~25s. Re-read the device before accepting, because POSTing
+        // /pair with no request pending does NOT fail — it starts a new
+        // OUTGOING pairing, which would both report false success and put an
+        // unexpected request on the phone. Re-reading also catches the phone
+        // re-sending during the prompt: that is a different request with a
+        // different key, and accepting it would pair on a key the user never
+        // compared.
+        let recheck_body = client.get(&device_path(&device_id))?;
+        let recheck = envelope_data(&recheck_body)?;
+        if recheck.get("pair_state").and_then(|v| v.as_str()) != Some("requested_by_peer") {
+            return Err(CliError::Api(format!(
+                "the pairing request from {device_id} is no longer pending — its \
+                 ~25s window closed; ask the phone to send it again, then re-run"
+            )));
+        }
+        let shown_key = detail.get("verification_key").and_then(|v| v.as_str());
+        let current_key = recheck.get("verification_key").and_then(|v| v.as_str());
+        if shown_key != current_key {
+            return Err(CliError::Api(
+                "the pending request changed while awaiting confirmation: its \
+                 verification key no longer matches the one displayed. Re-run \
+                 and compare the new key before accepting."
+                    .to_string(),
+            ));
+        }
+
+        let body = client.post_empty(&format!("{}/pair", device_path(&device_id)))?;
+        let data = envelope_data(&body)?;
+        let status = data
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        if status != "paired" {
+            return Err(CliError::Api(format!(
+                "the accept did not complete the pairing — the daemon reported \
+                 '{status}'. The request most likely expired and an outgoing \
+                 pairing was started instead; check the phone, and run \
+                 `rust-connect unpair {device_id}` if it shows an unexpected request."
+            )));
+        }
         if json {
             writeln!(out, "{body}")?;
         } else {

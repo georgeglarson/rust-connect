@@ -420,6 +420,194 @@ fn test_pair_incoming_request_without_yes_refuses_when_not_a_tty() {
 }
 
 #[test]
+fn test_pair_incoming_refuses_when_request_vanishes_before_accept() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static DETAIL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    DETAIL_CALLS.store(0, Ordering::SeqCst);
+
+    let server = MockServer::start(|request_line, _| {
+        if request_line.starts_with("GET /api/v1/devices?") {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "devices": [{ "id": "dev-gone", "name": "test phone" }],
+                    "total": 1
+                })),
+            )
+        } else if request_line == "GET /api/v1/devices/dev-gone HTTP/1.1" {
+            // First read: a request is pending. Second read (the re-check
+            // before accepting): it expired.
+            let n = DETAIL_CALLS.fetch_add(1, Ordering::SeqCst);
+            let pair_state = if n == 0 {
+                "requested_by_peer"
+            } else {
+                "not_paired"
+            };
+            (
+                200,
+                envelope(serde_json::json!({
+                    "id": "dev-gone",
+                    "state": "connected",
+                    "pair_state": pair_state,
+                    "verification_key": "00F8F3CE"
+                })),
+            )
+        } else {
+            (
+                404,
+                r#"{"status":"error","error":{"code":"NOT_FOUND","message":"nope"}}"#.into(),
+            )
+        }
+    });
+
+    let mut out = Vec::new();
+    let err = execute(
+        &server.client(),
+        &Command::Pair {
+            device_id: "dev-gone".to_string(),
+            yes: true,
+        },
+        false,
+        &mut out,
+    )
+    .expect_err("must not accept a request that is no longer pending");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("no longer pending"),
+        "error explains the expiry: {msg}"
+    );
+
+    let requests = server.recorded();
+    assert!(
+        !requests.iter().any(|r| r.contains("/pair ")),
+        "no accept may be sent once the request is gone: {requests:?}"
+    );
+}
+
+#[test]
+fn test_pair_incoming_refuses_when_verification_key_changed() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static DETAIL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    DETAIL_CALLS.store(0, Ordering::SeqCst);
+
+    let server = MockServer::start(|request_line, _| {
+        if request_line.starts_with("GET /api/v1/devices?") {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "devices": [{ "id": "dev-swap", "name": "test phone" }],
+                    "total": 1
+                })),
+            )
+        } else if request_line == "GET /api/v1/devices/dev-swap HTTP/1.1" {
+            // The phone re-sent during the confirmation: still pending, but
+            // it is a DIFFERENT request with a different SAS.
+            let n = DETAIL_CALLS.fetch_add(1, Ordering::SeqCst);
+            let key = if n == 0 { "00F8F3CE" } else { "DEADBEEF" };
+            (
+                200,
+                envelope(serde_json::json!({
+                    "id": "dev-swap",
+                    "state": "connected",
+                    "pair_state": "requested_by_peer",
+                    "verification_key": key
+                })),
+            )
+        } else {
+            (
+                404,
+                r#"{"status":"error","error":{"code":"NOT_FOUND","message":"nope"}}"#.into(),
+            )
+        }
+    });
+
+    let mut out = Vec::new();
+    let err = execute(
+        &server.client(),
+        &Command::Pair {
+            device_id: "dev-swap".to_string(),
+            yes: true,
+        },
+        false,
+        &mut out,
+    )
+    .expect_err("must not accept a request whose key changed");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("verification key"),
+        "error names the key mismatch: {msg}"
+    );
+
+    let requests = server.recorded();
+    assert!(
+        !requests.iter().any(|r| r.contains("/pair ")),
+        "no accept may be sent when the key changed: {requests:?}"
+    );
+}
+
+#[test]
+fn test_pair_incoming_reports_failure_when_daemon_did_not_pair() {
+    let server = MockServer::start(|request_line, _| {
+        if request_line.starts_with("GET /api/v1/devices?") {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "devices": [{ "id": "dev-race", "name": "test phone" }],
+                    "total": 1
+                })),
+            )
+        } else if request_line == "GET /api/v1/devices/dev-race HTTP/1.1" {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "id": "dev-race",
+                    "state": "connected",
+                    "pair_state": "requested_by_peer",
+                    "verification_key": "00F8F3CE"
+                })),
+            )
+        } else if request_line == "POST /api/v1/devices/dev-race/pair HTTP/1.1" {
+            // The request expired server-side between the re-check and the
+            // POST: the daemon started an OUTGOING pairing instead.
+            (
+                200,
+                envelope(serde_json::json!({
+                    "device_id": "dev-race",
+                    "status": "pairing_initiated"
+                })),
+            )
+        } else {
+            (
+                404,
+                r#"{"status":"error","error":{"code":"NOT_FOUND","message":"nope"}}"#.into(),
+            )
+        }
+    });
+
+    let mut out = Vec::new();
+    let err = execute(
+        &server.client(),
+        &Command::Pair {
+            device_id: "dev-race".to_string(),
+            yes: true,
+        },
+        false,
+        &mut out,
+    )
+    .expect_err("a non-paired status must not be reported as success");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("pairing_initiated") || msg.contains("did not complete"),
+        "error surfaces the real status: {msg}"
+    );
+    let output = String::from_utf8(out).expect("utf8");
+    assert!(
+        !output.contains("Paired with dev-race."),
+        "must not claim success: {output}"
+    );
+}
+
+#[test]
 fn test_share_resolves_prefix_and_streams_file_body() {
     let full_id = "0123456789abcdef0123456789abcdef";
     let temp = tempfile::TempDir::new().expect("tempdir");
