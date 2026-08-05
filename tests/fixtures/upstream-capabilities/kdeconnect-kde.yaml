@@ -1,0 +1,210 @@
+# kdeconnect-kde plugin inventory
+#
+# upstream_repo: https://invent.kde.org/network/kdeconnect-kde.git
+# pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+# extraction_date: 2026-08-05
+# field_key: X-KdeConnect-SupportedPacketType = incoming packet types this plugin handles
+# field_key: X-KdeConnect-OutgoingPacketType = outgoing packet types this plugin emits
+# note: plugin role names match the JSON file stem with kdeconnect_ prefix stripped; alignment with rust-connect is deferred to Sprint 3 (Task 3.1)
+plugins:
+  - role: battery
+    source_file: plugins/battery/kdeconnect_battery.json
+    incoming_packet_types:
+      - kdeconnect.battery
+    outgoing_packet_types:
+      - kdeconnect.battery
+  - role: clipboard
+    source_file: plugins/clipboard/kdeconnect_clipboard.json
+    incoming_packet_types:
+      - kdeconnect.clipboard
+      - kdeconnect.clipboard.connect
+      - kdeconnect.clipboard.file
+    outgoing_packet_types:
+      - kdeconnect.clipboard
+      - kdeconnect.clipboard.connect
+      - kdeconnect.clipboard.file
+  - role: connectivity_report
+    source_file: plugins/connectivity-report/kdeconnect_connectivity_report.json
+    incoming_packet_types:
+      - kdeconnect.connectivity_report
+    outgoing_packet_types: []
+  - role: contacts
+    source_file: plugins/contacts/kdeconnect_contacts.json
+    incoming_packet_types:
+      - kdeconnect.contacts.response_uids_timestamps
+      - kdeconnect.contacts.response_vcards
+    outgoing_packet_types:
+      - kdeconnect.contacts.request_all_uids_timestamps
+      - kdeconnect.contacts.request_vcards_by_uid
+  - role: digitizer
+    source_file: plugins/digitizer/kdeconnect_digitizer.json
+    incoming_packet_types:
+      - kdeconnect.digitizer
+      - kdeconnect.digitizer.session
+    outgoing_packet_types: []
+  - role: findmyphone
+    source_file: plugins/findmyphone/kdeconnect_findmyphone.json
+    incoming_packet_types: []
+    outgoing_packet_types:
+      - kdeconnect.findmyphone.request
+  - role: findthisdevice
+    source_file: plugins/findthisdevice/kdeconnect_findthisdevice.json
+    incoming_packet_types:
+      - kdeconnect.findmyphone.request
+    outgoing_packet_types: []
+  - role: lockdevice
+    source_file: plugins/lockdevice/kdeconnect_lockdevice.json
+    incoming_packet_types:
+      - kdeconnect.lock
+      - kdeconnect.lock.request
+    outgoing_packet_types:
+      - kdeconnect.lock
+      - kdeconnect.lock.request
+  - role: mmtelephony
+    source_file: plugins/mmtelephony/kdeconnect_mmtelephony.json
+    incoming_packet_types:
+      - kdeconnect.telephony
+      - kdeconnect.telephony.request_mute
+    outgoing_packet_types:
+      - kdeconnect.telephony
+  - role: mousepad
+    source_file: plugins/mousepad/kdeconnect_mousepad.json
+    incoming_packet_types:
+      - kdeconnect.mousepad.request
+    outgoing_packet_types:
+      - kdeconnect.mousepad.keyboardstate
+  - role: mpriscontrol
+    source_file: plugins/mpriscontrol/kdeconnect_mpriscontrol.json
+    incoming_packet_types:
+      - kdeconnect.mpris.request
+    outgoing_packet_types:
+      - kdeconnect.mpris
+  - role: mprisremote
+    source_file: plugins/mprisremote/kdeconnect_mprisremote.json
+    incoming_packet_types:
+      - kdeconnect.mpris
+    outgoing_packet_types:
+      - kdeconnect.mpris.request
+  - role: notifications
+    source_file: plugins/notifications/kdeconnect_notifications.json
+    incoming_packet_types:
+      - kdeconnect.notification
+    outgoing_packet_types:
+      - kdeconnect.notification.action
+      - kdeconnect.notification.reply
+      - kdeconnect.notification.request
+  - role: pausemusic
+    source_file: plugins/pausemusic/kdeconnect_pausemusic.json
+    incoming_packet_types:
+      - kdeconnect.telephony
+    outgoing_packet_types: []
+  - role: ping
+    source_file: plugins/ping/kdeconnect_ping.json
+    incoming_packet_types:
+      - kdeconnect.ping
+    outgoing_packet_types:
+      - kdeconnect.ping
+  - role: presenter
+    source_file: plugins/presenter/kdeconnect_presenter.json
+    incoming_packet_types:
+      - kdeconnect.presenter
+    outgoing_packet_types: []
+  - role: remotecommands
+    source_file: plugins/remotecommands/kdeconnect_remotecommands.json
+    incoming_packet_types:
+      - kdeconnect.runcommand
+    outgoing_packet_types:
+      - kdeconnect.runcommand.request
+  - role: remotecontrol
+    source_file: plugins/remotecontrol/kdeconnect_remotecontrol.json
+    incoming_packet_types: []
+    outgoing_packet_types:
+      - kdeconnect.mousepad.request
+  - role: remotekeyboard
+    source_file: plugins/remotekeyboard/kdeconnect_remotekeyboard.json
+    incoming_packet_types:
+      - kdeconnect.mousepad.echo
+      - kdeconnect.mousepad.keyboardstate
+    outgoing_packet_types:
+      - kdeconnect.mousepad.request
+  - role: remotesystemvolume
+    source_file: plugins/remotesystemvolume/kdeconnect_remotesystemvolume.json
+    incoming_packet_types:
+      - kdeconnect.systemvolume
+    outgoing_packet_types:
+      - kdeconnect.systemvolume.request
+  - role: runcommand
+    source_file: plugins/runcommand/kdeconnect_runcommand.json
+    incoming_packet_types:
+      - kdeconnect.runcommand.request
+    outgoing_packet_types:
+      - kdeconnect.runcommand
+      - kdeconnect.runcommand.output
+  - role: screensaver_inhibit
+    source_file: plugins/screensaver-inhibit/kdeconnect_screensaver_inhibit.json
+    incoming_packet_types: []
+    outgoing_packet_types: []
+    notes: declares no X-KdeConnect packet types in metadata
+  - role: sendnotifications
+    source_file: plugins/sendnotifications/kdeconnect_sendnotifications.json
+    incoming_packet_types:
+      - kdeconnect.notification.request
+    outgoing_packet_types:
+      - kdeconnect.notification
+  - role: sftp
+    source_file: plugins/sftp/kdeconnect_sftp.json
+    incoming_packet_types:
+      - kdeconnect.sftp
+    outgoing_packet_types:
+      - kdeconnect.sftp.request
+  - role: share
+    source_file: plugins/share/kdeconnect_share.json
+    incoming_packet_types:
+      - kdeconnect.share.request
+    outgoing_packet_types:
+      - kdeconnect.share.request
+      - kdeconnect.share.request.update
+  - role: shareinputdevices
+    source_file: plugins/shareinputdevices/kdeconnect_shareinputdevices.json
+    incoming_packet_types:
+      - kdeconnect.shareinputdevices
+    outgoing_packet_types:
+      - kdeconnect.mousepad.request
+      - kdeconnect.shareinputdevices.request
+  - role: shareinputdevicesremote
+    source_file: plugins/shareinputdevicesremote/kdeconnect_shareinputdevicesremote.json
+    incoming_packet_types:
+      - kdeconnect.mousepad.request
+      - kdeconnect.shareinputdevices.request
+    outgoing_packet_types:
+      - kdeconnect.shareinputdevices
+  - role: sms
+    source_file: plugins/sms/kdeconnect_sms.json
+    incoming_packet_types:
+      - kdeconnect.sms.attachment_file
+      - kdeconnect.sms.messages
+    outgoing_packet_types:
+      - kdeconnect.sms.request
+      - kdeconnect.sms.request_attachment
+      - kdeconnect.sms.request_conversation
+      - kdeconnect.sms.request_conversations
+  - role: systemvolume
+    source_file: plugins/systemvolume/kdeconnect_systemvolume.json
+    incoming_packet_types:
+      - kdeconnect.systemvolume.request
+    outgoing_packet_types:
+      - kdeconnect.systemvolume
+  - role: telephony
+    source_file: plugins/telephony/kdeconnect_telephony.json
+    incoming_packet_types:
+      - kdeconnect.telephony
+    outgoing_packet_types:
+      - kdeconnect.telephony.request_mute
+  - role: virtualmonitor
+    source_file: plugins/virtualmonitor/kdeconnect_virtualmonitor.json
+    incoming_packet_types:
+      - kdeconnect.virtualmonitor
+      - kdeconnect.virtualmonitor.request
+    outgoing_packet_types:
+      - kdeconnect.virtualmonitor
+      - kdeconnect.virtualmonitor.request

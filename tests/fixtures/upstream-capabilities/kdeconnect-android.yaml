@@ -1,0 +1,155 @@
+# kdeconnect-android plugin inventory
+#
+# upstream_repo: https://invent.kde.org/network/kdeconnect-android
+# pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+# extraction_date: 2026-08-05
+# field_key: incoming_packet_types = packet types this plugin handles
+# field_key: outgoing_packet_types = packet types this plugin emits
+# extraction notes:
+# - Kotlin plugins declare `override val supportedPacketTypes` / `outgoingPacketTypes`
+#   in either `= arrayOf(...)` (single- or multi-line) or `get() = arrayOf(...)` form.
+# - Java plugins declare `public @NonNull String[] getSupportedPacketTypes()` / `getOutgoingPacketTypes()`.
+# - Only `const val PACKET_TYPE_*` / `String PACKET_TYPE_*` declarations are treated as packet type constants; other identifiers and strings are discarded to avoid body-field noise.
+# - Roles are the plugin directory names; alignment with rust-connect and kdeconnect-kde is deferred to Sprint 3 (Task 3.1).
+plugins:
+  - role: battery
+    source_file: src/main/java/org/kde/kdeconnect/plugins/battery/BatteryPlugin.kt
+    incoming_packet_types:
+      - kdeconnect.battery
+    outgoing_packet_types:
+      - kdeconnect.battery
+  - role: clipboard
+    source_file: src/main/java/org/kde/kdeconnect/plugins/clipboard/ClipboardPlugin.kt
+    incoming_packet_types:
+      - kdeconnect.clipboard
+      - kdeconnect.clipboard.connect
+    outgoing_packet_types:
+      - kdeconnect.clipboard
+      - kdeconnect.clipboard.connect
+  - role: connectivityreport
+    source_file: src/main/java/org/kde/kdeconnect/plugins/connectivityreport/ConnectivityReportPlugin.kt
+    incoming_packet_types: []
+    outgoing_packet_types:
+      - kdeconnect.connectivity_report
+  - role: contacts
+    source_file: src/main/java/org/kde/kdeconnect/plugins/contacts/ContactsPlugin.kt
+    incoming_packet_types:
+      - kdeconnect.contacts.request_all_uids_timestamps
+      - kdeconnect.contacts.request_vcards_by_uid
+    outgoing_packet_types:
+      - kdeconnect.contacts.response_uids_timestamps
+      - kdeconnect.contacts.response_vcards
+  - role: digitizer
+    source_file: src/main/java/org/kde/kdeconnect/plugins/digitizer/DigitizerPlugin.kt
+    incoming_packet_types: []
+    outgoing_packet_types:
+      - kdeconnect.digitizer
+      - kdeconnect.digitizer.session
+  - role: findmyphone
+    source_file: src/main/java/org/kde/kdeconnect/plugins/findmyphone/FindMyPhonePlugin.java
+    incoming_packet_types:
+      - kdeconnect.findmyphone.request
+    outgoing_packet_types: []
+  - role: findremotedevice
+    source_file: src/main/java/org/kde/kdeconnect/plugins/findremotedevice/FindRemoteDevicePlugin.kt
+    incoming_packet_types: []
+    outgoing_packet_types: []
+    notes: no packet types declared in supportedPacketTypes/getSupportedPacketTypes nor outgoingPacketTypes/getOutgoingPacketTypes
+  - role: mousepad
+    source_file: src/main/java/org/kde/kdeconnect/plugins/mousepad/MousePadPlugin.kt
+    incoming_packet_types:
+      - kdeconnect.mousepad.keyboardstate
+    outgoing_packet_types:
+      - kdeconnect.mousepad.request
+  - role: mousereceiver
+    source_file: src/main/java/org/kde/kdeconnect/plugins/mousereceiver/MouseReceiverPlugin.kt
+    incoming_packet_types:
+      - kdeconnect.mousepad.request
+    outgoing_packet_types: []
+  - role: mpris
+    source_file: src/main/java/org/kde/kdeconnect/plugins/mpris/MprisPlugin.kt
+    incoming_packet_types:
+      - kdeconnect.mpris
+    outgoing_packet_types:
+      - kdeconnect.mpris.request
+  - role: mprisreceiver
+    source_file: src/main/java/org/kde/kdeconnect/plugins/mprisreceiver/MprisReceiverPlugin.java
+    incoming_packet_types:
+      - kdeconnect.mpris.request
+    outgoing_packet_types:
+      - kdeconnect.mpris
+  - role: notifications
+    source_file: src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt
+    incoming_packet_types:
+      - kdeconnect.notification.action
+      - kdeconnect.notification.reply
+      - kdeconnect.notification.request
+    outgoing_packet_types:
+      - kdeconnect.notification
+  - role: ping
+    source_file: src/main/java/org/kde/kdeconnect/plugins/ping/PingPlugin.kt
+    incoming_packet_types:
+      - kdeconnect.ping
+    outgoing_packet_types:
+      - kdeconnect.ping
+  - role: presenter
+    source_file: src/main/java/org/kde/kdeconnect/plugins/presenter/PresenterPlugin.kt
+    incoming_packet_types: []
+    outgoing_packet_types:
+      - kdeconnect.mousepad.request
+      - kdeconnect.presenter
+  - role: receivenotifications
+    source_file: src/main/java/org/kde/kdeconnect/plugins/receivenotifications/ReceiveNotificationsPlugin.kt
+    incoming_packet_types:
+      - kdeconnect.notification
+    outgoing_packet_types:
+      - kdeconnect.notification.request
+  - role: remotekeyboard
+    source_file: src/main/java/org/kde/kdeconnect/plugins/remotekeyboard/RemoteKeyboardPlugin.java
+    incoming_packet_types:
+      - kdeconnect.mousepad.request
+    outgoing_packet_types:
+      - kdeconnect.mousepad.echo
+      - kdeconnect.mousepad.keyboardstate
+  - role: runcommand
+    source_file: src/main/java/org/kde/kdeconnect/plugins/runcommand/RunCommandPlugin.java
+    incoming_packet_types:
+      - kdeconnect.runcommand
+      - kdeconnect.runcommand.output
+    outgoing_packet_types:
+      - kdeconnect.runcommand.request
+  - role: sftp
+    source_file: src/main/java/org/kde/kdeconnect/plugins/sftp/SftpPlugin.kt
+    incoming_packet_types:
+      - kdeconnect.sftp.request
+    outgoing_packet_types:
+      - kdeconnect.sftp
+  - role: share
+    source_file: src/main/java/org/kde/kdeconnect/plugins/share/SharePlugin.java
+    incoming_packet_types:
+      - kdeconnect.share.request
+      - kdeconnect.share.request.update
+    outgoing_packet_types:
+      - kdeconnect.share.request
+  - role: sms
+    source_file: src/main/java/org/kde/kdeconnect/plugins/sms/SMSPlugin.kt
+    incoming_packet_types:
+      - kdeconnect.sms.request
+      - kdeconnect.sms.request_attachment
+      - kdeconnect.sms.request_conversation
+      - kdeconnect.sms.request_conversations
+    outgoing_packet_types:
+      - kdeconnect.sms.attachment_file
+      - kdeconnect.sms.messages
+  - role: systemvolume
+    source_file: src/main/java/org/kde/kdeconnect/plugins/systemvolume/SystemVolumePlugin.kt
+    incoming_packet_types:
+      - kdeconnect.systemvolume
+    outgoing_packet_types:
+      - kdeconnect.systemvolume.request
+  - role: telephony
+    source_file: src/main/java/org/kde/kdeconnect/plugins/telephony/TelephonyPlugin.kt
+    incoming_packet_types:
+      - kdeconnect.telephony.request_mute
+    outgoing_packet_types:
+      - kdeconnect.telephony
