@@ -3,7 +3,7 @@
 //! Single Responsibility: Hold and provide access to shared state.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
@@ -135,18 +135,75 @@ impl AppState {
     /// listener fires only for devices that were ALREADY paired at connect
     /// time, so a connection that pairs after connecting gets its init
     /// packets only from the pairing-completion path (late-pairing plugin init).
+    /// Advertise every plugin's connect-time packets to a device.
+    ///
+    /// Retries across a brief window rather than firing once. Pairing
+    /// completes at the exact moment the phone is most likely to replace the
+    /// link — it redials on a fixed cadence and resets its link around
+    /// pairing — and a single blind pass loses the whole advertisement set to
+    /// a handle that was just evicted. The phone is then paired with no
+    /// features until the next connect re-advertises, which reads as a broken
+    /// app for up to a full redial cycle.
+    ///
+    /// Bounded on purpose: callers include the pairing path, which must not
+    /// hang. When every pass fails, the connect-time path in the listener
+    /// still re-advertises on the next connection — this only closes the gap
+    /// until then.
     pub async fn send_plugin_init_packets(&self, device_id: &crate::device::types::DeviceId) {
-        let packets = self.plugin_registry.notify_connected(device_id).await;
-        for pkt in &packets {
-            if let Err(e) = self.connection_manager.send_packet(device_id, pkt).await {
-                tracing::warn!(
-                    device_id = %device_id,
-                    packet_type = %pkt.packet_type,
-                    error = %e,
-                    event = "init_packet_send_failed",
-                    "Failed to send init packet after pairing"
-                );
+        const ATTEMPTS: usize = 3;
+        const LINK_WAIT: Duration = Duration::from_secs(2);
+        const POLL: Duration = Duration::from_millis(250);
+
+        for attempt in 1..=ATTEMPTS {
+            // Wait for a live link before spending the pass. A replacement in
+            // flight resolves within a poll or two; a genuinely absent link
+            // burns the whole window and we fall through to the next attempt.
+            let deadline = tokio::time::Instant::now() + LINK_WAIT;
+            while !self.connection_manager.is_connected(device_id).await
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(POLL).await;
             }
+
+            // Re-generate per pass: a fresh link deserves a fresh
+            // advertisement set, which is exactly what the connect-time path
+            // sends on every connection.
+            let packets = self.plugin_registry.notify_connected(device_id).await;
+            let mut failed = 0usize;
+            for pkt in &packets {
+                if let Err(e) = self.connection_manager.send_packet(device_id, pkt).await {
+                    failed += 1;
+                    tracing::debug!(
+                        device_id = %device_id,
+                        packet_type = %pkt.packet_type,
+                        error = %e,
+                        attempt,
+                        event = "init_packet_send_retrying",
+                        "Init packet send failed; will retry if attempts remain"
+                    );
+                }
+            }
+
+            if failed == 0 {
+                return;
+            }
+
+            tracing::debug!(
+                device_id = %device_id,
+                attempt,
+                failed,
+                total = packets.len(),
+                event = "init_packet_pass_incomplete",
+                "Plugin init pass did not complete"
+            );
         }
+
+        tracing::warn!(
+            device_id = %device_id,
+            attempts = ATTEMPTS,
+            event = "init_packets_undelivered",
+            "Could not deliver plugin init packets; the device will get them \
+             when it next connects, but may show no features until then"
+        );
     }
 }
