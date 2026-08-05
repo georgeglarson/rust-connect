@@ -4,6 +4,51 @@ Results from hands-on testing against real hardware, newest first. The
 point of this file: protocol-conformance claims in this repo are backed by
 observed behavior against real devices, not only by loopback tests.
 
+## 2026-08-05 — second Android device, v0.1.0 release build
+
+First run against a *different* handset than every session below, so this is
+device-diversity coverage rather than a repeat: a Samsung SM-G998U1 on the
+stock KDE Connect Android app, host on Wi-Fi LAN (no USB tethering; adb used
+only to read the phone's `wlan0` address).
+
+Build under test: the released v0.1.0 tree.
+
+### Packaged install, from the published artifacts
+
+- `.deb` and binary downloaded from the release and checksum-verified against
+  the published `SHA256SUMS`.
+- Installed to `/usr/bin` with the systemd **user** unit from
+  `/usr/lib/systemd/user/`, started with
+  `systemctl --user enable --now rust-connect.service`.
+- First start on a machine with no data dir exposed a packaging bug: with
+  `ProtectSystem=strict`, a `ReadWritePaths` target that does not exist yet
+  fails namespace setup (`status=226/NAMESPACE`) before the daemon can run to
+  create it. Fixed with an `ExecStartPre=+` mkdir; the release was re-cut and
+  the shipped unit re-verified.
+- Fresh identity minted on first start; `api_key` written `0600` as documented.
+
+### Inbound connection path (`usb_android_connects_to_us`)
+
+Automated, unattended:
+
+- Discovery broadcast sent; the phone dialed the host back from its LAN address.
+- Inbound accept succeeded, phone identified as a Galaxy S21 Ultra 5G.
+- Mutual TLS completed with the phone as TLS client, encrypted identity
+  exchange completed, link still alive at the end of the exchange.
+
+Prerequisite worth repeating: the installed daemon holds port 1716, so it must
+be stopped before running this suite.
+
+### Pairing
+
+- Phone-initiated pairing completed against the packaged daemon.
+- **Finding: the desktop side displayed no SAS on this path.** Accepting an
+  incoming request through the CLI completed the pairing without ever showing
+  the verification key, so there was nothing to compare against the phone's
+  dialog. The SAS was only surfaced for desktop-initiated pairing. Being fixed
+  separately; the parity claim in `SECURITY.md` was accurate only in the
+  outgoing direction when this session ran.
+
 ## 2026-08-02 — Android phone (stock KDE Connect app `org.kde.kdeconnect_tp`)
 
 Build under test: post-hardening `main` (rcgen certificate stack, SHA-512

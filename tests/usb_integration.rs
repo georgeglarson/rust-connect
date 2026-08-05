@@ -5,7 +5,10 @@
 //! 2. USB debugging enabled (adb)
 //! 3. RUST_CONNECT_TEST_USB=1 environment variable set
 //! 4. The phone and host on the same WiFi network (for UDP discovery)
-//! 5. Port 1716 available on the host (KDE Connect protocol port)
+//! 5. Port 1716 available on the host (KDE Connect protocol port) — if the
+//!    daemon is installed and running, STOP IT FIRST, or the test fails at
+//!    the listener bind with `AddrInUse`:
+//!      systemctl --user stop rust-connect     # …and start it again after
 //!
 //! IMPORTANT: The first run will pair with the Android device. Subsequent runs
 //! reuse the same certificate from a persistent directory so the Android app
