@@ -360,6 +360,18 @@ impl PairingHandler {
             self.set_pending_peer_cert(device_id, cert_der).await;
         }
 
+        // Surface the SAS in the journal at request time: every accept
+        // surface (CLI, API, UI) displays it, and the log is the fallback
+        // record if one does not.
+        if let Ok(Some(sas)) = self.get_verification_key(device_id).await {
+            info!(
+                device_id = %device_id,
+                verification_key = %sas,
+                event = "pair_request_sas",
+                "Incoming pairing request — compare this verification key on both devices"
+            );
+        }
+
         info!(
             device_id = %device_id,
             event = "pair_request_received",
