@@ -39,6 +39,23 @@ Automated, unattended:
 Prerequisite worth repeating: the installed daemon holds port 1716, so it must
 be stopped before running this suite.
 
+### Desktop-initiated pairing and post-pairing traffic (`usb_full_protocol_handshake`)
+
+- Direct dial to the phone, pair request sent, phone accepted.
+- **SAS matched on both sides** (compared by hand against the phone's dialog).
+- The encrypted link then carried real plugin traffic both ways: ping and a
+  battery request out, a `kdeconnect.battery` packet back.
+
+Note on running this by hand: the accept window is ~30 s from the request, and
+on Android the request arrives as a *silent* notification, so it is easy to
+miss. Have the KDE Connect app open before starting the test.
+
+### File transfer (`usb_send_file_to_android`)
+
+- Phone dialed the host, inbound handshake and encrypted identity exchange
+  completed, pairing confirmed.
+- 1 MiB payload sent over TLS on port 1739 and accepted by the phone.
+
 ### Pairing
 
 - Phone-initiated pairing completed against the packaged daemon.
