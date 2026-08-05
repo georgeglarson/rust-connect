@@ -105,7 +105,7 @@ rust-connect = { path = ".", features = ["test-helpers"] }
 
 # Testing
 tokio-test = "0.4"
-mockall = "0.12"
+mockall = "0.15"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 criterion = "0.5"
