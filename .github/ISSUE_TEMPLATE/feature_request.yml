@@ -1,0 +1,79 @@
+name: Feature Request
+description: Something rust-connect should do that it does not.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that you currently cannot?
+      placeholder: |
+        I want to trigger a pairing flow from a script without using curl
+        against the REST API directly.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: |
+        What rust-connect should do. If this is an API change, sketch the
+        request and response. Note that the API is consumed primarily by
+        automated agents — proposals must keep the predictable
+        `{ status, data, metadata }` envelope and structured error codes.
+      placeholder: |
+        A `rust-connect pair <device_id>` CLI subcommand that drives the
+        pairing flow and exits when the SAS is confirmed.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Protocol / plugin area
+      description: Which part of KDE Connect this concerns.
+      multiple: true
+      options:
+        - Discovery / transport (UDP/TCP 1716-1764, TLS)
+        - Pairing / identity
+        - REST API / event stream
+        - ping
+        - battery
+        - notification / sendnotifications
+        - sms
+        - clipboard
+        - share (file transfer)
+        - mpris
+        - telephony
+        - connectivity
+        - sftp
+        - mousepad / remotekeyboard / digitizer (input)
+        - lock
+        - systemvolume
+        - findmyphone
+        - presenter
+        - contacts
+        - runcommand
+        - Packaging / distribution
+        - Other (explain above)
+    validations:
+      required: true
+
+  - type: textarea
+    id: upstream
+    attributes:
+      label: Upstream KDE Connect support
+      description: |
+        Does upstream KDE Connect (the Android app or kdeconnect-kde)
+        already support this? If so, link the relevant protocol
+        documentation or upstream source. Wire compatibility with the
+        Android app is a hard constraint — features that require protocol
+        changes both sides need upstream precedent or a clear divergence
+        rationale.
+      placeholder: |
+        Yes — kdeconnect.sftp, documented at
+        https://invent.kde.org/network/kdeconnect-kde/-/tree/master/plugins/sftp
+    validations:
+      required: true

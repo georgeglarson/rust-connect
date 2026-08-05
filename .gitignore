@@ -1,0 +1,56 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config
+config.toml
+*.local.toml
+
+# Logs
+*.log
+
+# Certificates
+*.pem
+*.key
+*.crt
+
+# Build artifacts
+/dist/
+/build/
+
+# Test artifacts
+/coverage/
+
+# Frontend (if added later)
+node_modules/
+dist/
+.next/
+.nuxt/
+.svelte-kit/
+
+# Environment
+.env
+.env.local
+# CocoIndex Code (ccc)
+/.cocoindex_code/
+
+# Agent tooling state (local only, not for review)
+.mimocode/
+.review/
+.superpowers/
+.bob/
+
+# Working plans / scratch design docs
+plans/

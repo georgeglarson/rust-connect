@@ -1,0 +1,10 @@
+# cargo-audit configuration. cargo-deny has its own ignore list in
+# deny.toml (with the same rationale) — the two tools do not share config.
+
+[advisories]
+ignore = [
+    # quick-xml via tauri-winrt-notification: Windows-only transitive dep of
+    # notify-rust, not compiled on Linux/macOS targets.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

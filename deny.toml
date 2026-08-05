@@ -1,0 +1,51 @@
+# cargo-deny configuration. Project license: GPL-2.0-or-later.
+# This config is intentionally lenient for now — see [bans] below.
+
+[advisories]
+# Fail on any known vulnerability in the dependency tree.
+# (db-urls defaults to the RustSec advisory DB.)
+yanked = "warn"
+ignore = [
+    # proc-macro-error (via utoipa-gen): build-time OpenAPI codegen only,
+    # never in the runtime attack surface; no safe upgrade exists.
+    "RUSTSEC-2024-0370",
+    # quick-xml via tauri-winrt-notification: Windows-only transitive dep of
+    # notify-rust, not compiled on Linux/macOS targets.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
+
+[licenses]
+# Allowlist sized to the current dependency tree (verified against
+# `cargo metadata` output for Cargo.lock on 2026-08-02).
+# GPL-2.0-or-later is the project's own license; dependencies are permissive.
+allow = [
+    "GPL-2.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+]
+# Unknown/unlicensed crates fail closed (deny-by-default behavior).
+
+[bans]
+# multiple-versions stays at "warn" on measurement, not on principle:
+# `cargo deny check bans` reports 20 duplicated crates (thiserror 1 + 2,
+# syn, getrandom x3, sha2 0.10 + 0.11, the windows-* family, toml_edit,
+# winnow, and others), essentially all of them transitive and not
+# resolvable from this manifest. Flipping to "deny" would fail CI on other
+# people's dependency trees. Re-measure before changing it; the number is
+# the argument.
+multiple-versions = "warn"
+# wildcards is "deny" because the tree already has zero of them, so this
+# locks in a property we hold rather than announcing an intention.
+wildcards = "deny"
+highlight = "all"

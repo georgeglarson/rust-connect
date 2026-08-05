@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bad8236f865eab522ce7b9519babcc016fbafca4a5db80f9e3c59a9fd1b74e4c # shrinks to pt = "kdeconnect..", body = Array [Number(-2.2616791606519502e-165)], id = 0, payload_size = None

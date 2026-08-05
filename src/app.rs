@@ -1,0 +1,152 @@
+//! Application state shared across all components
+//!
+//! Single Responsibility: Hold and provide access to shared state.
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use tokio_util::sync::CancellationToken;
+
+use crate::config::settings::AppSettings;
+use crate::device::{DeviceRegistry, EventBroadcaster, LifecycleManager};
+use crate::plugins::{PluginAccess, PluginEventBroadcaster, PluginRegistry};
+use crate::protocol::{CertificateManager, ConnectionManager, PacketRouter, PairingHandler};
+
+pub struct AppState {
+    pub settings: AppSettings,
+    pub registry: Arc<DeviceRegistry>,
+    pub lifecycle: Arc<LifecycleManager>,
+    pub broadcaster: Arc<EventBroadcaster>,
+    pub cert_manager: Arc<CertificateManager>,
+    pub connection_manager: Arc<ConnectionManager>,
+    pub pairing_handler: Arc<PairingHandler>,
+    pub packet_router: Arc<PacketRouter>,
+    pub plugin_registry: Arc<PluginRegistry>,
+    pub plugin_events: Arc<PluginEventBroadcaster>,
+    pub shutdown: CancellationToken,
+    pub started_at: Instant,
+    pub plugins: PluginAccess,
+}
+
+impl AppState {
+    pub fn new(settings: AppSettings) -> crate::utils::Result<Self> {
+        Self::new_inner(settings, true)
+    }
+
+    /// Build application state without opening desktop input devices.
+    pub fn new_without_input(settings: AppSettings) -> crate::utils::Result<Self> {
+        Self::new_inner(settings, false)
+    }
+
+    fn new_inner(settings: AppSettings, enable_input: bool) -> crate::utils::Result<Self> {
+        settings.ensure_dirs_exist()?;
+
+        let cert_manager = Arc::new(CertificateManager::new(settings.cert_dir.clone()));
+        cert_manager.init()?;
+
+        let devices_path = settings.data_dir.join("devices.json");
+        let registry = Arc::new(DeviceRegistry::with_persistence(devices_path));
+        let broadcaster = Arc::new(EventBroadcaster::new(256, "device"));
+        let lifecycle = Arc::new(LifecycleManager::new(registry.clone(), broadcaster.clone()));
+
+        let pairing_path = settings.data_dir.join("paired.json");
+        // No with_timeout override: the requester/accepter timeouts stay at
+        // the Android-conformant 30s/25s defaults (PairingHandler.kt:151/88).
+        // The old pairing_timeout_mins config (default 30 MINUTES) let a
+        // stale outgoing request outlive the phone's 25s accepter timeout,
+        // which broke a live pair round vs the A15 on 2026-07-30: the
+        // phone's fresh request was mis-classified as the accept of our
+        // expired one, we answered with plugin traffic instead of pair=true,
+        // and the unpaired phone correctly rejected with pair=false.
+        let pairing_handler =
+            Arc::new(PairingHandler::new(cert_manager.clone()).with_persistence(pairing_path));
+
+        let connection_manager = Arc::new(ConnectionManager::new(cert_manager.clone())?);
+        let packet_router = Arc::new(PacketRouter::new());
+        let plugin_registry = Arc::new(PluginRegistry::new());
+        let plugin_events = Arc::new(PluginEventBroadcaster::new(256, "plugin"));
+        let shutdown = CancellationToken::new();
+        let started_at = Instant::now();
+
+        let plugins = crate::plugins::load_default_plugins(
+            plugin_events.clone(),
+            cert_manager.clone(),
+            connection_manager.clone(),
+            pairing_handler.clone(),
+            enable_input,
+        );
+
+        Ok(Self {
+            settings,
+            registry,
+            lifecycle,
+            broadcaster,
+            cert_manager,
+            connection_manager,
+            pairing_handler,
+            packet_router,
+            plugin_registry,
+            plugin_events,
+            shutdown,
+            started_at,
+            plugins,
+        })
+    }
+
+    pub async fn init_plugins(&self) {
+        crate::plugins::load_all(&self.plugin_registry, &self.plugins).await;
+
+        let plugin_registry = self.plugin_registry.clone();
+        let packet_router = self.packet_router.clone();
+        for plugin_name in self.plugin_registry.list().await {
+            if let Some(plugin) = plugin_registry.get(&plugin_name).await {
+                for cap in plugin.incoming_capabilities() {
+                    let plugin = plugin.clone();
+                    packet_router
+                        .register(&cap, move |device_id, packet| {
+                            let device_id = device_id.to_string();
+                            let plugin = plugin.clone();
+                            async move { plugin.handle_packet(&device_id, packet).await }
+                        })
+                        .await;
+                }
+            }
+        }
+    }
+
+    pub async fn initialize(&self) -> crate::utils::Result<()> {
+        self.init_plugins().await;
+
+        let plugins = self.plugin_registry.list().await;
+        tracing::info!(
+            plugin_count = plugins.len(),
+            plugins = ?plugins,
+            event = "plugins_loaded",
+            "Plugins loaded and wired to packet router"
+        );
+
+        Ok(())
+    }
+
+    /// Notify plugins that a device is connected-and-paired and send their
+    /// connect-time advertisements (runcommand's command list, …) over the
+    /// live link. MUST be called on every path that completes pairing on an
+    /// established connection: the connect-time notify in the orchestrator/
+    /// listener fires only for devices that were ALREADY paired at connect
+    /// time, so a connection that pairs after connecting gets its init
+    /// packets only from the pairing-completion path (late-pairing plugin init).
+    pub async fn send_plugin_init_packets(&self, device_id: &crate::device::types::DeviceId) {
+        let packets = self.plugin_registry.notify_connected(device_id).await;
+        for pkt in &packets {
+            if let Err(e) = self.connection_manager.send_packet(device_id, pkt).await {
+                tracing::warn!(
+                    device_id = %device_id,
+                    packet_type = %pkt.packet_type,
+                    error = %e,
+                    event = "init_packet_send_failed",
+                    "Failed to send init packet after pairing"
+                );
+            }
+        }
+    }
+}

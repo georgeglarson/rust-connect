@@ -1,0 +1,223 @@
+# Rust Connect
+
+A modern, API-first reimplementation of KDE Connect in Rust, compatible with the existing KDE Connect Android app.
+
+## Quick Start
+
+Run it in the foreground for development:
+
+```bash
+cargo run
+```
+
+An API key will be auto-generated and logged. Copy it, then open KDE Connect on your Android device to pair.
+
+## Install as a service
+
+```bash
+./packaging/install-user-service.sh
+```
+
+Builds a release binary into `~/.local/bin`, installs the unit to
+`~/.config/systemd/user/`, and enables it. Re-run it to upgrade. Then:
+
+```bash
+systemctl --user status rust-connect
+journalctl --user -u rust-connect -f
+```
+
+This is a **user** service, not a system one, and that is a requirement rather
+than a preference. Three parts of the daemon only work inside the desktop
+session:
+
+- Desktop notifications go through the session DBus, and the popup path checks
+  for `DISPLAY` or `WAYLAND_DISPLAY`.
+- The identity and paired-device state live in `~/.local/share/rust-connect`
+  (`own.crt`, `own.key`, `device_id`, `paired.json`).
+- Received files land in `~/Downloads`.
+
+A system unit with `ProtectHome=yes` cannot see any of that, so it would mint a
+fresh identity on every start and silently drop every pairing.
+
+The mousepad and presenter plugins additionally need access to `/dev/uinput`
+to inject input. The unit permits the device, but your user still needs
+filesystem access to it, via the `input` group or a udev rule. Without it the
+rest of the daemon works and remote input does not.
+
+The clipboard plugin syncs the session clipboard for real on Wayland via
+`wl-copy`/`wl-paste` (from wl-clipboard): incoming phone content is written
+with `wl-copy`, and a persistent `wl-paste --watch` watcher pushes local
+changes to connected devices. It needs `WAYLAND_DISPLAY` and
+`XDG_RUNTIME_DIR`, which the user unit inherits from the graphical session.
+Without a Wayland session or wl-clipboard it degrades to storing clipboard
+packets (and serving the REST API) without touching the desktop, and logs the
+degradation.
+
+The mpris plugin controls real session media players over D-Bus via zbus:
+it discovers `org.mpris.MediaPlayer2.*` players, publishes the player list
+and now-playing state to paired devices, and relays the phone's
+play/pause/next/previous/stop, seek, and volume commands to the bus. It needs
+a session D-Bus (`DBUS_SESSION_BUS_ADDRESS`, inherited from the graphical
+session). Without one it degrades to advertising an empty player list, and
+logs the degradation.
+
+Something not working? See [docs/troubleshooting.md](docs/troubleshooting.md)
+for firewall, pairing, clipboard, remote input, and certificate fixes.
+
+Tested against real hardware — see [docs/live-validation.md](docs/live-validation.md)
+for the Galaxy A15 feature matrix (pairing with SAS, share both ways,
+clipboard, notifications, upgrade continuity).
+
+## CLI Usage
+
+```
+rust-connect                    # Daemon with REST API (port 9090)
+rust-connect --no-api           # Daemon without the REST API
+rust-connect --help             # Full options
+```
+
+Subcommands drive the running daemon's REST API instead of starting a
+daemon. The API key is read from the data-dir `api_key` file
+(`~/.local/share/rust-connect/api_key`) unless `--api-key` /
+`RUST_CONNECT_API_KEY` is given; the base URL defaults to
+`http://127.0.0.1:9090` unless `--api-url` / `RUST_CONNECT_API_URL` is set.
+`--json` prints the raw API envelope for scripting. A key given as `--api-key`
+is visible in the process listing (`ps`, `/proc/<pid>/cmdline`), so prefer the
+environment variable or the key file on a shared machine.
+
+A key passed as `--api-key` lands in `/proc/<pid>/cmdline`, which any
+local user can read, and in your shell history. The key file is the
+default for that reason; `RUST_CONNECT_API_KEY` is the next best option.
+Reserve the flag for throwaway keys and interactive debugging.
+
+```
+rust-connect status             # Daemon health and device count
+rust-connect devices            # Table: ID, name, type, state, paired at
+rust-connect pair <device-id>   # Shows the SAS, waits for the phone to accept
+rust-connect unpair <device-id>
+rust-connect ping <device-id>
+rust-connect share <device-id> <file>
+rust-connect clipboard          # Print clipboard (or: clipboard set "text")
+```
+
+Exit codes: `0` success, `1` API error, `2` daemon unreachable.
+
+### REST API
+
+```bash
+curl -H "X-API-Key: YOUR_KEY" http://localhost:9090/api/v1/devices
+```
+
+The REST API is the single control surface. (An MCP stdio server existed in
+early versions and was cut from v1 — it returns in v2; see git history.)
+
+## API
+
+```
+GET    /api/v1/devices                          List paired devices
+GET    /api/v1/devices/:device_id               Get device details
+POST   /api/v1/devices/:device_id/pair           Pair a device
+DELETE /api/v1/devices/:device_id/unpair         Unpair a device
+POST   /api/v1/ping                              Send ping
+GET    /api/v1/plugins                           List loaded plugins
+GET    /api/v1/events?api_key=YOUR_KEY           SSE event stream (text/event-stream)
+GET    /api/v1/health                            Liveness, no auth required
+GET    /docs                                     Swagger UI (spec: /api-docs/openapi.json)
+```
+
+All endpoints except `/api/v1/health` require the API key, either as an
+`X-API-Key` header or an `api_key` query parameter. Responses follow
+`{ status, data, metadata }` format. Errors use structured codes like
+`DEVICE_NOT_FOUND`.
+
+The event stream is Server-Sent Events, not a WebSocket. Each event is one
+`data:` line carrying a JSON object, so `curl` reads it directly:
+
+```bash
+curl -N -H "X-API-Key: YOUR_KEY" http://localhost:9090/api/v1/events
+```
+
+`-N` disables curl's output buffering; without it the stream appears to
+hang. Device events and plugin events are interleaved on the one stream.
+
+## Web UI
+
+The daemon serves a single-page troubleshooting UI from the binary itself,
+no separate build step and no CDN. With the daemon running, open
+<http://localhost:9090/> (which redirects to `/ui`).
+
+It is a technical interface, not a polished product surface: it exposes
+every device endpoint, every plugin action, and the live event stream, so
+that a failure can be localized to the API rather than guessed at. Disable
+it with `ui_enabled = false` in the config file; it is on by default.
+
+## Security
+
+- rustls TLS 1.2 with mutual authentication (server role requests the client
+  certificate, mirroring Android's SslHelper)
+- TOFU certificate pinning (SHA256 fingerprints), enforced during the TLS
+  handshake in the custom certificate verifiers
+- Short Authentication String (SAS) displayed at pairing, byte-for-byte
+  compatible with Android's `PairingHandler.getVerificationKey`
+- Payload (file) transfers over TLS, bounded to the declared `payloadSize`
+- Auto-generated UUID API key on first run
+- Input validation and pairing rate limiting (max 10 concurrent pending)
+
+### Fuzzing
+
+The wire parser (`PacketSerializer::deserialize`) and the UDP identity
+decode path are fuzzed with cargo-fuzz (libFuzzer). The fuzz crate lives in
+`fuzz/` (requires nightly, pinned there via `rust-toolchain.toml`):
+
+```
+cargo install cargo-fuzz
+cd fuzz
+cargo fuzz run packet_deserialize   # raw bytes -> deserialize (+ round-trip)
+cargo fuzz run identity_packet      # discovery identity-packet decode path
+```
+
+Seed inputs (valid identity/pair/ping/share packets plus boundary cases:
+empty, 512 KiB limit, truncated JSON, deep nesting) live in
+`fuzz/corpus/<target>/`; any crashes are written to `fuzz/artifacts/`.
+CI runs a 60s smoke pass per target on PRs touching `src/protocol/` and a
+weekly 10-minute run (`.github/workflows/fuzz.yml`).
+
+## Project Structure
+
+```
+src/
+  main.rs            Entry point
+  lib.rs             Library root (the crate builds as both lib and bin)
+  bootstrap.rs       Production wiring (AppState construction, desktop backends)
+  daemon.rs          Service orchestration, reconnect, signal handling
+  app.rs             Shared state (AppState)
+  api/               REST API + SSE (router, handlers, auth, middleware, sse, openapi, ui)
+  cli/               clap CLI and the client-mode subcommands
+  device/            Device registry, lifecycle, event broadcasting
+  protocol/          KDE Connect protocol (discovery, connection, pairing, packet, router, crypto, connection_loop, listener, payload_transfer)
+  plugins/           Plugin system, 24 plugins (ping, battery, notification, sms, clipboard, share, mpris, telephony, pausemusic, connectivity, sftp, mousepad, lock, systemvolume, findmyphone, findthisdevice, presenter, contacts, runcommand, sendnotifications, remotekeyboard, digitizer, screensaver_inhibit, remotecommands)
+  services/          Service manager and connection orchestration
+  config/            Settings
+  utils/             Errors, logging
+tests/               Integration tests (API, protocol, CLI)
+docs/reference/      Android upstream sources the implementation conforms to
+docs/archive/        Historical planning documents
+```
+
+## Development
+
+```bash
+cargo test        # Run tests
+cargo fmt         # Format
+cargo clippy      # Lint
+```
+
+Live-device integration tests (require an Android device on adb):
+
+```bash
+RUST_CONNECT_TEST_USB=1 cargo test --test usb_integration -- --ignored --nocapture
+```
+
+## License
+
+GPL-2.0-or-later (compatible with KDE Connect)

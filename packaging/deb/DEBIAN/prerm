@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "remove" ]; then
+    # Best-effort: only reaches the invoking user's session manager, and dpkg
+    # usually runs as root where there is none. Users with a running instance
+    # stop it themselves; the binary going away stops it at next restart.
+    systemctl --user stop rust-connect.service 2>/dev/null || true
+fi

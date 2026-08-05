@@ -1,0 +1,98 @@
+name: Bug Report
+description: Something rust-connect does wrong, or fails to do.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before submitting: redact everything secret. Do not paste API keys,
+        private keys (`own.key`), or certificates (`own.crt`). Logs and config
+        excerpts below must already have these removed.
+
+  - type: input
+    id: version
+    attributes:
+      label: rust-connect version
+      description: Output of `rust-connect --version`, or the commit you built from.
+      placeholder: "rust-connect 0.1.0 (commit abc1234)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Host environment
+      description: |
+        Linux distro and version, desktop environment (GNOME / KDE / other),
+        and display server (X11 / Wayland).
+      placeholder: |
+        Fedora 41, KDE Plasma 6.3, Wayland
+    validations:
+      required: true
+
+  - type: textarea
+    id: peer
+    attributes:
+      label: Peer device
+      description: |
+        What is on the other end of the connection: the KDE Connect Android
+        app (state Android version and app version), kdeconnect-kde on a
+        desktop, or GSConnect. If the bug does not involve a peer, say so.
+      placeholder: |
+        Android 15, KDE Connect app 1.32.5 (F-Droid)
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened vs. what you expected
+      description: |
+        Describe the observed behavior and the expected behavior. If the
+        behavior diverges from upstream KDE Connect, note that — it changes
+        whether this is a bug or a protocol constraint.
+      placeholder: |
+        Expected: incoming share lands in ~/Downloads.
+        Observed: transfer starts, stalls at 100%, no file appears.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Relevant excerpts from `journalctl --user -u rust-connect -f`
+        (add `RUST_LOG=debug` for detail). Trim to the relevant window.
+        Do not paste API keys, private keys, or certificates — the key is
+        never logged by design, but verify before pasting.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: |
+        Relevant configuration (ports, plugin toggles, API bind address).
+        Redact API keys, private keys, and certificates explicitly — replace
+        them with `[REDACTED]` so it is clear they were present.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: network
+    attributes:
+      label: Firewall / network state
+      description: |
+        KDE Connect needs ports 1716-1764 open for both UDP and TCP on the
+        LAN interface. State your firewall (`firewalld`, `ufw`, `nftables`,
+        none) and whether those ports are open. Connection and discovery
+        bugs without this information cannot be diagnosed.
+      placeholder: |
+        firewalld, kdeconnect service enabled (1716-1764 tcp+udp open)
+    validations:
+      required: true

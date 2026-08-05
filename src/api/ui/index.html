@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>rust-connect troubleshooting</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #eee; height: 100vh; display: flex; flex-direction: column; }
+        header { padding: 1rem 2rem; background: #16213e; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; }
+        h1 { font-size: 1.2rem; color: #00d4ff; }
+        .status { font-size: 0.875rem; color: #888; }
+        .status.connected { color: #00ff88; }
+        .status.disconnected { color: #ff4444; }
+        .layout { display: flex; flex: 1; overflow: hidden; }
+        .sidebar { width: 300px; background: #16213e; border-right: 1px solid #333; overflow-y: auto; padding: 1rem; }
+        .main { flex: 1; overflow-y: auto; padding: 2rem; }
+        h2 { font-size: 1rem; color: #888; margin-bottom: 1rem; text-transform: uppercase; letter-spacing: 0.05em; }
+        
+        .device-item { background: #0f172a; border: 1px solid #333; border-radius: 4px; padding: 1rem; margin-bottom: 0.5rem; cursor: pointer; transition: border-color 0.2s; }
+        .device-item:hover, .device-item.active { border-color: #00d4ff; }
+        .device-item h3 { font-size: 1rem; margin-bottom: 0.25rem; }
+        .device-item .meta { font-size: 0.75rem; color: #888; }
+        
+        .tabs { display: flex; gap: 0.5rem; border-bottom: 1px solid #333; margin-bottom: 1.5rem; overflow-x: auto; padding-bottom: 0.5rem; }
+        .tab { background: none; border: none; color: #888; padding: 0.5rem 1rem; cursor: pointer; border-radius: 4px; font-size: 0.9rem; white-space: nowrap; }
+        .tab:hover { color: #eee; background: #333; }
+        .tab.active { color: #00d4ff; background: rgba(0, 212, 255, 0.1); }
+        .tab-pane { display: none; }
+        .tab-pane.active { display: block; }
+        
+        .card { background: #16213e; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
+        .card h3 { margin-bottom: 1rem; color: #eee; font-size: 1.1rem; }
+        
+        .row { display: flex; gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap; }
+        .col { flex: 1; min-width: 200px; }
+        
+        input, select, textarea { width: 100%; padding: 0.5rem; border: 1px solid #333; border-radius: 4px; background: #0a0a15; color: #eee; font-size: 0.875rem; margin-bottom: 0.5rem; }
+        button { padding: 0.5rem 1rem; background: #00d4ff; border: none; border-radius: 4px; color: #1a1a2e; font-weight: bold; cursor: pointer; font-size: 0.875rem; transition: opacity 0.2s; }
+        button:hover { opacity: 0.8; }
+        button.secondary { background: #333; color: #eee; }
+        button.danger { background: #ff4444; color: #fff; }
+        button:disabled { opacity: 0.4; cursor: not-allowed; }
+        button.playing { background: #00ff88; color: #1a1a2e; }
+        
+        .log-box { background: #0a0a15; border: 1px solid #333; border-radius: 4px; padding: 1rem; height: 300px; overflow-y: auto; font-family: monospace; font-size: 0.8rem; color: #aaa; white-space: pre-wrap; }
+        .log-entry { border-bottom: 1px solid #222; padding: 0.5rem 0; }
+        .log-entry:last-child { border-bottom: none; }
+        .log-time { color: #888; margin-right: 0.5rem; }
+        
+        .badge { display: inline-block; padding: 0.2rem 0.4rem; border-radius: 4px; font-size: 0.7rem; background: #333; color: #eee; margin-right: 0.25rem; }
+        .badge.paired { background: rgba(0, 255, 136, 0.2); color: #00ff88; }
+        .badge.connected { background: rgba(0, 212, 255, 0.2); color: #00d4ff; }
+        
+        .setup { background: #16213e; border-radius: 8px; padding: 2rem; text-align: center; max-width: 500px; margin: 4rem auto; }
+        .setup p { color: #888; margin-bottom: 1rem; line-height: 1.6; font-size: 0.875rem; }
+        .setup code { background: #0a0a15; padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.8rem; color: #00ff88; }
+        .setup input { margin-bottom: 1rem; }
+    </style>
+</head>
+<body>
+    <div id="setup-screen" class="setup" style="display: none;">
+        <h2 style="color:#00d4ff; text-transform:none; letter-spacing:0;">API Key Required</h2>
+        <p>Your API key is stored in: <br><code>~/.local/share/rust-connect/api_key</code></p>
+        <input type="text" id="api-key-input" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+        <button onclick="submitApiKey()">Connect</button>
+    </div>
+
+    <div id="main-screen" style="display: none; height: 100%; display: flex; flex-direction: column;">
+        <header>
+            <h1>rust-connect API Troubleshooting</h1>
+            <span id="daemon-status" class="status">Connecting...</span>
+        </header>
+
+        <div class="layout">
+            <div class="sidebar">
+                <h2>Devices</h2>
+                <div id="device-list">Loading...</div>
+            </div>
+            
+            <div class="main">
+                <div id="no-device-selected" class="card" style="text-align:center; color:#888;">
+                    Select a device from the sidebar to view capabilities.
+                </div>
+                
+                <div id="device-details" style="display: none;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                        <h2 id="selected-device-name" style="margin:0; color:#eee; text-transform:none;">Device Name</h2>
+                        <div id="selected-device-badges"></div>
+                    </div>
+                    
+                    <div class="tabs" id="plugin-tabs"></div>
+                    
+                    <div id="tab-content">
+                        
+                        <!-- Core / Management -->
+                        <div id="pane-core" class="tab-pane active card">
+                            <h3>Device Management</h3>
+                            <div class="row">
+                                <button onclick="action('pair')">Pair</button>
+                                <button onclick="action('unpair')" class="danger">Unpair</button>
+                                <button onclick="action('connect')" class="secondary">Connect</button>
+                                <button onclick="action('disconnect')" class="secondary">Disconnect</button>
+                                <button onclick="action('ping')" class="secondary">Ping</button>
+                                <button onclick="action('lock')" class="secondary">Lock Screen</button>
+                            </div>
+                            <h3>State Output</h3>
+                            <pre id="core-state-json" style="background:#0a0a15; padding:1rem; border-radius:4px; font-size:0.8rem; overflow-x:auto;"></pre>
+                        </div>
+                        
+                        <!-- Notifications -->
+                        <div id="pane-notifications" class="tab-pane card">
+                            <h3>Notifications</h3>
+                            <button onclick="refreshData('notifications')" class="secondary" style="margin-bottom:1rem;">Refresh View</button>
+                            <div id="notifications-list" class="log-box"></div>
+                            
+                            <h3 style="margin-top: 1.5rem;">Send Test Notification to Device</h3>
+                            <input type="text" id="notif-title" placeholder="Title">
+                            <textarea id="notif-body" placeholder="Body" rows="3"></textarea>
+                            <button onclick="sendNotification()">Send Notification</button>
+                        </div>
+                        
+                        <!-- Battery -->
+                        <div id="pane-battery" class="tab-pane card">
+                            <h3>Battery Status</h3>
+                            <div class="row" style="align-items:center;">
+                                <div class="col" style="font-size: 2.5rem; color: #00d4ff;" id="battery-level">--%</div>
+                                <div class="col" id="battery-charging" style="color: #888; font-size:1.2rem;">Unknown</div>
+                            </div>
+                            <button onclick="requestData('battery')" class="secondary" style="margin-top:1rem;">Request Update from Device</button>
+                        </div>
+                        
+                        <!-- SMS -->
+                        <div id="pane-sms" class="tab-pane card">
+                            <h3>SMS Control</h3>
+                            <button onclick="requestData('sms')" class="secondary" style="margin-bottom:1rem;">Request Threads from Device</button>
+                            
+                            <h4>Send Message</h4>
+                            <div class="row">
+                                <input type="text" id="sms-phone" placeholder="Phone Number" style="flex:1">
+                                <input type="text" id="sms-msg" placeholder="Message" style="flex:2">
+                                <button onclick="sendSms()">Send</button>
+                            </div>
+                            
+                            <h4>Threads</h4>
+                            <div id="sms-threads" class="log-box" style="height: 400px;"></div>
+                            <div id="sms-thread-detail" style="display:none; margin-top:1rem; padding:1rem; background:#0a0a15; border-radius:4px;">
+                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
+                                    <h4 id="sms-thread-title">Thread Messages</h4>
+                                    <button onclick="closeSmsThread()" class="secondary" style="padding:0.25rem 0.5rem;">Close</button>
+                                </div>
+                                <div id="sms-thread-messages" style="max-height:300px; overflow-y:auto;"></div>
+                            </div>
+                        </div>
+                        
+                        <!-- Clipboard -->
+                        <div id="pane-clipboard" class="tab-pane card">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                                <h3 style="margin:0;">Clipboard</h3>
+                                <div id="clipboard-status" style="font-size: 0.75rem; color: #888;">Never synced</div>
+                            </div>
+                            <div class="row">
+                                <textarea id="clipboard-content" rows="4" placeholder="Clipboard content will appear here..."></textarea>
+                            </div>
+                            <div class="row">
+                                <button onclick="requestData('clipboard')" class="secondary">Request from Phone</button>
+                                <button onclick="setClipboard()">Push to Phone</button>
+                            </div>
+                            <p style="font-size: 0.75rem; color: #888; margin-top: 0.5rem;">
+                                Clipboard syncs automatically when your phone sends changes. 
+                                "Request from Phone" asks the phone to send its current clipboard.
+                            </p>
+                        </div>
+                        
+                        <!-- Media (MPRIS) -->
+                        <div id="pane-mpris" class="tab-pane card">
+                            <h3>Media Controls</h3>
+                            <button onclick="requestData('mpris')" class="secondary" style="margin-bottom:1rem;">Request Update</button>
+                            <div id="mpris-players" class="log-box" style="height:auto; min-height:150px;"></div>
+                        </div>
+
+                        <!-- Telephony -->
+                        <div id="pane-telephony" class="tab-pane card">
+                            <h3>Telephony Events</h3>
+                            <p style="font-size:0.8rem; color:#888; margin-bottom:1rem;">
+                                Incoming call and SMS events from your phone. This is a read-only event log - events are recorded automatically when your phone notifies KDE Connect.
+                            </p>
+                            <div id="telephony-state" class="log-box" style="height:400px;"></div>
+                            <p style="font-size:0.75rem; color:#666; margin-top:0.5rem;">
+                                Empty? Make sure KDE Connect app on your phone is running and notifications are enabled.
+                            </p>
+                        </div>
+                        
+                        <!-- SFTP & Share -->
+                        <div id="pane-files" class="tab-pane card">
+                            <h3>File Transfer</h3>
+                            <h4>Share File to Device</h4>
+                            <div class="row">
+                                <input type="file" id="share-file-input" style="flex:1; background:#0a0a15;">
+                                <button onclick="shareFile()">Share to Device</button>
+                            </div>
+                            
+                            <h4 style="margin-top: 1.5rem;">SFTP Mount</h4>
+                            <div class="row">
+                                <button onclick="requestSftp()" class="secondary">Request SFTP</button>
+                                <button onclick="action('sftp/mount')">Mount SFTP</button>
+                                <button onclick="unmountSftp()" class="danger">Unmount SFTP</button>
+                            </div>
+                            <p style="font-size:0.75rem; color:#888; margin-bottom:0.5rem;">
+                                1) Request SFTP to ask phone for access &nbsp;2) Wait for response &nbsp;3) Mount to access phone's files
+                            </p>
+                            <pre id="sftp-info" style="background:#0a0a15; padding:1rem; border-radius:4px; font-size:0.8rem; overflow-x:auto; margin-top:1rem;"></pre>
+                        </div>
+                        
+                        <!-- System Volume -->
+                        <div id="pane-volume" class="tab-pane card">
+                            <h3>System Volume</h3>
+                            <div class="row" style="align-items:center;">
+                                <input type="range" id="volume-slider" min="0" max="100" style="flex:1">
+                                <button onclick="setVolume()">Set Volume</button>
+                            </div>
+                        </div>
+                        
+                        <!-- Live Event Stream -->
+                        <div id="pane-events" class="tab-pane card">
+                            <h3>Live Event Stream (SSE)</h3>
+                            <div id="event-log" class="log-box" style="height: 500px;"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = '/api/v1';
+        let apiKey = localStorage.getItem('rust_connect_api_key') || '';
+        let currentDeviceId = null;
+        let eventSource = null;
+
+        const TABS = [
+            { id: 'core', label: 'Management' },
+            { id: 'battery', label: 'Battery' },
+            { id: 'clipboard', label: 'Clipboard' },
+            { id: 'notifications', label: 'Notifications' },
+            { id: 'sms', label: 'SMS' },
+            { id: 'mpris', label: 'Media' },
+            { id: 'telephony', label: 'Telephony' },
+            { id: 'volume', label: 'Volume' },
+            { id: 'files', label: 'Files & SFTP' },
+            { id: 'events', label: 'Live Events' }
+        ];
+
+        function showSetup() {
+            document.getElementById('setup-screen').style.display = 'block';
+            document.getElementById('main-screen').style.display = 'none';
+        }
+
+        function showMain() {
+            document.getElementById('setup-screen').style.display = 'none';
+            document.getElementById('main-screen').style.display = 'flex';
+        }
+
+        function submitApiKey() {
+            const input = document.getElementById('api-key-input');
+            const key = input.value.trim();
+            if (key) {
+                localStorage.setItem('rust_connect_api_key', key);
+                location.reload();
+            }
+        }
+
+        async function fetchAPI(method, path, body = null) {
+            const opts = {
+                method,
+                headers: apiKey ? { 'X-API-Key': apiKey } : {}
+            };
+            if (body) {
+                opts.headers['Content-Type'] = 'application/json';
+                opts.body = JSON.stringify(body);
+            }
+            try {
+                const resp = await fetch(API_BASE + path, opts);
+                if (resp.status === 401 || resp.status === 403) {
+                    localStorage.removeItem('rust_connect_api_key');
+                    showSetup();
+                    throw new Error("Unauthorized (401)");
+                }
+                const isJson = resp.headers.get('content-type')?.includes('application/json');
+                const data = isJson ? await resp.json() : await resp.text();
+                if (!resp.ok) throw new Error(data.error?.message || `HTTP ${resp.status}`);
+                return data;
+            } catch (e) {
+                logEvent('API_ERROR', `${method} ${path} -> ${e.message}`);
+                throw e;
+            }
+        }
+
+        async function loadHealth() {
+            try {
+                await fetchAPI('GET', '/health');
+                const el = document.getElementById('daemon-status');
+                el.textContent = 'Daemon Running';
+                el.className = 'status connected';
+            } catch (e) {
+                const el = document.getElementById('daemon-status');
+                el.textContent = 'Daemon Offline';
+                el.className = 'status disconnected';
+            }
+        }
+
+        async function loadDevices() {
+            try {
+                const res = await fetchAPI('GET', '/devices');
+                const devices = res.data?.devices || [];
+                const listEl = document.getElementById('device-list');
+                
+                if (devices.length === 0) {
+                    listEl.innerHTML = '<div style="color:#888; padding:1rem; text-align:center;">No devices paired.</div>';
+                    return;
+                }
+                
+                let html = '';
+                for (const d of devices) {
+                    const activeClass = d.id === currentDeviceId ? 'active' : '';
+                    html += `
+                        <div class="device-item ${activeClass}" onclick="selectDevice('${d.id}')">
+                            <h3>${escapeHtml(d.name || d.id)}</h3>
+                            <div class="meta">ID: ${d.id.substring(0,8)}...</div>
+                            <div class="meta" style="margin-top:0.2rem;">
+                                <span class="badge" style="background:transparent; padding:0; color:#888;">${d.device_type}</span>
+                                <span class="badge ${d.state.toLowerCase()}">${d.state}</span>
+                            </div>
+                        </div>
+                    `;
+                }
+                listEl.innerHTML = html;
+                
+                if (currentDeviceId) {
+                    const current = devices.find(d => d.id === currentDeviceId);
+                    if (current) renderDeviceDetails(current);
+                }
+            } catch (e) {}
+        }
+
+        function selectDevice(id) {
+            currentDeviceId = id;
+            document.getElementById('no-device-selected').style.display = 'none';
+            document.getElementById('device-details').style.display = 'block';
+            loadDevices(); // update active state in sidebar
+            
+            const tabsEl = document.getElementById('plugin-tabs');
+            tabsEl.innerHTML = TABS.map((t, i) => `
+                <button class="tab ${i === 0 ? 'active' : ''}" onclick="switchTab('${t.id}', this)">${t.label}</button>
+            `).join('');
+            
+            document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
+            document.getElementById('pane-core').classList.add('active');
+            
+            refreshDeviceState();
+        }
+
+        function switchTab(tabId, btnEl) {
+            document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab-pane').forEach(el => el.classList.remove('active'));
+            btnEl.classList.add('active');
+            document.getElementById(`pane-${tabId}`).classList.add('active');
+            
+            // Auto fetch if tab needs fresh data
+            if (tabId === 'notifications') refreshData('notifications');
+            if (tabId === 'battery') refreshData('battery');
+            if (tabId === 'clipboard') refreshData('clipboard');
+            if (tabId === 'sms') refreshData('sms');
+            if (tabId === 'mpris') refreshData('mpris');
+            if (tabId === 'telephony') refreshData('telephony');
+            if (tabId === 'files') refreshData('sftp');
+        }
+
+        async function refreshDeviceState() {
+            if (!currentDeviceId) return;
+            try {
+                const res = await fetchAPI('GET', `/devices/${currentDeviceId}`);
+                renderDeviceDetails(res.data?.device);
+            } catch (e) {}
+        }
+
+        function renderDeviceDetails(d) {
+            if (!d) return;
+            document.getElementById('selected-device-name').textContent = d.name || d.id;
+            
+            let badges = '';
+            if (d.state === 'Paired' || d.state === 'Connected') badges += '<span class="badge paired">Paired</span>';
+            if (d.state === 'Connected') badges += '<span class="badge connected">Connected</span>';
+            document.getElementById('selected-device-badges').innerHTML = badges;
+            document.getElementById('core-state-json').textContent = JSON.stringify(d, null, 2);
+        }
+
+        // --- Generic Actions ---
+        
+        async function action(pathSegment) {
+            if (!currentDeviceId) return;
+            try {
+                const method = (pathSegment === 'unpair') ? 'DELETE' : 'POST';
+                let body = null;
+                let path = `/devices/${currentDeviceId}/${pathSegment}`;
+                
+                if (pathSegment === 'ping') {
+                    path = '/ping';
+                    body = { device_id: currentDeviceId };
+                } else if (pathSegment === 'connect') {
+                    const ip = prompt("Enter device IP:PORT to connect (e.g. 192.168.1.10:1716):");
+                    if (!ip) return;
+                    body = { address: ip };
+                } else if (pathSegment === 'lock') {
+                    body = { action: 'lock' };
+                } else if (pathSegment === 'sftp/mount') {
+                    body = { mountPoint: `/tmp/sftp_${currentDeviceId}` };
+                }
+                
+                await fetchAPI(method, path, body);
+                logEvent('ACTION', `Triggered ${pathSegment}`);
+                setTimeout(loadDevices, 1000);
+            } catch(e) { alert(e.message); }
+        }
+
+        async function requestData(plugin) {
+            if (!currentDeviceId) return;
+            try {
+                await fetchAPI('POST', `/devices/${currentDeviceId}/${plugin}/request`);
+                logEvent('ACTION', `Requested update for ${plugin}`);
+            } catch(e) { alert(e.message); }
+        }
+
+        async function refreshData(plugin) {
+            if (!currentDeviceId) return;
+            try {
+                let path = `/devices/${currentDeviceId}/${plugin}`;
+                if (plugin === 'notifications') path = '/notifications';
+                if (plugin === 'clipboard') path = '/clipboard';
+                if (plugin === 'sms') path = `/devices/${currentDeviceId}/sms/threads`;
+                
+                const res = await fetchAPI('GET', path);
+                renderPluginData(plugin, res.data || res);
+            } catch(e) {
+                console.warn(e);
+            }
+        }
+
+        function renderPluginData(plugin, data) {
+            console.log(`[UI] Rendering ${plugin} with data:`, data);
+            
+            // Normalize data: sometimes it's { type: '...', ...payload }, sometimes it's { battery: { ... } }
+            // and sometimes it's just the payload itself.
+            const payload = data.battery || data.clipboard || data.telephony || data.info || data.data || data;
+
+            if (plugin === 'battery') {
+                const charge = payload.current_charge ?? payload.currentCharge ?? payload.level;
+                const charging = payload.is_charging ?? payload.isCharging;
+                
+                console.log(`[UI] Battery parsed -> charge: ${charge}, charging: ${charging}`);
+                
+                const levelEl = document.getElementById('battery-level');
+                const chargingEl = document.getElementById('battery-charging');
+                
+                if (levelEl) levelEl.textContent = (charge !== undefined && charge !== null) ? `${charge}%` : '--%';
+                if (chargingEl) chargingEl.textContent = charging ? 'Charging ⚡' : 'Discharging';
+            }
+            
+            if (plugin === 'clipboard') {
+                const content = payload.content ?? payload.data?.content ?? (typeof payload === 'string' ? payload : '');
+                console.log(`[UI] Clipboard parsed -> len: ${content?.length}, val: ${content}`);
+                const el = document.getElementById('clipboard-content');
+                if (el) {
+                    el.value = content;
+                    // Flash the background to show update
+                    el.style.backgroundColor = '#16213e';
+                    setTimeout(() => { el.style.backgroundColor = '#0a0a15'; }, 500);
+                }
+                const statusEl = document.getElementById('clipboard-status');
+                if (statusEl) statusEl.textContent = `Last synced: ${new Date().toLocaleTimeString()}`;
+            }
+            
+            if (plugin === 'sftp') {
+                const s = data.sftp || data;
+                document.getElementById('sftp-info').textContent = JSON.stringify(s, null, 2);
+            }
+            if (plugin === 'telephony') {
+                const t = data.telephony || data;
+                const calls = t.calls || [];
+                if (!calls.length) {
+                    document.getElementById('telephony-state').innerHTML = '<div class="empty">No telephony events recorded</div>';
+                    return;
+                }
+                const eventIcons = { incoming: '📲', ringing: '🔔', talking: '📞', missed: '📵', silent: '🔇', offgoing: '📤' };
+                const eventColors = { incoming: '#00ff88', ringing: '#ffcc00', talking: '#00d4ff', missed: '#ff4444', silent: '#888', offgoing: '#888' };
+                const html = calls.slice().reverse().map(c => {
+                    const icon = eventIcons[c.event] || '📱';
+                    const color = eventColors[c.event] || '#888';
+                    const number = c.number || 'Unknown';
+                    const name = c.contactName || c.contact_name || '';
+                    const time = c.timestamp ? formatTime(c.timestamp) : '';
+                    return `<div class="log-entry">
+                        <span class="log-time">${time}</span>
+                        <span style="color:${color}; font-weight:bold;">${icon} ${c.event}</span>
+                        ${name ? `<strong>${escapeHtml(name)}</strong> ` : ''}
+                        <span style="color:#888">${escapeHtml(number)}</span>
+                    </div>`;
+                }).join('');
+                document.getElementById('telephony-state').innerHTML = html;
+            }
+            if (plugin === 'notifications') {
+                const notes = data.notifications || [];
+                const cancelled = new Set(notes.filter(n => n.is_cancel).map(n => n.id));
+                const html = notes.filter(n => !n.is_cancel && !cancelled.has(n.id)).map(n => `
+                    <div class="log-entry">
+                        <span class="log-time">[${formatTime(n.timestamp || n.received_at)}]</span>
+                        <strong>${escapeHtml(n.appName || n.app_name || 'Unknown')}</strong><br>
+                        ${escapeHtml(n.title || '')} - <span style="color:#888">${escapeHtml(n.text || n.content || '')}</span>
+                    </div>
+                `).join('');
+                document.getElementById('notifications-list').innerHTML = html || '<div class="empty">No active notifications</div>';
+            }
+            if (plugin === 'sms') {
+                const threads = data.threads || [];
+                const html = threads.map(t => {
+                    const phone = t.addresses?.[0]?.address || 'Unknown';
+                    const name = t.name || phone;
+                    return `<div class="log-entry" onclick="viewSmsThread('${t.thread_id}')" style="cursor:pointer;">
+                        <strong>${escapeHtml(name)}</strong> <span style="color:#888;font-size:0.75rem;">${escapeHtml(phone)}</span> (${t.read_count} msgs)
+                        <br><span style="color:#666">${escapeHtml(t.snippet || '...')}</span>
+                    </div>`;
+                }).join('');
+                document.getElementById('sms-threads').innerHTML = html || '<div class="empty">No threads found</div>';
+                document.getElementById('sms-thread-detail').style.display = 'none';
+            }
+            if (plugin === 'mpris') {
+                const players = data.players || [];
+                if (!players.length) {
+                    document.getElementById('mpris-players').innerHTML = '<div class="empty">No media playing</div>';
+                    return;
+                }
+                document.getElementById('mpris-players').innerHTML = players.map(p => `
+                    <div style="border-bottom:1px solid #333; padding-bottom:1rem; margin-bottom:1rem;">
+                        <h4 style="color:#00d4ff; margin-bottom:0.5rem;">${escapeHtml(p.player)}</h4>
+                        <div style="margin-bottom:0.5rem; color:#eee;">
+                            <strong>${escapeHtml(p.title || 'Unknown Title')}</strong><br>
+                            <span style="color:#888">${escapeHtml(p.artist || 'Unknown Artist')}</span>
+                        </div>
+                        <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
+                            <button onclick="mprisAction('${p.player}', 'Previous')" class="secondary" ${!p.canGoPrevious ? 'disabled' : ''}>⏮ Prev</button>
+                            <button onclick="mprisAction('${p.player}', 'PlayPause')" class="${p.isPlaying ? 'playing' : 'secondary'}">${p.isPlaying ? '⏸ Playing' : '▶ Play'}</button>
+                            <button onclick="mprisAction('${p.player}', 'Stop')" class="secondary" ${!p.canPlay ? 'disabled' : ''}>⏹ Stop</button>
+                            <button onclick="mprisAction('${p.player}', 'Next')" class="secondary" ${!p.canGoNext ? 'disabled' : ''}>⏭ Next</button>
+                        </div>
+                    </div>
+                `).join('');
+            }
+        }
+
+        // --- Custom Forms ---
+        
+        async function setClipboard() {
+            const content = document.getElementById('clipboard-content').value;
+            try {
+                await fetchAPI('POST', '/clipboard', { content });
+                logEvent('ACTION', 'Sent text to clipboard');
+            } catch(e) { alert(e.message); }
+        }
+
+        async function sendNotification() {
+            if (!currentDeviceId) return;
+            const title = document.getElementById('notif-title').value;
+            const body = document.getElementById('notif-body').value;
+            try {
+                await fetchAPI('POST', `/devices/${currentDeviceId}/notification`, { 
+                    id: Math.floor(Math.random()*100000).toString(),
+                    title: title || 'Test Notification', 
+                    text: body || 'Hello from rust-connect!', 
+                    is_cancel: false 
+                });
+                logEvent('ACTION', 'Sent test notification');
+                document.getElementById('notif-title').value = '';
+                document.getElementById('notif-body').value = '';
+            } catch(e) { alert(e.message); }
+        }
+
+        async function sendSms() {
+            if (!currentDeviceId) return;
+            const phone = document.getElementById('sms-phone').value;
+            const body = document.getElementById('sms-msg').value;
+            if (!phone || !body) return alert("Number and message required");
+            try {
+                await fetchAPI('POST', `/devices/${currentDeviceId}/sms/send`, { 
+                    phone_number: phone,
+                    message_body: body
+                });
+                logEvent('ACTION', `Sent SMS to ${phone}`);
+                document.getElementById('sms-msg').value = '';
+            } catch(e) { alert(e.message); }
+        }
+
+        async function viewSmsThread(threadId) {
+            if (!currentDeviceId) return;
+            try {
+                const data = await fetchAPI('GET', `/devices/${currentDeviceId}/sms/threads/${threadId}`);
+                const messages = data.messages || [];
+                document.getElementById('sms-thread-title').textContent = `Thread ${threadId} (${messages.length} messages)`;
+                const html = messages.map(m => {
+                    const addr = m.addresses?.[0]?.address || 'Unknown';
+                    const type = m.type === 1 ? 'Sent' : 'Received';
+                    const time = m.date ? formatTime(m.date) : '';
+                    return `<div style="margin-bottom:0.75rem; padding:0.5rem; background:#1a1a2e; border-radius:4px;">
+                        <div style="display:flex; justify-content:space-between; margin-bottom:0.25rem;">
+                            <strong style="color:#00d4ff;">${escapeHtml(addr)}</strong>
+                            <span style="color:#888;font-size:0.75rem;">${type} ${time}</span>
+                        </div>
+                        <div style="color:#eee;">${escapeHtml(m.body || '')}</div>
+                    </div>`;
+                }).join('') || '<div class="empty">No messages in this thread. KDE Connect protocol does not sync SMS message history - only notifications of new incoming/outgoing messages.</div>';
+                document.getElementById('sms-thread-messages').innerHTML = html;
+                document.getElementById('sms-thread-detail').style.display = 'block';
+            } catch(e) { alert(e.message); }
+        }
+
+        function closeSmsThread() {
+            document.getElementById('sms-thread-detail').style.display = 'none';
+        }
+
+        async function mprisAction(player, action) {
+            if (!currentDeviceId) return;
+            try {
+                await fetchAPI('POST', `/devices/${currentDeviceId}/mpris/${encodeURIComponent(player)}/action`, { action });
+                logEvent('ACTION', `MPRIS ${action} on ${player}`);
+            } catch(e) { alert(e.message); }
+        }
+        
+        async function shareFile() {
+            if (!currentDeviceId) return;
+            const fileInput = document.getElementById('share-file-input');
+            const file = fileInput.files[0];
+            if (!file) return alert("Select a file first");
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+                const resp = await fetch(`${API_BASE}/devices/${currentDeviceId}/share/send?filename=${encodeURIComponent(file.name)}`, {
+                    method: 'POST',
+                    headers: apiKey ? { 'X-API-Key': apiKey } : {},
+                    body: file
+                });
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                logEvent('ACTION', `Shared ${file.name} to device`);
+                fileInput.value = '';
+            } catch(e) { alert(e.message); }
+        }
+
+        async function requestSftp() {
+            if (!currentDeviceId) return;
+            try {
+                await fetchAPI('POST', `/devices/${currentDeviceId}/sftp/request`);
+                logEvent('ACTION', 'SFTP requested - polling for connection details');
+            } catch(e) { alert(e.message); }
+        }
+
+        async function unmountSftp() {
+            if (!currentDeviceId) return;
+            try {
+                await fetchAPI('DELETE', `/devices/${currentDeviceId}/sftp/mount?mount_point=/tmp/sftp_${currentDeviceId}`);
+                logEvent('ACTION', `Requested SFTP unmount`);
+                refreshData('sftp');
+            } catch(e) { alert(e.message); }
+        }
+
+        async function setVolume() {
+            if (!currentDeviceId) return;
+            const vol = parseInt(document.getElementById('volume-slider').value);
+            try {
+                await fetchAPI('POST', `/devices/${currentDeviceId}/volume`, { volume: vol, muted: false });
+                logEvent('ACTION', `Set system volume to ${vol}`);
+            } catch(e) { alert(e.message); }
+        }
+
+        // --- SSE & Event Log ---
+
+        function setupSSE() {
+            if (eventSource) return;
+            const url = `${API_BASE}/events?api_key=${encodeURIComponent(apiKey)}`;
+            eventSource = new EventSource(url);
+            
+            eventSource.onmessage = (e) => {
+                try {
+                    const payload = JSON.parse(e.data);
+                    const eventType = payload.type || payload.event_type;
+                    logEvent('SSE', `Event: ${eventType} (Device: ${payload.device_id || 'Global'})`);
+                    
+                    // Core UI Refresh triggers
+                    if (['discovered', 'state_changed', 'paired', 'connected', 'disconnected', 'removed'].includes(eventType)) {
+                        loadDevices();
+                    }
+                    
+                    // Target updates to the active UI
+                    if (currentDeviceId && (payload.device_id === currentDeviceId || !payload.device_id)) {
+                        if (eventType === 'Battery') {
+                            renderPluginData('battery', payload);
+                        }
+                        if (eventType === 'ClipboardUpdate') {
+                            renderPluginData('clipboard', payload);
+                        }
+                        if (eventType === 'MprisUpdate') {
+                            refreshData('mpris');
+                        }
+                        if (eventType === 'Notification') {
+                            refreshData('notifications');
+                        }
+                        if (eventType === 'SmsThreadsUpdate') {
+                            refreshData('sms');
+                        }
+                        if (eventType === 'TelephonyUpdate') {
+                            renderPluginData('telephony', payload);
+                        }
+                        if (eventType === 'SftpUpdate') {
+                            logEvent('SSE', `SFTP ${payload.available ? 'available' : 'unavailable'} at ${payload.ip}:${payload.port}`);
+                            refreshData('sftp');
+                        }
+                    }
+                } catch(err) {}
+            };
+            
+            eventSource.onerror = (e) => {
+                logEvent('SYSTEM', 'SSE connection lost. Reconnecting...');
+            };
+        }
+
+        function logEvent(type, msg) {
+            const el = document.getElementById('event-log');
+            if (!el) return;
+            const time = new Date().toLocaleTimeString();
+            let typeColor = '#333';
+            if (type === 'ACTION') typeColor = '#0066cc';
+            if (type === 'SSE') typeColor = '#009944';
+            if (type === 'API_ERROR') typeColor = '#cc0000';
+            
+            const html = `
+                <div class="log-entry">
+                    <span class="log-time">[${time}]</span> 
+                    <span class="badge" style="background:${typeColor}">${type}</span> 
+                    ${escapeHtml(msg)}
+                </div>
+            `;
+            el.insertAdjacentHTML('afterbegin', html);
+        }
+
+        function escapeHtml(s) {
+            if (!s) return '';
+            return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+        function formatTime(ts) {
+            if (!ts) return '';
+            const d = typeof ts === 'string' ? new Date(ts) : new Date(ts * 1000);
+            return d.toLocaleTimeString();
+        }
+
+        // --- Init ---
+        
+        if (apiKey) {
+            showMain();
+            loadHealth();
+            loadDevices();
+            setupSSE();
+            setInterval(loadHealth, 15000);
+        } else {
+            showSetup();
+        }
+    </script>
+</body>
+</html>
