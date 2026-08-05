@@ -8,7 +8,7 @@
 //! 5. Port 1716 available on the host (KDE Connect protocol port) — if the
 //!    daemon is installed and running, STOP IT FIRST, or the test fails at
 //!    the listener bind with `AddrInUse`:
-//!      systemctl --user stop rust-connect     # …and start it again after
+//!    `systemctl --user stop rust-connect` (and start it again afterwards)
 //!
 //! IMPORTANT: The first run will pair with the Android device. Subsequent runs
 //! reuse the same certificate from a persistent directory so the Android app
@@ -23,9 +23,33 @@
 //!   RUST_CONNECT_TEST_USB=1 cargo test --test usb_integration usb_send_file_to_android -- --ignored --nocapture
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Where this suite's fixed test identity lives.
+///
+/// It must be STABLE ACROSS REBOOTS. Android pins the certificate at first
+/// pairing and refuses a different one for the same device id, so a cert dir
+/// that gets cleared mints a new cert the phone then rejects. The symptom is
+/// not an obvious error: the phone lists the device but reports it "not
+/// reachable", and the only cure is unpairing it by hand on the phone.
+///
+/// This used to sit under `std::env::temp_dir()`, which is exactly what the
+/// docstring above promised it would not be — `/tmp` is cleared on reboot and
+/// aged out by tmpfiles policy.
+///
+/// Override with `RUST_CONNECT_TEST_CERT_DIR` to pair as a throwaway identity.
+fn test_cert_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("RUST_CONNECT_TEST_CERT_DIR") {
+        return PathBuf::from(dir);
+    }
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(".local/share/rust-connect-usb-test-certs"),
+        None => std::env::temp_dir().join("rust-connect-usb-test-certs"),
+    }
+}
 
 use rust_connect::device::DeviceType;
 use rust_connect::protocol::{
@@ -152,7 +176,7 @@ async fn usb_android_connects_to_us() {
         }
     };
 
-    let cert_dir = std::env::temp_dir().join("rust-connect-usb-test-certs");
+    let cert_dir = test_cert_dir();
     std::fs::create_dir_all(&cert_dir).unwrap();
     let cert_manager = Arc::new(CertificateManager::new(cert_dir.clone()));
     cert_manager.init().unwrap();
@@ -330,7 +354,7 @@ async fn usb_full_protocol_handshake() {
 
     // Use a persistent cert directory so the same cert is reused across test runs.
     // The Android app stores the cert from the first pairing and rejects new certs.
-    let cert_dir = std::env::temp_dir().join("rust-connect-usb-test-certs");
+    let cert_dir = test_cert_dir();
     std::fs::create_dir_all(&cert_dir).unwrap();
     let cert_manager = Arc::new(CertificateManager::new(cert_dir.clone()));
     cert_manager.init().unwrap();
@@ -609,7 +633,7 @@ async fn usb_discovery_broadcast_format() {
     if !check_usb() {
         return;
     }
-    let cert_dir = std::env::temp_dir().join("rust-connect-usb-test-certs");
+    let cert_dir = test_cert_dir();
     std::fs::create_dir_all(&cert_dir).unwrap();
     let cert_manager = Arc::new(CertificateManager::new(cert_dir.clone()));
     cert_manager.init().unwrap();
@@ -694,7 +718,7 @@ async fn usb_send_file_to_android() {
         }
     };
 
-    let cert_dir = std::env::temp_dir().join("rust-connect-usb-test-certs");
+    let cert_dir = test_cert_dir();
     std::fs::create_dir_all(&cert_dir).unwrap();
     let cert_manager = Arc::new(CertificateManager::new(cert_dir.clone()));
     cert_manager.init().unwrap();
