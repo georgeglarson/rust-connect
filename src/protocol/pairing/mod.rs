@@ -24,6 +24,18 @@ pub enum PairState {
     Paired,
 }
 
+impl PairState {
+    /// Stable string form for API responses.
+    pub fn as_api_str(&self) -> &'static str {
+        match self {
+            PairState::NotPaired => "not_paired",
+            PairState::Requested => "requested",
+            PairState::RequestedByPeer => "requested_by_peer",
+            PairState::Paired => "paired",
+        }
+    }
+}
+
 /// Requester-side pairing timeout: how long we wait for the peer's accept
 /// (Android PairingHandler.kt:151 — 30 seconds).
 pub const PAIR_REQUEST_TIMEOUT_SECS: i64 = 30;

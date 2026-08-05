@@ -95,6 +95,12 @@ pub struct DeviceSummary {
     pub last_seen: DateTime<Utc>,
     /// Stamped by the pairing store (authoritative), None when unpaired.
     pub paired_at: Option<DateTime<Utc>>,
+    /// Pairing lifecycle state, overlaid from the pairing store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pair_state: Option<String>,
+    /// SAS verification key, present only while a pairing is pending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_key: Option<String>,
 }
 
 impl From<&Device> for DeviceSummary {
@@ -106,6 +112,8 @@ impl From<&Device> for DeviceSummary {
             state: d.state,
             last_seen: d.last_seen,
             paired_at: d.paired_at,
+            pair_state: d.pair_state.clone(),
+            verification_key: d.verification_key.clone(),
         }
     }
 }
