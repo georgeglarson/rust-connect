@@ -4,7 +4,19 @@ A modern, API-first reimplementation of KDE Connect in Rust, compatible with the
 
 ## Quick Start
 
-Run it in the foreground for development:
+Download the `.deb` from the [latest release](https://github.com/georgeglarson/rust-connect/releases/latest) and install it:
+
+```bash
+sudo apt install ./rust-connect_0.1.0_amd64.deb
+systemctl --user enable --now rust-connect.service
+```
+
+The package ships a systemd **user** unit (see below for why it must be a
+user service, not a system one). The second command starts it for your user
+right away; for other users it starts at their next login.
+
+No Debian-based distro? Grab the `rust-connect` binary from the same release
+(x86-64 Linux, glibc 2.17+), or build from source:
 
 ```bash
 cargo run
@@ -21,7 +33,10 @@ cat ~/.local/share/rust-connect/api_key
 
 Then open KDE Connect on your Android device to pair.
 
-## Install as a service
+## Install as a service (from source)
+
+Installed the `.deb`? You already have the service — skip this section.
+From a source checkout:
 
 ```bash
 ./packaging/install-user-service.sh
@@ -118,8 +133,8 @@ Exit codes: `0` success, `1` API error, `2` daemon unreachable.
 curl -H "X-API-Key: YOUR_KEY" http://localhost:9090/api/v1/devices
 ```
 
-The REST API is the single control surface. (An MCP stdio server existed in
-early versions and was cut from v1 — it returns in v2; see git history.)
+The REST API is the single control surface. (An MCP server is planned for
+v2.)
 
 ## API
 
