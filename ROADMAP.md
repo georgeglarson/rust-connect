@@ -32,27 +32,41 @@ the existing KDE Connect Android app.
 Interop focus is Android; kdeconnect-kde and GSConnect peers work but get
 less validation.
 
+## Functional completeness
+
+The canonical implementation plan is
+[`docs/functional-completeness-plan.md`](docs/functional-completeness-plan.md).
+It replaces the earlier assumption that the nine behavioral gaps in
+`docs/parity-checklist.md` were the whole remaining surface. That checklist
+explicitly excluded plugin-level parity, and live validation covers only a
+subset of advertised features and environments.
+
+The immediate order is:
+
+1. build an exhaustive capability/evidence ledger from current Android, KDE,
+   GSConnect, and production Rust wiring;
+2. close advertised-but-incomplete desktop effects (system volume,
+   run-command configuration, SFTP browsing, notification actions/icons,
+   MPRIS album art, and smaller backend gaps);
+3. close the nine known protocol gaps and recovery/security fault cases;
+4. classify and implement the remaining upstream feature union;
+5. validate A15 and S21 plus Sway, GNOME, KDE, Wayland, and X11; and
+6. make inventory/evidence closure a release gate.
+
+Completeness is now a bounded claim. `UNVERIFIED` remains visible until a real
+peer, upstream-derived fixture, or applicable environment proves the behavior.
+
 ## Next
 
-- Live-device validation matrix: every plugin against real Android
-  devices across app versions, tracked and repeatable.
-- Notification icons and inline actions. Notifications sync today, but
-  the icon payload and the action buttons the Android app offers are not
-  wired through.
-- systemvolume as a real provider: the plugin answers volume requests,
-  but the desktop side does not yet publish sink lists and per-sink
-  volume from PipeWire/PulseAudio.
-- sftp as an actual mount rather than an advertised endpoint, so browsing
-  the phone works from a file manager.
-- Packaging beyond the deb script: rpm, then Flatpak.
+- Sprint 0 of the functional-completeness plan: exhaustive inventory,
+  evidence ledger, test-provenance classification, and independent audits.
+- Then close advertised features that currently lack their promised desktop
+  effect before spending effort on optional parity or packaging breadth.
 
 ## Later
 
 - Desktop shell integration: tray/indicator and native pairing UI.
-- Absolute pointer positioning for `kdeconnect.mousepad.request` packets
-  carrying `x`/`y`. These need absolute axes on the uinput device, which
-  the current relative-only pointer does not register. No shipped client
-  sends them over the network today, so they are logged and dropped.
+- Packaging beyond the deb script: rpm, then Flatpak.
 - Broader distro matrix (non-systemd, musl, immutable distros).
 - macOS exploration. The protocol is portable; the desktop integration
   is the open question.
