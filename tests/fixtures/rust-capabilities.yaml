@@ -1,0 +1,142 @@
+# Rust Connect plugin inventory
+#
+# Generated from the live PluginAccess::all() via the loader.
+# Each entry: one block per plugin with name + both capability directions.
+# Lifecycle-only plugins (no packet types) are recorded with empty lists.
+# The tripwire test refuses to pass when this fixture and the loader diverge.
+# Regenerate after an intentional change with UPDATE_RUST_CAPABILITIES_FIXTURE=1.
+plugins:
+  - name: battery
+    incoming_capabilities:
+      - kdeconnect.battery
+    outgoing_capabilities:
+      - kdeconnect.battery.request
+  - name: clipboard
+    incoming_capabilities:
+      - kdeconnect.clipboard
+      - kdeconnect.clipboard.connect
+    outgoing_capabilities:
+      - kdeconnect.clipboard
+      - kdeconnect.clipboard.connect
+  - name: connectivity
+    incoming_capabilities:
+      - kdeconnect.connectivity_report
+    outgoing_capabilities:
+      []
+  - name: contacts
+    incoming_capabilities:
+      - kdeconnect.contacts.response_uids_timestamps
+      - kdeconnect.contacts.response_vcards
+    outgoing_capabilities:
+      - kdeconnect.contacts.request_all_uids_timestamps
+      - kdeconnect.contacts.request_vcards_by_uid
+  - name: digitizer
+    incoming_capabilities:
+      - kdeconnect.digitizer.session
+      - kdeconnect.digitizer
+    outgoing_capabilities:
+      []
+  - name: findmyphone
+    incoming_capabilities:
+      []
+    outgoing_capabilities:
+      - kdeconnect.findmyphone.request
+  - name: findthisdevice
+    incoming_capabilities:
+      - kdeconnect.findmyphone.request
+    outgoing_capabilities:
+      []
+  - name: lock
+    incoming_capabilities:
+      - kdeconnect.lock
+      - kdeconnect.lock.request
+    outgoing_capabilities:
+      - kdeconnect.lock
+      - kdeconnect.lock.request
+  - name: mousepad
+    incoming_capabilities:
+      - kdeconnect.mousepad.request
+    outgoing_capabilities:
+      - kdeconnect.mousepad.keyboardstate
+  - name: mpris
+    incoming_capabilities:
+      - kdeconnect.mpris
+      - kdeconnect.mpris.request
+    outgoing_capabilities:
+      - kdeconnect.mpris
+      - kdeconnect.mpris.request
+  - name: notification
+    incoming_capabilities:
+      - kdeconnect.notification
+    outgoing_capabilities:
+      - kdeconnect.notification
+      - kdeconnect.notification.request
+      - kdeconnect.notification.reply
+  - name: pausemusic
+    incoming_capabilities:
+      - kdeconnect.telephony
+    outgoing_capabilities:
+      []
+  - name: ping
+    incoming_capabilities:
+      - kdeconnect.ping
+    outgoing_capabilities:
+      - kdeconnect.ping
+  - name: presenter
+    incoming_capabilities:
+      - kdeconnect.presenter
+    outgoing_capabilities:
+      []
+  - name: remotecommands
+    incoming_capabilities:
+      - kdeconnect.runcommand
+    outgoing_capabilities:
+      - kdeconnect.runcommand.request
+  - name: remotekeyboard
+    incoming_capabilities:
+      - kdeconnect.mousepad.echo
+      - kdeconnect.mousepad.keyboardstate
+    outgoing_capabilities:
+      - kdeconnect.mousepad.request
+  - name: runcommand
+    incoming_capabilities:
+      - kdeconnect.runcommand.request
+    outgoing_capabilities:
+      - kdeconnect.runcommand
+  - name: screensaver-inhibit
+    incoming_capabilities:
+      []
+    outgoing_capabilities:
+      []
+  - name: sendnotifications
+    incoming_capabilities:
+      - kdeconnect.notification.request
+    outgoing_capabilities:
+      - kdeconnect.notification
+  - name: sftp
+    incoming_capabilities:
+      - kdeconnect.sftp
+    outgoing_capabilities:
+      - kdeconnect.sftp.request
+  - name: share
+    incoming_capabilities:
+      - kdeconnect.share.request
+      - kdeconnect.share.request.update
+    outgoing_capabilities:
+      - kdeconnect.share.request
+  - name: sms
+    incoming_capabilities:
+      - kdeconnect.sms.messages
+    outgoing_capabilities:
+      - kdeconnect.sms.request
+      - kdeconnect.sms.request_conversations
+  - name: systemvolume
+    incoming_capabilities:
+      - kdeconnect.systemvolume
+    outgoing_capabilities:
+      - kdeconnect.systemvolume.request
+  - name: telephony
+    incoming_capabilities:
+      - kdeconnect.telephony
+    outgoing_capabilities:
+      []
