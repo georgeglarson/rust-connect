@@ -1832,8 +1832,6 @@ async fn test_verification_key_matches_android_algorithm_and_timestamp() {
 
 /// The SAS must be computable the moment an incoming request (carrying its
 /// cert) is staged — the daemon logs it then, and API surfaces read it for
-/// The SAS must be computable the moment an incoming request (carrying its
-/// cert) is staged — the daemon logs it then, and API surfaces read it for
 /// display before the accept.
 #[tokio::test]
 async fn test_verification_key_available_while_incoming_request_pending() {

@@ -331,9 +331,8 @@
                 let html = '';
                 for (const d of devices) {
                     const activeClass = d.id === currentDeviceId ? 'active' : '';
-                    const pairLabel = d.pair_state === 'requested_by_peer' ? 'Accept' : 'Pair';
                     const sasLine = (d.pair_state === 'requested_by_peer' && d.verification_key)
-                        ? `<div style="margin:0.5rem 0; color:#ffc800;">Verification key: <code>${d.verification_key}</code> — compare with the phone</div>`
+                        ? `<div style="margin:0.5rem 0; color:#ffc800;">Verification key: <code>${escapeHtml(d.verification_key)}</code> — compare with the phone</div>`
                         : '';
                     html += `
                         <div class="device-item ${activeClass}" onclick="selectDevice('${d.id}')">
