@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::protocol::{DEFAULT_TCP_PORT, DEFAULT_UDP_PORT, PROTOCOL_VERSION};
+use crate::protocol::{DEFAULT_TCP_PORT, DEFAULT_UDP_PORT};
 use crate::utils::errors::{Error, Result};
 
 const DEFAULT_DEVICE_NAME: &str = "Rust Connect Device";
@@ -22,7 +22,6 @@ pub struct AppSettings {
     pub device_name: String,
     pub tcp_port: u16,
     pub udp_port: u16,
-    pub protocol_version: u32,
     pub cert_dir: PathBuf,
     pub data_dir: PathBuf,
     pub log_level: String,
@@ -55,7 +54,6 @@ impl Default for AppSettings {
             device_name: DEFAULT_DEVICE_NAME.to_string(),
             tcp_port: DEFAULT_TCP_PORT,
             udp_port: DEFAULT_UDP_PORT,
-            protocol_version: PROTOCOL_VERSION,
             cert_dir: data_dir.join("certs"),
             data_dir: data_dir.clone(),
             log_level: DEFAULT_LOG_LEVEL.to_string(),
@@ -286,7 +284,6 @@ mod tests {
         let settings = AppSettings::default();
         assert_eq!(settings.tcp_port, DEFAULT_TCP_PORT);
         assert_eq!(settings.udp_port, DEFAULT_UDP_PORT);
-        assert_eq!(settings.protocol_version, PROTOCOL_VERSION);
         assert_eq!(settings.broadcast_interval_secs, 60);
         assert!(settings.api_enabled);
         assert!(settings.api_keys.is_empty());
@@ -435,6 +432,28 @@ mod tests {
 
         let settings = AppSettings::load_from_file(&path).expect("Value expected to be present");
         assert_eq!(settings.device_name, "minimal");
+        assert_eq!(settings.tcp_port, DEFAULT_TCP_PORT);
+        assert_eq!(settings.udp_port, DEFAULT_UDP_PORT);
+    }
+
+    /// Removing `protocol_version` from `AppSettings` must not break
+    /// existing config files that still contain the field (older
+    /// versions let users set it; it was never read). serde's default
+    /// behavior ignores unknown fields, so a config that carries the
+    /// legacy key must still load — and the loaded settings must equal
+    /// the defaults (the field had no effect when present either).
+    #[test]
+    fn test_load_ignores_legacy_protocol_version_field() {
+        let temp = tempfile::TempDir::new().expect("Value expected to be present");
+        let path = temp.path().join("legacy.toml");
+        std::fs::write(
+            &path,
+            "device_name = \"legacy\"\nprotocol_version = 7\n",
+        )
+        .expect("Value expected to be present");
+
+        let settings = AppSettings::load_from_file(&path).expect("Value expected to be present");
+        assert_eq!(settings.device_name, "legacy");
         assert_eq!(settings.tcp_port, DEFAULT_TCP_PORT);
         assert_eq!(settings.udp_port, DEFAULT_UDP_PORT);
     }
