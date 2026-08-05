@@ -945,6 +945,9 @@ impl Plugin for MprisPlugin {
         ]
     }
 
+    fn is_backend_available(&self) -> bool {
+        self.backend.read().map(|b| b.is_some()).unwrap_or(false)
+    }
     fn on_disconnected(&self, device_id: &str) {
         if let Ok(mut players) = self.players.write() {
             players.remove(device_id);

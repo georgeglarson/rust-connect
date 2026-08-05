@@ -43,6 +43,13 @@ pub struct Tool {
     pub endpoint: String,
     pub method: String,
     pub parameters: Vec<ToolParameter>,
+    /// Whether the plugin's backend is currently operational. Plugins
+    /// without a separable backend always report `true`; plugins that
+    /// detect a session-bus / portal / clipboard backend at runtime
+    /// (clipboard, mpris, …) report the live state. `false` means the
+    /// tool is listed for discoverability but cannot service a request
+    /// right now — callers should not invoke the endpoint.
+    pub available: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -60,7 +67,7 @@ pub struct ToolsResponse {
 }
 
 fn capability_to_tool(cap: &str, _incoming: bool) -> Option<Tool> {
-    let (name, description, endpoint, method, params) = match cap {
+    let (name, description, endpoint, method, params, available) = match cap {
         "kdeconnect.ping" => (
             "ping_device".to_string(),
             "Send a ping to a device to check connectivity".to_string(),
@@ -72,6 +79,7 @@ fn capability_to_tool(cap: &str, _incoming: bool) -> Option<Tool> {
                 required: true,
                 description: "Target device ID".to_string(),
             }],
+            true,
         ),
         "kdeconnect.battery" => (
             "get_battery".to_string(),
@@ -84,6 +92,7 @@ fn capability_to_tool(cap: &str, _incoming: bool) -> Option<Tool> {
                 required: true,
                 description: "Target device ID".to_string(),
             }],
+            true,
         ),
         "kdeconnect.clipboard" => (
             "get_clipboard".to_string(),
@@ -91,6 +100,10 @@ fn capability_to_tool(cap: &str, _incoming: bool) -> Option<Tool> {
             "/api/v1/clipboard".to_string(),
             "GET".to_string(),
             vec![],
+            // availability is overridden by list_tools once it has the
+            // owning plugin in hand; this default keeps the lookup
+            // callable in isolation.
+            true,
         ),
         "kdeconnect.sms" => (
             "get_sms".to_string(),
@@ -103,6 +116,7 @@ fn capability_to_tool(cap: &str, _incoming: bool) -> Option<Tool> {
                 required: true,
                 description: "Target device ID".to_string(),
             }],
+            true,
         ),
         "kdeconnect.mpris" => (
             "get_media".to_string(),
@@ -115,6 +129,8 @@ fn capability_to_tool(cap: &str, _incoming: bool) -> Option<Tool> {
                 required: true,
                 description: "Target device ID".to_string(),
             }],
+            // overridden by list_tools; see kdeconnect.clipboard note.
+            true,
         ),
         "kdeconnect.telephony" => (
             "get_telephony".to_string(),
@@ -127,6 +143,7 @@ fn capability_to_tool(cap: &str, _incoming: bool) -> Option<Tool> {
                 required: true,
                 description: "Target device ID".to_string(),
             }],
+            true,
         ),
         "kdeconnect.notification" => (
             "get_notifications".to_string(),
@@ -134,6 +151,7 @@ fn capability_to_tool(cap: &str, _incoming: bool) -> Option<Tool> {
             "/api/v1/notifications".to_string(),
             "GET".to_string(),
             vec![],
+            true,
         ),
         "kdeconnect.share" => (
             "share_file".to_string(),
@@ -154,6 +172,7 @@ fn capability_to_tool(cap: &str, _incoming: bool) -> Option<Tool> {
                     description: "Path to file to share".to_string(),
                 },
             ],
+            true,
         ),
         "kdeconnect.runcommand" => (
             "get_remotecommands".to_string(),
@@ -166,6 +185,7 @@ fn capability_to_tool(cap: &str, _incoming: bool) -> Option<Tool> {
                 required: true,
                 description: "Target device ID".to_string(),
             }],
+            true,
         ),
         _ => return None,
     };
@@ -177,6 +197,7 @@ fn capability_to_tool(cap: &str, _incoming: bool) -> Option<Tool> {
         endpoint,
         method,
         parameters: params,
+        available,
     })
 }
 
@@ -232,8 +253,23 @@ pub async fn list_tools(
     let mut tools = Vec::new();
 
     for plugin in plugins {
+        // One lookup, both pieces of state — availability is a trait
+        // method on the same Plugin trait that incoming_capabilities
+        // lives on, so a generic hook covers any future backend-bearing
+        // plugin (sendnotifications, pausemusic, screensaver_inhibit)
+        // without per-plugin special cases in this handler.
+        let available = state
+            .plugin_registry
+            .get(&plugin.name)
+            .await
+            .map(|p| p.is_backend_available())
+            .unwrap_or(true);
+
         for cap in &plugin.incoming_capabilities {
-            if let Some(tool) = capability_to_tool(cap, true) {
+            if let Some(mut tool) = capability_to_tool(cap, true) {
+                if !available {
+                    tool.available = false;
+                }
                 tools.push(tool);
             }
         }

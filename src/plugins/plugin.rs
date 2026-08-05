@@ -23,4 +23,16 @@ pub trait Plugin: Send + Sync {
     fn on_disconnected(&self, device_id: &str) {
         let _ = device_id;
     }
+
+    /// Whether the plugin's backend is operational. Plugins without a
+    /// separable backend (most of them) report `true`; plugins that
+    /// detect a session bus / portal / clipboard backend at runtime
+    /// (clipboard, mpris, sendnotifications, pausemusic,
+    /// screensaver_inhibit) override to report the live state.
+    /// Default `true` keeps existing plugins honest-by-default; the
+    /// listing surfaces `false` so /api/v1/tools never advertises a
+    /// tool the backend can't actually service.
+    fn is_backend_available(&self) -> bool {
+        true
+    }
 }

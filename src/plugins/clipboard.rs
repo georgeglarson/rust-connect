@@ -636,6 +636,9 @@ impl Plugin for ClipboardPlugin {
         ]
     }
 
+    fn is_backend_available(&self) -> bool {
+        self.backend.read().map(|b| b.is_some()).unwrap_or(false)
+    }
     fn on_connected(&self, _device_id: &str) -> Vec<Packet> {
         // clipboard.connect is sent on connect with the last-known content and
         // its update timestamp (kdeconnect-kde clipboardplugin.cpp:39-42,

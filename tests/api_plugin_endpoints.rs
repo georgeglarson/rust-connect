@@ -517,3 +517,65 @@ async fn test_notification_dismiss_route_exists() {
     assert_ne!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
+
+/// /api/v1/tools must report backend availability honestly. The default test
+/// app constructs AppState via `new_without_input`, which never calls
+/// `enable_session_backend` for clipboard/mpris/etc — so those tools should
+/// come back with `available: false` rather than be advertised as healthy.
+#[tokio::test]
+async fn test_list_tools_marks_degraded_backends() {
+    let (state, _temp, api_key) = create_test_app().await;
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/tools")
+                .header("X-API-Key", &api_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let tools = json["data"]["tools"]
+        .as_array()
+        .expect("tools must be an array");
+
+    let clipboard = tools
+        .iter()
+        .find(|t| t["name"] == "get_clipboard")
+        .expect("clipboard tool must be present");
+    assert_eq!(
+        clipboard["available"],
+        serde_json::json!(false),
+        "clipboard tool must be marked unavailable when no session backend is enabled"
+    );
+
+    let mpris = tools
+        .iter()
+        .find(|t| t["name"] == "get_media")
+        .expect("mpris tool must be present");
+    assert_eq!(
+        mpris["available"],
+        serde_json::json!(false),
+        "mpris tool must be marked unavailable when no session D-Bus backend is enabled"
+    );
+
+    // Plugins without a separable backend (ping) should remain available.
+    let ping = tools
+        .iter()
+        .find(|t| t["name"] == "ping_device")
+        .expect("ping tool must be present");
+    assert_eq!(
+        ping["available"],
+        serde_json::json!(true),
+        "ping has no separable backend and must remain available"
+    );
+}
