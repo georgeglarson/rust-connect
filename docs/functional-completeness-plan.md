@@ -1,7 +1,10 @@
 # Plan: Functional completeness and evidence closure
 
-**Generated:** 2026-08-05  
-**Estimated complexity:** High  
+**Generated:** 2026-08-05
+**Amended:** 2026-08-05, after a three-lane audit (MiniMax-M3 claim
+verification + gap sweep, GLM-5.2 adversarial review; reports in
+`plans/audit-2026-08-05-plan-review/`, verdict in the vault project page)
+**Estimated complexity:** High
 **Canonical scope:** This file defines the work. `ROADMAP.md` summarizes it.
 
 ## Overview
@@ -66,19 +69,35 @@ from an incomplete checklist.
 advertised by Rust Connect and every current upstream plugin/capability. Removing a
 Rust plugin or adding a fixture capability makes the coverage check fail.
 
+**Sequencing amendment (2026-08-05).** Sprint 0 runs as two slices so Sprint 1
+does not wait on the full machinery:
+
+- **Slice 0A (thin, first):** Task 0.1 (pinned upstream inventory), Task 0.2
+  (Rust inventory generated from the loader), and the ledger skeleton with the
+  status vocabulary (Task 0.3). Enough to see and prioritize every gap.
+- **Slice 0B (then, in parallel with Sprint 1):** the self-referential-test
+  pass (Task 0.4), the black-box audit (Task 0.5), and the lint/mutation gates
+  (Task 0.3 validation).
+
+Sprint 1 tasks depend on Slice 0A only — their gaps are known from current
+source and do not require the full ledger machinery to start.
+
 ### Task 0.1: Pin all three upstream inventories
 
-- **Location:** `tools/update-upstream-inventory.sh`,
-  `tests/fixtures/upstream-capabilities/`, `docs/functional-coverage.md`
-- **Description:** Extract plugin names, incoming/outgoing packet types, and source
-  revision from current kdeconnect-android, kdeconnect-kde, and GSConnect. Commit
-  normalized fixtures and the exact upstream SHAs; do not depend on a developer's
-  absolute checkout path.
+- **Location:** `tests/fixtures/upstream-capabilities/`,
+  `docs/functional-coverage.md` (refresh script under `tools/` optional)
+- **Description:** Record plugin names, incoming/outgoing packet types, and the
+  exact source revision of kdeconnect-android, kdeconnect-kde, and GSConnect as
+  committed, normalized fixtures. A hand-built, cited inventory is sufficient;
+  automatic multi-language extraction is deferred unless the drift review
+  (Task 5.3) proves it unmanageable. Do not depend on a developer's absolute
+  checkout path.
 - **Dependencies:** None.
-- **Acceptance criteria:** The extractor is deterministic; diffs expose upstream
-  additions/removals; every fixture entry cites its upstream file.
-- **Validation:** Run twice with no diff; mutate one fixture and watch the inventory
-  test fail.
+- **Acceptance criteria:** Every fixture entry cites its upstream file and pinned
+  SHA; the completeness test fails when a Rust plugin or fixture capability has
+  no ledger row; diffs expose upstream additions/removals at refresh time.
+- **Validation:** Mutate one fixture and watch the inventory test fail; refresh
+  from the pinned upstreams and confirm a clean re-run.
 
 ### Task 0.2: Generate the Rust capability inventory from production wiring
 
@@ -95,37 +114,61 @@ Rust plugin or adding a fixture capability makes the coverage check fail.
 ### Task 0.3: Create the evidence ledger and status vocabulary
 
 - **Location:** `docs/functional-coverage.md`, `docs/live-validation.md`
-- **Description:** Add one row per feature/role, not merely per module. Columns:
-  upstream refs, packet directions, desktop/phone effect, API/CLI surface,
-  lifecycle/recovery, hostile-input tests, fixture provenance, A15, S21, other
-  Android, Sway, GNOME, KDE, X11, and status. Use `PASS`, `FAIL`, `UNVERIFIED`,
-  `NOT-APPLICABLE`, and `INTENTIONAL-DIVERGENCE`; every non-pass state needs a
-  reason and owner task.
+- **Description:** Three small matrices instead of one wide one, so the ledger
+  stays maintainable by one person:
+  1. **Feature ledger** — one row per feature/role (not merely per module), with
+     columns for the eight evidence dimensions (upstream refs, desktop/phone
+     effect, API/CLI surface, lifecycle/recovery, hostile-input behavior,
+     fixture provenance, live-device evidence, environment evidence) plus status.
+  2. **Environment matrix** — keyed by the backends that actually vary by
+     desktop (clipboard-X11/Wayland, uinput, audio, session D-Bus, notification
+     server), not one column per DE per feature.
+  3. **Device matrix** — A15, S21, other Android (volunteer).
+
+  Use `PASS`, `FAIL`, `UNVERIFIED`, `NOT-APPLICABLE`, and
+  `INTENTIONAL-DIVERGENCE`; every non-pass state needs a reason and owner task.
 - **Dependencies:** Tasks 0.1–0.2.
 - **Acceptance criteria:** The old protocol checklist, all Rust plugins, and all
   upstream-only capabilities are represented. No prose claim can substitute for a
-  row's evidence links.
+  row's evidence links. An effect `PASS` requires a peer-side or phone-side
+  artifact — our own log line or API response does not count ("packet-sent is
+  never receipt evidence", enforced the same way as wire conformance).
 - **Validation:** A schema/lint test rejects missing rows, unknown status values,
-  uncited `PASS`, and expired upstream revisions.
+  uncited `PASS`, an effect `PASS` without a peer-side artifact, and expired
+  upstream revisions.
 
-### Task 0.4: Reclassify tests by evidence source
+### Task 0.4: Eliminate self-referential wire-conformance evidence
 
 - **Location:** `tests/`, module-local tests, `docs/functional-coverage.md`
-- **Description:** Label coverage as Rust-self, upstream-fixture, independent-peer,
-  live-device, environment, or fault-injection. Identify tests that serialize Rust
-  structs and then parse them with Rust structs as self-referential evidence.
+- **Description:** A targeted pass, not an exhaustive relabeling: find every
+  wire-conformance test whose fixture is produced by serializing this repo's own
+  structs (or hand-typed against them) and convert it to an upstream-derived
+  literal fixture or an independent-peer check. The defect class that repeatedly
+  bit this project is narrow — wire shapes certified by Rust-to-Rust agreement —
+  so only wire-conformance tests need provenance labels; other unit tests do not.
+  Known instances at audit time (fix or justify each):
+  `tests/protocol_integration.rs:49`
+  (`test_identity_packet_format_matches_kde_connect`),
+  `src/protocol/types.rs:567`
+  (`test_packet_payload_fields_serialize_camel_case`), the six `*_wire_shape`
+  tests in `src/plugins/mpris/mod.rs`, `src/plugins/clipboard.rs:841`
+  (`test_local_change_packet_wire_shape`), `src/api/handlers/share.rs:572`, and
+  the runcommand `_wire_shape` trio in `src/plugins/runcommand.rs`.
 - **Dependencies:** Task 0.3.
-- **Acceptance criteria:** Every `PASS` has at least one non-self-referential source
-  for its wire shape or observable effect.
+- **Acceptance criteria:** Every wire-conformance `PASS` has at least one
+  non-self-referential source for its wire shape.
 - **Validation:** Coverage lint refuses a wire-conformance `PASS` backed only by a
-  Rust-self test.
+  Rust-self test; each converted test cites its upstream fixture source.
 
-### Task 0.5: Run two independent gap audits
+### Task 0.5: Run one independent black-box gap audit
 
 - **Location:** `docs/audits/functional-gap-audit-YYYY-MM-DD.md`
-- **Description:** One source-diff audit compares all three upstreams; a separate
-  black-box audit starts from the published binary/API without trusting internal
-  docs. Reproduce each finding before promoting it into the ledger or backlog.
+- **Description:** One black-box audit starting from the published binary/API —
+  what a skeptic does — without trusting internal docs. (The source-diff audit
+  from the original plan is cut: three prior multi-lane source audits already
+  covered that surface, and Task 0.1's pinned inventory fixtures keep it covered
+  going forward.) Reproduce each finding before promoting it into the ledger or
+  backlog.
 - **Dependencies:** Tasks 0.1–0.4.
 - **Acceptance criteria:** Auditors use the full ledger boundary; disputed findings
   remain `UNVERIFIED` with a proposed experiment.
@@ -134,12 +177,18 @@ Rust plugin or adding a fixture capability makes the coverage check fail.
 
 ## Sprint 1: Close advertised-but-incomplete functionality
 
-**Goal:** Anything Rust Connect advertises to an Android peer produces the promised
-desktop effect, or the capability is withheld when its backend is unavailable.
+**Goal:** Anything Rust Connect advertises to an Android peer — and anything the
+REST API, CLI, or web UI offers to a local caller — produces the promised effect,
+or is withheld/removed when its backend is unavailable.
 
 **Demo/validation:** On the A15 and S21, each applicable advertised capability has a
 user-visible result and recovery check. Starting the daemon without a required
-backend produces honest capability negotiation and a diagnostic.
+backend produces honest capability negotiation and a diagnostic. Every documented
+API route, UI control, and config option either works or does not exist.
+
+**Dependencies for all tasks below: Slice 0A only** (see Sprint 0 sequencing) —
+these gaps are known from current source and do not wait on the full ledger
+machinery.
 
 ### Task 1.1: Implement the local system-volume provider
 
@@ -221,6 +270,24 @@ backend produces honest capability negotiation and a diagnostic.
 - **Validation:** evdev event capture, live call/media test, X11 clipboard roundtrip,
   audio-backend restart tests.
 
+### Task 1.7: Close advertised control-surface gaps
+
+- **Location:** `src/api/router.rs`, `src/api/ui/`, `src/config/settings.rs`,
+  `src/api/handlers/plugins/`
+- **Description:** Wire or remove every documented control. Audit-time instances:
+  `POST /devices/{id}/clipboard/request` has a handler, an OpenAPI annotation,
+  and a web-UI button but no router entry (404 today); `settings.udp_port` (the
+  `--port` flag) and `settings.protocol_version` are accepted but never read —
+  discovery binds the port constant; the `/api/v1/tools` catalog lists plugins
+  whose backend failed to init. The SFTP mount/unmount UI buttons are owned by
+  Task 1.3.
+- **Dependencies:** Slice 0A.
+- **Acceptance criteria:** Every route in the OpenAPI spec is reachable and
+  exercised by a test; every config option and CLI flag either changes behavior
+  or is deleted; the tools catalog reflects backend availability.
+- **Validation:** Route-table lint comparing router entries against OpenAPI paths
+  and UI actions; a dead-knob test fails when a setting has no reader.
+
 ## Sprint 2: Close known protocol, recovery, and security gaps
 
 **Goal:** Resolve the nine documented behavioral gaps and test the failure modes
@@ -282,12 +349,20 @@ connections without stale state or resource growth.
   command execution, input injection, persistent state
 - **Description:** Audit unauthenticated LAN paths and paired-but-malicious peers.
   Cover CPU/memory/disk/fd/task bounds, path handling, secret exposure, certificate
-  rotation, replay, and authorization across every API operation.
+  rotation, replay, and authorization across every API operation. Additionally:
+  (a) cross-check upstream KDE Connect CVE/advisory history for protocol-level
+  vulnerabilities a reimplementation inherits; (b) verify `devices.json` pruning
+  against the real store — `prune_stale_devices` (`src/device/registry.rs`)
+  drops stale *unpaired* records, and the reinstall-duplicate pattern (dead
+  device ids surviving under one device name) may be paired-or-persisted records
+  it does not catch; (c) classify the single-key, no-scopes API authorization
+  model as an intentional divergence with a recorded reason, or scope it.
 - **Dependencies:** Sprint 0; run again after Tasks 1.2–1.5.
 - **Acceptance criteria:** Every finding has a reproducer; high/critical findings are
   fixed before the next release; lower risks remain explicit ledger entries.
-- **Validation:** Hostile-peer suite, fuzz corpus, dependency audit, and independent
-  semantic scan with findings treated as leads rather than truth.
+- **Validation:** Hostile-peer suite, fuzz corpus, dependency audit, advisory
+  cross-check note, and independent semantic scan with findings treated as leads
+  rather than truth.
 
 ## Sprint 3: Account for the full upstream feature union
 
@@ -310,6 +385,12 @@ pairs with kdeconnectd/GSConnect in addition to Android.
 - **Validation:** Inventory completeness test.
 
 ### Task 3.2: Build the kdeconnectd independent-peer harness
+
+**Announcement-critical (2026-08-05 amendment).** Desktop peers exercise the
+desktop-provider direction — clipboard, mpris, runcommand, sendnotifications,
+remotekeyboard, and the Task 1.1 volume provider — that no Android phone ever
+touches. Any public claim broader than Android-core requires this harness to
+have run; do not let it drift behind the announcement.
 
 - **Location:** `tests/interop/`, test scripts, CI/on-demand documentation
 - **Description:** Run kdeconnectd and Rust Connect in separate network namespaces;
@@ -382,6 +463,20 @@ unknowns. A multi-day daemon soak finishes without resource drift or lost recove
   backend, and no repetitive network storm.
 - **Validation:** Before/after metrics and automated thresholds.
 
+### Task 4.5: Validate the install path on clean distributions
+
+- **Location:** `packaging/`, `docs/testing.md`, release workflow documentation
+- **Description:** Install the published `.deb` (and the binary path) on a clean
+  Debian, Ubuntu, and Fedora instance; enable the user service; pair a phone.
+  Record first-run findings. The manual walk of 2026-08-05 found three
+  first-run defects no test caught (including `226/NAMESPACE` on fresh
+  installs); a manual walk is not a gate until it is owned and repeatable.
+- **Dependencies:** Sprint 1.
+- **Acceptance criteria:** Fresh install reaches a paired, working daemon on each
+  distribution, or the failure is a documented, ledgered known issue.
+- **Validation:** Recorded run per distribution with artifacts; re-run after each
+  release cut.
+
 ## Sprint 5: Make evidence closure the release gate
 
 **Goal:** Ensure future features and upstream changes cannot recreate an invisible
@@ -407,9 +502,18 @@ the roadmap is generated from the same ledger used by implementation work.
 - **Description:** Use bounded claims: Android-core complete, advertised-feature
   complete, environment-validated, KDE parity, GSConnect parity. Never publish
   "all functional gaps closed" without naming the boundary and evidence date.
+  Announcement wording belongs here too: the launch text says "Android-core
+  complete on the tested devices; every advertised feature real; the ledger is
+  public including its `UNVERIFIED` rows" — never "KDE Connect protocol
+  complete", "all environments", or "no bugs". The "built with AI" half of the
+  public claim also needs a recorded decision in this task: the public repo
+  carries no AI-assist evidence (collapsed history, no trailers), so choose the
+  substantiation — personal testimony, a curated craft log, or restored selected
+  history — before any announcement, not during.
 - **Dependencies:** Task 5.1.
 - **Acceptance criteria:** Release notes are mechanically derived from ledger status;
-  unknowns and intentional divergences remain visible.
+  unknowns and intentional divergences remain visible; the AI-provenance decision
+  is recorded and referenced by the announcement draft.
 - **Validation:** Dry-run a release summary from the ledger.
 
 ### Task 5.3: Add upstream drift review
@@ -421,6 +525,25 @@ the roadmap is generated from the same ledger used by implementation work.
 - **Acceptance criteria:** New upstream plugins/capabilities cannot remain invisible;
   no standing automation mutates implementation or claims parity automatically.
 - **Validation:** Test against a fixture containing one synthetic upstream addition.
+
+### Task 5.4: Gate public-document truthfulness
+
+- **Location:** `README.md`, `ROADMAP.md`, `SECURITY.md`,
+  `KDECONNECT_PROTOCOL.md`, `CONTRIBUTING.md`, CI
+- **Description:** One-time scrub of existing drift, then an ongoing check.
+  Known drift at audit time: SECURITY.md conflates the 1800 s pair-timestamp
+  staleness window with the 30 s/25 s pairing lifetimes; KDECONNECT_PROTOCOL.md
+  "Common Bugs" describes long-fixed behavior; the README's TLS-roles sentence
+  is true-but-ambiguous under the TCP/TLS role inversion; the share body-limit
+  docs say 100 MiB where the router allows 101 MiB; the README lists two fuzz
+  targets where three exist. Where a number or capability list can be generated
+  from the ledger or the route table, generate it; where it cannot, CI
+  cross-checks it.
+- **Dependencies:** Task 5.1.
+- **Acceptance criteria:** No public claim contradicts current code; capability
+  and count claims are either generated or cross-checked in CI.
+- **Validation:** Mutation-check: change a plugin count or endpoint in code and
+  watch the doc check fail.
 
 ## Testing strategy
 
@@ -452,6 +575,12 @@ the roadmap is generated from the same ledger used by implementation work.
 - Upstream changes during the project can move the target. Pin evidence per sprint
   and review drift at boundaries rather than continuously chasing head.
 - The API is a control surface, not proof the underlying desktop integration works.
+- Announcement prose drifts toward "complete" under pressure — this project's own
+  history shows it. The bound in Task 5.2 is only as strong as the hand-written
+  launch text being checked against the ledger before posting.
+- Ledger cells evidenced by our own logs are self-referential one layer up: an
+  effect `PASS` needs a peer-side artifact, exactly like a wire `PASS` needs a
+  non-self fixture.
 
 ## Rollback plan
 
