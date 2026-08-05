@@ -608,6 +608,70 @@ fn test_pair_incoming_reports_failure_when_daemon_did_not_pair() {
 }
 
 #[test]
+fn test_pair_incoming_json_without_yes_refuses_instead_of_prompting() {
+    let server = MockServer::start(|request_line, _| {
+        if request_line.starts_with("GET /api/v1/devices?") {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "devices": [{ "id": "dev-json", "name": "test phone" }],
+                    "total": 1
+                })),
+            )
+        } else if request_line == "GET /api/v1/devices/dev-json HTTP/1.1" {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "id": "dev-json",
+                    "state": "connected",
+                    "pair_state": "requested_by_peer",
+                    "verification_key": "00F8F3CE"
+                })),
+            )
+        } else {
+            (
+                404,
+                r#"{"status":"error","error":{"code":"NOT_FOUND","message":"nope"}}"#.into(),
+            )
+        }
+    });
+
+    let mut out = Vec::new();
+    let err = execute(
+        &server.client(),
+        &Command::Pair {
+            device_id: "dev-json".to_string(),
+            yes: false,
+        },
+        true, // --json
+        &mut out,
+    )
+    .expect_err("json mode must refuse rather than prompt");
+    let msg = format!("{err}");
+    assert!(msg.contains("--yes"), "error names the flag: {msg}");
+    // The json-specific refusal must be taken before the tty/non-tty guard:
+    // the test harness has no tty, so the generic non-interactive refusal
+    // would also satisfy a `--yes`-only check. Requiring the json phrasing
+    // pins the fix (json mode refuses with its own message rather than
+    // reaching the prompt).
+    assert!(
+        msg.contains("--json"),
+        "error explains json mode cannot prompt: {msg}"
+    );
+
+    let output = String::from_utf8(out).expect("utf8");
+    assert!(
+        !output.contains("Accept pairing?"),
+        "no prompt may be written to the json stream: {output}"
+    );
+    let requests = server.recorded();
+    assert!(
+        !requests.iter().any(|r| r.contains("/pair ")),
+        "no accept sent: {requests:?}"
+    );
+}
+
+#[test]
 fn test_share_resolves_prefix_and_streams_file_body() {
     let full_id = "0123456789abcdef0123456789abcdef";
     let temp = tempfile::TempDir::new().expect("tempdir");

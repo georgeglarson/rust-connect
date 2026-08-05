@@ -498,6 +498,14 @@ fn cmd_pair(
         }
 
         if !yes {
+            if json {
+                return Err(CliError::Api(
+                    "an incoming pairing request is pending; --json cannot prompt \
+                     for confirmation — compare the verification key (it is on the \
+                     device record) and re-run with --yes"
+                        .to_string(),
+                ));
+            }
             if !std::io::stdin().is_terminal() {
                 return Err(CliError::Api(
                     "an incoming pairing request is pending; re-run with --yes \
