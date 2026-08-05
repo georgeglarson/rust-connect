@@ -61,11 +61,7 @@ fn extract_yaml_blocks(text: &str) -> BTreeMap<String, String> {
         let trimmed = line.trim_start();
         // Markdown section heading?
         if !in_yaml && trimmed.starts_with("## ") {
-            current_heading = Some(
-                trimmed
-                    .trim_start_matches(|c: char| c == '#' || c == ' ' || c == '\t')
-                    .to_string(),
-            );
+            current_heading = Some(trimmed.trim_start_matches(['#', ' ', '\t']).to_string());
             continue;
         }
         // Fence open/close
@@ -123,9 +119,8 @@ fn heading_to_label(heading: &str) -> String {
 /// up to the next `  - feature:` start.
 fn parse_block_rows(body: &str) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
-    let mut iter = body.lines().peekable();
     let mut current: Option<BTreeMap<String, String>> = None;
-    while let Some(line) = iter.next() {
+    for line in body.lines() {
         let indent = line.len() - line.trim_start().len();
         let body = line.trim_start();
         // Sequence marker starts a new row
@@ -143,18 +138,19 @@ fn parse_block_rows(body: &str) -> Vec<Row> {
             continue;
         }
         // Mid-row key
-        if indent >= 4 && !body.starts_with("- ") && current.is_some() {
+        if indent >= 4 && !body.starts_with("- ") {
             if let Some((k, v)) = body.split_once(':') {
                 let k = k.trim();
                 let v = v.trim();
-                let row = current.as_mut().expect("current row");
-                if v.is_empty() {
-                    // header-only key; expect list on following lines
-                    row.entry(k.to_string()).or_insert_with(String::new);
-                } else {
-                    // Flow style?
-                    let cleaned = v.trim_matches('"').to_string();
-                    row.insert(k.to_string(), cleaned);
+                if let Some(row) = current.as_mut() {
+                    if v.is_empty() {
+                        // header-only key; expect list on following lines
+                        row.entry(k.to_string()).or_default();
+                    } else {
+                        // Flow style?
+                        let cleaned = v.trim_matches('"').to_string();
+                        row.insert(k.to_string(), cleaned);
+                    }
                 }
             }
             continue;
@@ -162,21 +158,22 @@ fn parse_block_rows(body: &str) -> Vec<Row> {
         // List item under a header-only key (status list isn't used here; we
         // emit each row's status as a single scalar, but this allows extra
         // content under side-headings).
-        if body.starts_with("- ") && current.is_some() {
+        if body.starts_with("- ") {
             let item = body
                 .trim_start_matches("- ")
                 .trim()
                 .trim_matches('"')
                 .to_string();
-            let row = current.as_mut().expect("current row");
-            // Heuristic: if last header-key is empty, fill it
-            if let Some((_, v)) = row.iter_mut().last() {
-                if v.is_empty() {
-                    *v = item;
-                    continue;
+            if let Some(row) = current.as_mut() {
+                // Heuristic: if last header-key is empty, fill it
+                if let Some((_, v)) = row.iter_mut().last() {
+                    if v.is_empty() {
+                        *v = item;
+                        continue;
+                    }
                 }
+                row.entry("items".to_string()).or_insert(item);
             }
-            row.entry("items".to_string()).or_insert(item);
         }
     }
     if let Some(row) = current.take() {

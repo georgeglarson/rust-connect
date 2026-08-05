@@ -87,8 +87,7 @@ fn parse_simple_yaml(text: &str) -> std::collections::BTreeMap<String, FixtureEn
                 continue;
             }
             // Otherwise it's a capability list item
-            if current.is_some() {
-                let entry = current.as_mut().expect("entry open");
+            if let Some(entry) = current.as_mut() {
                 match section {
                     Sec::Incoming => entry
                         .incoming_capabilities
@@ -226,10 +225,7 @@ async fn rust_capability_inventory_matches_fixture() {
     }
 
     let raw = std::fs::read_to_string(fixture_path()).expect("read fixture");
-    let mut fixture_entries: Vec<FixtureEntry> = parse_simple_yaml(&raw)
-        .into_iter()
-        .map(|(_, v)| v)
-        .collect();
+    let mut fixture_entries: Vec<FixtureEntry> = parse_simple_yaml(&raw).into_values().collect();
     fixture_entries.sort_by(|a, b| a.name.cmp(&b.name));
 
     assert_eq!(
