@@ -283,6 +283,14 @@ pub enum DeviceEvent {
         device_name: String,
     },
 
+    /// A peer asked to pair and is awaiting local acceptance. Carries no
+    /// verification key: clients re-read the device over the authenticated
+    /// API, which keeps the key on one path.
+    PairRequested {
+        device_id: DeviceId,
+        device_name: String,
+    },
+
     /// Device connected
     Connected {
         device_id: DeviceId,

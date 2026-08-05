@@ -394,7 +394,11 @@
             if (!currentDeviceId) return;
             try {
                 const res = await fetchAPI('GET', `/devices/${currentDeviceId}`);
-                renderDeviceDetails(res.data?.device);
+                // The detail endpoint returns the device at `data`, not under
+                // `data.device`; accept either so a future envelope change
+                // doesn't silently blank the pane.
+                const d = res.data?.device || res.data;
+                renderDeviceDetails(d);
             } catch (e) {}
         }
 
@@ -722,7 +726,7 @@
                     logEvent('SSE', `Event: ${eventType} (Device: ${payload.device_id || 'Global'})`);
                     
                     // Core UI Refresh triggers
-                    if (['discovered', 'state_changed', 'paired', 'connected', 'disconnected', 'removed'].includes(eventType)) {
+                    if (['discovered', 'state_changed', 'paired', 'connected', 'disconnected', 'removed', 'pair_requested'].includes(eventType)) {
                         loadDevices();
                     }
                     
