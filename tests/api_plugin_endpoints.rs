@@ -460,6 +460,37 @@ async fn test_sms_threads_returns_thread_objects() {
     }
 }
 
+/// The clipboard-request route must exist (handler + OpenAPI annotation +
+/// web-UI button all reference it; the route was missing from the router and
+/// the UI was 404-ing). The test device is registered but not connected, so
+/// a 400 / 500 / connection-error is the expected outcome; 404 would mean
+/// the route was never wired.
+#[tokio::test]
+async fn test_clipboard_request_route_exists() {
+    let (state, _temp, api_key) = create_test_app().await;
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(
+                    "/api/v1/devices/test-phoneaaaaaaaaaaaaaaaaaaaaaa/clipboard/request",
+                )
+                .header("X-API-Key", &api_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "POST /api/v1/devices/{{id}}/clipboard/request must be wired (handler + OpenAPI exist; UI button posts to it)"
+    );
+}
+
 /// The dismiss route must exist and must sit under the same singular
 /// `notification` path segment as its sibling reply route. The test device is
 /// registered but not connected, so a 400 is the expected outcome; 404 would

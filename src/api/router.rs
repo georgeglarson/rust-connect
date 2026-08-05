@@ -79,6 +79,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/clipboard", get(handlers::get_clipboard))
         .route("/api/v1/clipboard", post(handlers::set_clipboard))
         .route(
+            "/api/v1/devices/:device_id/clipboard/request",
+            post(handlers::request_clipboard),
+        )
+        .route(
             "/api/v1/devices/:device_id/battery",
             get(handlers::get_device_battery),
         )
