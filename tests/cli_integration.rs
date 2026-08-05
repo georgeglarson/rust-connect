@@ -249,7 +249,8 @@ fn test_pair_shows_sas_and_polls_until_paired() {
                     "id": "dev-a",
                     "state": "paired",
                     "paired_at": "2026-08-03T00:00:00Z",
-                    "verification_key": "00F8F3CE"
+                    "verification_key": "00F8F3CE",
+                    "pair_state": "not_paired"
                 })),
             )
         } else {
@@ -265,6 +266,7 @@ fn test_pair_shows_sas_and_polls_until_paired() {
         &server.client(),
         &Command::Pair {
             device_id: "dev-a".to_string(),
+            yes: false,
         },
         false,
         &mut out,
@@ -284,19 +286,131 @@ fn test_pair_shows_sas_and_polls_until_paired() {
 
     let requests = server.recorded();
     assert_eq!(
-        requests[0].lines().next().expect("request line"),
-        "GET /api/v1/devices?page=1&limit=100 HTTP/1.1",
-        "the device id is resolved against the device list first"
+        requests[1].lines().next().expect("request line"),
+        "GET /api/v1/devices/dev-a HTTP/1.1",
+        "detail is fetched first to detect an incoming request"
     );
     assert_eq!(
-        requests[1].lines().next().expect("request line"),
+        requests[2].lines().next().expect("request line"),
         "POST /api/v1/devices/dev-a/pair HTTP/1.1"
     );
     assert!(
-        requests[2..]
+        requests[3..]
             .iter()
             .all(|r| r.starts_with("GET /api/v1/devices/dev-a ")),
         "subsequent requests poll the device: {requests:?}"
+    );
+}
+
+#[test]
+fn test_pair_incoming_request_prints_sas_and_accepts_with_yes() {
+    let server = MockServer::start(|request_line, _| {
+        if request_line.starts_with("GET /api/v1/devices?") {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "devices": [{ "id": "dev-in", "name": "test phone" }],
+                    "total": 1
+                })),
+            )
+        } else if request_line == "GET /api/v1/devices/dev-in HTTP/1.1" {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "id": "dev-in",
+                    "state": "connected",
+                    "pair_state": "requested_by_peer",
+                    "verification_key": "00F8F3CE"
+                })),
+            )
+        } else if request_line == "POST /api/v1/devices/dev-in/pair HTTP/1.1" {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "device_id": "dev-in",
+                    "status": "paired"
+                })),
+            )
+        } else {
+            (
+                404,
+                r#"{"status":"error","error":{"code":"NOT_FOUND","message":"nope"}}"#.into(),
+            )
+        }
+    });
+
+    let mut out = Vec::new();
+    execute(
+        &server.client(),
+        &Command::Pair {
+            device_id: "dev-in".to_string(),
+            yes: true,
+        },
+        false,
+        &mut out,
+    )
+    .expect("accept succeeds");
+    let output = String::from_utf8(out).expect("utf8");
+
+    assert!(output.contains("00F8F3CE"), "SAS printed: {output}");
+    assert!(output.contains("Paired with dev-in."), "completion: {output}");
+
+    let requests = server.recorded();
+    assert!(
+        requests.iter().any(|r| r.starts_with("POST /api/v1/devices/dev-in/pair ")),
+        "accept POSTed: {requests:?}"
+    );
+}
+
+#[test]
+fn test_pair_incoming_request_without_yes_refuses_when_not_a_tty() {
+    // Test stdin is not a terminal, so the no-flag path must refuse rather
+    // than accept blind.
+    let server = MockServer::start(|request_line, _| {
+        if request_line.starts_with("GET /api/v1/devices?") {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "devices": [{ "id": "dev-in", "name": "test phone" }],
+                    "total": 1
+                })),
+            )
+        } else if request_line == "GET /api/v1/devices/dev-in HTTP/1.1" {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "id": "dev-in",
+                    "state": "connected",
+                    "pair_state": "requested_by_peer",
+                    "verification_key": "00F8F3CE"
+                })),
+            )
+        } else {
+            (
+                404,
+                r#"{"status":"error","error":{"code":"NOT_FOUND","message":"nope"}}"#.into(),
+            )
+        }
+    });
+
+    let mut out = Vec::new();
+    let err = execute(
+        &server.client(),
+        &Command::Pair {
+            device_id: "dev-in".to_string(),
+            yes: false,
+        },
+        false,
+        &mut out,
+    )
+    .expect_err("must refuse to accept blind");
+    let msg = format!("{err}");
+    assert!(msg.contains("--yes"), "error names the flag: {msg}");
+
+    let requests = server.recorded();
+    assert!(
+        !requests.iter().any(|r| r.contains("/pair ")),
+        "no accept must be sent: {requests:?}"
     );
 }
 

@@ -99,6 +99,9 @@ pub enum Command {
     Pair {
         /// Device ID or unique prefix (see `rust-connect devices`)
         device_id: String,
+        /// Accept an incoming pairing request without prompting
+        #[arg(long)]
+        yes: bool,
     },
     /// Unpair a device
     Unpair {
@@ -286,7 +289,7 @@ pub fn execute(
     match command {
         Command::Status => cmd_status(client, json, out),
         Command::Devices => cmd_devices(client, json, out),
-        Command::Pair { device_id } => cmd_pair(client, device_id, json, out),
+        Command::Pair { device_id, yes } => cmd_pair(client, device_id, *yes, json, out),
         Command::Unpair { device_id } => cmd_unpair(client, device_id, json, out),
         Command::Ping { device_id } => cmd_ping(client, device_id, json, out),
         Command::Share { device_id, file } => cmd_share(client, device_id, file, json, out),
@@ -464,10 +467,71 @@ fn cmd_devices(client: &ApiClient, json: bool, out: &mut impl Write) -> Result<(
 fn cmd_pair(
     client: &ApiClient,
     device_id: &str,
+    yes: bool,
     json: bool,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
+    use std::io::IsTerminal;
+
     let device_id = resolve_device_id(client, device_id)?;
+
+    // Detail first: an incoming request must be shown and confirmed, never
+    // accepted blind (POSTing /pair while a request is pending IS the accept).
+    let detail_body = client.get(&device_path(&device_id))?;
+    let detail = envelope_data(&detail_body)?;
+
+    if detail.get("pair_state").and_then(|v| v.as_str()) == Some("requested_by_peer") {
+        if !json {
+            writeln!(out, "Incoming pairing request from {device_id}.")?;
+            match detail.get("verification_key").and_then(|v| v.as_str()) {
+                Some(sas) => {
+                    writeln!(out, "\nVerification key (SAS): {sas}\n")?;
+                    writeln!(out, "Compare this code with the one shown on your phone.")?;
+                }
+                None => {
+                    writeln!(out, "Verification key unavailable — compare on the phone side.")?;
+                }
+            }
+        }
+
+        if !yes {
+            if !std::io::stdin().is_terminal() {
+                return Err(CliError::Api(
+                    "an incoming pairing request is pending; re-run with --yes \
+                     to accept it non-interactively"
+                        .to_string(),
+                ));
+            }
+            write!(out, "Accept pairing? [y/N] ")?;
+            out.flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer).map_err(|e| {
+                CliError::Api(format!("failed to read confirmation: {e}"))
+            })?;
+            let answer = answer.trim().to_ascii_lowercase();
+            if answer != "y" && answer != "yes" {
+                writeln!(out, "Not accepted. The request expires on its own within ~25s.")?;
+                return Ok(());
+            }
+        }
+
+        let body = client
+            .post_empty(&format!("{}/pair", device_path(&device_id)))
+            .map_err(|e| {
+                CliError::Api(format!(
+                    "{e} — the request may have expired (25s window); ask the \
+                     phone to send it again, then re-run"
+                ))
+            })?;
+        if json {
+            writeln!(out, "{body}")?;
+        } else {
+            writeln!(out, "Paired with {device_id}.")?;
+        }
+        return Ok(());
+    }
+
+    // No incoming request pending: daemon-initiated pairing (existing flow).
     let body = client.post_empty(&format!("{}/pair", device_path(&device_id)))?;
     let data = envelope_data(&body)?;
 
@@ -690,7 +754,7 @@ mod tests {
 
         let cli = parse(&["rust-connect", "pair", "abc123"]).expect("parse");
         match cli.command {
-            Some(Command::Pair { device_id }) => assert_eq!(device_id, "abc123"),
+            Some(Command::Pair { device_id, yes: _ }) => assert_eq!(device_id, "abc123"),
             other => panic!("expected pair, got {other:?}"),
         }
 
