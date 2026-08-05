@@ -33,6 +33,13 @@ SyslogIdentifier=rust-connect
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
+# Both ReadWritePaths targets must exist BEFORE the mount namespace is set
+# up, or the unit dies with status=226/NAMESPACE — on a fresh install the
+# data dir doesn't exist yet, and ProtectSystem=strict stops the daemon from
+# creating it. The "+" prefix runs this one command outside the sandbox (as
+# the same user) so the paths exist by the time ExecStart's namespace forms.
+# Found live on the first clean .deb install, 2026-08-05.
+ExecStartPre=+/usr/bin/mkdir -p %h/.local/share/rust-connect %h/Downloads
 ReadWritePaths=%h/.local/share/rust-connect %h/Downloads
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
