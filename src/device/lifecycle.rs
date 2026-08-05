@@ -366,6 +366,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pair_requested_event_is_broadcast() {
+        let (_registry, broadcaster, _lifecycle) = setup();
+        let mut rx = broadcaster.subscribe();
+
+        broadcaster.broadcast(DeviceEvent::PairRequested {
+            device_id: "evt-peer-aaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            device_name: "test phone".to_string(),
+        });
+
+        let event = rx.recv().await.expect("event delivered");
+        match event {
+            DeviceEvent::PairRequested {
+                device_id,
+                device_name,
+            } => {
+                assert_eq!(device_id, "evt-peer-aaaaaaaaaaaaaaaaaaaaaa");
+                assert_eq!(device_name, "test phone");
+            }
+            other => panic!("expected PairRequested, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_transition_nonexistent_device() -> anyhow::Result<()> {
         let (_, _, lifecycle) = setup();
         let result = lifecycle

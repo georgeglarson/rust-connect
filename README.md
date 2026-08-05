@@ -118,7 +118,9 @@ Reserve the flag for throwaway keys and interactive debugging.
 ```
 rust-connect status             # Daemon health and device count
 rust-connect devices            # Table: ID, name, type, state, paired at
-rust-connect pair <device-id>   # Shows the SAS, waits for the phone to accept
+rust-connect pair <device-id>   # Outgoing: shows the SAS, waits for the phone.
+                                # Incoming request pending: shows the SAS and
+                                # asks before accepting (--yes to skip the prompt).
 rust-connect unpair <device-id>
 rust-connect ping <device-id>
 rust-connect share <device-id> <file>

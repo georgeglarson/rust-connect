@@ -50,8 +50,8 @@ documented here so reviewers do not file them as bugs. See
   for interop. See `src/protocol/connection/tls.rs`.
 - **Pre-pairing TOFU accepts any self-signed certificate.** Trust is
   established out-of-band via a 32-bit Short Authentication String (SAS)
-  shown on both devices during pairing — the same model as upstream KDE
-  Connect and the Android app. An active on-LAN attacker who MITMs the
+  shown on both the initiating and accepting side (CLI, API, web UI, and the daemon journal)
+  — the same model as upstream KDE Connect and the Android app. An active on-LAN attacker who MITMs the
   *first* connection during the pairing window is the known residual
   risk; the SAS comparison is the only defense, as upstream.
 - **Peer certificate expiry is not enforced.** Authentication is TOFU

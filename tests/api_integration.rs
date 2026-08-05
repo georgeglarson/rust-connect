@@ -593,3 +593,89 @@ async fn test_security_headers_present() {
         Some("geolocation=(), microphone=(), camera=()")
     );
 }
+
+#[tokio::test]
+async fn test_device_endpoints_expose_pair_state_for_incoming_request() {
+    let (state, _temp, api_key) = create_test_app().await;
+
+    // Generate and store own certificate so we can compute verification keys
+    state
+        .cert_manager
+        .ensure_own_certificate("test-daemon-aaaaaaaaaaaaaaaaaaaaaa", "Test Daemon")
+        .expect("Value expected to be present");
+
+    let device_id = "pairstate-peer-aaaaaaaaaaaaaaaaaa".to_string();
+    let device = Device::new(
+        device_id.clone(),
+        "test phone".to_string(),
+        DeviceType::Phone,
+        8,
+    );
+    state.registry.add(device).await.unwrap();
+
+    // Stage an incoming request carrying its peer cert — the connection-loop
+    // order — so the verification key is computable while it is pending.
+    let (cert_pem, _) = state
+        .cert_manager
+        .generate_certificate(&device_id, "Peer")
+        .unwrap();
+    let cert_der = openssl::x509::X509::from_pem(&cert_pem)
+        .unwrap()
+        .to_der()
+        .unwrap();
+    state
+        .pairing_handler
+        .receive_pair_request_with_cert(
+            &device_id,
+            Some(chrono::Utc::now().timestamp()),
+            Some(cert_der),
+        )
+        .await
+        .unwrap();
+
+    let app = build_router(state.clone());
+
+    // Detail endpoint: pair_state + verification_key both present.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/devices/{device_id}"))
+                .header("X-API-Key", &api_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let data = &json["data"];
+    assert_eq!(data["pair_state"], "requested_by_peer");
+    assert!(
+        data["verification_key"].is_string(),
+        "SAS must be exposed while the incoming request is pending: {data}"
+    );
+
+    // List endpoint: same two fields on the summary.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices")
+                .header("X-API-Key", &api_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let listed = &json["data"]["devices"][0];
+    assert_eq!(listed["pair_state"], "requested_by_peer");
+    assert!(listed["verification_key"].is_string());
+}

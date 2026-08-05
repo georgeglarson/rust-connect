@@ -24,6 +24,18 @@ pub enum PairState {
     Paired,
 }
 
+impl PairState {
+    /// Stable string form for API responses.
+    pub fn as_api_str(&self) -> &'static str {
+        match self {
+            PairState::NotPaired => "not_paired",
+            PairState::Requested => "requested",
+            PairState::RequestedByPeer => "requested_by_peer",
+            PairState::Paired => "paired",
+        }
+    }
+}
+
 /// Requester-side pairing timeout: how long we wait for the peer's accept
 /// (Android PairingHandler.kt:151 — 30 seconds).
 pub const PAIR_REQUEST_TIMEOUT_SECS: i64 = 30;
@@ -346,6 +358,18 @@ impl PairingHandler {
         // expiry path and cannot orphan (see the auto-accept arm above).
         if let Some(cert_der) = cert_der {
             self.set_pending_peer_cert(device_id, cert_der).await;
+        }
+
+        // Surface the SAS in the journal at request time: every accept
+        // surface (CLI, API, UI) displays it, and the log is the fallback
+        // record if one does not.
+        if let Ok(Some(sas)) = self.get_verification_key(device_id).await {
+            info!(
+                device_id = %device_id,
+                verification_key = %sas,
+                event = "pair_request_sas",
+                "Incoming pairing request — compare this verification key on both devices"
+            );
         }
 
         info!(

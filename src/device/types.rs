@@ -158,6 +158,11 @@ pub struct Device {
     /// Verification key for pairing confirmation (8 hex chars, present during pending pairing)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verification_key: Option<String>,
+
+    /// Pairing lifecycle state, overlaid from the pairing store on API
+    /// responses only — the registry's persisted copies never set it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pair_state: Option<String>,
 }
 
 impl Device {
@@ -180,6 +185,7 @@ impl Device {
             last_seen: now,
             paired_at: None,
             verification_key: None,
+            pair_state: None,
         }
     }
 
@@ -214,6 +220,10 @@ impl Device {
 
     pub fn set_verification_key(&mut self, key: String) {
         self.verification_key = Some(key);
+    }
+
+    pub fn set_pair_state(&mut self, state: String) {
+        self.pair_state = Some(state);
     }
 
     pub fn clear_verification_key(&mut self) {
@@ -269,6 +279,14 @@ pub enum DeviceEvent {
 
     /// Device paired
     Paired {
+        device_id: DeviceId,
+        device_name: String,
+    },
+
+    /// A peer asked to pair and is awaiting local acceptance. Carries no
+    /// verification key: clients re-read the device over the authenticated
+    /// API, which keeps the key on one path.
+    PairRequested {
         device_id: DeviceId,
         device_name: String,
     },

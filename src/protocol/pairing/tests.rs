@@ -1829,3 +1829,39 @@ async fn test_verification_key_matches_android_algorithm_and_timestamp() {
     let other = CertificateManager::compute_verification_key(&our_pub, &peer_pub, pair_ts + 1);
     assert_ne!(key, other);
 }
+
+/// The SAS must be computable the moment an incoming request (carrying its
+/// cert) is staged — the daemon logs it then, and API surfaces read it for
+/// display before the accept.
+#[tokio::test]
+async fn test_verification_key_available_while_incoming_request_pending() {
+    let temp_dir = tempfile::TempDir::new().expect("Value expected to be present");
+    let cert_manager = Arc::new(CertificateManager::new(temp_dir.path().to_path_buf()));
+    cert_manager
+        .ensure_own_certificate("test-daemon-aaaaaaaaaaaaaaaaaaaaaa", "Test Daemon")
+        .expect("Value expected to be present");
+    let device_id = "sas-visible-aaaaaaaaaaaaaaaaaaaaaa".to_string();
+
+    let (cert_pem, _) = cert_manager
+        .generate_certificate(&device_id, "Peer")
+        .expect("Value expected to be present");
+    let cert_der = openssl::x509::X509::from_pem(&cert_pem)
+        .expect("Value expected to be present")
+        .to_der()
+        .expect("Value expected to be present");
+
+    let handler = PairingHandler::new(cert_manager.clone());
+    handler
+        .receive_pair_request_with_cert(&device_id, Some(Utc::now().timestamp()), Some(cert_der))
+        .await
+        .expect("Value expected to be present");
+
+    let key = handler
+        .get_verification_key(&device_id)
+        .await
+        .expect("Value expected to be present");
+    assert!(
+        key.is_some(),
+        "SAS must be available while the incoming request is pending"
+    );
+}

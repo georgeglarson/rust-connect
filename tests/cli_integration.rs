@@ -249,7 +249,8 @@ fn test_pair_shows_sas_and_polls_until_paired() {
                     "id": "dev-a",
                     "state": "paired",
                     "paired_at": "2026-08-03T00:00:00Z",
-                    "verification_key": "00F8F3CE"
+                    "verification_key": "00F8F3CE",
+                    "pair_state": "not_paired"
                 })),
             )
         } else {
@@ -265,6 +266,7 @@ fn test_pair_shows_sas_and_polls_until_paired() {
         &server.client(),
         &Command::Pair {
             device_id: "dev-a".to_string(),
+            yes: false,
         },
         false,
         &mut out,
@@ -284,19 +286,388 @@ fn test_pair_shows_sas_and_polls_until_paired() {
 
     let requests = server.recorded();
     assert_eq!(
-        requests[0].lines().next().expect("request line"),
-        "GET /api/v1/devices?page=1&limit=100 HTTP/1.1",
-        "the device id is resolved against the device list first"
+        requests[1].lines().next().expect("request line"),
+        "GET /api/v1/devices/dev-a HTTP/1.1",
+        "detail is fetched first to detect an incoming request"
     );
     assert_eq!(
-        requests[1].lines().next().expect("request line"),
+        requests[2].lines().next().expect("request line"),
         "POST /api/v1/devices/dev-a/pair HTTP/1.1"
     );
     assert!(
-        requests[2..]
+        requests[3..]
             .iter()
             .all(|r| r.starts_with("GET /api/v1/devices/dev-a ")),
         "subsequent requests poll the device: {requests:?}"
+    );
+}
+
+#[test]
+fn test_pair_incoming_request_prints_sas_and_accepts_with_yes() {
+    let server = MockServer::start(|request_line, _| {
+        if request_line.starts_with("GET /api/v1/devices?") {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "devices": [{ "id": "dev-in", "name": "test phone" }],
+                    "total": 1
+                })),
+            )
+        } else if request_line == "GET /api/v1/devices/dev-in HTTP/1.1" {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "id": "dev-in",
+                    "state": "connected",
+                    "pair_state": "requested_by_peer",
+                    "verification_key": "00F8F3CE"
+                })),
+            )
+        } else if request_line == "POST /api/v1/devices/dev-in/pair HTTP/1.1" {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "device_id": "dev-in",
+                    "status": "paired"
+                })),
+            )
+        } else {
+            (
+                404,
+                r#"{"status":"error","error":{"code":"NOT_FOUND","message":"nope"}}"#.into(),
+            )
+        }
+    });
+
+    let mut out = Vec::new();
+    execute(
+        &server.client(),
+        &Command::Pair {
+            device_id: "dev-in".to_string(),
+            yes: true,
+        },
+        false,
+        &mut out,
+    )
+    .expect("accept succeeds");
+    let output = String::from_utf8(out).expect("utf8");
+
+    assert!(output.contains("00F8F3CE"), "SAS printed: {output}");
+    assert!(
+        output.contains("Paired with dev-in."),
+        "completion: {output}"
+    );
+
+    let requests = server.recorded();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.starts_with("POST /api/v1/devices/dev-in/pair ")),
+        "accept POSTed: {requests:?}"
+    );
+}
+
+#[test]
+fn test_pair_incoming_request_without_yes_refuses_when_not_a_tty() {
+    // Test stdin is not a terminal, so the no-flag path must refuse rather
+    // than accept blind.
+    let server = MockServer::start(|request_line, _| {
+        if request_line.starts_with("GET /api/v1/devices?") {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "devices": [{ "id": "dev-in", "name": "test phone" }],
+                    "total": 1
+                })),
+            )
+        } else if request_line == "GET /api/v1/devices/dev-in HTTP/1.1" {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "id": "dev-in",
+                    "state": "connected",
+                    "pair_state": "requested_by_peer",
+                    "verification_key": "00F8F3CE"
+                })),
+            )
+        } else {
+            (
+                404,
+                r#"{"status":"error","error":{"code":"NOT_FOUND","message":"nope"}}"#.into(),
+            )
+        }
+    });
+
+    let mut out = Vec::new();
+    let err = execute(
+        &server.client(),
+        &Command::Pair {
+            device_id: "dev-in".to_string(),
+            yes: false,
+        },
+        false,
+        &mut out,
+    )
+    .expect_err("must refuse to accept blind");
+    let msg = format!("{err}");
+    assert!(msg.contains("--yes"), "error names the flag: {msg}");
+
+    let requests = server.recorded();
+    assert!(
+        !requests.iter().any(|r| r.contains("/pair ")),
+        "no accept must be sent: {requests:?}"
+    );
+}
+
+#[test]
+fn test_pair_incoming_refuses_when_request_vanishes_before_accept() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static DETAIL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    DETAIL_CALLS.store(0, Ordering::SeqCst);
+
+    let server = MockServer::start(|request_line, _| {
+        if request_line.starts_with("GET /api/v1/devices?") {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "devices": [{ "id": "dev-gone", "name": "test phone" }],
+                    "total": 1
+                })),
+            )
+        } else if request_line == "GET /api/v1/devices/dev-gone HTTP/1.1" {
+            // First read: a request is pending. Second read (the re-check
+            // before accepting): it expired.
+            let n = DETAIL_CALLS.fetch_add(1, Ordering::SeqCst);
+            let pair_state = if n == 0 {
+                "requested_by_peer"
+            } else {
+                "not_paired"
+            };
+            (
+                200,
+                envelope(serde_json::json!({
+                    "id": "dev-gone",
+                    "state": "connected",
+                    "pair_state": pair_state,
+                    "verification_key": "00F8F3CE"
+                })),
+            )
+        } else {
+            (
+                404,
+                r#"{"status":"error","error":{"code":"NOT_FOUND","message":"nope"}}"#.into(),
+            )
+        }
+    });
+
+    let mut out = Vec::new();
+    let err = execute(
+        &server.client(),
+        &Command::Pair {
+            device_id: "dev-gone".to_string(),
+            yes: true,
+        },
+        false,
+        &mut out,
+    )
+    .expect_err("must not accept a request that is no longer pending");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("no longer pending"),
+        "error explains the expiry: {msg}"
+    );
+
+    let requests = server.recorded();
+    assert!(
+        !requests.iter().any(|r| r.contains("/pair ")),
+        "no accept may be sent once the request is gone: {requests:?}"
+    );
+}
+
+#[test]
+fn test_pair_incoming_refuses_when_verification_key_changed() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static DETAIL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    DETAIL_CALLS.store(0, Ordering::SeqCst);
+
+    let server = MockServer::start(|request_line, _| {
+        if request_line.starts_with("GET /api/v1/devices?") {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "devices": [{ "id": "dev-swap", "name": "test phone" }],
+                    "total": 1
+                })),
+            )
+        } else if request_line == "GET /api/v1/devices/dev-swap HTTP/1.1" {
+            // The phone re-sent during the confirmation: still pending, but
+            // it is a DIFFERENT request with a different SAS.
+            let n = DETAIL_CALLS.fetch_add(1, Ordering::SeqCst);
+            let key = if n == 0 { "00F8F3CE" } else { "DEADBEEF" };
+            (
+                200,
+                envelope(serde_json::json!({
+                    "id": "dev-swap",
+                    "state": "connected",
+                    "pair_state": "requested_by_peer",
+                    "verification_key": key
+                })),
+            )
+        } else {
+            (
+                404,
+                r#"{"status":"error","error":{"code":"NOT_FOUND","message":"nope"}}"#.into(),
+            )
+        }
+    });
+
+    let mut out = Vec::new();
+    let err = execute(
+        &server.client(),
+        &Command::Pair {
+            device_id: "dev-swap".to_string(),
+            yes: true,
+        },
+        false,
+        &mut out,
+    )
+    .expect_err("must not accept a request whose key changed");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("verification key"),
+        "error names the key mismatch: {msg}"
+    );
+
+    let requests = server.recorded();
+    assert!(
+        !requests.iter().any(|r| r.contains("/pair ")),
+        "no accept may be sent when the key changed: {requests:?}"
+    );
+}
+
+#[test]
+fn test_pair_incoming_reports_failure_when_daemon_did_not_pair() {
+    let server = MockServer::start(|request_line, _| {
+        if request_line.starts_with("GET /api/v1/devices?") {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "devices": [{ "id": "dev-race", "name": "test phone" }],
+                    "total": 1
+                })),
+            )
+        } else if request_line == "GET /api/v1/devices/dev-race HTTP/1.1" {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "id": "dev-race",
+                    "state": "connected",
+                    "pair_state": "requested_by_peer",
+                    "verification_key": "00F8F3CE"
+                })),
+            )
+        } else if request_line == "POST /api/v1/devices/dev-race/pair HTTP/1.1" {
+            // The request expired server-side between the re-check and the
+            // POST: the daemon started an OUTGOING pairing instead.
+            (
+                200,
+                envelope(serde_json::json!({
+                    "device_id": "dev-race",
+                    "status": "pairing_initiated"
+                })),
+            )
+        } else {
+            (
+                404,
+                r#"{"status":"error","error":{"code":"NOT_FOUND","message":"nope"}}"#.into(),
+            )
+        }
+    });
+
+    let mut out = Vec::new();
+    let err = execute(
+        &server.client(),
+        &Command::Pair {
+            device_id: "dev-race".to_string(),
+            yes: true,
+        },
+        false,
+        &mut out,
+    )
+    .expect_err("a non-paired status must not be reported as success");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("pairing_initiated") || msg.contains("did not complete"),
+        "error surfaces the real status: {msg}"
+    );
+    let output = String::from_utf8(out).expect("utf8");
+    assert!(
+        !output.contains("Paired with dev-race."),
+        "must not claim success: {output}"
+    );
+}
+
+#[test]
+fn test_pair_incoming_json_without_yes_refuses_instead_of_prompting() {
+    let server = MockServer::start(|request_line, _| {
+        if request_line.starts_with("GET /api/v1/devices?") {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "devices": [{ "id": "dev-json", "name": "test phone" }],
+                    "total": 1
+                })),
+            )
+        } else if request_line == "GET /api/v1/devices/dev-json HTTP/1.1" {
+            (
+                200,
+                envelope(serde_json::json!({
+                    "id": "dev-json",
+                    "state": "connected",
+                    "pair_state": "requested_by_peer",
+                    "verification_key": "00F8F3CE"
+                })),
+            )
+        } else {
+            (
+                404,
+                r#"{"status":"error","error":{"code":"NOT_FOUND","message":"nope"}}"#.into(),
+            )
+        }
+    });
+
+    let mut out = Vec::new();
+    let err = execute(
+        &server.client(),
+        &Command::Pair {
+            device_id: "dev-json".to_string(),
+            yes: false,
+        },
+        true, // --json
+        &mut out,
+    )
+    .expect_err("json mode must refuse rather than prompt");
+    let msg = format!("{err}");
+    assert!(msg.contains("--yes"), "error names the flag: {msg}");
+    // The json-specific refusal must be taken before the tty/non-tty guard:
+    // the test harness has no tty, so the generic non-interactive refusal
+    // would also satisfy a `--yes`-only check. Requiring the json phrasing
+    // pins the fix (json mode refuses with its own message rather than
+    // reaching the prompt).
+    assert!(
+        msg.contains("--json"),
+        "error explains json mode cannot prompt: {msg}"
+    );
+
+    let output = String::from_utf8(out).expect("utf8");
+    assert!(
+        !output.contains("Accept pairing?"),
+        "no prompt may be written to the json stream: {output}"
+    );
+    let requests = server.recorded();
+    assert!(
+        !requests.iter().any(|r| r.contains("/pair ")),
+        "no accept sent: {requests:?}"
     );
 }
 

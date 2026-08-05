@@ -46,6 +46,17 @@ pub async fn list_devices(
         // without it the list forces N+1 detail fetches on every client.
         let mut device = device.clone();
         device.reconcile_paired_at(state.pairing_handler.paired_since(&device.id).await);
+        device.set_pair_state(
+            state
+                .pairing_handler
+                .pair_state(&device.id)
+                .await
+                .as_api_str()
+                .to_string(),
+        );
+        if let Ok(Some(key)) = state.pairing_handler.get_verification_key(&device.id).await {
+            device.set_verification_key(key);
+        }
         page_devices.push(DeviceSummary::from(&device));
     }
 
@@ -81,6 +92,15 @@ pub async fn get_device(
     if let Ok(Some(key)) = state.pairing_handler.get_verification_key(&device_id).await {
         device.set_verification_key(key);
     }
+
+    device.set_pair_state(
+        state
+            .pairing_handler
+            .pair_state(&device_id)
+            .await
+            .as_api_str()
+            .to_string(),
+    );
 
     // The pairing store owns paired_at; the record's own copy could not
     // self-correct because a reconnecting paired device never re-enters the

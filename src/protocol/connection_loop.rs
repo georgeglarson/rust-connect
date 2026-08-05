@@ -9,7 +9,7 @@ use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
 use crate::app::AppState;
-use crate::device::types::{DeviceId, DeviceState};
+use crate::device::types::{DeviceEvent, DeviceId, DeviceState};
 use crate::protocol::pairing::PairState;
 use crate::protocol::types::Packet;
 use tokio_util::sync::CancellationToken;
@@ -205,6 +205,23 @@ pub async fn run_packet_loop(
                                             event = "pair_request_received",
                                             "Pairing request received, awaiting user acceptance"
                                         );
+                                        // Surface the pending request so the UI
+                                        // refreshes inside the request's short
+                                        // window instead of waiting for the next
+                                        // poll. The event carries no key: clients
+                                        // re-read the device over the authenticated
+                                        // API, which is the single path the key
+                                        // travels.
+                                        let device_name = state
+                                            .registry
+                                            .get(device_id)
+                                            .await
+                                            .map(|d| d.name)
+                                            .unwrap_or_else(|_| device_id.clone());
+                                        state.broadcaster.broadcast(DeviceEvent::PairRequested {
+                                            device_id: device_id.clone(),
+                                            device_name,
+                                        });
                                     }
                                 }
                             } else {
