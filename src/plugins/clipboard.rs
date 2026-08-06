@@ -875,7 +875,9 @@ mod tests {
         let (plugin, _) = make_plugin();
         // Use the fixture's literal content so the produced body matches
         // the upstream-derived shape field-for-field.
-        plugin.core.apply_local_change(upstream_body["content"].as_str().unwrap().to_string());
+        plugin
+            .core
+            .apply_local_change(upstream_body["content"].as_str().unwrap().to_string());
 
         let packets = plugin.on_connected("dev-1");
         assert_eq!(packets.len(), 1);

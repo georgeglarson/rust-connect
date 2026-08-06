@@ -168,7 +168,10 @@ mod tests {
 
         let (plugin, broadcaster) = setup();
         let mut rx = broadcaster.subscribe();
-        plugin.handle_packet("device1", echo_packet(upstream_body)).await.unwrap();
+        plugin
+            .handle_packet("device1", echo_packet(upstream_body))
+            .await
+            .unwrap();
 
         match rx.recv().await.expect("Value expected to be present") {
             PluginEvent::RemoteKeyboardEcho {

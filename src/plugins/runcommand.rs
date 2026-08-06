@@ -570,10 +570,7 @@ mod tests {
 
         let plugin = RuncommandPlugin::new();
         let reply = plugin
-            .handle_packet(
-                "device1",
-                request_packet(upstream_body),
-            )
+            .handle_packet("device1", request_packet(upstream_body))
             .await
             .unwrap()
             .expect("requestCommandList must be answered");

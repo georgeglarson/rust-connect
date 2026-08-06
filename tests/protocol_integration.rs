@@ -77,10 +77,9 @@ fn test_identity_packet_format_matches_kde_connect() {
     );
     let packet = id.to_packet().unwrap();
     let bytes = PacketSerializer::serialize(&packet).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(
-        std::str::from_utf8(&bytes).expect("utf-8 wire"),
-    )
-    .expect("parse our wire");
+    let parsed: serde_json::Value =
+        serde_json::from_str(std::str::from_utf8(&bytes).expect("utf-8 wire"))
+            .expect("parse our wire");
 
     // Field-by-field: name, casing, type must all match upstream.
     assert_eq!(parsed["type"], fixture["type"]);
@@ -100,7 +99,10 @@ fn test_identity_packet_format_matches_kde_connect() {
         parsed["body"]["outgoingCapabilities"],
         fixture["body"]["outgoingCapabilities"]
     );
-    assert!(parsed["id"].is_number(), "id must be a number per networkpacket.cpp:46");
+    assert!(
+        parsed["id"].is_number(),
+        "id must be a number per networkpacket.cpp:46"
+    );
 
     // Top-level shape: id, type, body are the only required keys; our
     // packet has no payload so payloadSize / payloadTransferInfo are absent.

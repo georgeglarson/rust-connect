@@ -93,11 +93,7 @@ const NON_SELF_CITE_TOKENS: &[&str] = &[
 /// Order used to weaken a row when one of its cells disagrees with
 /// `status: PASS`. We pick the weakest non-PASS/NOT-APPLICABLE value
 /// present; ties broken by this order.
-const STATUS_WEAKNESS: &[&str] = &[
-    "INTENTIONAL-DIVERGENCE",
-    "FAIL",
-    "UNVERIFIED",
-];
+const STATUS_WEAKNESS: &[&str] = &["INTENTIONAL-DIVERGENCE", "FAIL", "UNVERIFIED"];
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -345,9 +341,7 @@ fn upstream_roles() -> BTreeSet<String> {
 
 /// Check whether a cite contains any non-self artifact token.
 fn cite_has_non_self_token(cite: &str) -> bool {
-    NON_SELF_CITE_TOKENS
-        .iter()
-        .any(|tok| cite.contains(tok))
+    NON_SELF_CITE_TOKENS.iter().any(|tok| cite.contains(tok))
 }
 
 /// Pick the weakest status in a list of cell values. `PASS` and
@@ -453,9 +447,7 @@ fn functional_coverage_ledger_is_consistent() {
                 if let Some(weakest) = weakest_status(&cells) {
                     let bad: Vec<String> = cells
                         .iter()
-                        .filter(|(_, v)| {
-                            v.as_str() != "PASS" && v.as_str() != "NOT-APPLICABLE"
-                        })
+                        .filter(|(_, v)| v.as_str() != "PASS" && v.as_str() != "NOT-APPLICABLE")
                         .map(|(k, v)| format!("{}={}", k, v))
                         .collect();
                     panic!(
@@ -483,20 +475,20 @@ fn functional_coverage_ledger_is_consistent() {
                 );
 
                 // D5 fixture-provenance: feature_ledger rows only.
-                if label == "feature_ledger" {
-                    if row.cells.get("fixture_provenance").map(|s| s.as_str()) == Some("PASS") {
-                        let ok = cite.contains("tests/fixtures/upstream-wire/")
-                            || cite.contains("peer")
-                            || cite.contains("kdeconnect-android")
-                            || cite.contains("kdeconnect-kde")
-                            || cite.contains("gsconnect")
-                            || cite.contains("upstream");
-                        assert!(
-                            ok,
-                            "{} row `{}` has `fixture_provenance: PASS` but cite `{}` does not reference `tests/fixtures/upstream-wire/` or a peer/upstream artifact (D5)",
-                            label, row.feature, cite
-                        );
-                    }
+                if label == "feature_ledger"
+                    && row.cells.get("fixture_provenance").map(|s| s.as_str()) == Some("PASS")
+                {
+                    let ok = cite.contains("tests/fixtures/upstream-wire/")
+                        || cite.contains("peer")
+                        || cite.contains("kdeconnect-android")
+                        || cite.contains("kdeconnect-kde")
+                        || cite.contains("gsconnect")
+                        || cite.contains("upstream");
+                    assert!(
+                        ok,
+                        "{} row `{}` has `fixture_provenance: PASS` but cite `{}` does not reference `tests/fixtures/upstream-wire/` or a peer/upstream artifact (D5)",
+                        label, row.feature, cite
+                    );
                 }
             }
         }
@@ -658,7 +650,10 @@ fn upstream_wire_provenance_is_consistent() {
         );
         referenced.insert(file.clone());
     }
-    let orphans: Vec<&String> = on_disk.iter().filter(|f| !referenced.contains(*f)).collect();
+    let orphans: Vec<&String> = on_disk
+        .iter()
+        .filter(|f| !referenced.contains(*f))
+        .collect();
     assert!(
         orphans.is_empty(),
         "files in {} lack provenance entries: {:?}",
@@ -672,18 +667,24 @@ fn upstream_wire_provenance_is_consistent() {
     let pin_gsconnect = read_upstream_pin(UPSTREAM_FILES[1]);
 
     for (file, fields) in entries.iter() {
-        let kind = fields
-            .get("kind")
-            .expect("provenance entry missing `kind`");
+        let kind = fields.get("kind").expect("provenance entry missing `kind`");
         assert!(
-            matches!(kind.as_str(), "upstream-derived" | "live-transcript" | "hand-authored-from-observation"),
+            matches!(
+                kind.as_str(),
+                "upstream-derived" | "live-transcript" | "hand-authored-from-observation"
+            ),
             "fixture `{}` has unknown `kind` `{}`",
             file,
             kind
         );
 
         if kind == "upstream-derived" {
-            for required in ["upstream_repo", "pinned_commit", "source_file", "extraction_date"] {
+            for required in [
+                "upstream_repo",
+                "pinned_commit",
+                "source_file",
+                "extraction_date",
+            ] {
                 assert!(
                     fields.contains_key(required),
                     "fixture `{}` (upstream-derived) missing `{}`",

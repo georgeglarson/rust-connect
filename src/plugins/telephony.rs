@@ -188,7 +188,10 @@ mod tests {
             .clone();
 
         let (plugin, _) = setup();
-        plugin.handle_packet("device1", telephony_packet(upstream_body)).await.unwrap();
+        plugin
+            .handle_packet("device1", telephony_packet(upstream_body))
+            .await
+            .unwrap();
         let calls = plugin.get_calls("device1");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].event, "ringing");

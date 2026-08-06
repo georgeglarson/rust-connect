@@ -1293,10 +1293,11 @@ mod tests {
         // INTENTIONAL-DIVERGENCE in docs/functional-coverage.md (mpris row).
         let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/upstream-wire/mpris/player_list.json");
-        let upstream_body: serde_json::Value =
-            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&fixture_path).expect("read mpris player_list fixture"))
-                .expect("parse fixture")["body"]
-                .clone();
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read mpris player_list fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
 
         let (plugin, _) = setup();
         plugin.core.apply_player_added(sample_state());
@@ -1315,7 +1316,10 @@ mod tests {
 
         // The intentional divergence: false vs true.
         assert_eq!(packet.body["playerList"], upstream_body["playerList"]);
-        assert_eq!(packet.body["supportAlbumArtPayload"], serde_json::json!(false));
+        assert_eq!(
+            packet.body["supportAlbumArtPayload"],
+            serde_json::json!(false)
+        );
         assert_ne!(
             packet.body["supportAlbumArtPayload"], upstream_body["supportAlbumArtPayload"],
             "expected upstream to advertise supportAlbumArtPayload=true (mpriscontrolplugin.cpp:392)"
@@ -1326,10 +1330,11 @@ mod tests {
     fn test_props_changed_partial_update_wire_shape() {
         let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/upstream-wire/mpris/props_changed_playback_status.json");
-        let upstream_body: serde_json::Value =
-            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&fixture_path).expect("read fixture"))
-                .expect("parse fixture")["body"]
-                .clone();
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
 
         let (plugin, _) = setup();
         plugin.core.apply_player_added(sample_state());
@@ -1351,10 +1356,11 @@ mod tests {
     fn test_props_changed_metadata_wire_shape() {
         let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/upstream-wire/mpris/props_changed_metadata.json");
-        let upstream_body: serde_json::Value =
-            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&fixture_path).expect("read fixture"))
-                .expect("parse fixture")["body"]
-                .clone();
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
 
         let (plugin, _) = setup();
         let changed = PlayerPropsChanged {
@@ -1372,10 +1378,11 @@ mod tests {
     fn test_props_changed_volume_wire_shape() {
         let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/upstream-wire/mpris/props_changed_volume.json");
-        let upstream_body: serde_json::Value =
-            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&fixture_path).expect("read fixture"))
-                .expect("parse fixture")["body"]
-                .clone();
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
 
         let (plugin, _) = setup();
         let changed = PlayerPropsChanged {
@@ -1457,10 +1464,11 @@ mod tests {
     fn test_seeked_wire_shape() {
         let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/upstream-wire/mpris/seeked.json");
-        let upstream_body: serde_json::Value =
-            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&fixture_path).expect("read fixture"))
-                .expect("parse fixture")["body"]
-                .clone();
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
 
         let (plugin, _) = setup();
         plugin.core.apply_player_added(sample_state());
@@ -1482,10 +1490,11 @@ mod tests {
     fn test_now_playing_answer_wire_shape() {
         let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/upstream-wire/mpris/now_playing_answer.json");
-        let upstream_body: serde_json::Value =
-            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&fixture_path).expect("read fixture"))
-                .expect("parse fixture")["body"]
-                .clone();
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
 
         let (plugin, _) = setup();
         let packet = plugin.core.now_playing_answer(&sample_state(), true);

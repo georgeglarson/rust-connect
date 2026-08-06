@@ -34,7 +34,7 @@ async fn test_reply_id_captured_from_request_reply_id() -> anyhow::Result<()> {
     )
     .expect("parse fixture")["body"]
         .clone();
-    let packet = Packet::new("kdeconnect.notification".to_string(), fixture_body);
+    let packet = Packet::new("kdeconnect.notification".to_string(), fixture_body.clone());
 
     let broadcaster = Arc::new(PluginEventBroadcaster::new(16, "plugin"));
     let mut rx = broadcaster.subscribe();
@@ -42,16 +42,18 @@ async fn test_reply_id_captured_from_request_reply_id() -> anyhow::Result<()> {
 
     assert!(plugin.handle_packet("device-1", packet).await.is_ok());
 
+    let expected_reply_id = fixture_body["requestReplyId"].as_str().unwrap().to_string();
+
     let event = rx.recv().await.context("Value expected to be present")?;
     match event {
         PluginEvent::Notification { reply_id, .. } => {
-            assert_eq!(reply_id, Some("uuid-1234".to_string()));
+            assert_eq!(reply_id, Some(expected_reply_id.clone()));
         }
         _ => panic!("Wrong event type"),
     }
 
     let history = plugin.get_history(None, 1);
-    assert_eq!(history[0].reply_id, Some("uuid-1234".to_string()));
+    assert_eq!(history[0].reply_id, Some(expected_reply_id));
     Ok(())
 }
 

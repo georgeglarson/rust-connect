@@ -568,7 +568,10 @@ mod tests {
             )
             .await
             .unwrap();
-        plugin.handle_packet("device1", telephony_packet(cancel_body)).await.unwrap();
+        plugin
+            .handle_packet("device1", telephony_packet(cancel_body))
+            .await
+            .unwrap();
         assert_eq!(backend.resumed().len(), 1);
     }
 

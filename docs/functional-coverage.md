@@ -20,6 +20,43 @@ status-vocabulary schema. A thin schema-lint test refuses to merge unknown
 statuses, missing rows for any Rust plugin or upstream-only role, and a
 non-PASS row without a reason.
 
+`Slice 0B` (2026-08-06) tightens the lint so it cannot quietly hide a
+half-verified PASS row, a self-referential cite, or a wire-conformance
+test that asserts against this repo's own structs. Three new invariants:
+
+- **Rollup (D3).** A row's `status: PASS` requires every status-valued
+  cell in that row (`desktop_effect`, `api_surface`, `lifecycle`,
+  `hostile_input`, `fixture_provenance`, `live_device`, `environment`
+  for `feature_ledger`; the env/device analogs for the other matrices)
+  to be `PASS` or `NOT-APPLICABLE`. Any weaker cell forces the row's
+  status down. Most rows above were silently carrying an `UNVERIFIED`
+  cell under a `PASS` cover; the rollup makes the gap visible and
+  names the owner task to close it.
+- **Cite-on-PASS (D4).** Every PASS row must carry a `cite` containing
+  at least one non-self artifact token (`docs/live-validation.md`,
+  `upstream`, `tests/fixtures/upstream-wire/`, `kdeconnect-android`,
+  `kdeconnect-kde`, `gsconnect`, or `peer`). A cite that is only
+  `src/…` or `tests/…` paths fails — these are the same-repo artifacts
+  the row was meant to be verified against, not evidence.
+- **Fixture-provenance gate (D5).** A `feature_ledger` row with
+  `fixture_provenance: PASS` must reference at least one upstream-wire
+  fixture under `tests/fixtures/upstream-wire/` (the one the row's
+  wire tests actually load) or an independent-peer artifact. Rows
+  whose wire tests are behavioral-only may keep `fixture_provenance:
+  PASS` with a cite noting "no wire-shape tests; behavioral only" —
+  recorded in the slice-0b report. Rust-self wire-conformance tests
+  (assertions against the repo's own structs) are no longer accepted
+  under `fixture_provenance: PASS`.
+
+The D6 lint also enforces a provenance index
+(`tests/fixtures/upstream-wire/provenance.yaml`) covering every
+upstream-wire fixture, with each entry's `used_by` resolving to a
+`fn` in this repo and each `pinned_commit` matching the pin in
+`tests/fixtures/upstream-capabilities/*.yaml`. This makes the chain
+"this row is PASS because of this test because of this fixture
+because of this upstream commit at this file:line" mechanically
+checkable.
+
 The machine-readable portion lives in fenced YAML blocks immediately under
 each matrix heading. The lint parses them. Markdown prose above and below the
 fences is human context only and is not parsed.
@@ -74,10 +111,10 @@ feature_ledger:
     fixture_provenance: PASS
     live_device: PASS
     environment: UNVERIFIED
-    status: PASS
-    cite: "docs/live-validation.md 2026-08-02 Battery row (live 90%, charging); docs/parity-checklist.md Discovery/Lifecycle CONFORMANT"
-    reason:
-    owner:
+    status: UNVERIFIED
+    cite: "tests/fixtures/upstream-wire/identity/basic.json (basic identity wire shape used by battery plugin); docs/live-validation.md 2026-08-02 Battery row (live 90%, charging); docs/parity-checklist.md Discovery/Lifecycle CONFORMANT"
+    reason: "Slice 0B rollup (D3): hostile_input and environment are UNVERIFIED, blocking status=PASS. fixture_provenance promoted to PASS via the slice-0b upstream-wire fixtures; the remaining two cells are owned by the Sprint 2 hostile-input audit (Task 2.5) and the env matrix expansion (Task 4.1)."
+    owner: "Tasks 2.5 + 4.1"
 
   - feature: clipboard
     rust_impl: true
@@ -90,10 +127,10 @@ feature_ledger:
     fixture_provenance: PASS
     live_device: PASS
     environment: UNVERIFIED
-    status: PASS
-    cite: "docs/live-validation.md 2026-08-02 Clipboard desktop<->phone rows"
-    reason:
-    owner:
+    status: UNVERIFIED
+    cite: "tests/fixtures/upstream-wire/clipboard/{local_change,connect}.json (kdeconnect-android ClipboardPlugin.kt:77-81,93-97); docs/live-validation.md 2026-08-02 Clipboard desktop<->phone rows"
+    reason: "Slice 0B rollup (D3): hostile_input and environment are UNVERIFIED, blocking status=PASS. fixture_provenance promoted via the slice-0b clipboard fixtures; remaining cells owned by Sprint 2 hostile-input audit (Task 2.5) and env-matrix expansion (Task 4.1)."
+    owner: "Tasks 2.5 + 4.1"
 
   - feature: connectivity
     rust_impl: true
@@ -106,10 +143,10 @@ feature_ledger:
     fixture_provenance: UNVERIFIED
     live_device: PASS
     environment: UNVERIFIED
-    status: PASS
+    status: UNVERIFIED
     cite: "docs/live-validation.md 2026-08-02 Connectivity row"
-    reason:
-    owner:
+    reason: "Slice 0B rollup (D3): hostile_input, fixture_provenance, and environment are UNVERIFIED, blocking status=PASS. No upstream-wire fixture yet for connectivity_report — the wire shape is a JSON object published by upstream's NetworkPacket wrapper; Task 0.4 follow-up to transcribe when the plugin's wire test is added."
+    owner: "Task 0.4 follow-up (fixture_provenance); Tasks 2.5, 4.1 (the other two)"
 
   - feature: contacts
     rust_impl: true
@@ -119,12 +156,12 @@ feature_ledger:
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment"
+    cite: "tests/fixtures/upstream-wire/contacts/{request_all_uids_timestamps,request_vcards_by_uid,response_uids_timestamps}.json (kdeconnect-kde plugins/contacts/contactsplugin.cpp:169-185; kdeconnect-android ContactsPlugin.kt:110-119)"
+    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived contacts fixtures. Remaining cells owned by Sprint 3 / Task 3.1 alignment."
     owner: "Task 3.1"
 
   - feature: digitizer
@@ -151,12 +188,12 @@ feature_ledger:
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment"
+    cite: "tests/fixtures/upstream-wire/findmyphone/ring_request.json (kdeconnect-kde plugins/findmyphone/findmyphoneplugin.cpp:17-21)"
+    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived ring_request fixture. Remaining cells owned by Sprint 3 / Task 3.1 alignment."
     owner: "Task 3.1"
 
   - feature: findthisdevice
@@ -199,12 +236,12 @@ feature_ledger:
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 1 / Task 1.6 absolute-axes verification"
+    cite: "tests/fixtures/upstream-wire/mousepad/presenter_slide_keys.json (kdeconnect-android PresenterPlugin.kt:53-74 + KeyListenerView.java:36-37,48,53)"
+    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived presenter_slide_keys fixture. Remaining cells owned by Sprint 1 / Task 1.6 absolute-axes verification."
     owner: "Task 1.6"
 
   - feature: mpris
@@ -215,13 +252,13 @@ feature_ledger:
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: INTENTIONAL-DIVERGENCE
     live_device: UNVERIFIED
     environment: UNVERIFIED
-    status: UNVERIFIED
-    cite:
-    reason: "Sprint 1 / Task 1.5 album-art and session-bus work pending"
-    owner: "Task 1.5"
+    status: INTENTIONAL-DIVERGENCE
+    cite: "tests/fixtures/upstream-wire/mpris/{player_list,props_changed_playback_status,props_changed_metadata,props_changed_volume,seeked,now_playing_answer}.json (kdeconnect-kde plugins/mpriscontrol/mpriscontrolplugin.cpp:116-119,139-146,155-159,186-193,317-358,387-394); the rust plugin intentionally advertises supportAlbumArtPayload=false (mpriscontrolplugin.cpp:392 upstream emits true) because the daemon does not implement album-art payload transfer — sending true would be capability-dishonest."
+    reason: "Slice 0B promotion: six upstream-derived fixtures now load in src/plugins/mpris/mod.rs. fixture_provenance=PASS would be a mislabel here — the only divergence is a single VALUE (false vs true) on supportAlbumArtPayload, all upstream KEYS are present and identical. Recording the divergence explicitly so an integrator decision can resolve it."
+    owner: "Task 1.5 (album-art & session-bus work)"
 
   - feature: notification
     rust_impl: true
@@ -231,13 +268,13 @@ feature_ledger:
     api_surface: PASS
     lifecycle: PASS
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: PASS
     live_device: PASS
     environment: UNVERIFIED
-    status: PASS
-    cite: "docs/live-validation.md 2026-08-02 Notification desktop->phone and mirror rows"
-    reason:
-    owner:
+    status: UNVERIFIED
+    cite: "tests/fixtures/upstream-wire/notification/{reply_id_request,request_packet}.json (NotificationsPlugin.kt:251-262 + kdeconnect-kde notificationsplugin.cpp:29); docs/live-validation.md 2026-08-02 Notification desktop->phone and mirror rows"
+    reason: "Slice 0B rollup (D3): hostile_input and environment are UNVERIFIED, blocking status=PASS. fixture_provenance promoted via the slice-0b notification fixtures (including the negative replyUuid fixture, hand-authored, marking the original replyUuid defect); remaining cells owned by Tasks 2.5, 4.1."
+    owner: "Tasks 2.5 + 4.1"
 
   - feature: pausemusic
     rust_impl: true
@@ -247,12 +284,12 @@ feature_ledger:
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: PASS
     live_device: NOT-APPLICABLE
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite:
-    reason: "Sprint 1 / Task 1.6 mute-vs-pause policy pending"
+    cite: "tests/fixtures/upstream-wire/pausemusic/telephony_talking_cancel_string.json (kdeconnect-android TelephonyPlugin.kt:114-116)"
+    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived telephony cancel fixture (pausemusic observes telephony events). Remaining cells owned by Sprint 1 / Task 1.6 mute-vs-pause policy."
     owner: "Task 1.6"
 
   - feature: ping
@@ -266,10 +303,10 @@ feature_ledger:
     fixture_provenance: PASS
     live_device: PASS
     environment: UNVERIFIED
-    status: PASS
-    cite: "docs/live-validation.md 2026-08-02 Ping row"
-    reason:
-    owner:
+    status: UNVERIFIED
+    cite: "tests/fixtures/upstream-wire/identity/basic.json (the discovery-broadcast identity shape used by the ping flow); docs/live-validation.md 2026-08-02 Ping row"
+    reason: "Slice 0B rollup (D3): environment is UNVERIFIED, blocking status=PASS. The ping packet itself is empty-body (kdeconnect-kde plugins/ping/pingplugin.cpp + PingPlugin.kt:54-58) so fixture_provenance promotes via the identity fixture; the open cell is owned by Task 4.1."
+    owner: "Task 4.1"
 
   - feature: presenter
     rust_impl: true
@@ -311,12 +348,12 @@ feature_ledger:
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment"
+    cite: "tests/fixtures/upstream-wire/remotekeyboard/echo_ack.json (kdeconnect-android RemoteKeyboardPlugin.java:383-395)"
+    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived echo_ack fixture. Remaining cells owned by Sprint 3 / Task 3.1 alignment."
     owner: "Task 3.1"
 
   - feature: runcommand
@@ -327,12 +364,12 @@ feature_ledger:
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: INTENTIONAL-DIVERGENCE
     live_device: UNVERIFIED
     environment: UNVERIFIED
-    status: UNVERIFIED
-    cite:
-    reason: "Sprint 1 / Task 1.2 allowlist + output-stream work pending"
+    status: INTENTIONAL-DIVERGENCE
+    cite: "tests/fixtures/upstream-wire/runcommand/{command_list_empty,command_list_populated,request_command_list,request_key}.json (kdeconnect-kde plugins/runcommand/runcommandplugin.cpp:188-195; kdeconnect-android RunCommandPlugin.java:251-262); the rust plugin intentionally advertises canAddCommand=false (upstream emits true at runcommandplugin.cpp:192) because the allowlist is one-way — we push commands to the phone, the phone never pushes them to us."
+    reason: "Slice 0B promotion: four upstream-derived fixtures now load in src/plugins/runcommand.rs. Recording canAddCommand as INTENTIONAL-DIVERGENCE so an integrator decision can resolve it. Remaining cells owned by Sprint 1 / Task 1.2 allowlist + output-stream work."
     owner: "Task 1.2"
 
   - feature: screensaver-inhibit
@@ -378,10 +415,10 @@ feature_ledger:
     fixture_provenance: UNVERIFIED
     live_device: PASS
     environment: UNVERIFIED
-    status: PASS
+    status: UNVERIFIED
     cite: "lane-4-sftp-lifecycle tests: src/plugins/sftp/mounter.rs (argv/stdin/password redaction), src/plugins/sftp/mod.rs (state machine + Debug redaction + cleanup + startup_sweep), tests/api_integration.rs (sftp mount/unmount/info + tools + unpair-drops-creds + shutdown-drops-creds). Upstream: kdeconnect-kde @ f5ed3ed8 plugins/sftp/mounter.cpp:72,93-95,99-100,103-105,114,204; plugins/sftp/sftpplugin.cpp:88-104,136-163. Live: docs/live-validation.md 2026-08-06 entry 'SFTP desktop browsing lifecycle (Galaxy A15)' — request/creds-no-password/mount/browse/copy/unmount/reconnect/disconnect-cleanup all observed on a paired A15 under the hardened systemd unit."
-    reason: "Sprint 1 / Task 1.3 done incl. live-device validation on one phone; hostile-input, fixture provenance, and non-Fedora environments remain UNVERIFIED."
-    owner: "Task 1.3"
+    reason: "Slice 0B rollup (D3): hostile_input, fixture_provenance, environment UNVERIFIED, blocking status=PASS. Sprint 1 / Task 1.3 done incl. live-device validation on one phone; the sftp plugin has no slice-0b upstream-wire fixtures yet (its protocol is request/response with binary payload, not the simple JSON shape) — Task 0.4 follow-up to transcribe the request body shape from sftpplugin.cpp:88-104."
+    owner: "Task 1.3 + Task 0.4 follow-up (fixture_provenance); Tasks 2.5, 4.1 (the rest)"
 
   - feature: share
     rust_impl: true
@@ -394,10 +431,10 @@ feature_ledger:
     fixture_provenance: PASS
     live_device: PASS
     environment: UNVERIFIED
-    status: PASS
-    cite: "docs/live-validation.md 2026-08-02 Share desktop<->phone rows + 81 KiB PNG receipt"
-    reason:
-    owner:
+    status: UNVERIFIED
+    cite: "tests/fixtures/upstream-wire/share/{text_share_request,url_share_request,share_file_request}.json (SharePlugin.java:268-269,339-341); docs/live-validation.md 2026-08-02 Share desktop<->phone rows + 81 KiB PNG receipt"
+    reason: "Slice 0B rollup (D3): hostile_input and environment are UNVERIFIED, blocking status=PASS. fixture_provenance promoted via the slice-0b share fixtures; remaining cells owned by Tasks 2.5, 4.1."
+    owner: "Tasks 2.5 + 4.1"
 
   - feature: sms
     rust_impl: true
@@ -427,9 +464,9 @@ feature_ledger:
     live_device: PASS
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "docs/live-validation.md 2026-08-06 (A15: sinkList render, phone->desktop volume+mute, REST<->pactl parity, wire deltas); live-captured pactl fixtures; subscribe supervision tests"
-    reason: "Provider validated live on A15; phone-app delta re-render caveat recorded in the live-validation entry. Remaining: hostile-input audit (Task 2.5) and non-Sway environments (Task 4.1)"
-    owner: "Task 1.1"
+    cite: "tests/fixtures/upstream-wire/systemvolume/sink_list.json (kdeconnect-kde plugins/systemvolume/pulse.cpp:90-104); docs/live-validation.md 2026-08-06 (A15: sinkList render, phone->desktop volume+mute, REST<->pactl parity, wire deltas); live-captured pactl fixtures; subscribe supervision tests"
+    reason: "Slice 0B promotion: fixture_provenance now PASS via the slice-0b sink_list fixture (was UNVERIFIED). Provider validated live on A15; phone-app delta re-render caveat recorded in the live-validation entry. Remaining: hostile-input audit (Task 2.5) and non-Sway environments (Task 4.1)."
+    owner: "Tasks 2.5 + 4.1"
 
   - feature: telephony
     rust_impl: true
@@ -439,12 +476,12 @@ feature_ledger:
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment"
+    cite: "tests/fixtures/upstream-wire/telephony/ringing.json (kdeconnect-android TelephonyPlugin.kt:78,95,99,105)"
+    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived ringing fixture. Remaining cells owned by Sprint 3 / Task 3.1 alignment."
     owner: "Task 3.1"
 
   # Behavioral parity rows — sourced from docs/parity-checklist.md.
@@ -525,10 +562,10 @@ feature_ledger:
     fixture_provenance: PASS
     live_device: PASS
     environment: UNVERIFIED
-    status: PASS
-    cite: "docs/parity-checklist.md Link layer TLS-role row CONFORMANT"
-    reason:
-    owner:
+    status: UNVERIFIED
+    cite: "tests/fixtures/upstream-wire/identity/basic.json (the identity packet shape exchanged at TLS handshake — kdeconnect-kde lanlinkprovider.cpp:391,573); docs/parity-checklist.md Link layer TLS-role row CONFORMANT"
+    reason: "Slice 0B rollup (D3): environment UNVERIFIED, blocking status=PASS. fixture_provenance promoted via the slice-0b identity fixture. Open cell owned by Task 4.1."
+    owner: "Task 4.1"
 
   - feature: pairing-sas-displayed
     rust_impl: true
@@ -538,13 +575,13 @@ feature_ledger:
     api_surface: PASS
     lifecycle: PASS
     hostile_input: PASS
-    fixture_provenance: PASS
+    fixture_provenance: UNVERIFIED
     live_device: PASS
     environment: UNVERIFIED
-    status: PASS
+    status: UNVERIFIED
     cite: "docs/live-validation.md 2026-08-05 'Phone-initiated pairing: SAS verified identical on both devices' (key 65D58104)"
-    reason:
-    owner:
+    reason: "Slice 0B rollup (D3): fixture_provenance and environment UNVERIFIED, blocking status=PASS. Pairing uses the kdeconnect.pair packet type — fixture transcription is the slice-0b follow-up (D5 can't be cleared without an upstream-wire fixture for the pair packet body). Environment owned by Task 4.1."
+    owner: "Task 0.4 follow-up (fixture_provenance); Task 4.1 (environment)"
 
   - feature: cad-pair-false-on-unpaired-traffic
     rust_impl: true
@@ -557,10 +594,10 @@ feature_ledger:
     fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
-    status: PASS
-    cite: "docs/parity-checklist.md Link layer 'Unpaired device sends non-pair packet' row CONFORMANT (fixed 2026-08-04)"
-    reason:
-    owner:
+    status: UNVERIFIED
+    cite: "docs/parity-checklist.md Link layer 'Unpaired device sends non-pair packet' row CONFORMANT (fixed 2026-08-04); kdeconnect-kde core/device.cpp:391-394 is the wire oracle"
+    reason: "Slice 0B rollup (D3): live_device and environment UNVERIFIED, blocking status=PASS. Behavior-driven test, not a wire-shape literal; the slice-0b follow-up transcribes the pair=false body fixture. Live_device: Task 4.3. Environment: Task 4.1."
+    owner: "Tasks 4.3 + 4.1"
 
   - feature: identity-tls-exchange-with-rejection
     rust_impl: true
@@ -573,10 +610,10 @@ feature_ledger:
     fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
-    status: PASS
-    cite: "docs/parity-checklist.md Link layer 'v8 encrypted identity re-exchange' row CONFORMANT"
-    reason:
-    owner:
+    status: UNVERIFIED
+    cite: "tests/fixtures/upstream-wire/identity/basic.json (kdeconnect-kde core/deviceinfo.h:123-133 toIdentityPacket); docs/parity-checklist.md Link layer 'v8 encrypted identity re-exchange' row CONFORMANT"
+    reason: "Slice 0B rollup (D3): live_device and environment UNVERIFIED, blocking status=PASS. fixture_provenance promoted via the slice-0b identity fixture. Remaining cells owned by Tasks 4.3, 4.1."
+    owner: "Tasks 4.3 + 4.1"
 
   - feature: cap-overwrite-on-empty-identity
     rust_impl: true
