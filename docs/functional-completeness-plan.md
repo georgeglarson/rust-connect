@@ -334,6 +334,31 @@ that ordinary happy-path suites miss.
 malformed peers, interrupted transfers, suspend/resume, and repeated replacement
 connections without stale state or resource growth.
 
+### Task 2.0: Reconnect/recovery bug cluster (vk #1020) — sequenced first (George, 2026-08-06)
+
+- **Location:** `src/device/lifecycle.rs`, `src/services/connection_orchestrator.rs`,
+  `src/api/handlers/device.rs`, `src/protocol/connection_loop.rs`,
+  `src/plugins/sftp/mod.rs`
+- **Description:** Four live-observed defects, one cluster: (1) API state desyncs
+  after outbound reconnect — `GET /devices` reports `disconnected` with a frozen
+  `last_seen` while the packet loop actively processes traffic; (2) paired-phone
+  reconnect churn — both house handsets close their links every ~22–60s in
+  lockstep with the 60s broadcast after a long sleep, leaving ~20s connected
+  windows; (3) `POST sftp/request` returned `sent: true` to a 2.5h-dead link
+  (false success; keepalive never observed the peer dead); (4) stale-mount WARN
+  spam every churn cycle from unreleased mount state. Repro: phone offline
+  ~2.5h, restore, watch `/devices` state vs journal.
+- **Dependencies:** Sprint 1 lanes (ordering decision: George bumped this ahead
+  of all Sprint 2 tasks — it is user-visible daily-driver instability, and
+  Tasks 2.2/2.4 build on a reconnect layer that is currently lying).
+- **Acceptance criteria:** State store and live connection cannot disagree
+  (test drives a reconnect and asserts both views); a 2.5h-dead link is
+  observed dead and sends fail honestly; a stable link stays stable across
+  broadcast cycles; no WARN spam from idempotent cleanup.
+- **Validation:** Red-before-green tests with the transcript recorder +
+  replay harness; live soak on both handsets (including the post-sleep
+  scenario) with the churn absent from the journal for >= 30 min.
+
 ### Task 2.1: Fix the robustness trio
 
 - **Location:** `src/protocol/payload_transfer.rs`, `src/device/registry.rs`,
