@@ -47,6 +47,12 @@ pub enum PluginEvent {
         user: String,
         path: String,
         available: bool,
+        /// True when the device's filesystem is currently mounted at
+        /// `mount_point`. Updated on every mount/unmount/rotation so SSE
+        /// listeners can drive a live indicator.
+        mounted: bool,
+        /// Server-determined path; `None` when nothing is mounted.
+        mount_point: Option<String>,
     },
     RemoteKeyboardEcho {
         device_id: String,
