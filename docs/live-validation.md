@@ -139,3 +139,38 @@ tether (rndis) — the phone used both during the session.
 
 Raw command output and a phone screenshot from this session are archived
 outside the repo (session transcripts, `adb exec-out screencap`).
+
+## 2026-08-06 — systemvolume provider live validation (A15, dev daemon)
+
+Session against the Task 1.1 dev build with wire transcript recording
+(`RUST_CONNECT_TRANSCRIPT_DIR`, per-device jsonl with direction + timestamps).
+
+| Flow | Result | Evidence |
+|---|---|---|
+| Fresh pair, phone-initiated | PASS | phone dialog SAS `E8FC00CB` == daemon `verification_key`; accept inside the 25 s window completed pairing |
+| Provider caps advertised | PASS | identity outgoing includes `kdeconnect.systemvolume`, incoming `kdeconnect.systemvolume.request` (backend: pactl, 2 sinks) |
+| Phone lists desktop sinks | PASS | Multimedia control → Devices tab rendered both sinks with correct default radio and volumes (45% / 50%, matched pactl) |
+| Phone → desktop volume | PASS | slider tap → `kdeconnect.systemvolume.request {name, volume}` → `pactl get-sink-volume` 49280 / 75% |
+| Phone → desktop mute | PASS | speaker icon → `request {muted: true}` → `pactl get-sink-mute` yes |
+| Desktop → wire deltas | PASS | pactl volume/mute changes pushed as sparse deltas; full sinkList pushed on connect and on sink-set change (transcript dir=out) |
+| REST ↔ pactl parity | PASS | `GET /api/v1/systemvolume/sinks` tracked live pactl; `POST .../control` moved pactl |
+
+### Findings
+
+- **The stock Android app never sends `requestSinks`** (kdeconnect-android
+  @ a88f6fa0 has no sender; the Devices tab renders whatever sinkList the
+  desktop pushes). Upstream kdeconnect-kde pushes on connect; rust-connect
+  now does the same via the capability-gated peer sync (`sync_peers`), which
+  also ended the controller role's blind `requestSinks` spam at non-provider
+  peers.
+- **pipewire-pulse subscribe dialect** differs from PulseAudio: sink events
+  carry no quoted name (`Event 'change' on sink #68`), suspended-sink
+  volume/mute changes can surface only as `card` events, and default-sink
+  moves arrive as `server` events. The parser classifies all three; test
+  fixtures are live captures, not hand-typed.
+- **Phone-app caveat (observed, not a rust-connect defect):** after the
+  initial sinkList render, the stock app's Devices tab did not visibly apply
+  subsequent sparse deltas (slider kept its optimistic position; logcat
+  silent). Our deltas match upstream's shape exactly
+  (systemvolumeplugin-pulse.cpp:69-88). Phone→desktop control is PASS;
+  desktop→phone UI re-render stays UNVERIFIED in the ledger.

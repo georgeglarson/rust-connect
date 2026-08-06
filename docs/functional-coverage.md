@@ -419,16 +419,16 @@ feature_ledger:
     rust_impl: true
     upstream:
     upstream_ref: "kdeconnect-kde plugins/systemvolume/ + remotesystemvolume/ / kdeconnect-android SystemVolumePlugin.kt"
-    desktop_effect: UNVERIFIED
+    desktop_effect: PASS
     api_surface: PASS
-    lifecycle: UNVERIFIED
+    lifecycle: PASS
     hostile_input: UNVERIFIED
     fixture_provenance: PASS
-    live_device: UNVERIFIED
+    live_device: PASS
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "src/plugins/systemvolume/ + functional-coverage REST routes /api/v1/systemvolume/sinks{,:name/control}; backend契约覆盖 pactl JSON、subscribe events"
-    reason: "Provider implemented (pactl + subscribe supervision + REST surface); live_device + environment + lifecycle evidence remain the integrator's job"
+    cite: "docs/live-validation.md 2026-08-06 (A15: sinkList render, phone->desktop volume+mute, REST<->pactl parity, wire deltas); live-captured pactl fixtures; subscribe supervision tests"
+    reason: "Provider validated live on A15; phone-app delta re-render caveat recorded in the live-validation entry. Remaining: hostile-input audit (Task 2.5) and non-Sway environments (Task 4.1)"
     owner: "Task 1.1"
 
   - feature: telephony
