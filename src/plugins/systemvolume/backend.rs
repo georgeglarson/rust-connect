@@ -213,72 +213,80 @@ impl PactlBackend {
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
+
+    /// `pactl get-default-sink` prints a single sink name. `None` when the
+    /// PA daemon is gone; callers treat that as "unknown default", not an
+    /// error — the list itself still succeeded.
+    async fn default_sink_name(&self) -> Option<String> {
+        self.run(&["get-default-sink"])
+            .await
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
 }
 
 /// Raw shape of a single sink entry from `pactl --format=json list sinks`.
-/// Only the fields used by the wire contract are decoded; unknown ones are
-/// left untouched (default for serde).
+/// Captured against pactl 17.0 with pipewire-pulse on 2026-08-05: pactl
+/// 15+ emits a BARE JSON ARRAY of these objects (no wrapping key), `mute`
+/// is a JSON boolean, and `volume` is a per-channel map of channel name to
+/// `{ value, value_percent, db }` where `value` is already on PA's absolute
+/// scale (PA_VOLUME_NORM = 65536 == 100%). Sink entries carry no default
+/// flag; the default sink comes from `pactl get-default-sink`. Only the
+/// fields used by the wire contract are decoded; unknown ones are ignored.
 #[derive(Debug, Clone, Deserialize)]
 struct PactlSink {
     name: String,
     #[serde(default)]
     description: Option<String>,
-    /// PA volume is a struct with `value` and `value_flat`; the wire
-    /// payload uses the per-channel integer, ceiling `max_volume`.
     #[serde(default)]
-    volume: Option<PactlVolume>,
-    /// `Mute: yes/no` text per pulse.proto.
+    volume: Option<std::collections::BTreeMap<String, PactlChannelVolume>>,
     #[serde(default)]
-    mute: Option<String>,
-    /// Present in `pactl --format=json list sinks`; mirrors PA's
-    /// `is_default` flag.
-    #[serde(default)]
-    is_default: Option<bool>,
+    mute: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct PactlVolume {
+struct PactlChannelVolume {
     #[serde(default)]
-    value: Option<f64>,
-    #[serde(default)]
-    value_flat: Option<f64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PactlSinkList {
-    sinks: Vec<PactlSink>,
+    value: Option<i64>,
 }
 
 /// Default fallback normal volume for PA. PulseAudioQt::normalVolume()
-/// returns 65536 (systemvolumeplugin-pulse.cpp:94). pactl reports
-/// volume as a fraction in `--format=json`; we multiply by this scale so
-/// the wire shape matches the upstream integer scale.
+/// returns 65536 (systemvolumeplugin-pulse.cpp:94) — the same scale pactl's
+/// per-channel `value` integers already use, so no rescaling is needed.
 #[allow(dead_code)]
 const PA_VOLUME_NORM: i64 = 65_536;
 
 impl PactlSink {
     fn to_state(&self, max_volume: i64) -> LocalSinkState {
-        // Prefer `value_flat` (average across channels, which is what
-        // PulseAudioQt::Sink::volume() returns upstream, pulse.cpp:93),
-        // fall back to `value` (front-left channel).
-        let frac = self
+        // The wire payload wants one integer per sink with ceiling
+        // `maxVolume` (systemvolumeplugin-pulse.cpp:90-95). PA's sink volume
+        // is the max across channels, and `pactl set-sink-volume` applies one
+        // value to every channel, so max is the honest representative.
+        let volume = self
             .volume
             .as_ref()
-            .and_then(|v| v.value_flat.or(v.value))
-            .unwrap_or(0.0);
-        let volume = (frac.clamp(0.0, 1.0) * max_volume as f64).round() as i64;
-        let muted = match self.mute.as_deref() {
-            Some("yes") | Some("true") | Some("1") => Some(true),
-            Some("no") | Some("false") | Some("0") => Some(false),
-            _ => None,
-        };
+            .map(|chans| chans.values().filter_map(|c| c.value).max().unwrap_or(0))
+            .unwrap_or(0);
         LocalSinkState {
             name: self.name.clone(),
             description: self.description.clone(),
             volume: Some(volume),
             max_volume: Some(max_volume),
-            muted,
-            enabled: self.is_default,
+            muted: self.mute,
+            // Filled in by `mark_default` from `pactl get-default-sink`;
+            // pactl sink entries themselves carry no default flag.
+            enabled: None,
+        }
+    }
+}
+
+/// Set `enabled` on exactly the sink whose name matches the default. A
+/// missing default (daemon gone mid-call) leaves every row at `None`.
+fn mark_default(states: &mut [LocalSinkState], default: Option<&str>) {
+    if let Some(def) = default {
+        for st in states.iter_mut() {
+            st.enabled = Some(st.name == def);
         }
     }
 }
@@ -306,24 +314,26 @@ impl VolumeBackend for PactlBackend {
 
     async fn list_sinks(&self) -> Result<Vec<LocalSinkState>> {
         let stdout = self.run(&["--format=json", "list", "sinks"]).await?;
-        let parsed: PactlSinkList = serde_json::from_str(&stdout).map_err(|e| {
+        // pactl 15+ emits a bare JSON array of sink objects.
+        let sinks: Vec<PactlSink> = serde_json::from_str(&stdout).map_err(|e| {
             crate::utils::errors::Error::io(
                 format!("pactl list sinks JSON parse failed: {e}"),
                 None::<String>,
             )
         })?;
-        let states: Vec<LocalSinkState> = parsed
-            .sinks
+        let default = self.default_sink_name().await;
+        let mut states: Vec<LocalSinkState> = sinks
             .into_iter()
             .map(|s| s.to_state(self.max_volume))
             .collect();
+        mark_default(&mut states, default.as_deref());
         Ok(states)
     }
 
     async fn set_volume(&self, name: &str, volume: i64) -> Result<()> {
-        // PI volume is a fraction, but `set-sink-volume` with a percent
-        // or absolute int also works; absolute is what upstream uses
-        // (pulse.cpp:44-45). We pass the integer directly.
+        // The wire volume is already on PA's absolute scale (ceiling
+        // 65536); `pactl set-sink-volume` accepts it directly, matching
+        // upstream's write path (systemvolumeplugin-pulse.cpp:44-45).
         let volume_str = volume.to_string();
         self.run(&["set-sink-volume", name, &volume_str]).await?;
         Ok(())
@@ -735,81 +745,125 @@ mod tests {
 
     // ---------- pactl JSON shape ----------
 
-    /// Exact `pactl --format=json list sinks` shape on a live KDE neon
-    /// session (kdeconnect-kde is the consumer). We mirror this for the
-    /// `PactlSink` deserializer; the fixture would survive upstream
-    /// changes because serde ignores unknown fields.
+    /// Real `pactl --format=json list sinks` output captured 2026-08-05 on
+    /// this project's development machine (pactl 17.0, pipewire-pulse,
+    /// Fedora 43): a bare JSON array, boolean `mute`, per-channel volume
+    /// map with integer `value` already on PA's 65536 scale. Do not edit
+    /// this fixture by hand — re-capture from a live pactl and trim.
+    const REAL_PACTL_LIST_SINKS: &str = r#"[
+        {
+            "index": 68,
+            "name": "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Headphones__sink",
+            "description": "700 Series Chipset Family HD Audio Headphones",
+            "mute": false,
+            "volume": {
+                "front-left": {
+                    "value": 32760,
+                    "value_percent": "50%",
+                    "db": "-18.07 dB"
+                },
+                "front-right": {
+                    "value": 32760,
+                    "value_percent": "50%",
+                    "db": "-18.07 dB"
+                }
+            },
+            "state": "SUSPENDED"
+        },
+        {
+            "index": 2516,
+            "name": "alsa_output.pci-0000_01_00.1.hdmi-stereo",
+            "description": "AD104 High Definition Audio Controller Digital Stereo (HDMI)",
+            "mute": false,
+            "volume": {
+                "front-left": {
+                    "value": 29437,
+                    "value_percent": "45%",
+                    "db": "-20.86 dB"
+                },
+                "front-right": {
+                    "value": 29437,
+                    "value_percent": "45%",
+                    "db": "-20.86 dB"
+                }
+            },
+            "state": "SUSPENDED"
+        }
+    ]"#;
+
     #[test]
     fn parse_pactl_sink_list_json() {
-        // The JSON keys are what pactl actually emits. The "mute" field
-        // is a string ("yes"/"no") in pactl-shell-protocol-v2 output.
-        let raw = r#"{
-            "sinks": [
-                {
-                    "name": "alsa_output.pci-0000_00_1f.3.analog-stereo",
-                    "description": "Built-in Audio Analog Stereo",
-                    "mute": "no",
-                    "volume": { "value": 0.5, "value_flat": 0.7 },
-                    "is_default": true
-                },
-                {
-                    "name": "alsa_output.usb-foo",
-                    "description": "USB Audio",
-                    "mute": "yes",
-                    "volume": { "value": 0.25, "value_flat": 0.25 },
-                    "is_default": false
-                }
-            ]
-        }"#;
-        let parsed: PactlSinkList = serde_json::from_str(raw).expect("parse");
-        assert_eq!(parsed.sinks.len(), 2);
-        let converted: Vec<LocalSinkState> = parsed
-            .sinks
-            .into_iter()
-            .map(|s| s.to_state(65_536))
-            .collect();
+        let parsed: Vec<PactlSink> = serde_json::from_str(REAL_PACTL_LIST_SINKS).expect("parse");
+        assert_eq!(parsed.len(), 2);
+        let converted: Vec<LocalSinkState> =
+            parsed.into_iter().map(|s| s.to_state(65_536)).collect();
         assert_eq!(
             converted[0].name,
-            "alsa_output.pci-0000_00_1f.3.analog-stereo"
+            "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Headphones__sink"
         );
-        // 0.7 * 65536 = 45875.2, round() = 45875
-        assert_eq!(converted[0].volume, Some(45_875));
+        // pactl reports per-channel PA integers; we take the max (32760).
+        assert_eq!(converted[0].volume, Some(32_760));
         assert_eq!(converted[0].muted, Some(false));
-        assert_eq!(converted[0].enabled, Some(true));
-        assert_eq!(converted[1].muted, Some(true));
-        assert_eq!(converted[1].enabled, Some(false));
+        // Parsing alone cannot know the default; mark_default does.
+        assert_eq!(converted[0].enabled, None);
+        assert_eq!(converted[1].volume, Some(29_437));
+        assert_eq!(converted[1].muted, Some(false));
     }
 
     #[test]
     fn parse_pactl_sink_list_unknown_fields_ignored() {
-        let raw = r#"{
-            "sinks": [{
-                "name": "s",
-                "description": "d",
-                "muted": false,
-                "volume": { "value": 0.5, "value_flat": 0.5 },
-                "is_default": false,
-                "future_field": "ignored"
-            }]
-        }"#;
-        let parsed: PactlSinkList = serde_json::from_str(raw).expect("parse");
-        assert_eq!(parsed.sinks.len(), 1);
+        let raw = r#"[{
+            "index": 1,
+            "name": "s",
+            "description": "d",
+            "mute": false,
+            "volume": { "front-left": { "value": 65536, "value_percent": "100%", "db": "0.00 dB" } },
+            "state": "RUNNING",
+            "future_field": "ignored"
+        }]"#;
+        let parsed: Vec<PactlSink> = serde_json::from_str(raw).expect("parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].clone().to_state(65_536).volume, Some(65_536));
     }
 
     #[test]
     fn parse_pactl_sink_list_missing_volume() {
-        let raw = r#"{
-            "sinks": [{
-                "name": "s",
-                "description": "d",
-                "muted": false,
-                "volume": {},
-                "is_default": false
-            }]
-        }"#;
-        let parsed: PactlSinkList = serde_json::from_str(raw).expect("parse");
-        let state = parsed.sinks[0].clone().to_state(65_536);
+        let raw = r#"[{ "name": "s", "description": "d", "mute": true }]"#;
+        let parsed: Vec<PactlSink> = serde_json::from_str(raw).expect("parse");
+        let state = parsed[0].clone().to_state(65_536);
         assert_eq!(state.volume, Some(0));
+        assert_eq!(state.muted, Some(true));
+    }
+
+    #[test]
+    fn mark_default_sets_enabled_only_on_match() {
+        let mut states = vec![
+            LocalSinkState {
+                name: "a".to_string(),
+                description: None,
+                volume: Some(0),
+                max_volume: Some(65_536),
+                muted: None,
+                enabled: None,
+            },
+            LocalSinkState {
+                name: "b".to_string(),
+                description: None,
+                volume: Some(0),
+                max_volume: Some(65_536),
+                muted: None,
+                enabled: None,
+            },
+        ];
+        mark_default(&mut states, Some("b"));
+        assert_eq!(states[0].enabled, Some(false));
+        assert_eq!(states[1].enabled, Some(true));
+        // None is a no-op on an already-marked list; production only ever
+        // marks a freshly parsed list, where None leaves everything at
+        // `enabled: None` (unknown default).
+        mark_default(&mut states, None);
+        assert_eq!(states[0].enabled, Some(false));
+        assert_eq!(states[1].enabled, Some(true));
     }
 
     // ---------- MockBackend ----------
