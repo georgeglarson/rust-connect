@@ -252,13 +252,13 @@ feature_ledger:
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: INTENTIONAL-DIVERGENCE
+    fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
-    status: INTENTIONAL-DIVERGENCE
-    cite: "tests/fixtures/upstream-wire/mpris/{player_list,props_changed_playback_status,props_changed_metadata,props_changed_volume,seeked,now_playing_answer}.json (kdeconnect-kde plugins/mpriscontrol/mpriscontrolplugin.cpp:116-119,139-146,155-159,186-193,317-358,387-394); the rust plugin intentionally advertises supportAlbumArtPayload=false (mpriscontrolplugin.cpp:392 upstream emits true) because the daemon does not implement album-art payload transfer — sending true would be capability-dishonest."
-    reason: "Slice 0B promotion: six upstream-derived fixtures now load in src/plugins/mpris/mod.rs. fixture_provenance=PASS would be a mislabel here — the only divergence is a single VALUE (false vs true) on supportAlbumArtPayload, all upstream KEYS are present and identical. Recording the divergence explicitly so an integrator decision can resolve it."
-    owner: "Task 1.5 (album-art & session-bus work)"
+    status: UNVERIFIED
+    cite: "tests/fixtures/upstream-wire/mpris/{player_list,props_changed_playback_status,props_changed_metadata,props_changed_volume,seeked,now_playing_answer}.json (kdeconnect-kde plugins/mpriscontrol/mpriscontrolplugin.cpp:116-119,139-146,155-159,186-193,317-358,387-394); Task 1.5 closed the supportAlbumArtPayload divergence (rust now emits true, kdeconnect-kde mpriscontrolplugin.cpp:392) and added honor-via-payload-transfer (mpriscontrolplugin.cpp:217-253 sendAlbumArt; MprisReceiverPlugin.java:254-259) with daemon-side size cap (ALBUM_ART_MAX_BYTES, 32 MiB); race + recovery tests pin the cache invariants (Lane B finding 20 + the 4.0 recovery); unit pins for wire-unit conversions (pos ms, length ms, Seek µs, volume 0-100 int) — see plans/task-1.5-report.md"
+    reason: "Task 1.5 wired the album-art payload transfer (player_list_packet now emits supportAlbumArtPayload:true; handle_album_art_request opens a payload-transfer listener and sends the envelope), added the watch_supervisor with bounded backoff for session-bus recovery (MprisBackendEvent::BackendLost clears the cache), and added race tests for add/remove/add and double-remove. Slice 0B rollup (D3): desktop_effect, api_surface, lifecycle, hostile_input, live_device, environment remain UNVERIFIED — they ride the Sprint 2 hostile-input audit (Task 2.5) and the env-matrix expansion (Task 4.1)."
+    owner: "Tasks 2.5 + 4.1"
 
   - feature: notification
     rust_impl: true

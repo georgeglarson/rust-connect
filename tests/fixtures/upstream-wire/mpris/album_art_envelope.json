@@ -1,0 +1,16 @@
+{
+  "id": 1754400000120,
+  "type": "kdeconnect.mpris",
+  "body": {
+    "player": "VLC media player",
+    "transferringAlbumArt": true,
+    "albumArtUrl": "file:///tmp/art.png"
+  },
+  "payloadSize": 1234,
+  "payloadTransferInfo": {
+    "ip": "192.168.1.5",
+    "port": 1739,
+    "availableStreams": 1,
+    "totalStreams": 1
+  }
+}

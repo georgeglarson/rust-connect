@@ -53,8 +53,8 @@ fixtures:
     source_file: plugins/mpriscontrol/mpriscontrolplugin.cpp
     source_lines: "387-394"
     extraction_date: "2026-08-06"
-    note: "Upstream advertises supportAlbumArtPayload=true; rust plugin intentionally sends false (no payload transfer) — recorded as INTENTIONAL-DIVERGENCE in mpris ledger row."
-    used_by: "src/plugins/mpris/mod.rs::test_player_list_wire_shape_intentional_no_album_art_payload"
+    note: "Upstream advertises supportAlbumArtPayload=true; rust plugin now matches (Task 1.5) — see handle_album_art_request in src/plugins/mpris/mod.rs for the payload-transfer send path. The mpris ledger row moved from INTENTIONAL-DIVERGENCE to fixture_provenance:PASS as of Task 1.5."
+    used_by: "src/plugins/mpris/mod.rs::test_player_list_wire_shape_upstream_conformant"
 
   - file: mpris/props_changed_playback_status.json
     kind: upstream-derived
@@ -100,6 +100,16 @@ fixtures:
     source_lines: "317-358"
     extraction_date: "2026-08-06"
     used_by: "src/plugins/mpris/mod.rs::test_now_playing_answer_wire_shape"
+
+  - file: mpris/album_art_envelope.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/mpriscontrol/mpriscontrolplugin.cpp
+    source_lines: "246-251"
+    extraction_date: "2026-08-06"
+    note: "Task 1.5: the envelope body (player + transferringAlbumArt + albumArtUrl) is byte-for-byte upstream (mpriscontrolplugin.cpp:246-251; MprisReceiverPlugin.java:254-259). The payloadSize + payloadTransferInfo envelope is the daemon's existing payload-transfer machinery (same path the share plugin uses); the on-the-wire envelope shape is identical to a kdeconnect-kde share+payload send."
+    used_by: "src/plugins/mpris/mod.rs::test_album_art_envelope_wire_shape"
 
   - file: clipboard/local_change.json
     kind: upstream-derived

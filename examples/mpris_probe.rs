@@ -61,6 +61,9 @@ async fn main() {
             } => {
                 println!("SEEKED: {service} -> {}us", position_us);
             }
+            MprisBackendEvent::BackendLost => {
+                println!("BACKEND LOST: session bus dropped; recovery in progress");
+            }
         }
     }
 
