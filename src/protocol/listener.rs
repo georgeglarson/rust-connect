@@ -13,7 +13,7 @@ use tracing::{debug, info, trace, warn};
 use crate::app::AppState;
 use crate::device::types::{DeviceId, DeviceState};
 use crate::protocol::connection_loop::{run_packet_loop, LoopResult};
-use crate::protocol::types::{Identity, MAX_PORT, MIN_PORT};
+use crate::protocol::types::Identity;
 use crate::utils::errors::Error;
 
 /// Cap on concurrent inbound connection handlers. Each accepted socket
@@ -73,45 +73,17 @@ impl TcpListenerService {
     }
 
     pub async fn bind_port(preferred: u16) -> Result<(TcpListener, u16), std::io::Error> {
-        match TcpListener::bind(format!("0.0.0.0:{}", preferred)).await {
-            Ok(listener) => {
-                debug!(
-                    port = preferred,
-                    event = "port_bound",
-                    "Bound preferred port"
-                );
-                Ok((listener, preferred))
-            }
-            Err(e) => {
-                warn!(
-                    port = preferred,
-                    error = %e,
-                    event = "port_unavailable",
-                    "Preferred port unavailable, trying fallback range"
-                );
-                for port in MIN_PORT..=MAX_PORT {
-                    if port == preferred {
-                        continue;
-                    }
-                    match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
-                        Ok(listener) => {
-                            info!(
-                                port = port,
-                                preferred = preferred,
-                                event = "fallback_port_bound",
-                                "Bound fallback port"
-                            );
-                            return Ok((listener, port));
-                        }
-                        Err(_) => continue,
-                    }
-                }
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    format!("No available ports in range {}-{}", MIN_PORT, MAX_PORT),
-                ))
-            }
-        }
+        TcpListener::bind(format!("0.0.0.0:{preferred}"))
+            .await
+            .map(|listener| (listener, preferred))
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to bind protocol port {preferred}: {error}; another rust-connect instance is already running"
+                    ),
+                )
+            })
     }
 
     pub async fn run_from_bound(&self, listener: TcpListener) -> Result<(), std::io::Error> {
@@ -419,17 +391,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bind_port_fallback_when_preferred_taken() {
+    async fn test_bind_port_fails_when_requested_port_is_taken() {
         let _guard = PORT_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let occupied = TcpListener::bind("0.0.0.0:1750")
+        let occupied = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("Value expected to be present");
-        let (listener, port) = TcpListenerService::bind_port(1750)
+        let port = occupied
+            .local_addr()
+            .expect("Value expected to be present")
+            .port();
+
+        let error = TcpListenerService::bind_port(port)
             .await
-            .expect("Value expected to be present");
-        assert!((MIN_PORT..=MAX_PORT).contains(&port));
+            .expect_err("a configured protocol port conflict must be fatal");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(error.to_string().contains(&port.to_string()));
+        assert!(error
+            .to_string()
+            .contains("another rust-connect instance is already running"));
         drop(occupied);
-        drop(listener);
     }
 
     #[tokio::test]

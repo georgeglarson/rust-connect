@@ -51,7 +51,7 @@ pub async fn start_services(
 
     let discovery = start_discovery(&state, identity.clone(), shutdown.clone()).await?;
     let tcp = start_tcp_listener(&state, tcp_listener, identity.clone(), shutdown.clone());
-    let api = start_api_server(&state, shutdown.clone()).await;
+    let api = start_api_server(&state, shutdown.clone()).await?;
 
     info!(event = "daemon_ready", "Daemon ready - all systems active");
 
@@ -271,9 +271,9 @@ fn start_tcp_listener(
 async fn start_api_server(
     state: &Arc<AppState>,
     _shutdown: CancellationToken,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Result<Option<tokio::task::JoinHandle<()>>> {
     if !state.settings.api_enabled {
-        return None;
+        return Ok(None);
     }
 
     let api_state = state.clone();
@@ -290,34 +290,32 @@ async fn start_api_server(
 
     // Tuple form so IPv6 bind addresses ("::1") get correct bracket handling;
     // format!("{}:{}") would produce invalid "::1:9090".
-    let listener = tokio::net::TcpListener::bind((api_bind.as_str(), api_port)).await;
+    let listener = tokio::net::TcpListener::bind((api_bind.as_str(), api_port))
+        .await
+        .map_err(|error| {
+            crate::utils::errors::Error::ConnectionError(format!(
+                "failed to bind API port {api_port} on {api_bind}: {error}; another rust-connect instance is already running"
+            ))
+        })?;
 
-    match listener {
-        Ok(listener) => {
-            info!(
-                bind = %api_bind,
-                port = api_port,
-                event = "api_server_starting",
-                "Starting API server"
-            );
-            Some(tokio::spawn(async move {
-                // into_make_service_with_connect_info provides ConnectInfo<SocketAddr>;
-                // the rate limiter buckets per client IP and breaks without it.
-                if let Err(e) = axum::serve(
-                    listener,
-                    router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                )
-                .await
-                {
-                    tracing::error!(error = %e, event = "api_server_failed", "API server stopped");
-                }
-            }))
+    info!(
+        bind = %api_bind,
+        port = api_port,
+        event = "api_server_starting",
+        "Starting API server"
+    );
+    Ok(Some(tokio::spawn(async move {
+        // into_make_service_with_connect_info provides ConnectInfo<SocketAddr>;
+        // the rate limiter buckets per client IP and breaks without it.
+        if let Err(e) = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        {
+            tracing::error!(error = %e, event = "api_server_failed", "API server stopped");
         }
-        Err(e) => {
-            warn!(bind = %api_bind, port = api_port, error = %e, event = "api_bind_failed", "API address in use, continuing without API server");
-            None
-        }
-    }
+    })))
 }
 
 #[cfg(test)]
@@ -351,8 +349,37 @@ mod tests {
         identity
     }
 
-    /// An unknown mDNS-resolved device is registered and dialed — the same
-    /// outcome a received UDP identity produces.
+    #[tokio::test]
+    async fn test_start_services_fails_when_api_port_is_taken() {
+        let (base_state, _t) = test_state();
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Value expected to be present");
+        let port = occupied
+            .local_addr()
+            .expect("Value expected to be present")
+            .port();
+
+        let mut settings = base_state.settings.clone();
+        settings.tcp_port = 0;
+        settings.udp_port = 0;
+        settings.api_bind = "127.0.0.1".to_string();
+        settings.api_port = port;
+        let state =
+            Arc::new(AppState::new_without_input(settings).expect("Value expected to be present"));
+        state.connection_manager.set_device_identity(OUR_ID, "Us");
+        let shutdown = CancellationToken::new();
+
+        let error = match start_services(state, peer_identity(0), shutdown).await {
+            Ok(_) => panic!("an enabled API port conflict must be fatal"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains(&port.to_string()));
+        assert!(error
+            .to_string()
+            .contains("another rust-connect instance is already running"));
+    }
     #[tokio::test]
     async fn test_mdns_resolve_unknown_device_registers_and_dials() {
         let (state, _t) = test_state();
