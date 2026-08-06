@@ -282,7 +282,23 @@ impl Mounter {
         let args = build_sshfs_args(req);
         let output = self.runner.run_with_stdin(sshfs, &args, Some(password))?;
         if output.status != 0 {
+            // stderr first; sshfs occasionally reports on stdout only.
+            // Both streams are password-free (the password travels on
+            // stdin and sshfs never echoes it).
             let detail = format_truncated(&output.stderr);
+            let detail = if detail.is_empty() {
+                format_truncated(&output.stdout)
+            } else {
+                detail
+            };
+            tracing::warn!(
+                mount_point = %req.mount_point.display(),
+                status = output.status,
+                stderr = %format_truncated(&output.stderr),
+                stdout = %format_truncated(&output.stdout),
+                event = "sftp_mount_failed",
+                "sshfs exited non-zero"
+            );
             if detail.is_empty() {
                 return Ok(MountOutcome::Failed(format!(
                     "sshfs exited with status {}",

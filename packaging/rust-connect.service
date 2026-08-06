@@ -30,7 +30,15 @@ SyslogIdentifier=rust-connect
 # ProtectHome is therefore deliberately ABSENT. Do not add it back: it would
 # hide the identity and the download dir, and the daemon would silently
 # re-pair from scratch on every start.
-NoNewPrivileges=yes
+# NoNewPrivileges / RestrictSUIDSGID are deliberately OFF for the SFTP
+# browsing feature: unprivileged users cannot mount() directly (needs
+# CAP_SYS_ADMIN), so sshfs must delegate to the setuid fusermount3 helper,
+# which requires privilege elevation to work. With either flag on,
+# fusermount3 core-dumps in drop_privs (observed live 2026-08-06). The
+# daemon itself stays unprivileged; only setuid helpers it spawns can
+# elevate. See the SystemCallFilter note below — keep in sync with the
+# sftp-fuse drop-in documented in docs/live-validation.md.
+NoNewPrivileges=no
 PrivateTmp=yes
 ProtectSystem=strict
 # Both ReadWritePaths targets must exist BEFORE the mount namespace is set
@@ -47,17 +55,27 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
-RestrictSUIDSGID=yes
+# OFF for the same fusermount3 reason as NoNewPrivileges above.
+RestrictSUIDSGID=no
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 SystemCallArchitectures=native
-SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
+# SFTP browsing carve-out: mount()/umount2() are not in @system-service, and
+# fusermount3's privilege drop needs the uid/gid-management syscalls, which
+# are @privileged members. A blanket "~@privileged" deny would cancel both,
+# so the deny below is the @privileged group MINUS those calls (enumerated
+# via `systemd-analyze syscall-filter @privileged` on systemd 258). After a
+# systemd upgrade, re-diff that list against this line — drift silently
+# breaks SFTP mounts (EPERM/SIGSYS) or widens the sandbox.
+SystemCallFilter=@system-service mount umount2 setuid setuid32 setreuid setreuid32 setresuid setresuid32 setfsuid setfsuid32 setgroups setgroups32 capset
+SystemCallFilter=~@chown @clock @module @raw-io @reboot @swap _sysctl acct bpf chroot fanotify_init fanotify_mark nfsservctl open_by_handle_at pivot_root quotactl quotactl_fd setdomainname sethostname vhangup @resources
 # The mousepad plugin injects input through /dev/uinput (evdev). This permits
 # the device under systemd's policy; the user still needs filesystem access to
 # it (input group or a udev rule) or the plugin fails to open it at runtime.
 DeviceAllow=/dev/uinput rw
+# sshfs/fusermount3 need the FUSE device for SFTP browsing.
+DeviceAllow=/dev/fuse rw
 
 [Install]
 WantedBy=default.target

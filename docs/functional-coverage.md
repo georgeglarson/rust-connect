@@ -376,11 +376,11 @@ feature_ledger:
     lifecycle: PASS
     hostile_input: UNVERIFIED
     fixture_provenance: UNVERIFIED
-    live_device: UNVERIFIED
+    live_device: PASS
     environment: UNVERIFIED
     status: PASS
-    cite: "lane-4-sftp-lifecycle tests: src/plugins/sftp/mounter.rs (argv/stdin/password redaction), src/plugins/sftp/mod.rs (state machine + Debug redaction + cleanup + startup_sweep), tests/api_integration.rs (sftp mount/unmount/info + tools + unpair-drops-creds + shutdown-drops-creds). Upstream: kdeconnect-kde @ f5ed3ed8 plugins/sftp/mounter.cpp:72,93-95,99-100,103-105,114,204; plugins/sftp/sftpplugin.cpp:88-104,136-163."
-    reason: "Sprint 1 / Task 1.3 implementation done; live-device validation belongs to the integrating session."
+    cite: "lane-4-sftp-lifecycle tests: src/plugins/sftp/mounter.rs (argv/stdin/password redaction), src/plugins/sftp/mod.rs (state machine + Debug redaction + cleanup + startup_sweep), tests/api_integration.rs (sftp mount/unmount/info + tools + unpair-drops-creds + shutdown-drops-creds). Upstream: kdeconnect-kde @ f5ed3ed8 plugins/sftp/mounter.cpp:72,93-95,99-100,103-105,114,204; plugins/sftp/sftpplugin.cpp:88-104,136-163. Live: docs/live-validation.md 2026-08-06 entry 'SFTP desktop browsing lifecycle (Galaxy A15)' — request/creds-no-password/mount/browse/copy/unmount/reconnect/disconnect-cleanup all observed on a paired A15 under the hardened systemd unit."
+    reason: "Sprint 1 / Task 1.3 done incl. live-device validation on one phone; hostile-input, fixture provenance, and non-Fedora environments remain UNVERIFIED."
     owner: "Task 1.3"
 
   - feature: share

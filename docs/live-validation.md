@@ -4,6 +4,80 @@ Results from hands-on testing against real hardware, newest first. The
 point of this file: protocol-conformance claims in this repo are backed by
 observed behavior against real devices, not only by loopback tests.
 
+## 2026-08-06 — SFTP desktop browsing lifecycle (Galaxy A15)
+
+Lane 4 (Task 1.3) live validation, run under the production systemd user
+unit on the laptop (Fedora 43, systemd 258, sshfs 3.7.6, fusermount3
+3.16.2). Device: paired Galaxy A15 5G, stock KDE Connect app, Wi-Fi LAN.
+Raw API transcripts stayed in `/tmp` (ephemeral, per the SMS-body rule);
+the sanitized facts below are the evidence.
+
+### Observed, in order
+
+- `POST /sftp/request` → phone answers within ~0.1–4s; credentials stored.
+  Fresh requests rotate port + password (1739 → 1741 observed).
+- `GET /sftp` while unmounted and mounted: **no password field in any
+  response** (checked by serialization grep, not eyeball).
+- `POST /sftp/mount` → `mount_state: mounted`; `/proc/mounts` shows
+  `kdeconnect@<ip>:/storage/emulated/0 <data_dir>/mounts/sftp-<id>
+  fuse.sshfs rw,nosuid,nodev,relatime,user_id=1000`.
+- Browse: 12 top-level storage dirs visible through the mount.
+- Copy: 301-byte file from `Download/` copied to the desktop, content
+  intact.
+- `DELETE /sftp/mount` → `unmounted`; `/proc/mounts` clean.
+- Reconnect: fresh request + mount again → mounted (credential rotation
+  path).
+- Disconnect while mounted (`POST /devices/<id>/disconnect`) → mount
+  released AND credentials dropped (`GET /sftp` → 404 `sftp_connection`).
+- Daemon shutdown while creds held → journal shows `sftp_cleaned_up`;
+  next boot's startup sweep released the leftover mount dir
+  (`sftp_startup_sweep count=1`).
+
+### Integration defects the green suite hid (all fixed, regression-tested)
+
+1. **Loader wiring:** `load_default_plugins` built the sftp plugin with
+   `with_events()` — the fallback data dir is
+   `/tmp/rust-connect-sftp-fallback`, inside the unit's `PrivateTmp` and
+   outside `ReadWritePaths`. Every mount point landed there. Fixed: the
+   loader takes `data_dir` and uses `with_events_and_data_dir`
+   (`test_sftp_mount_point_uses_app_data_dir`).
+2. **Host-fact test:** `/tools` availability test asserted sshfs ABSENT;
+   installing sshfs broke it. Replaced with a probe-consistency assertion.
+3. **ETXTBSY flake** in the fake-binary test harness under parallel
+   execution (~2/31 runs) — bounded retry on errno 26.
+
+### The sandbox carve-out (why FUSE works under this unit now)
+
+The hardened user unit killed/blocked sshfs three different ways; the
+permanent carve-out lives in a documented drop-in
+(`~/.config/systemd/user/rust-connect.service.d/sftp-fuse.conf`, mirrored
+in `packaging/rust-connect.service`):
+
+1. `mount()`/`umount2()` are not in `@system-service` — seccomp killed
+   sshfs with SIGSYS ("exited with status -1"). Re-allowed explicitly.
+2. Unprivileged users cannot `mount()` directly (needs CAP_SYS_ADMIN);
+   the only working path is the setuid `fusermount3` helper, which
+   core-dumped in `drop_privs` under `NoNewPrivileges=yes` +
+   `RestrictSUIDSGID=yes`. Both flags lifted for this unit.
+3. `fusermount3`'s privilege drop needs the uid/gid-management syscalls
+   (`@privileged` members) — the blanket `~@privileged` deny became a
+   surgical deny list (verified against `systemd-analyze syscall-filter`
+   on systemd 258; drift risk documented in the drop-in comment).
+
+One transient `fusermount3: mount failed: Operation not permitted` was
+observed once under the final config and never reproduced across three
+subsequent mounts with the identical effective config (bisect steps 1–3
+all mounted, including full base hardening restored). Recorded honestly;
+not attributed to a directive.
+
+### Gaps
+
+- Second device (S21) was connected during the session but the SFTP leg
+  ran on the A15 only.
+- Unpair-while-mounted leg was covered by the integration tests, not live
+  (unpairing a daily-driver phone mid-validation was not worth it).
+- Hostile input and non-Fedora environments remain UNVERIFIED.
+
 ## 2026-08-05 — second Android device, v0.1.0 release build
 
 First run against a *different* handset than every session below, so this is
