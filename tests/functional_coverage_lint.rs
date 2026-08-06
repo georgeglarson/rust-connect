@@ -643,7 +643,7 @@ fn upstream_wire_provenance_is_consistent() {
 
     // Every entry's `file` exists; every on-disk file has an entry.
     let mut referenced: BTreeSet<String> = BTreeSet::new();
-    for (file, fields) in entries.iter() {
+    for file in entries.keys() {
         assert!(
             !file.is_empty(),
             "provenance entry missing `file:` key in {}",

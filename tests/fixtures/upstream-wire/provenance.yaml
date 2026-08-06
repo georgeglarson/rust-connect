@@ -1,0 +1,24 @@
+# Wire-shape fixture provenance index (Slice 0B).
+#
+# Every fixture under tests/fixtures/upstream-wire/ (other than this file)
+# must have an entry here. The lint parses this file with the same
+# restricted-YAML style as the ledger and refuses to merge if:
+#
+#   - any on-disk fixture lacks an entry (orphan),
+#   - any entry points at a file that does not exist,
+#   - any `used_by` reference does not resolve (file or test fn missing),
+#   - any upstream-derived `pinned_commit` disagrees with the pin in
+#     tests/fixtures/upstream-capabilities/*.yaml.
+#
+# Three `kind` values are recognized:
+#
+#   upstream-derived              — pure wire literal transcribed from a
+#                                   pinned upstream commit (preferred)
+#   live-transcript               — captured from a real session or recorded
+#                                   test run; carries `note` describing the
+#                                   capture
+#   hand-authored-from-observation — not literally captured, but written by
+#                                   hand from observing what an upstream peer
+#                                   sends; carries `note` with the
+#                                   observation evidence
+fixtures:
