@@ -11,6 +11,7 @@ pub fn load_default_plugins(
     cert_manager: Arc<crate::protocol::crypto::CertificateManager>,
     connection_manager: Arc<crate::protocol::ConnectionManager>,
     pairing_handler: Arc<crate::protocol::pairing::PairingHandler>,
+    data_dir: std::path::PathBuf,
     enable_input: bool,
 ) -> PluginAccess {
     let mousepad = if enable_input {
@@ -53,7 +54,10 @@ pub fn load_default_plugins(
         // entry point (bootstrap.rs create_state), same as clipboard/mpris.
         pausemusic: Arc::new(super::PausemusicPlugin::new()),
         connectivity: Arc::new(super::ConnectivityPlugin::new()),
-        sftp: Arc::new(super::SftpPlugin::with_events(plugin_events.clone())),
+        sftp: Arc::new(super::SftpPlugin::with_events_and_data_dir(
+            plugin_events.clone(),
+            data_dir,
+        )),
         mousepad: Arc::new(mousepad),
         lock: Arc::new(super::LockPlugin::new()),
         // The systemvolume provider side needs the connection manager

@@ -73,6 +73,7 @@ impl AppState {
             cert_manager.clone(),
             connection_manager.clone(),
             pairing_handler.clone(),
+            settings.data_dir.clone(),
             enable_input,
         );
 

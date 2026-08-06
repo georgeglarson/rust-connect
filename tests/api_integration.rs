@@ -629,6 +629,26 @@ fn test_sftp_mount_endpoints_in_openapi() {
     );
 }
 
+/// The sftp plugin must take its mount root from the app's data dir,
+/// NOT a hardcoded fallback. Live validation (2026-08-06) caught the
+/// loader wiring `with_events` (temp-dir fallback) instead of
+/// `with_events_and_data_dir`: every mount point landed under
+/// /tmp/rust-connect-sftp-fallback — inside the service's PrivateTmp
+/// and outside the sandbox's ReadWritePaths.
+#[tokio::test]
+async fn test_sftp_mount_point_uses_app_data_dir() {
+    let (state, temp, _api_key) = create_test_app().await;
+    let mp = state
+        .plugins
+        .sftp
+        .mount_point("sftpdatadiraaaaaaaaaaaaaaaa");
+    assert!(
+        mp.starts_with(temp.path()),
+        "sftp mount point {mp:?} must live under the app data dir {:?}",
+        temp.path()
+    );
+}
+
 /// /api/v1/tools honesty: the browse_sftp tool's `available` flag MUST
 /// match the mounter's live backend probe on whatever host runs the
 /// suite. Asserting a fixed true/false would bake in a host assumption
