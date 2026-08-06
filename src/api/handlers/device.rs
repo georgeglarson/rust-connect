@@ -9,8 +9,31 @@ use std::sync::Arc;
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
 use crate::app::AppState;
-use crate::device::types::{DeviceId, DeviceState};
+use crate::device::types::{Device, DeviceId, DeviceState};
 use crate::utils::errors::Error;
+
+async fn reconcile_rendered_connection_state(state: &AppState, device: &mut Device) {
+    let live_connected = state.connection_manager.is_connected(&device.id).await;
+    let rendered_state = if live_connected {
+        DeviceState::Connected
+    } else if device.state == DeviceState::Connected {
+        DeviceState::Disconnected
+    } else {
+        device.state
+    };
+
+    if rendered_state != device.state {
+        tracing::debug!(
+            device_id = %device.id,
+            registry_state = ?device.state,
+            live_connected,
+            rendered_state = ?rendered_state,
+            event = "device_render_state_reconciled",
+            "Rendering live connection state over stale registry state"
+        );
+        device.state = rendered_state;
+    }
+}
 
 #[utoipa::path(
     get,
@@ -45,6 +68,7 @@ pub async fn list_devices(
         // The pairing store owns paired_at (same overlay as get_device);
         // without it the list forces N+1 detail fetches on every client.
         let mut device = device.clone();
+        reconcile_rendered_connection_state(&state, &mut device).await;
         device.reconcile_paired_at(state.pairing_handler.paired_since(&device.id).await);
         device.set_pair_state(
             state
@@ -106,6 +130,7 @@ pub async fn get_device(
     // self-correct because a reconnecting paired device never re-enters the
     // Paired lifecycle state. Same overlay shape as the verification key above.
     device.reconcile_paired_at(state.pairing_handler.paired_since(&device_id).await);
+    reconcile_rendered_connection_state(&state, &mut device).await;
 
     Ok(Json(ApiResponse::ok(device)))
 }
@@ -628,6 +653,76 @@ mod tests {
         (peer_cm, server_handle, peer_temp)
     }
 
+    #[tokio::test]
+    async fn test_list_devices_renders_live_link_as_connected() {
+        let (state, _t) = test_state();
+        let (_peer_cm, server_handle, _pt) = connect_peer(&state).await;
+        state
+            .registry
+            .upsert_device(crate::device::Device::new(
+                PEER_ID.to_string(),
+                "Peer".to_string(),
+                crate::device::DeviceType::Phone,
+                8,
+            ))
+            .await
+            .expect("Value expected to be present");
+
+        let response = list_devices(
+            State(state.clone()),
+            axum::extract::Query(std::collections::HashMap::new()),
+        )
+        .await
+        .expect("Value expected to be present");
+
+        assert_eq!(response.0.data.devices.len(), 1);
+        assert_eq!(response.0.data.devices[0].state, DeviceState::Connected);
+        assert_eq!(
+            state
+                .registry
+                .get(&PEER_ID.to_string())
+                .await
+                .expect("Value expected to be present")
+                .state,
+            DeviceState::Discovered,
+            "render-time reconciliation must not mutate the registry"
+        );
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_get_device_renders_dead_link_as_disconnected() {
+        let (state, _t) = test_state();
+        let mut device = crate::device::Device::new(
+            PEER_ID.to_string(),
+            "Peer".to_string(),
+            crate::device::DeviceType::Phone,
+            8,
+        );
+        device.state = DeviceState::Connected;
+        state
+            .registry
+            .upsert_device(device)
+            .await
+            .expect("Value expected to be present");
+
+        let response = get_device(State(state.clone()), Path(PEER_ID.to_string()))
+            .await
+            .expect("Value expected to be present");
+
+        assert_eq!(response.0.data.state, DeviceState::Disconnected);
+        assert_eq!(
+            state
+                .registry
+                .get(&PEER_ID.to_string())
+                .await
+                .expect("Value expected to be present")
+                .state,
+            DeviceState::Connected,
+            "render-time reconciliation must not mutate the registry"
+        );
+    }
+
     async fn pair_locally(state: &Arc<AppState>, device_id: &str) {
         state
             .pairing_handler
@@ -646,7 +741,6 @@ mod tests {
                 .await
         );
     }
-
     #[tokio::test]
     async fn test_unpair_connected_peer_sends_pair_false() {
         let (state, _t) = test_state();
