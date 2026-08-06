@@ -629,6 +629,53 @@ fn test_sftp_mount_endpoints_in_openapi() {
     );
 }
 
+/// /api/v1/tools honesty: the browse_sftp tool MUST report
+/// `available: false` when sshfs / fusermount are missing on PATH.
+/// The dev host (and the CI host) doesn't have sshfs, so the live test
+/// exercises the unavailable leg; the available leg is covered by a
+/// direct SftpPlugin::is_backend_available test (which uses a fake
+/// runner).
+#[tokio::test]
+async fn test_sftp_tool_reports_unavailable_when_backend_missing() {
+    let (state, _temp, api_key) = create_test_app().await;
+    let app = build_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/tools")
+                .header("X-API-Key", &api_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let tools = body["data"]["tools"].as_array().expect("tools array");
+    let sftp_tool = tools
+        .iter()
+        .find(|t| t["name"] == "browse_sftp")
+        .expect("browse_sftp tool must appear in /tools");
+    // On a host without sshfs, the backend-availability gate must
+    // surface this honestly: the tool is listed (discoverability) but
+    // marked unavailable.
+    assert_eq!(
+        sftp_tool["available"],
+        serde_json::Value::Bool(false),
+        "browse_sftp must report available:false when sshfs is missing"
+    );
+    assert_eq!(
+        sftp_tool["endpoint"],
+        "/api/v1/devices/{device_id}/sftp/mount"
+    );
+}
+
 #[tokio::test]
 async fn test_unpair_device_not_paired() {
     let (state, _temp, api_key) = create_test_app().await;

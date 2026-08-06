@@ -200,6 +200,22 @@ fn capability_to_tool(cap: &str, _incoming: bool) -> Option<Tool> {
             // isolation.
             true,
         ),
+        "kdeconnect.sftp" => (
+            "browse_sftp".to_string(),
+            "Mount the device's filesystem locally via sshfs and browse it".to_string(),
+            "/api/v1/devices/{device_id}/sftp/mount".to_string(),
+            "POST".to_string(),
+            vec![ToolParameter {
+                name: "device_id".to_string(),
+                param_type: "string".to_string(),
+                required: true,
+                description: "Target device ID".to_string(),
+            }],
+            // Overridden by list_tools via SftpPlugin::is_backend_available
+            // — false when sshfs / fusermount are missing on PATH so the
+            // tool is never advertised as servable when it isn't.
+            true,
+        ),
         _ => return None,
     };
 
