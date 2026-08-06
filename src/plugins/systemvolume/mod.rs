@@ -110,16 +110,23 @@ pub struct SystemVolumePlugin {
     /// Provider-side snapshot of THIS desktop's sinks. Single source of
     /// truth for /api/v1/systemvolume/sinks and for the wire payload
     /// when the phone asks. Refreshed on subscribe events and on
-    /// requestSinks.
-    local_sinks: RwLock<HashMap<String, SinkState>>,
+    /// requestSinks. Shared with the supervisor task, which mirrors
+    /// every pushed state into it.
+    local_sinks: Arc<RwLock<HashMap<String, SinkState>>>,
     /// Provider default sink name (the one currently marked enabled).
-    default_sink: RwLock<Option<String>>,
+    default_sink: Arc<RwLock<Option<String>>>,
     /// Backend seam; `None` until `enable_session_backend()` succeeds.
     /// All provider behavior is gated on this being set.
     backend: RwLock<Option<Arc<dyn VolumeBackend>>>,
     /// Connection manager — the fan-out path for pushes to paired
     /// devices on local sink changes (clipboard/mpris pattern).
     connection_manager: RwLock<Option<Arc<crate::protocol::ConnectionManager>>>,
+    /// Device registry — the supervisor's peer sync reads peer
+    /// capabilities from it to decide which side we play per peer:
+    /// push sinkList to consumers (peer incoming has
+    /// `kdeconnect.systemvolume`), request sinks only from providers
+    /// (peer outgoing has it).
+    device_registry: RwLock<Option<Arc<crate::device::DeviceRegistry>>>,
     /// Plugin event broadcaster — surface local sink changes on the
     /// SSE event stream so the UI/CLI can react.
     plugin_events: Arc<PluginEventBroadcaster>,
@@ -141,10 +148,11 @@ impl SystemVolumePlugin {
     pub fn new() -> Self {
         Self {
             sinks: RwLock::new(HashMap::new()),
-            local_sinks: RwLock::new(HashMap::new()),
-            default_sink: RwLock::new(None),
+            local_sinks: Arc::new(RwLock::new(HashMap::new())),
+            default_sink: Arc::new(RwLock::new(None)),
             backend: RwLock::new(None),
             connection_manager: RwLock::new(None),
+            device_registry: RwLock::new(None),
             plugin_events: Arc::new(PluginEventBroadcaster::new(16, "plugin")),
             watcher_started: AtomicBool::new(false),
             backend_available: AtomicBool::new(false),
@@ -164,6 +172,16 @@ impl SystemVolumePlugin {
             .unwrap_or_else(|e| e.into_inner()) = Some(connection_manager);
         self.plugin_events = plugin_events;
         self
+    }
+
+    /// Wire the device registry for the capability-gated peer sync.
+    /// Called from bootstrap after the plugin is Arc'd (the loader's
+    /// builder chain does not have the registry).
+    pub fn with_device_registry(&self, registry: Arc<crate::device::DeviceRegistry>) {
+        *self
+            .device_registry
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(registry);
     }
 
     /// Inject a backend (tests use a recording mock; production uses
@@ -256,43 +274,63 @@ impl SystemVolumePlugin {
 
         let local_sinks = self.local_sinks_handle();
         let default_sink = self.default_sink_handle();
+        let live_sinks = self.local_sinks.clone();
+        let live_default = self.default_sink.clone();
+        let registry_for_loop = self
+            .device_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let backend_for_loop = backend.clone();
         let plugin_events = self.plugin_events.clone();
         let cm_for_loop = cm.clone();
 
         // Supervised subscribe loop. Exponential backoff on unexpected
         // exit (clipboard.rs WATCHER_INITIAL_BACKOFF / MAX_BACKOFF /
-        // HEALTHY_AFTER pattern).
+        // HEALTHY_AFTER pattern). A 5s tick drives the capability-gated
+        // peer sync so newly connected consumers get their sinkList
+        // without waiting for a sink event.
         tokio::spawn(async move {
             const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
             const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
             const HEALTHY_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
             let mut backoff = INITIAL_BACKOFF;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut synced: std::collections::HashSet<String> = Default::default();
             loop {
                 let started = std::time::Instant::now();
                 let exited = loop {
-                    match rx.recv().await {
-                        Some(ev) => {
-                            if let Some(new_list) = handle_subscribe_event(
-                                &ev,
-                                &backend_for_loop,
-                                &local_sinks,
-                                &default_sink,
-                            )
-                            .await
-                            {
-                                push_local_state(
-                                    &new_list,
-                                    &local_sinks,
-                                    &default_sink,
-                                    &plugin_events,
-                                    &cm_for_loop,
-                                )
-                                .await;
+                    tokio::select! {
+                        ev = rx.recv() => {
+                            match ev {
+                                Some(ev) => {
+                                    if let Some(new_list) = handle_subscribe_event(
+                                        &ev,
+                                        &backend_for_loop,
+                                        &local_sinks,
+                                        &default_sink,
+                                    )
+                                    .await
+                                    {
+                                        push_local_state(
+                                            &new_list,
+                                            &local_sinks,
+                                            &default_sink,
+                                            &live_sinks,
+                                            &live_default,
+                                            &plugin_events,
+                                            &cm_for_loop,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                None => break true,
                             }
                         }
-                        None => break true,
+                        _ = tick.tick() => {}
                     }
+                    sync_peers(&registry_for_loop, &cm_for_loop, &live_sinks, &mut synced).await;
                 };
                 let _ = exited;
                 if started.elapsed() >= HEALTHY_AFTER {
@@ -393,7 +431,12 @@ impl SystemVolumePlugin {
             if s.muted.is_some() {
                 existing.muted = s.muted;
             }
-            // enabled is the default sink flag; recompute separately.
+            // enabled carries the default-sink flag from mark_default;
+            // recompute_default reads it back from this state, so it must
+            // be merged here or the default is never discovered.
+            if s.enabled.is_some() {
+                existing.enabled = s.enabled;
+            }
             existing.name = s.name.clone();
             state.insert(s.name.clone(), existing);
         }
@@ -491,13 +534,14 @@ impl Plugin for SystemVolumePlugin {
     }
 
     fn on_connected(&self, _device_id: &str) -> Vec<Packet> {
-        // Controller side: ask the peer for its sink list. The provider
-        // side does not need to push anything proactively; the phone
-        // asks via requestSinks (systemvolumeplugin-pulse.cpp:36-37).
-        vec![Packet::new(
-            "kdeconnect.systemvolume.request".to_string(),
-            serde_json::json!({ "requestSinks": true }),
-        )]
+        // Intentionally empty. The Android app never sends requestSinks:
+        // it renders whatever sinkList the desktop pushes (upstream
+        // kdeconnect-kde pushes on connect). The handshake lives in the
+        // supervisor's capability-gated peer sync (sync_peers), which
+        // pushes sinkList to consumers and requests sinks only from
+        // providers — so a phone never receives requestSinks spam and a
+        // non-provider peer never gets a sinkList it cannot use.
+        Vec::new()
     }
 
     fn on_disconnected(&self, device_id: &str) {
@@ -791,6 +835,70 @@ async fn handle_subscribe_event(
     }
 }
 
+/// Capability-gated peer handshake (the async side of `on_connected`).
+/// Pushes the full sinkList to every connected consumer (peer incoming
+/// has `kdeconnect.systemvolume` — the Android app renders whatever the
+/// desktop pushes and never asks) and requests sinks only from peers
+/// that advertise a provider (desktop-to-desktop). Runs on subscribe
+/// events and a 5s tick; each peer is synced once per connection.
+async fn sync_peers(
+    registry: &Option<Arc<crate::device::DeviceRegistry>>,
+    cm: &Arc<crate::protocol::ConnectionManager>,
+    live_sinks: &Arc<RwLock<HashMap<String, SinkState>>>,
+    synced: &mut std::collections::HashSet<String>,
+) {
+    let Some(reg) = registry else {
+        return;
+    };
+    let connected = cm.connected_device_ids().await;
+    synced.retain(|d| connected.contains(d));
+    for dev in connected {
+        if synced.contains(&dev) {
+            continue;
+        }
+        let Ok(peer) = reg.get(&dev).await else {
+            continue;
+        };
+        let consumes = peer
+            .incoming_capabilities
+            .iter()
+            .any(|c| c == "kdeconnect.systemvolume");
+        let provides = peer
+            .outgoing_capabilities
+            .iter()
+            .any(|c| c == "kdeconnect.systemvolume");
+        if consumes {
+            let list = build_sink_list_packet(live_sinks);
+            if let Err(e) = cm.send_packet(&dev, &list).await {
+                tracing::warn!(
+                    device_id = %dev,
+                    error = %e,
+                    event = "systemvolume_initial_list_failed",
+                    "Failed to push initial sink list"
+                );
+            }
+        }
+        if provides {
+            let req = Packet::new(
+                "kdeconnect.systemvolume.request".to_string(),
+                serde_json::json!({ "requestSinks": true }),
+            );
+            let _ = cm.send_packet(&dev, &req).await;
+        }
+        synced.insert(dev);
+    }
+}
+
+/// Full `sinkList` packet in the upstream shape
+/// (systemvolumeplugin-pulse.cpp:90-95).
+fn build_sink_list_packet(live_sinks: &Arc<RwLock<HashMap<String, SinkState>>>) -> Packet {
+    let state = live_sinks.read().unwrap_or_else(|e| e.into_inner());
+    Packet::new(
+        "kdeconnect.systemvolume".to_string(),
+        serde_json::json!({ "sinkList": state.values().cloned().collect::<Vec<_>>() }),
+    )
+}
+
 /// Push the new local-sinks list to every connected device and to
 /// the plugin event stream. Replicates the sinkList / per-sink delta
 /// shape upstream publishes (pulse.cpp:69-104).
@@ -799,6 +907,8 @@ async fn push_local_state(
     new_list: &[LocalSinkState],
     local_sinks: &Arc<RwLock<HashMap<String, SinkState>>>,
     default_sink: &Arc<RwLock<Option<String>>>,
+    live_sinks: &Arc<RwLock<HashMap<String, SinkState>>>,
+    live_default: &Arc<RwLock<Option<String>>>,
     plugin_events: &Arc<PluginEventBroadcaster>,
     cm: &Arc<crate::protocol::ConnectionManager>,
 ) {
@@ -824,13 +934,24 @@ async fn push_local_state(
 
     let deltas: Vec<Packet> = build_deltas(&old_map, new_list);
 
-    // Update the supervisor's snapshot.
+    // Update the supervisor's snapshot (the diff base for wire pushes).
     {
         let mut state = local_sinks.write().unwrap_or_else(|e| e.into_inner());
         *state = new_map.clone();
     }
     {
         let mut d = default_sink.write().unwrap_or_else(|e| e.into_inner());
+        *d = new_default.clone();
+    }
+    // Mirror into the plugin's live state so the REST surface and
+    // requestSinks answers track reality — the snapshot above is only
+    // the supervisor's diff base.
+    {
+        let mut state = live_sinks.write().unwrap_or_else(|e| e.into_inner());
+        *state = new_map.clone();
+    }
+    {
+        let mut d = live_default.write().unwrap_or_else(|e| e.into_inner());
         *d = new_default.clone();
     }
 
@@ -851,11 +972,14 @@ async fn push_local_state(
                 );
             }
         }
-        // If the default sink changed, also push a full sinkList —
-        // upstream rebuilds its copy on sinkAdded/Removed
-        // (pulse.cpp:109-115) but not on defaultChanged; the safest
-        // for the phone is the full list so its UI can re-render.
-        if old_default != new_default {
+        // Push a full sinkList when the sink SET changed or the default
+        // moved — upstream rebuilds its copy on sinkAdded/Removed
+        // (pulse.cpp:109-115) but not on defaultChanged; the safest for
+        // the phone is the full list so its UI can re-render. Per-sink
+        // deltas alone would leave new sinks invisible on the phone.
+        let set_changed =
+            old_map.len() != new_map.len() || new_map.keys().any(|k| !old_map.contains_key(k));
+        if old_default != new_default || set_changed {
             let list_packet = Packet::new(
                 "kdeconnect.systemvolume".to_string(),
                 serde_json::json!({ "sinkList": new_map.values().cloned().collect::<Vec<_>>() }),
@@ -1370,18 +1494,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_on_connected_requests_sinks() {
+    async fn test_on_connected_is_quiet_peer_sync_owns_handshake() {
+        // on_connected no longer emits requestSinks blindly (that spammed
+        // phones on every identity re-exchange). The capability-gated
+        // handshake lives in sync_peers.
         let plugin = SystemVolumePlugin::new();
-        let packets = plugin.on_connected("device1");
-        assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0].packet_type, "kdeconnect.systemvolume.request");
-        assert_eq!(
-            packets[0]
-                .body
-                .get("requestSinks")
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
+        assert!(plugin.on_connected("device1").is_empty());
     }
 
     #[tokio::test]
@@ -1520,7 +1638,7 @@ mod tests {
         let inner: Arc<dyn VolumeBackend> = backend;
         let list = handle_subscribe_event(
             &SubscribeEvent::SinkChanged {
-                name: "s1".to_string(),
+                name: Some("s1".to_string()),
             },
             &inner,
             &Arc::new(RwLock::new(HashMap::new())),
@@ -1538,7 +1656,7 @@ mod tests {
         let inner: Arc<dyn VolumeBackend> = backend;
         let r = handle_subscribe_event(
             &SubscribeEvent::Unclassified {
-                line: "Event 'change' on server".to_string(),
+                line: "Event 'change' on client #3693".to_string(),
             },
             &inner,
             &Arc::new(RwLock::new(HashMap::new())),

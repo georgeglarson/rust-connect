@@ -105,6 +105,11 @@ pub async fn create_state(settings: AppSettings) -> Result<Arc<AppState>> {
     // backend (pactl). Degrades with a log event when pactl is missing
     // or the PA daemon is unreachable; the provider side then refuses
     // to advertise (Plugin::is_backend_available() returns false).
+    // The registry handle powers the capability-gated peer sync.
+    state
+        .plugins
+        .systemvolume
+        .with_device_registry(state.registry.clone());
     state.plugins.systemvolume.enable_session_backend().await;
 
     info!(
