@@ -474,19 +474,18 @@ fn functional_coverage_ledger_is_consistent() {
                     label, row.feature, cite, NON_SELF_CITE_TOKENS
                 );
 
-                // D5 fixture-provenance: feature_ledger rows only.
+                // D5 fixture-provenance: feature_ledger rows only. Per the brief the
+                // cite MUST reference `tests/fixtures/upstream-wire/` (a
+                // fixture the row's wire tests actually load) OR an
+                // independent-peer artifact — not just any upstream name.
                 if label == "feature_ledger"
                     && row.cells.get("fixture_provenance").map(|s| s.as_str()) == Some("PASS")
                 {
-                    let ok = cite.contains("tests/fixtures/upstream-wire/")
-                        || cite.contains("peer")
-                        || cite.contains("kdeconnect-android")
-                        || cite.contains("kdeconnect-kde")
-                        || cite.contains("gsconnect")
-                        || cite.contains("upstream");
+                    let ok =
+                        cite.contains("tests/fixtures/upstream-wire/") || cite.contains("peer");
                     assert!(
                         ok,
-                        "{} row `{}` has `fixture_provenance: PASS` but cite `{}` does not reference `tests/fixtures/upstream-wire/` or a peer/upstream artifact (D5)",
+                        "{} row `{}` has `fixture_provenance: PASS` but cite `{}` does not reference `tests/fixtures/upstream-wire/` or a peer artifact (D5)",
                         label, row.feature, cite
                     );
                 }
@@ -611,24 +610,37 @@ fn upstream_wire_provenance_is_consistent() {
     );
 
     // Collect every fixture file (relative to WIRE_FIXTURE_DIR) — everything
-    // except provenance.yaml itself.
+    // except provenance.yaml itself. Walk recursively so subdirectories
+    // (mpris/, clipboard/, …) are scanned; rel paths are computed against
+    // the top-level dir so they match the provenance entries.
     let mut on_disk: BTreeSet<String> = BTreeSet::new();
-    for entry in std::fs::read_dir(&dir).expect("read upstream-wire dir") {
-        let entry = entry.expect("read_dir entry");
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
+    fn walk(prefix: &std::path::Path, dir: &std::path::Path, out: &mut BTreeSet<String>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) => panic!("read_dir {}: {}", dir.display(), e),
+        };
+        for entry in entries {
+            let entry = entry.expect("read_dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                walk(prefix, &path, out);
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(prefix)
+                .expect("file under upstream-wire")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel == "provenance.yaml" {
+                continue;
+            }
+            out.insert(rel);
         }
-        let rel = path
-            .strip_prefix(&dir)
-            .expect("file under upstream-wire")
-            .to_string_lossy()
-            .replace('\\', "/");
-        if rel == "provenance.yaml" {
-            continue;
-        }
-        on_disk.insert(rel);
     }
+    walk(&dir, &dir, &mut on_disk);
 
     let index_text = read(PROVENANCE_INDEX);
     let entries = parse_provenance_index(&index_text);
