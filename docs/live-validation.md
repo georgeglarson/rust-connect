@@ -4,6 +4,33 @@ Results from hands-on testing against real hardware, newest first. The
 point of this file: protocol-conformance claims in this repo are backed by
 observed behavior against real devices, not only by loopback tests.
 
+## 2026-08-06 — SFTP second-device leg (Galaxy S21 Ultra 5G)
+
+Lane-4 follow-up open item closed: same lifecycle on the second handset,
+run against the installed production daemon at main `13b2771`. Device:
+paired Galaxy S21 Ultra 5G (`c341ee1e…`), stock KDE Connect app, Wi-Fi LAN.
+
+- `POST /sftp/request` → credentials arrived (port 1739, user `kdeconnect`,
+  path `/storage/emulated/0`); **no password field in any API response**.
+  First request after a fresh link can be dropped by the phone (~12s to
+  answer on retry) — the link was mid-handshake; second request answered.
+- `POST /sftp/mount` → `mounted`; browse returned real S21 storage
+  (Alarms, Android, Audiobooks, Capture+, DCIM, Documents, Download, …).
+- Copy: 36-byte `Music/.thumbnails/.database_uuid` copied to the desktop;
+  **md5 match** `348604dec8f33e7cd5a6d0d776febb87` source vs copy.
+- `DELETE /sftp/mount` → `unmounted`.
+
+Run conditions were hostile, and that is worth recording: the S21 had been
+offline ~2.5h (phone asleep) before this leg, and since its return both
+phones are in the #1020 reconnect-churn cluster — phone-side link closes
+every ~22–60s, plus the API-state desync after outbound reconnect (state
+says `disconnected` while packets flow). The leg succeeded on the fifth
+connected window of a wait-connect→request→creds(0.5s poll)→mount→copy→
+unmount sprint, after two daemon restarts to resync state. The SFTP plugin
+itself behaved correctly throughout; the churn is connectivity-layer and
+owned by vk #1020. Same host facts as the A15 entry (Fedora 43, sshfs
+3.7.6, hardened user unit).
+
 ## 2026-08-06 — SFTP desktop browsing lifecycle (Galaxy A15)
 
 Lane 4 (Task 1.3) live validation, run under the production systemd user

@@ -416,7 +416,7 @@ feature_ledger:
     live_device: PASS
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/sftp/credentials.json (kdeconnect-android SftpPlugin.kt:126-137 — credentials packet body, transcribed in the Slice 0B follow-up). The binary payload stream rides on a separate channel and is not asserted here. Lane-4-lifecycle tests: src/plugins/sftp/mounter.rs (argv/stdin/password redaction), src/plugins/sftp/mod.rs (state machine + Debug redaction + cleanup + startup_sweep + credentials_packet_shape_matches_android), tests/api_integration.rs (sftp mount/unmount/info + tools + unpair-drops-creds + shutdown-drops-creds). Upstream: kdeconnect-kde @ f5ed3ed8 plugins/sftp/mounter.cpp:72,93-95,99-100,103-105,114,204; plugins/sftp/sftpplugin.cpp:88-104,136-163. Live: docs/live-validation.md 2026-08-06 entry 'SFTP desktop browsing lifecycle (Galaxy A15)' — request/creds-no-password/mount/browse/copy/unmount/reconnect/disconnect-cleanup all observed on a paired A15 under the hardened systemd unit."
+    cite: "tests/fixtures/upstream-wire/sftp/credentials.json (kdeconnect-android SftpPlugin.kt:126-137 — credentials packet body, transcribed in the Slice 0B follow-up). The binary payload stream rides on a separate channel and is not asserted here. Lane-4-lifecycle tests: src/plugins/sftp/mounter.rs (argv/stdin/password redaction), src/plugins/sftp/mod.rs (state machine + Debug redaction + cleanup + startup_sweep + credentials_packet_shape_matches_android), tests/api_integration.rs (sftp mount/unmount/info + tools + unpair-drops-creds + shutdown-drops-creds). Upstream: kdeconnect-kde @ f5ed3ed8 plugins/sftp/mounter.cpp:72,93-95,99-100,103-105,114,204; plugins/sftp/sftpplugin.cpp:88-104,136-163. Live: docs/live-validation.md 2026-08-06 entries 'SFTP desktop browsing lifecycle (Galaxy A15)' (full lifecycle incl. reconnect + disconnect-cleanup) and 'SFTP second-device leg (Galaxy S21 Ultra 5G)' (request/creds-no-password/mount/browse/copy-md5-match/unmount on the second handset, run inside the vk #1020 churn window)."
     reason: "Slice 0B rollup (D3): hostile_input and environment are UNVERIFIED, blocking status=PASS. fixture_provenance promoted to PASS via the new sftp/credentials.json fixture (replaces the prior UNVERIFIED status — the credentials packet IS JSON-shaped, only the data stream is binary). The remaining two cells are owned by the Sprint 2 hostile-input audit (Task 2.5) and the env matrix expansion (Task 4.1)."
     owner: "Tasks 2.5 + 4.1"
 
@@ -1966,6 +1966,15 @@ device_matrix:
     cite: "docs/live-validation.md 2026-08-05 'Phone-initiated pairing: SAS verified identical on both devices'"
     reason: "A15 not yet exercised"
     owner: "Sprint 4 / Task 4.2"
+
+  - feature: sftp-desktop-browsing
+    A15: PASS
+    S21: PASS
+    other_android: UNVERIFIED
+    status: UNVERIFIED
+    cite: "docs/live-validation.md 2026-08-06 'SFTP desktop browsing lifecycle (Galaxy A15)' + 'SFTP second-device leg (Galaxy S21 Ultra 5G)'"
+    reason: "Both house handsets exercised end-to-end (request/creds/mount/browse/copy/unmount); other-Android not yet"
+    owner: "Sprint 4 / Task 4.3"
 ```
 
 ---
