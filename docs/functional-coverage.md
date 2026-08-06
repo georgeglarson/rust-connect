@@ -420,15 +420,15 @@ feature_ledger:
     upstream:
     upstream_ref: "kdeconnect-kde plugins/systemvolume/ + remotesystemvolume/ / kdeconnect-android SystemVolumePlugin.kt"
     desktop_effect: UNVERIFIED
-    api_surface: UNVERIFIED
+    api_surface: PASS
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite:
-    reason: "Sprint 1 / Task 1.1 audio-backend work pending"
+    cite: "src/plugins/systemvolume/ + functional-coverage REST routes /api/v1/systemvolume/sinks{,:name/control}; backend契约覆盖 pactl JSON、subscribe events"
+    reason: "Provider implemented (pactl + subscribe supervision + REST surface); live_device + environment + lifecycle evidence remain the integrator's job"
     owner: "Task 1.1"
 
   - feature: telephony
@@ -1813,8 +1813,8 @@ environment_matrix:
     session_dbus: NOT-APPLICABLE
     notification_server: NOT-APPLICABLE
     status: UNVERIFIED
-    cite:
-    reason: "audio-backend (PipeWire / PulseAudio) integration is Sprint 1 / Task 1.1"
+    cite: "src/plugins/systemvolume/backend.rs::PactlBackend (pactl list/subscribe/set), fixture-derived wire assertions"
+    reason: "pactl backend implemented + mock-tested; live PipeWire / PulseAudio session verification remains the integrator's job"
     owner: "Task 1.1"
 
   - feature: inputdevices-uinput
