@@ -353,30 +353,25 @@ pub async fn run_packet_loop(
                         }
                     }
                     Err(crate::utils::errors::Error::ConnectionTimeout(_)) => {
+                        // Idle tick only. Liveness is owned by the kernel:
+                        // TCP keepalive (30s idle / 10s interval / 3 probes)
+                        // plus TCP_USER_TIMEOUT (30s) are configured on every
+                        // link (inbound + outbound, see protocol::keepalive),
+                        // so a dead peer surfaces as a recv ERROR within ~60s
+                        // and falls into the disconnect branch below.
+                        //
+                        // Deliberately NO application-level probe here: the
+                        // 2026-08-06 first attempt sent a real `kdeconnect.ping`
+                        // per idle tick, and Android renders incoming pings as
+                        // user-visible "Ping!" notifications — the keepalive
+                        // nagged the user's phone every 30 seconds (George's
+                        // post-reboot report). Peer-visible packets are never
+                        // a valid liveness probe.
                         debug!(
                             device_id = %device_id,
                             event = "recv_timeout",
-                            "recv_packet timeout, probing peer"
+                            "recv_packet timeout; kernel keepalive owns liveness"
                         );
-                        if let Err(error) = cm.send_packet(device_id, &Packet::ping()).await {
-                            warn!(
-                                device_id = %device_id,
-                                error = %error,
-                                event = "keepalive_probe_failed",
-                                "Keepalive probe failed, disconnecting dead link"
-                            );
-                            match cm.disconnect(device_id, generation).await {
-                                Ok(true) => {
-                                    lifecycle.try_transition(device_id, DeviceState::Disconnected).await;
-                                    plugin_registry.notify_disconnected(device_id).await;
-                                }
-                                Ok(false) => {}
-                                Err(error) => {
-                                    warn!(device_id = %device_id, error = %error, event = "disconnect_failed", "Failed to disconnect dead link");
-                                }
-                            }
-                            return LoopResult::Disconnected;
-                        }
                     }
                     Err(e) => {
                         warn!(
