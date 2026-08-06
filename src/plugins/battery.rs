@@ -182,16 +182,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_connected_requests_battery() {
-        // Asserts the wire shape of the rust plugin's outgoing request against
-        // the upstream-derived literal at
-        // tests/fixtures/upstream-wire/battery/request.json. The type must
-        // match; the body must equal the fixture (empty body — see provenance
-        // note for the divergence from GSConnect's `{request: true}` shape).
+        // DIVERGENCE PIN (vk #1018): upstream GSConnect sends
+        // `{"request": true}` (gsconnect battery.js:364-368 `_requestState`);
+        // the fixture holds that upstream shape. The rust plugin sends an
+        // empty body. The divergence is behaviorally inert today — Android's
+        // BatteryPlugin does not implement `kdeconnect.battery.request` at
+        // all (supportedPacketTypes = [kdeconnect.battery] only) and no
+        // implementation reads the field — but vk #1018 aligns the body.
+        // Invert to `assert_eq!` when it lands.
         let plugin = make_plugin();
         let packets = plugin.on_connected("test-device");
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].packet_type, "kdeconnect.battery.request");
-        let expected_body: serde_json::Value = serde_json::from_str(
+        let upstream_body: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("tests/fixtures/upstream-wire/battery/request.json"),
@@ -199,7 +202,12 @@ mod tests {
             .expect("battery/request.json"),
         )
         .expect("battery/request.json parses");
-        assert_eq!(packets[0].body, expected_body);
+        assert_eq!(
+            upstream_body["request"], true,
+            "fixture is the upstream shape"
+        );
+        assert_eq!(packets[0].body, serde_json::json!({}));
+        assert_ne!(packets[0].body, upstream_body);
     }
 
     #[tokio::test]

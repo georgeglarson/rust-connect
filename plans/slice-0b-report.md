@@ -442,3 +442,37 @@ src/plugins/sftp/mod.rs                                       — 1 new wire-sha
 ```
 
 6 commits on `slice-0b-wire-provenance` (1 added by this lane at ad4adae), no pushes, no merges.
+## Integrator addendum — lock/battery reclassification (2026-08-06)
+
+The integrator (main session) verified the follow-up lane against the pinned
+upstream clones and corrected two items:
+
+1. **Lock is FAIL, not INTENTIONAL-DIVERGENCE.** The follow-up lane recorded
+   the `locked`-vs-`isLocked` divergence as "a deliberate choice" /
+   INTENTIONAL-DIVERGENCE. No such decision exists anywhere in the project
+   record — the plugin predates upstream verification. Upstream contract
+   (kdeconnect-kde@f5ed3ed8 `plugins/lockdevice/lockdeviceplugin.cpp`):
+   `setLocked` (command, :63), `requestLocked` (connected() query, :122),
+   `isLocked` (sendState, :116), `lockResult` (command result, :104),
+   carried on `kdeconnect.lock` / `kdeconnect.lock.request` (header :16-17).
+   Neither kdeconnect-android nor GSConnect implements lock, so the break is
+   desktop-peer-direction only. Ledger lock row: `status: FAIL`,
+   `fixture_provenance: PASS` (fixtures now hold upstream truth), owner
+   **vk #1018** (filed 2026-08-06). Fixtures corrected to upstream truth:
+   `lock_state.json` `{"isLocked": true}`, `lock_request.json`
+   `{"requestLocked": null}`. Tests rewritten as DEFECT PINs
+   (`test_upstream_lock_state_shape_currently_misparsed`,
+   `test_lock_request_reply_diverges_from_upstream_field`) — green today,
+   self-invalidating when vk #1018 lands (telephony invented-field precedent).
+2. **Battery fixture corrected to upstream truth.** `battery/request.json`
+   held the rust empty body as `hand-authored-from-observation`; it now holds
+   GSConnect's `{"request": true}` (battery.js:364-368) as `upstream-derived`,
+   with `test_on_connected_requests_battery` pinning the divergence. The
+   divergence is behaviorally inert (Android's BatteryPlugin does not
+   implement the request type; no implementation reads the field) but joins
+   vk #1018 for conformance.
+
+All other follow-up-lane dispositions verified: 16 fixtures valid against
+the pinned clones (spot-checked by the integrator: notification reply id,
+runcommand commandList/canAddCommand, lock sendState/connected shapes,
+battery request), battery/ping overclaims corrected, gates green.

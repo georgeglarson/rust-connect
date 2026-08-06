@@ -112,8 +112,8 @@ feature_ledger:
     live_device: PASS
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/battery/request.json (Slice 0B follow-up: rust plugin's kdeconnect.battery.request body, an empty object — divergence from GSConnect@{request: true} recorded in the fixture provenance); docs/live-validation.md 2026-08-02 Battery row (live 90%, charging); docs/parity-checklist.md Discovery/Lifecycle CONFORMANT"
-    reason: "Slice 0B rollup (D3): hostile_input and environment are UNVERIFIED, blocking status=PASS. fixture_provenance promoted to PASS via the new battery/request.json fixture (replaces the prior identity/basic.json overcite); the remaining two cells are owned by the Sprint 2 hostile-input audit (Task 2.5) and the env matrix expansion (Task 4.1)."
+    cite: "tests/fixtures/upstream-wire/battery/request.json holds the upstream truth (gsconnect battery.js:364-368 `{request: true}`); the rust plugin's empty-body divergence is pinned by test_on_connected_requests_battery and queued in vk #1018 — behaviorally inert, as no implementation reads the field and Android does not implement the request type. docs/live-validation.md 2026-08-02 Battery row (live 90%, charging); docs/parity-checklist.md Discovery/Lifecycle CONFORMANT"
+    reason: "Slice 0B rollup (D3): hostile_input and environment are UNVERIFIED, blocking status=PASS. fixture_provenance promoted to PASS via battery/request.json (upstream truth; replaces the prior identity/basic.json overcite); the remaining two cells are owned by the Sprint 2 hostile-input audit (Task 2.5) and the env matrix expansion (Task 4.1)."
     owner: "Tasks 2.5 + 4.1"
 
   - feature: clipboard
@@ -215,18 +215,18 @@ feature_ledger:
   - feature: lock
     rust_impl: true
     upstream:
-    upstream_ref: "kdeconnect-kde plugins/lockdevice/ (no android equivalent — desktop-origin)"
+    upstream_ref: "kdeconnect-kde plugins/lockdevice/ (no android or gsconnect equivalent — desktop-origin)"
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: INTENTIONAL-DIVERGENCE
+    fixture_provenance: PASS
     live_device: NOT-APPLICABLE
     environment: UNVERIFIED
-    status: INTENTIONAL-DIVERGENCE
-    cite: "tests/fixtures/upstream-wire/lock/{lock_request,lock_state}.json (kdeconnect-kde plugins/lockdevice/lockdeviceplugin.cpp:104,116,122). The rust plugin's reply body uses `locked: <bool>` (src/plugins/lock.rs:94-96); upstream uses `isLocked`/`lockResult` (lockdeviceplugin.cpp:104,116). The decision to keep the rust plugin's shorter field name is documented in the lock_state fixture provenance. No Android LockPlugin exists in the pinned clone (lock is desktop-originated; the bearer side has no Android consumer for this type)."
-    reason: "Slice 0B promotion: two upstream-derived fixtures now load in src/plugins/lock.rs. fixture_provenance pinned at INTENTIONAL-DIVERGENCE because the rust plugin's reply field name (`locked`) does not match the upstream key (`isLocked`). The remaining cells are owned by Sprint 1 / Task 1.6 verification."
-    owner: "Task 1.6"
+    status: FAIL
+    cite: "tests/fixtures/upstream-wire/lock/{lock_request,lock_state}.json hold the upstream truth (kdeconnect-kde plugins/lockdevice/lockdeviceplugin.cpp:104,116,122: setLocked/requestLocked/isLocked/lockResult on kdeconnect.lock/.request). The rust plugin reads and emits a `locked` field no upstream uses (src/plugins/lock.rs) — not a deliberate decision; the plugin predates upstream verification. Defect pinned by test_upstream_lock_state_shape_currently_misparsed + test_lock_request_reply_diverges_from_upstream_field. No Android lock implementation exists, so phones are unaffected; the break is desktop-peer-direction."
+    reason: "Wire contract FAIL vs kdeconnect-kde lockdevice (the only lock implementation upstream): field names disagree in both directions, so a kde peer's state parses as false and our replies are unreadable there. Rewriting to the kde contract is vk #1018; live validation rides Task 3.2's kdeconnectd harness. fixture_provenance is PASS: both fixtures are upstream-derived and loaded."
+    owner: "vk #1018"
 
   - feature: mousepad
     rust_impl: true

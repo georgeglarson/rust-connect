@@ -333,9 +333,13 @@ fixtures:
     used_by: "src/plugins/digitizer.rs::test_capitalized_rubber_activates_rubber_tool"
 
   - file: battery/request.json
-    kind: hand-authored-from-observation
+    kind: upstream-derived
+    upstream_repo: gsconnect
+    pinned_commit: 35bc59911f81e1ce6dd30a9dbf255e2c013f5bb5
+    source_file: src/service/plugins/battery.js
+    source_lines: "364-368"
     extraction_date: "2026-08-06"
-    note: "Rust plugin emits `kdeconnect.battery.request` with EMPTY body on connect (src/plugins/battery.rs:63-68). Upstream behavior varies: kdeconnect-kde's batteryplugin.cpp never emits a request packet (only the status under PACKET_TYPE_BATTERY at :119), and kdeconnect-android's BatteryPlugin.kt:103-110 only handles PACKET_TYPE_BATTERY (no .request branch). GSConnect@35bc5991 battery.js:366-368 emits `{request: true}` — both bodies are equivalent wire signals. The rust plugin's empty-body choice is recorded; if a real phone peer rejects empty bodies, the divergence belongs in an INTEGRATOR decision, not a code fix."
+    note: "Upstream truth: GSConnect `_requestState` emits `{request: true}` on `kdeconnect.battery.request`. The rust plugin currently sends an EMPTY body — recorded as a divergence pinned by test_on_connected_requests_battery (vk #1018 aligns it). The divergence is behaviorally inert: kdeconnect-android's BatteryPlugin.kt does not implement the request type at all (supportedPacketTypes = [kdeconnect.battery]) and no implementation reads the body; kdeconnect-kde never emits a request."
     used_by: "src/plugins/battery.rs::test_on_connected_requests_battery"
 
   - file: lock/lock_request.json
@@ -345,8 +349,8 @@ fixtures:
     source_file: plugins/lockdevice/lockdeviceplugin.cpp
     source_lines: "122"
     extraction_date: "2026-08-06"
-    note: "kdeconnect-kde's lockdevice plugin:122 sends `kdeconnect.lock.request` with `requestLocked: null`; the request is type-driven (empty body)."
-    used_by: "src/plugins/lock.rs::test_lock_request_answers_with_stored_state"
+    note: "Upstream truth: kdeconnect-kde's lockdevice `connected()` sends `kdeconnect.lock.request` with `{\"requestLocked\": null}`. The rust plugin answers any lock.request body regardless of fields (matching kde's query->sendState flow), so the fixture's field is not read today; the reply-side field divergence is the defect, pinned by test_lock_request_reply_diverges_from_upstream_field (ledger lock row FAIL, vk #1018)."
+    used_by: "src/plugins/lock.rs::test_lock_request_reply_diverges_from_upstream_field"
 
   - file: lock/lock_state.json
     kind: upstream-derived
@@ -355,8 +359,8 @@ fixtures:
     source_file: plugins/lockdevice/lockdeviceplugin.cpp
     source_lines: "104,116"
     extraction_date: "2026-08-06"
-    note: "INTENTIONAL-DIVERGENCE. kdeconnect-kde's lock device emits `lockResult: <bool>` (setLocked reply at :104) or `isLocked: <bool>` (sendState at :116). The rust plugin answers with `locked: <bool>` (src/plugins/lock.rs:94-96) — no upstream field literally matches. There is no Android LockPlugin in the pinned clone (lock is desktop-originated; the Android side has no consumer). The rust plugin's `locked` is a deliberate choice and is now recorded as INTENTIONAL-DIVERGENCE on the lock ledger row; an integrator should confirm whether the rename to `isLocked` is wanted before any KDE interop matters."
-    used_by: "src/plugins/lock.rs::test_lock_state_stored"
+    note: "Upstream truth: kdeconnect-kde's lockdevice emits `lockResult: <bool>` (setLocked reply, :104) or `isLocked: <bool>` (sendState, :116) on `kdeconnect.lock`. The rust plugin reads and emits `locked` instead — no upstream field matches. This was NOT a deliberate decision (integrator review 2026-08-06): the plugin predates upstream verification. Ledger lock row is FAIL, owner vk #1018 (rewrite to the kde contract; validate via Task 3.2 kdeconnectd harness). No Android implementation of lock exists, so phones are unaffected. Defect pinned by test_upstream_lock_state_shape_currently_misparsed."
+    used_by: "src/plugins/lock.rs::test_upstream_lock_state_shape_currently_misparsed"
 
   - file: findthisdevice/ring_request.json
     kind: upstream-derived
