@@ -56,7 +56,13 @@ pub fn load_default_plugins(
         sftp: Arc::new(super::SftpPlugin::with_events(plugin_events.clone())),
         mousepad: Arc::new(mousepad),
         lock: Arc::new(super::LockPlugin::new()),
-        systemvolume: Arc::new(super::SystemVolumePlugin::new()),
+        // The systemvolume provider side needs the connection manager
+        // so pactl subscribe events can push live deltas to paired
+        // phones; the controller side shares the same plugin instance.
+        systemvolume: Arc::new(
+            super::SystemVolumePlugin::new()
+                .with_connection_manager(connection_manager.clone(), plugin_events.clone()),
+        ),
         ping: Arc::new(super::PingPlugin::new()),
         findmyphone: Arc::new(super::FindMyPhonePlugin::new()),
         findthisdevice: Arc::new(super::FindThisDevicePlugin::new()),

@@ -17,6 +17,7 @@ pub mod remotecommands;
 pub mod remotekeyboard;
 pub mod sftp;
 pub mod sms;
+pub mod systemvolume;
 pub mod telephony;
 pub mod volume;
 
@@ -32,6 +33,7 @@ pub use remotecommands::*;
 pub use remotekeyboard::*;
 pub use sftp::*;
 pub use sms::*;
+pub use systemvolume::*;
 pub use telephony::*;
 pub use volume::*;
 
@@ -185,6 +187,17 @@ fn capability_to_tool(cap: &str, _incoming: bool) -> Option<Tool> {
                 required: true,
                 description: "Target device ID".to_string(),
             }],
+            true,
+        ),
+        "kdeconnect.systemvolume" => (
+            "list_local_sinks".to_string(),
+            "List local audio sinks (provider)".to_string(),
+            "/api/v1/systemvolume/sinks".to_string(),
+            "GET".to_string(),
+            vec![],
+            // overridden by list_tools once it has the owning plugin
+            // in hand; the default keeps the lookup callable in
+            // isolation.
             true,
         ),
         _ => return None,

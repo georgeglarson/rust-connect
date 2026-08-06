@@ -101,6 +101,12 @@ pub async fn create_state(settings: AppSettings) -> Result<Arc<AppState>> {
         .enable_session_backend()
         .await;
 
+    // Same gate for the systemvolume provider's PulseAudio/PipeWire
+    // backend (pactl). Degrades with a log event when pactl is missing
+    // or the PA daemon is unreachable; the provider side then refuses
+    // to advertise (Plugin::is_backend_available() returns false).
+    state.plugins.systemvolume.enable_session_backend().await;
+
     info!(
         device_name = %state.settings.device_name,
         tcp_port = state.settings.tcp_port,

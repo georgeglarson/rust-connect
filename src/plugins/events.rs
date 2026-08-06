@@ -88,6 +88,13 @@ pub enum PluginEvent {
         number_of_files: u32,
         total_payload_size: u64,
     },
+    /// Local sink state refresh from the PulseAudio/PipeWire backend.
+    /// `device_id` is "local" — these are the sinks WE expose, not a
+    /// peer's. Mirrors the broadcast shape of other local-only events
+    /// (clipboard-desktop-update).
+    SystemVolumeUpdate {
+        sinks: Vec<crate::plugins::systemvolume::SinkState>,
+    },
 }
 
 /// Plugin event broadcaster (type alias for backward compatibility).

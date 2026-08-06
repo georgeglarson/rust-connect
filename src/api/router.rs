@@ -158,6 +158,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/devices/:device_id/volume",
             post(handlers::set_volume),
         )
+        .route("/api/v1/systemvolume/sinks", get(handlers::get_local_sinks))
+        .route(
+            "/api/v1/systemvolume/sinks/:name/control",
+            post(handlers::set_local_sink_control),
+        )
         .route(
             "/api/v1/devices/:device_id/sftp/request",
             post(handlers::request_sftp),
