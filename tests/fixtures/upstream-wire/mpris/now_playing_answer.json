@@ -1,0 +1,23 @@
+{
+  "id": 1754400000115,
+  "type": "kdeconnect.mpris",
+  "body": {
+    "player": "VLC media player",
+    "title": "Test Song",
+    "artist": "Test Artist, Guest",
+    "album": "Test Album",
+    "albumArtUrl": "file:///tmp/art.png",
+    "url": "file:///music/test.ogg",
+    "length": 180000,
+    "pos": 60000,
+    "isPlaying": true,
+    "canPause": true,
+    "canPlay": true,
+    "canGoNext": true,
+    "canGoPrevious": false,
+    "canSeek": true,
+    "loopStatus": "None",
+    "shuffle": false,
+    "volume": 75
+  }
+}

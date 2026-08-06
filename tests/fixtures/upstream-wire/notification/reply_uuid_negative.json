@@ -1,0 +1,11 @@
+{
+  "id": 1754400000021,
+  "type": "kdeconnect.notification",
+  "body": {
+    "id": "notif-legacy",
+    "appName": "Signal",
+    "title": "Alice",
+    "text": "Call me",
+    "replyUuid": "uuid-1234"
+  }
+}

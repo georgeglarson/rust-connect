@@ -1262,29 +1262,75 @@ mod tests {
     // Wire shapes we SEND (control role) — exact JSON, upstream-cited
     // -----------------------------------------------------------------
 
+    // -----------------------------------------------------------------
+    // Wire shapes we SEND (control role) — load upstream-derived fixtures.
+    //
+    // Each fixture is a literal `kdeconnect.mpris` packet from
+    // kdeconnect-kde@f5ed3ed8 plugins/mpriscontrol/mpriscontrolplugin.cpp:
+    //
+    //   mpris/player_list.json                  — sendPlayerList :387-394
+    //   mpris/props_changed_playback_status.json — propertiesChanged :155-159
+    //                                              + always-attached :186-193
+    //   mpris/props_changed_metadata.json       — mprisPlayerMetadataToNetworkPacket :396-425
+    //   mpris/props_changed_volume.json        — propertiesChanged :139-146
+    //   mpris/seeked.json                      — seeked :116-119
+    //   mpris/now_playing_answer.json          — requestNowPlaying + requestVolume :317-358
+    //
+    // The rust plugin intentionally sends `supportAlbumArtPayload: false`
+    // (we don't transfer album-art payloads) where upstream sends `true`.
+    // That divergence is documented in the player_list test below and
+    // recorded against the mpris ledger row.
+    // -----------------------------------------------------------------
+
     #[test]
-    fn test_player_list_wire_shape() {
-        // mpriscontrolplugin.cpp:387-394: {"playerList": [...],
-        // "supportAlbumArtPayload": ...}. We send false — no payload transfer
-        // (module docs).
+    fn test_player_list_wire_shape_intentional_no_album_art_payload() {
+        // Upstream emits `supportAlbumArtPayload: true`
+        // (mpriscontrolplugin.cpp:391-392). The rust plugin advertises
+        // `false` because we don't transfer album-art payloads (module
+        // docs). The phone UI checks the flag before requesting a payload
+        // — sending false is the correct advertisement for our capabilities,
+        // but the field's VALUE differs from upstream. Recorded as
+        // INTENTIONAL-DIVERGENCE in docs/functional-coverage.md (mpris row).
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/mpris/player_list.json");
+        let upstream_body: serde_json::Value =
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&fixture_path).expect("read mpris player_list fixture"))
+                .expect("parse fixture")["body"]
+                .clone();
+
         let (plugin, _) = setup();
         plugin.core.apply_player_added(sample_state());
         let packet = plugin.core.player_list_packet();
         assert_eq!(packet.packet_type, "kdeconnect.mpris");
-        assert_eq!(
-            packet.body,
-            serde_json::json!({
-                "playerList": ["VLC media player"],
-                "supportAlbumArtPayload": false,
-            })
+
+        // Our shape matches upstream's KEYS exactly — playerList and
+        // supportAlbumArtPayload both present — only the album-art flag
+        // value intentionally differs.
+        let our = packet.body.as_object().expect("body is object");
+        let theirs = upstream_body.as_object().expect("upstream body is object");
+        assert_eq!(our.len(), theirs.len(), "key set must match upstream");
+        for k in theirs.keys() {
+            assert!(our.contains_key(k), "missing upstream key `{}`", k);
+        }
+
+        // The intentional divergence: false vs true.
+        assert_eq!(packet.body["playerList"], upstream_body["playerList"]);
+        assert_eq!(packet.body["supportAlbumArtPayload"], serde_json::json!(false));
+        assert_ne!(
+            packet.body["supportAlbumArtPayload"], upstream_body["supportAlbumArtPayload"],
+            "expected upstream to advertise supportAlbumArtPayload=true (mpriscontrolplugin.cpp:392)"
         );
     }
 
     #[test]
     fn test_props_changed_partial_update_wire_shape() {
-        // PlaybackStatus change: ONLY isPlaying plus player/canSeek/pos
-        // (mpriscontrolplugin.cpp:155-159 for isPlaying, :186-193 for the
-        // always-attached fields).
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/mpris/props_changed_playback_status.json");
+        let upstream_body: serde_json::Value =
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&fixture_path).expect("read fixture"))
+                .expect("parse fixture")["body"]
+                .clone();
+
         let (plugin, _) = setup();
         plugin.core.apply_player_added(sample_state());
 
@@ -1298,21 +1344,18 @@ mod tests {
             .apply_props_changed(state, &changed)
             .expect("changed playback status must produce a packet");
         assert_eq!(packet.packet_type, "kdeconnect.mpris");
-        assert_eq!(
-            packet.body,
-            serde_json::json!({
-                "player": "VLC media player",
-                "isPlaying": false,
-                "canSeek": true,
-                "pos": 60000,
-            })
-        );
+        assert_eq!(packet.body, upstream_body);
     }
 
     #[test]
     fn test_props_changed_metadata_wire_shape() {
-        // Metadata change carries the full metadata mapping
-        // (mpriscontrolplugin.cpp:147-154 + :396-425).
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/mpris/props_changed_metadata.json");
+        let upstream_body: serde_json::Value =
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&fixture_path).expect("read fixture"))
+                .expect("parse fixture")["body"]
+                .clone();
+
         let (plugin, _) = setup();
         let changed = PlayerPropsChanged {
             metadata: true,
@@ -1322,25 +1365,18 @@ mod tests {
             .core
             .apply_props_changed(sample_state(), &changed)
             .expect("metadata change must produce a packet");
-        assert_eq!(
-            packet.body,
-            serde_json::json!({
-                "player": "VLC media player",
-                "title": "Test Song",
-                "artist": "Test Artist, Guest",
-                "album": "Test Album",
-                "albumArtUrl": "file:///tmp/art.png",
-                "url": "file:///music/test.ogg",
-                "length": 180000,
-                "canSeek": true,
-                "pos": 60000,
-            })
-        );
+        assert_eq!(packet.body, upstream_body);
     }
 
     #[test]
     fn test_props_changed_volume_wire_shape() {
-        // Volume is a 0-100 int (mpriscontrolplugin.cpp:139-146).
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/mpris/props_changed_volume.json");
+        let upstream_body: serde_json::Value =
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&fixture_path).expect("read fixture"))
+                .expect("parse fixture")["body"]
+                .clone();
+
         let (plugin, _) = setup();
         let changed = PlayerPropsChanged {
             volume: Some(42),
@@ -1350,7 +1386,11 @@ mod tests {
             .core
             .apply_props_changed(sample_state(), &changed)
             .unwrap();
-        assert_eq!(packet.body.get("volume").unwrap(), 42);
+        // Volume is a 0-100 int (mpriscontrolplugin.cpp:139-146). The full
+        // packet also carries player/canSeek/pos (the always-attached set
+        // at :186-193); compare against the upstream-derived full body.
+        assert_eq!(packet.body, upstream_body);
+        assert_eq!(packet.body["volume"], serde_json::json!(42));
     }
 
     #[test]
@@ -1415,18 +1455,22 @@ mod tests {
 
     #[test]
     fn test_seeked_wire_shape() {
-        // {"pos": <ms>, "player": <name>} — mpriscontrolplugin.cpp:116-119;
-        // µs→ms (:117). GSConnect sends the same (mpris.js:361-372).
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/mpris/seeked.json");
+        let upstream_body: serde_json::Value =
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&fixture_path).expect("read fixture"))
+                .expect("parse fixture")["body"]
+                .clone();
+
         let (plugin, _) = setup();
         plugin.core.apply_player_added(sample_state());
         let packet = plugin
             .core
             .apply_seeked("org.mpris.MediaPlayer2.vlc", 90_000_000)
             .expect("known service must produce a packet");
-        assert_eq!(
-            packet.body,
-            serde_json::json!({ "pos": 90000, "player": "VLC media player" })
-        );
+        // {"pos": <ms>, "player": <name>} — mpriscontrolplugin.cpp:116-119;
+        // µs→ms (:117). GSConnect sends the same (mpris.js:361-372).
+        assert_eq!(packet.body, upstream_body);
         // Untracked service → nothing.
         assert!(plugin
             .core
@@ -1436,32 +1480,18 @@ mod tests {
 
     #[test]
     fn test_now_playing_answer_wire_shape() {
-        // requestNowPlaying + requestVolume answer
-        // (mpriscontrolplugin.cpp:317-358).
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/mpris/now_playing_answer.json");
+        let upstream_body: serde_json::Value =
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&fixture_path).expect("read fixture"))
+                .expect("parse fixture")["body"]
+                .clone();
+
         let (plugin, _) = setup();
         let packet = plugin.core.now_playing_answer(&sample_state(), true);
-        assert_eq!(
-            packet.body,
-            serde_json::json!({
-                "player": "VLC media player",
-                "title": "Test Song",
-                "artist": "Test Artist, Guest",
-                "album": "Test Album",
-                "albumArtUrl": "file:///tmp/art.png",
-                "url": "file:///music/test.ogg",
-                "length": 180000,
-                "pos": 60000,
-                "isPlaying": true,
-                "canPause": true,
-                "canPlay": true,
-                "canGoNext": true,
-                "canGoPrevious": false,
-                "canSeek": true,
-                "loopStatus": "None",
-                "shuffle": false,
-                "volume": 75,
-            })
-        );
+        // requestNowPlaying + requestVolume answer
+        // (mpriscontrolplugin.cpp:317-358).
+        assert_eq!(packet.body, upstream_body);
     }
 
     #[test]

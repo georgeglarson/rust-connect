@@ -1,0 +1,8 @@
+{
+  "id": 1754400000040,
+  "type": "kdeconnect.runcommand",
+  "body": {
+    "commandList": "{}",
+    "canAddCommand": false
+  }
+}

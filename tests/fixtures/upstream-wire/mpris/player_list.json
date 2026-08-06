@@ -1,0 +1,8 @@
+{
+  "id": 1754400000110,
+  "type": "kdeconnect.mpris",
+  "body": {
+    "playerList": ["VLC media player"],
+    "supportAlbumArtPayload": true
+  }
+}

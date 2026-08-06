@@ -45,13 +45,31 @@ async fn test_full_app_initialization() {
     state.packet_router.route("test", packet).await.unwrap();
 }
 
+/// Conformance: the wire shape we emit must match what upstream peers send.
+/// Both kdeconnect-kde (`core/deviceinfo.h:123-133 toIdentityPacket`,
+/// `core/networkpacket.cpp:43-63 serialize`) and kdeconnect-android
+/// (`NetworkPacket.kt` + `LanLinkProvider.kt:567` broadcast) write the same
+/// top-level fields: `id` (number), `type` (string), `body` (object), with
+/// `body` carrying `deviceId`, `deviceName`, `deviceType`, `protocolVersion`,
+/// `tcpPort`, `incomingCapabilities`, `outgoingCapabilities`.
 #[test]
 fn test_identity_packet_format_matches_kde_connect() {
     use rust_connect::protocol::packet::PacketSerializer;
     use rust_connect::protocol::types::Identity;
 
+    // Fixture: tests/fixtures/upstream-wire/identity/basic.json
+    //   kdeconnect-kde@f5ed3ed8 core/deviceinfo.h:123-133
+    //   kdeconnect-kde@f5ed3ed8 core/networkpacket.cpp:43-63
+    //   kdeconnect-android@a88f6fa0 NetworkPacket.kt
+    // Synthetic device id/name only — field names, casing, types come from
+    // upstream.
+    let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/upstream-wire/identity/basic.json");
+    let fixture_text = std::fs::read_to_string(&fixture_path).expect("read identity fixture");
+    let fixture: serde_json::Value = serde_json::from_str(&fixture_text).expect("parse fixture");
+
     let id = Identity::new(
-        "test-id".to_string(),
+        "test_device_id_a".to_string(),
         "Test Device".to_string(),
         DeviceType::Desktop,
         vec!["kdeconnect.ping".to_string()],
@@ -59,26 +77,39 @@ fn test_identity_packet_format_matches_kde_connect() {
     );
     let packet = id.to_packet().unwrap();
     let bytes = PacketSerializer::serialize(&packet).unwrap();
-    let json_str = String::from_utf8(bytes).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(
+        std::str::from_utf8(&bytes).expect("utf-8 wire"),
+    )
+    .expect("parse our wire");
 
-    let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+    // Field-by-field: name, casing, type must all match upstream.
+    assert_eq!(parsed["type"], fixture["type"]);
+    assert_eq!(parsed["body"]["deviceId"], fixture["body"]["deviceId"]);
+    assert_eq!(parsed["body"]["deviceName"], fixture["body"]["deviceName"]);
+    assert_eq!(parsed["body"]["deviceType"], fixture["body"]["deviceType"]);
+    assert_eq!(
+        parsed["body"]["protocolVersion"],
+        fixture["body"]["protocolVersion"]
+    );
+    assert_eq!(parsed["body"]["tcpPort"], fixture["body"]["tcpPort"]);
+    assert_eq!(
+        parsed["body"]["incomingCapabilities"],
+        fixture["body"]["incomingCapabilities"]
+    );
+    assert_eq!(
+        parsed["body"]["outgoingCapabilities"],
+        fixture["body"]["outgoingCapabilities"]
+    );
+    assert!(parsed["id"].is_number(), "id must be a number per networkpacket.cpp:46");
 
-    assert_eq!(parsed["type"], "kdeconnect.identity");
-    assert_eq!(parsed["body"]["deviceId"], "test-id");
-    assert_eq!(parsed["body"]["deviceName"], "Test Device");
-    assert_eq!(parsed["body"]["deviceType"], "desktop");
-    assert!(parsed["body"]["protocolVersion"].is_number());
-    assert!(parsed["body"]["tcpPort"].is_number());
-    assert!(parsed["body"]["incomingCapabilities"].is_array());
-    assert!(parsed["body"]["outgoingCapabilities"].is_array());
-    assert!(parsed["id"].is_number());
-
-    let mut json_str = json_str;
-    json_str.truncate(json_str.trim_end().len());
-
-    assert!(json_str.starts_with("{\"id\":"));
-    assert!(json_str.contains("\"type\":\"kdeconnect.identity\""));
-    assert!(json_str.ends_with("}"));
+    // Top-level shape: id, type, body are the only required keys; our
+    // packet has no payload so payloadSize / payloadTransferInfo are absent.
+    let top = parsed.as_object().unwrap();
+    assert!(top.contains_key("id"));
+    assert!(top.contains_key("type"));
+    assert!(top.contains_key("body"));
+    assert!(!top.contains_key("payloadSize"));
+    assert!(!top.contains_key("payloadTransferInfo"));
 }
 
 #[tokio::test]

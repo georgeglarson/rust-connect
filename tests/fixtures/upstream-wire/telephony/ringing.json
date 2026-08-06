@@ -1,0 +1,9 @@
+{
+  "id": 1754400000070,
+  "type": "kdeconnect.telephony",
+  "body": {
+    "event": "ringing",
+    "phoneNumber": "+1234567890",
+    "contactName": "John Doe"
+  }
+}

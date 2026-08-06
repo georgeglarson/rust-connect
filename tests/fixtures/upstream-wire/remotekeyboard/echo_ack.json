@@ -1,0 +1,12 @@
+{
+  "id": 1754400000060,
+  "type": "kdeconnect.mousepad.echo",
+  "body": {
+    "key": "a",
+    "specialKey": 0,
+    "shift": false,
+    "ctrl": true,
+    "alt": false,
+    "isAck": true
+  }
+}

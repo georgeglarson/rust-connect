@@ -1,0 +1,8 @@
+{
+  "id": 1754400000090,
+  "type": "kdeconnect.telephony",
+  "body": {
+    "event": "talking",
+    "isCancel": "true"
+  }
+}

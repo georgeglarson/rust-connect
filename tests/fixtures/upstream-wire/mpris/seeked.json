@@ -1,0 +1,8 @@
+{
+  "id": 1754400000114,
+  "type": "kdeconnect.mpris",
+  "body": {
+    "pos": 90000,
+    "player": "VLC media player"
+  }
+}

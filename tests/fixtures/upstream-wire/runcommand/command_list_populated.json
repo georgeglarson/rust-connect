@@ -1,0 +1,8 @@
+{
+  "id": 1754400000041,
+  "type": "kdeconnect.runcommand",
+  "body": {
+    "commandList": "{\"suspend\":{\"name\":\"Suspend\",\"command\":\"systemctl suspend\"}}",
+    "canAddCommand": false
+  }
+}

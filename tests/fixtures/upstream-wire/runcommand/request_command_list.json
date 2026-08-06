@@ -1,0 +1,7 @@
+{
+  "id": 1754400000042,
+  "type": "kdeconnect.runcommand.request",
+  "body": {
+    "requestCommandList": true
+  }
+}

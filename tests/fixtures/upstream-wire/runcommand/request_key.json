@@ -1,0 +1,7 @@
+{
+  "id": 1754400000043,
+  "type": "kdeconnect.runcommand.request",
+  "body": {
+    "key": "suspend"
+  }
+}

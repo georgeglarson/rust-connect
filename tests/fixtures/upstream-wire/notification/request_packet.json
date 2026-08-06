@@ -1,0 +1,7 @@
+{
+  "id": 1754400000022,
+  "type": "kdeconnect.notification.request",
+  "body": {
+    "request": true
+  }
+}

@@ -22,3 +22,66 @@
 #                                   sends; carries `note` with the
 #                                   observation evidence
 fixtures:
+  - file: identity/basic.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: core/deviceinfo.h
+    source_lines: "123-133"
+    extraction_date: "2026-08-06"
+    used_by: "tests/protocol_integration.rs::test_identity_packet_format_matches_kde_connect"
+
+  - file: mpris/player_list.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/mpriscontrol/mpriscontrolplugin.cpp
+    source_lines: "387-394"
+    extraction_date: "2026-08-06"
+    note: "Upstream advertises supportAlbumArtPayload=true; rust plugin intentionally sends false (no payload transfer) — recorded as INTENTIONAL-DIVERGENCE in mpris ledger row."
+    used_by: "src/plugins/mpris/mod.rs::test_player_list_wire_shape_intentional_no_album_art_payload"
+
+  - file: mpris/props_changed_playback_status.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/mpriscontrol/mpriscontrolplugin.cpp
+    source_lines: "155-159,186-193"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/mpris/mod.rs::test_props_changed_partial_update_wire_shape"
+
+  - file: mpris/props_changed_metadata.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/mpriscontrol/mpriscontrolplugin.cpp
+    source_lines: "147-154,396-425"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/mpris/mod.rs::test_props_changed_metadata_wire_shape"
+
+  - file: mpris/props_changed_volume.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/mpriscontrol/mpriscontrolplugin.cpp
+    source_lines: "139-146,186-193"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/mpris/mod.rs::test_props_changed_volume_wire_shape"
+
+  - file: mpris/seeked.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/mpriscontrol/mpriscontrolplugin.cpp
+    source_lines: "116-119"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/mpris/mod.rs::test_seeked_wire_shape"
+
+  - file: mpris/now_playing_answer.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/mpriscontrol/mpriscontrolplugin.cpp
+    source_lines: "317-358"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/mpris/mod.rs::test_now_playing_answer_wire_shape"

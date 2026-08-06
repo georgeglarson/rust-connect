@@ -1,0 +1,8 @@
+{
+  "id": 1754400000011,
+  "type": "kdeconnect.clipboard.connect",
+  "body": {
+    "content": "synced text",
+    "timestamp": 1700000000000
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "id": 1754400000001,
+  "type": "kdeconnect.share.request",
+  "body": {
+    "filename": "1754400000000.bin",
+    "numberOfFiles": 1,
+    "totalPayloadSize": 81
+  },
+  "payloadSize": 81,
+  "payloadTransferInfo": {
+    "port": 1739
+  }
+}

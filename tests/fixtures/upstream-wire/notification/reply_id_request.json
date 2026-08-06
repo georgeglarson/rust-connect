@@ -1,0 +1,11 @@
+{
+  "id": 1754400000020,
+  "type": "kdeconnect.notification",
+  "body": {
+    "id": "0|com.google.android.apps.messaging|42|null|10123",
+    "appName": "Messages",
+    "title": "Camille",
+    "text": "on my way",
+    "requestReplyId": "b3f1c2d4-5e6a-7b8c-9d0e-1f2a3b4c5d6e"
+  }
+}
