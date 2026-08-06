@@ -20,6 +20,7 @@ pub fn configure_keepalive(stream: &TcpStream) {
                 .with_interval(Duration::from_secs(10))
                 .with_retries(3),
         );
+        let _ = sock_ref.set_tcp_user_timeout(Some(Duration::from_secs(30)));
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -76,6 +77,13 @@ mod tests {
                     .expect("Value expected to be present"),
                 3,
                 "TCP_KEEPCNT must be 3"
+            );
+            assert_eq!(
+                sock_ref
+                    .tcp_user_timeout()
+                    .expect("Value expected to be present"),
+                Some(Duration::from_secs(30)),
+                "TCP_USER_TIMEOUT must bound unacknowledged keepalive probes"
             );
         }
     }

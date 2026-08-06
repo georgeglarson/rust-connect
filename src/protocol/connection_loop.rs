@@ -356,8 +356,27 @@ pub async fn run_packet_loop(
                         debug!(
                             device_id = %device_id,
                             event = "recv_timeout",
-                            "recv_packet timeout, keepalive will handle liveness check"
+                            "recv_packet timeout, probing peer"
                         );
+                        if let Err(error) = cm.send_packet(device_id, &Packet::ping()).await {
+                            warn!(
+                                device_id = %device_id,
+                                error = %error,
+                                event = "keepalive_probe_failed",
+                                "Keepalive probe failed, disconnecting dead link"
+                            );
+                            match cm.disconnect(device_id, generation).await {
+                                Ok(true) => {
+                                    lifecycle.try_transition(device_id, DeviceState::Disconnected).await;
+                                    plugin_registry.notify_disconnected(device_id).await;
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    warn!(device_id = %device_id, error = %error, event = "disconnect_failed", "Failed to disconnect dead link");
+                                }
+                            }
+                            return LoopResult::Disconnected;
+                        }
                     }
                     Err(e) => {
                         warn!(
