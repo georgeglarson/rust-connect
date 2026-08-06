@@ -23,6 +23,8 @@ use crate::utils::errors::Result;
 
 use super::plugin::Plugin;
 
+pub mod mounter;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SftpConnectionInfo {
