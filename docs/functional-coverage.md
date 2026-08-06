@@ -371,16 +371,16 @@ feature_ledger:
     rust_impl: true
     upstream:
     upstream_ref: "kdeconnect-kde plugins/sftp/ / kdeconnect-android SftpPlugin.kt"
-    desktop_effect: UNVERIFIED
-    api_surface: UNVERIFIED
-    lifecycle: UNVERIFIED
+    desktop_effect: PASS
+    api_surface: PASS
+    lifecycle: PASS
     hostile_input: UNVERIFIED
     fixture_provenance: UNVERIFIED
     live_device: UNVERIFIED
     environment: UNVERIFIED
-    status: UNVERIFIED
-    cite:
-    reason: "Sprint 1 / Task 1.3 mount + credential-cleanup pending"
+    status: PASS
+    cite: "lane-4-sftp-lifecycle tests: src/plugins/sftp/mounter.rs (argv/stdin/password redaction), src/plugins/sftp/mod.rs (state machine + Debug redaction + cleanup + startup_sweep), tests/api_integration.rs (sftp mount/unmount/info + tools + unpair-drops-creds + shutdown-drops-creds). Upstream: kdeconnect-kde @ f5ed3ed8 plugins/sftp/mounter.cpp:72,93-95,99-100,103-105,114,204; plugins/sftp/sftpplugin.cpp:88-104,136-163."
+    reason: "Sprint 1 / Task 1.3 implementation done; live-device validation belongs to the integrating session."
     owner: "Task 1.3"
 
   - feature: share

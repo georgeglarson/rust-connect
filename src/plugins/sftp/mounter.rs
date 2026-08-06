@@ -352,6 +352,10 @@ mod tests {
     /// `.fail` sidecar file containing an exit code so tests can
     /// simulate sshfs crashes without using process-global env vars
     /// (parallel test execution makes env-var shims race-prone).
+    /// Exits as soon as the captures are flushed; the caller (the
+    /// runner's `wait_with_output`) blocks on our exit, so a "stay
+    /// alive" sleep is unnecessary and only widens the race window
+    /// for parallel tests.
     fn write_fake_sshfs(dir: &Path, record_path: &Path) -> PathBuf {
         let path = dir.join("sshfs");
         let argv_log = record_path.to_string_lossy().into_owned();
@@ -362,7 +366,6 @@ mod tests {
              printf '%s\\n' \"$0\" \"$@\" > {argv_log:?}\n\
              cat > {stdin_log:?} <&0\n\
              if [ -f {fail_flag:?} ]; then exit \"$(cat {fail_flag:?})\"; fi\n\
-             sleep 0.2 || true\n\
              exit 0\n",
         );
         let mut f = std::fs::OpenOptions::new()

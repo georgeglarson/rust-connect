@@ -160,3 +160,102 @@ This dials the device directly and runs the normal TLS/pairing flow — as secur
 as a discovered connection. If client isolation blocks direct connections too,
 there is no workaround on that network; move both devices to the same
 non-isolated network.
+
+## SFTP browsing — `browse_sftp` is unavailable or the mount fails
+
+The SFTP mount is the only feature that needs a **local** tool beyond the
+daemon itself: it spawns `sshfs` (and unmounts via `fusermount3` /
+`fusermount`). The daemon reports backend availability honestly — when
+either is missing, `/api/v1/tools` lists `browse_sftp` with
+`available: false` and the `POST /devices/{id}/sftp/mount` endpoint
+returns HTTP 503.
+
+Install the prerequisite packages:
+
+```bash
+# Debian / Ubuntu
+sudo apt install sshfs fuse3
+
+# Fedora
+sudo dnf install fuse-sshfs fuse3
+
+# Arch
+sudo pacman -S sshfs fuse3
+```
+
+After installing, log out and back in (FUSE needs the `fuse` group on
+the user), then check:
+
+```bash
+which sshfs fusermount3          # both must be found
+curl -H "X-API-Key: $(cat ~/.local/share/rust-connect/api_key)" \
+    http://127.0.0.1:9090/api/v1/tools | jq '.data.tools[] | select(.name=="browse_sftp")'
+# -> "available": true
+```
+
+### Where the mount appears and why it disappears
+
+The mount point is **server-determined** and lives under your data dir:
+
+```
+~/.local/share/rust-connect/mounts/sftp-<device_id>/
+```
+
+The desktop does not let you pick the path — caller-controlled paths
+were an XSS-style surface in the old contract and are gone. The
+mount is released automatically on:
+
+- device disconnect (`on_disconnected`)
+- unpair (`DELETE /devices/{id}/unpair`)
+- device deletion (`DELETE /devices/{id}`)
+- daemon shutdown (after `stop_services` runs, so no new mount
+  requests race in)
+- daemon startup — any stale mount left by a previous crash is
+  released by `startup_sweep` before the API server starts accepting
+  requests
+
+If a mount is left in place after a crash, the next boot will clean it
+up; you don't need to do anything.
+
+### Credentials are never persisted
+
+`kdeconnect.sftp` packets carry the SFTP password in memory only.
+After a daemon restart the desktop has no way to mount anything until
+the phone re-sends the credentials — the **deliberate** behavior. The
+phone's Android app sends a fresh `kdeconnect.sftp` packet every time
+the SFTP browsing session is requested, so a re-request from the UI is
+enough to restore access. The password never appears in:
+
+- process argv (sshfs is invoked with `-o password_stdin` and the
+  password travels on stdin; see the `mounter.rs` doc comment + the
+  upstream citation)
+- env vars (the runner never sets the password as an env var)
+- the API response (the `get_sftp_info` handler omits the field; a
+  regression test pins this)
+- log lines (a custom `Debug` on `SftpConnectionInfo` redacts the
+  password as `***redacted***`; the `sftp_connected` log line does not
+  carry the field)
+- the filesystem (no `password` file is written; mounts dir is
+  created on demand and the password is dropped on every cleanup leg)
+
+### Mount failures show up in the response, not just the log
+
+A failed mount returns HTTP 200 with `mount_state: "failed"` and the
+sshfs stderr in the `error` field of the response body, e.g.:
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "device_id": "...",
+    "mounted": false,
+    "mount_state": "failed",
+    "mount_point": "/home/.../mounts/sftp-...",
+    "error": "remote host has changed"
+  }
+}
+```
+
+This is a deliberate departure from "log and 500" — the caller (the
+web UI, an MCP agent) needs the reason to surface a useful message
+without parsing daemon logs.
