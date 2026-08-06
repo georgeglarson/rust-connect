@@ -629,14 +629,19 @@ fn test_sftp_mount_endpoints_in_openapi() {
     );
 }
 
-/// /api/v1/tools honesty: the browse_sftp tool MUST report
-/// `available: false` when sshfs / fusermount are missing on PATH.
-/// The dev host (and the CI host) doesn't have sshfs, so the live test
-/// exercises the unavailable leg; the available leg is covered by a
-/// direct SftpPlugin::is_backend_available test (which uses a fake
-/// runner).
+/// /api/v1/tools honesty: the browse_sftp tool's `available` flag MUST
+/// match the mounter's live backend probe on whatever host runs the
+/// suite. Asserting a fixed true/false would bake in a host assumption
+/// (this broke on 2026-08-06 when sshfs was installed on the dev host);
+/// the invariant under test is end-to-end agreement between the /tools
+/// surface and the probe. Both absolute legs are covered by the
+/// fake-runner mounter tests.
 #[tokio::test]
-async fn test_sftp_tool_reports_unavailable_when_backend_missing() {
+async fn test_sftp_tool_availability_matches_backend_probe() {
+    let expected = rust_connect::plugins::sftp::mounter::Mounter::new(std::sync::Arc::new(
+        rust_connect::plugins::sftp::mounter::SystemCommandRunner::new(),
+    ))
+    .is_available();
     let (state, _temp, api_key) = create_test_app().await;
     let app = build_router(state);
     let response = app
@@ -662,13 +667,12 @@ async fn test_sftp_tool_reports_unavailable_when_backend_missing() {
         .iter()
         .find(|t| t["name"] == "browse_sftp")
         .expect("browse_sftp tool must appear in /tools");
-    // On a host without sshfs, the backend-availability gate must
-    // surface this honestly: the tool is listed (discoverability) but
-    // marked unavailable.
+    // The tool is always listed (discoverability); its availability
+    // flag must equal the probe's verdict on this host.
     assert_eq!(
         sftp_tool["available"],
-        serde_json::Value::Bool(false),
-        "browse_sftp must report available:false when sshfs is missing"
+        serde_json::Value::Bool(expected),
+        "browse_sftp availability must match the backend probe"
     );
     assert_eq!(
         sftp_tool["endpoint"],
