@@ -74,6 +74,14 @@ pub enum Error {
     #[error("Device not paired: {0}")]
     DeviceNotPaired(String),
 
+    /// Service Unavailable (HTTP 503). Used when a backend is required
+    /// for the requested operation and is missing (e.g. sshfs/fusermount
+    /// for the SFTP mount endpoint). Distinct from ConnectionError
+    /// (the daemon-to-device link is fine; the desktop's local tool
+    /// isn't).
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     // Plugin Errors
     #[error("Plugin not found: {0}")]
     PluginNotFound(String),
@@ -158,6 +166,11 @@ pub enum ErrorCode {
     NoPendingPairRequest,
     DeviceNotPaired,
 
+    /// Local backend missing (e.g. sshfs, fusermount, pactl) — the
+    /// daemon can serve the request in principle but its local tool
+    /// isn't installed. HTTP 503.
+    ServiceUnavailable,
+
     // Plugin
     PluginNotFound,
     PluginError,
@@ -209,6 +222,7 @@ impl ErrorCode {
             Self::PairingRejected => "PAIRING_REJECTED",
             Self::NoPendingPairRequest => "NO_PENDING_PAIR_REQUEST",
             Self::DeviceNotPaired => "DEVICE_NOT_PAIRED",
+            Self::ServiceUnavailable => "SERVICE_UNAVAILABLE",
             Self::PluginNotFound => "PLUGIN_NOT_FOUND",
             Self::PluginError => "PLUGIN_ERROR",
             Self::NoPluginForPacketType => "NO_PLUGIN_FOR_PACKET_TYPE",
@@ -240,7 +254,8 @@ impl ErrorCode {
             Self::PairingTimeout
             | Self::ConnectionError
             | Self::TlsError
-            | Self::ConnectionTimeout => 503,
+            | Self::ConnectionTimeout
+            | Self::ServiceUnavailable => 503,
             Self::PacketTooLarge => 413,
             _ => 500,
         }
@@ -294,6 +309,7 @@ impl Error {
             Self::PairingRejected(_) => ErrorCode::PairingRejected,
             Self::NoPendingPairRequest(_) => ErrorCode::NoPendingPairRequest,
             Self::DeviceNotPaired(_) => ErrorCode::DeviceNotPaired,
+            Self::ServiceUnavailable(_) => ErrorCode::ServiceUnavailable,
             Self::PluginNotFound(_) => ErrorCode::PluginNotFound,
             Self::PluginError { .. } => ErrorCode::PluginError,
             Self::NoPluginForPacketType(_) => ErrorCode::NoPluginForPacketType,

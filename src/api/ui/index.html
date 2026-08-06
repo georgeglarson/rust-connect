@@ -445,9 +445,11 @@
                     body = { address: ip };
                 } else if (pathSegment === 'lock') {
                     body = { action: 'lock' };
-                } else if (pathSegment === 'sftp/mount') {
-                    body = { mountPoint: `/tmp/sftp_${currentDeviceId}` };
                 }
+                // sftp/mount is server-determined — the daemon picks the
+                // mount point under <data_dir>/mounts/. The old
+                // `mountPoint` body was an XSS-style caller-controlled
+                // path and is gone.
                 
                 await fetchAPI(method, path, body);
                 logEvent('ACTION', `Triggered ${pathSegment}`);
@@ -696,7 +698,10 @@
         async function unmountSftp() {
             if (!currentDeviceId) return;
             try {
-                await fetchAPI('DELETE', `/devices/${currentDeviceId}/sftp/mount?mount_point=/tmp/sftp_${currentDeviceId}`);
+                // Mount point is server-determined; the old
+                // ?mount_point= query was an XSS-style caller-controlled
+                // path and is gone.
+                await fetchAPI('DELETE', `/devices/${currentDeviceId}/sftp/mount`);
                 logEvent('ACTION', `Requested SFTP unmount`);
                 refreshData('sftp');
             } catch(e) { alert(e.message); }

@@ -168,6 +168,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(handlers::request_sftp),
         )
         .route(
+            "/api/v1/devices/:device_id/sftp/mount",
+            post(handlers::mount_sftp).delete(handlers::unmount_sftp),
+        )
+        .route(
             "/api/v1/devices/:device_id/sftp",
             get(handlers::get_sftp_info),
         )

@@ -11,6 +11,7 @@ use rust_connect::app::AppState;
 use rust_connect::config::settings::AppSettings;
 use rust_connect::device::{Device, DeviceType};
 use rust_connect::plugins::Plugin;
+use utoipa::OpenApi;
 
 async fn create_test_app() -> (Arc<AppState>, tempfile::TempDir, String) {
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -505,6 +506,126 @@ async fn test_daemon_shutdown_releases_sftp() {
     assert_eq!(
         state.plugins.sftp.get_mount_status(device_id).state,
         rust_connect::plugins::sftp::MountState::Unmounted
+    );
+}
+
+/// POST /api/v1/devices/{id}/sftp/mount without creds → 4xx. The
+/// specific code depends on whether sshfs is on PATH (400 with a
+/// credentials hint, or 503 for backend unavailable). Both are
+/// legitimate "client must /sftp/request first OR install sshfs"
+/// outcomes per the lane brief.
+#[tokio::test]
+async fn test_sftp_mount_without_credentials_returns_4xx() {
+    let (state, _temp, api_key) = create_test_app().await;
+    let device_id = "no-creds-sftp-device-aaaaaaaaaaaa";
+    let app = build_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/devices/{device_id}/sftp/mount"))
+                .header("X-API-Key", &api_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    assert!(
+        status == StatusCode::BAD_REQUEST || status == StatusCode::SERVICE_UNAVAILABLE,
+        "expected 400 or 503, got {status}"
+    );
+}
+
+/// DELETE /api/v1/devices/{id}/sftp/mount when nothing is mounted → 404.
+#[tokio::test]
+async fn test_sftp_unmount_when_not_mounted_returns_404() {
+    let (state, _temp, api_key) = create_test_app().await;
+    let device_id = "not-mounted-sftp-aaaaaaaaaaaaaaa";
+    let app = build_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/devices/{device_id}/sftp/mount"))
+                .header("X-API-Key", &api_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// GET /api/v1/devices/{id}/sftp response now carries `mounted` and
+/// `mount_point` (and `mount_state`).
+#[tokio::test]
+async fn test_sftp_info_response_includes_mount_state() {
+    let (state, _temp, api_key) = create_test_app().await;
+    let device_id = "sftp-info-state-aaaaaaaaaaaaaaaa";
+    // Plant credentials so the endpoint returns 200 (not 404).
+    let pkt = rust_connect::protocol::types::Packet::new(
+        "kdeconnect.sftp".to_string(),
+        serde_json::json!({
+            "ip": "192.168.1.55",
+            "port": 1740,
+            "user": "kdeconnect",
+            "password": "state-secret",
+            "path": "/storage/emulated/0"
+        }),
+    );
+    state
+        .plugins
+        .sftp
+        .handle_packet(device_id, pkt)
+        .await
+        .expect("handle sftp packet");
+    let app = build_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/devices/{device_id}/sftp"))
+                .header("X-API-Key", &api_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let data = &body["data"];
+    // The mount-state surface is always present.
+    assert!(data.get("mounted").is_some(), "missing mounted: {data}");
+    assert!(
+        data.get("mount_point").is_some(),
+        "missing mount_point: {data}"
+    );
+    assert!(
+        data.get("mount_state").is_some(),
+        "missing mount_state: {data}"
+    );
+    // And the password is NOT in the response.
+    let serialized = serde_json::to_string(&body).unwrap();
+    assert!(
+        !serialized.contains("state-secret"),
+        "password leaked in API response: {serialized}"
+    );
+}
+
+/// Both new endpoints appear in the OpenAPI spec.
+#[test]
+fn test_sftp_mount_endpoints_in_openapi() {
+    let spec = rust_connect::api::openapi::ApiDoc::openapi();
+    let paths: Vec<&str> = spec.paths.paths.keys().map(|s| s.as_str()).collect();
+    assert!(
+        paths.contains(&"/api/v1/devices/{device_id}/sftp/mount"),
+        "mount path missing from OpenAPI: {paths:?}"
     );
 }
 

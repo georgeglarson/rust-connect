@@ -53,6 +53,8 @@ use crate::device::types::{Device, DeviceState, DeviceType};
         handlers::get_device_connectivity,
 
         handlers::request_sftp,
+        handlers::mount_sftp,
+        handlers::unmount_sftp,
         handlers::get_sftp_info,
         handlers::send_file_to_device,
         handlers::send_text_to_device,
