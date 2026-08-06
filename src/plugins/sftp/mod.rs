@@ -155,13 +155,14 @@ impl SftpPlugin {
     pub fn get_mount_status(&self, device_id: &str) -> MountStatus {
         let mounts = self.mounts.read().unwrap_or_else(|e| e.into_inner());
         let mount_point = mount_point_for(&self.data_dir, device_id);
-        match mounts.get(device_id) {
+        let state = mounts.get(device_id).cloned();
+        match state {
             Some(MountState::Mounted) | Some(MountState::Mounting) => MountStatus {
-                state: mounts.get(device_id).cloned().unwrap(),
+                state: state.expect("matched just above"),
                 mount_point: Some(mount_point),
             },
             Some(MountState::Failed(_)) => MountStatus {
-                state: mounts.get(device_id).cloned().unwrap(),
+                state: state.expect("matched just above"),
                 mount_point: Some(mount_point),
             },
             _ => MountStatus {
@@ -249,6 +250,80 @@ impl SftpPlugin {
             state: final_state,
             mount_point: None,
         })
+    }
+
+    /// Lifecycle hook: unmount + drop credentials for a single device.
+    /// Idempotent — safe to call on an already-cleaned device. Used by
+    /// the unpair and delete handlers and the daemon shutdown path.
+    pub async fn cleanup_device(&self, device_id: &str) {
+        let mp = self.mount_point(device_id);
+        if mp.exists() {
+            let _ = self.mounter.unmount(&mp);
+        }
+        self.set_mount_state(device_id, MountState::Unmounted);
+        if let Ok(mut connections) = self.connections.write() {
+            connections.remove(device_id);
+        }
+    }
+
+    /// Daemon-shutdown cleanup: unmount every active mount, drop every
+    /// stored credential, clear the tables. Best-effort — failures are
+    /// logged, not returned.
+    pub async fn cleanup_all(&self) {
+        // Devices with an active mount OR a stored credential must be
+        // cleaned — the two sets are not identical (a device can have
+        // creds from a kdeconnect.sftp packet but not be mounted yet).
+        let mut devices: std::collections::BTreeSet<String> = self
+            .mounts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        devices.extend(
+            self.connections
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .cloned(),
+        );
+        for d in devices {
+            self.cleanup_device(&d).await;
+        }
+    }
+
+    /// Startup sweep: walk `<data_dir>/mounts/`, attempt `fusermount3 -u`
+    /// (or `fusermount -u`) on every `sftp-*` directory left by a
+    /// previous crash. Does NOT require sshfs on PATH — a host that
+    /// installs the daemon but never sshfs still gets a clean restart.
+    pub fn startup_sweep(&self) -> Vec<String> {
+        let mounts_dir = self.data_dir.join("mounts");
+        let mut released = Vec::new();
+        let entries = match std::fs::read_dir(&mounts_dir) {
+            Ok(e) => e,
+            Err(_) => return released, // no mounts dir yet, nothing to do
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let s = name.to_string_lossy();
+            if !s.starts_with("sftp-") {
+                continue;
+            }
+            let path = entry.path();
+            let outcome = self.mounter.unmount(&path);
+            let label = match &outcome {
+                Ok(UnmountOutcome::Unmounted) => {
+                    // Best-effort: remove the now-empty dir so the next
+                    // mount starts clean.
+                    let _ = std::fs::remove_dir(&path);
+                    "unmounted"
+                }
+                Ok(UnmountOutcome::Failed(_)) => "failed",
+                Err(_) => "error",
+            };
+            released.push(format!("{}:{}", path.display(), label));
+        }
+        released
     }
 
     /// Credential rotation path: if the device is currently mounted,
@@ -471,7 +546,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
     use super::*;
-    use crate::plugins::sftp::mounter::{CommandOutput, CommandRunner, MountOutcome, UnmountOutcome};
+    use crate::plugins::sftp::mounter::{
+        CommandOutput, CommandRunner, MountOutcome, UnmountOutcome,
+    };
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -573,7 +650,9 @@ mod tests {
     fn test_plugin_with_runner(runner: ScriptedRunner) -> (SftpPlugin, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let plugin = SftpPlugin::with_mounter(
-            Arc::new(crate::plugins::events::PluginEventBroadcaster::new(8, "test")),
+            Arc::new(crate::plugins::events::PluginEventBroadcaster::new(
+                8, "test",
+            )),
             dir.path().to_path_buf(),
             Arc::new(runner),
         );
@@ -584,8 +663,14 @@ mod tests {
     fn sftp_connection_info_debug_redacts_password() {
         let info = sample_info();
         let debug = format!("{info:?}");
-        assert!(debug.contains("***redacted***"), "missing redaction marker: {debug}");
-        assert!(!debug.contains("phonesecret"), "password leaked in Debug: {debug}");
+        assert!(
+            debug.contains("***redacted***"),
+            "missing redaction marker: {debug}"
+        );
+        assert!(
+            !debug.contains("phonesecret"),
+            "password leaked in Debug: {debug}"
+        );
         // Other fields are still visible.
         assert!(debug.contains("192.168.1.50"));
         assert!(debug.contains("kdeconnect"));
@@ -615,7 +700,10 @@ mod tests {
         let status = plugin.get_mount_status("dev1");
         assert_eq!(status.state, MountState::Mounted);
         let mp = status.mount_point.expect("mount point set on success");
-        assert!(mp.starts_with(dir.path()), "mount point under data_dir: {mp:?}");
+        assert!(
+            mp.starts_with(dir.path()),
+            "mount point under data_dir: {mp:?}"
+        );
         assert_eq!(mp.file_name().and_then(|s| s.to_str()), Some("sftp-dev1"));
     }
 
@@ -630,7 +718,13 @@ mod tests {
             .mount_device("dev1", &sample_info())
             .await
             .expect("mount call");
-        assert!(matches!(status, MountStatus { state: MountState::Failed(_), .. }));
+        assert!(matches!(
+            status,
+            MountStatus {
+                state: MountState::Failed(_),
+                ..
+            }
+        ));
         let stored = plugin.get_mount_status("dev1");
         match stored.state {
             MountState::Failed(msg) => assert!(msg.contains("connection refused")),
@@ -661,7 +755,9 @@ mod tests {
             .iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
-        assert!(argv_str.windows(2).any(|w| w[0] == "-o" && w[1] == "password_stdin"));
+        assert!(argv_str
+            .windows(2)
+            .any(|w| w[0] == "-o" && w[1] == "password_stdin"));
     }
 
     #[tokio::test]
@@ -712,10 +808,8 @@ mod tests {
         // sshfs succeeds first time, FAILS on the second call (rotation
         // re-mount). The plugin must unmount the stale mount before
         // attempting the re-mount, and the final state is Failed.
-        let runner = ScriptedRunner::with_outcomes(
-            MountOutcome::Mounted,
-            UnmountOutcome::Unmounted,
-        );
+        let runner =
+            ScriptedRunner::with_outcomes(MountOutcome::Mounted, UnmountOutcome::Unmounted);
         let argv_log = runner.argv_log.clone();
         let (plugin, _d) = test_plugin_with_runner(runner);
 
@@ -756,13 +850,21 @@ mod tests {
         // (Re-mount always re-uses the tracked mount point; the unmount
         // is what tears the stale one down before the new one starts.)
         let log = argv_log.lock().unwrap();
-        assert!(log.len() >= 3, "expected at least 3 spawns, got {}", log.len());
+        assert!(
+            log.len() >= 3,
+            "expected at least 3 spawns, got {}",
+            log.len()
+        );
         // First spawn is the initial mount.
         assert!(log[0].iter().any(|a| a == "password_stdin"));
         // Second spawn is the unmount (contains -u, NOT password_stdin).
-        let is_unmount = log[1].iter().any(|a| a == "-u")
-            && !log[1].iter().any(|a| a == "password_stdin");
-        assert!(is_unmount, "second spawn should be the unmount: {:?}", log[1]);
+        let is_unmount =
+            log[1].iter().any(|a| a == "-u") && !log[1].iter().any(|a| a == "password_stdin");
+        assert!(
+            is_unmount,
+            "second spawn should be the unmount: {:?}",
+            log[1]
+        );
         // Third spawn is the re-mount (contains the NEW password in stdin).
         assert!(log[2].iter().any(|a| a == "password_stdin"));
     }
@@ -770,8 +872,162 @@ mod tests {
     #[tokio::test]
     async fn unmount_unknown_device_is_a_noop() {
         let (plugin, _d) = test_plugin_with_runner(ScriptedRunner::always_succeed());
-        let status = plugin.unmount_device("never-mounted").await.expect("unmount");
+        let status = plugin
+            .unmount_device("never-mounted")
+            .await
+            .expect("unmount");
         assert_eq!(status.state, MountState::Unmounted);
+    }
+
+    #[tokio::test]
+    async fn cleanup_device_drops_connection_and_mount() {
+        let runner = ScriptedRunner::always_succeed();
+        let argv_log = runner.argv_log.clone();
+        let (plugin, _d) = test_plugin_with_runner(runner);
+        plugin.set_connection("dev1", sample_info());
+        plugin
+            .mount_device("dev1", &sample_info())
+            .await
+            .expect("mount");
+        assert!(plugin.get_connection("dev1").is_some());
+        assert_eq!(plugin.get_mount_status("dev1").state, MountState::Mounted);
+
+        plugin.cleanup_device("dev1").await;
+        assert!(plugin.get_connection("dev1").is_none());
+        assert_eq!(plugin.get_mount_status("dev1").state, MountState::Unmounted);
+        // cleanup_device unmounts the tracked mount point.
+        let log = argv_log.lock().unwrap();
+        let last = log.last().expect("at least one spawn");
+        assert!(last.iter().any(|a| a == "-u"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_device_idempotent() {
+        let (plugin, _d) = test_plugin_with_runner(ScriptedRunner::always_succeed());
+        // Clean an already-clean device — must not panic, must not error.
+        plugin.cleanup_device("never-seen").await;
+        plugin.cleanup_device("never-seen").await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_all_unmounts_every_tracked_device() {
+        let runner = ScriptedRunner::always_succeed();
+        let argv_log = runner.argv_log.clone();
+        let (plugin, _d) = test_plugin_with_runner(runner);
+        // Two devices, both mounted.
+        plugin
+            .mount_device("dev1", &sample_info())
+            .await
+            .expect("mount1");
+        plugin
+            .mount_device("dev2", &sample_info())
+            .await
+            .expect("mount2");
+        plugin.cleanup_all().await;
+        assert_eq!(plugin.get_mount_status("dev1").state, MountState::Unmounted);
+        assert_eq!(plugin.get_mount_status("dev2").state, MountState::Unmounted);
+        // The last two spawns should be the unmounts (cleanup_unmounts).
+        let log = argv_log.lock().unwrap();
+        let n = log.len();
+        assert!(n >= 4, "expected at least 2 mounts + 2 unmounts, got {n}");
+        for argset in &log[n - 2..] {
+            assert!(argset.iter().any(|a| a == "-u"));
+        }
+    }
+
+    #[test]
+    fn startup_sweep_releases_stale_mounts() {
+        // The data dir has two stale sftp-* dirs from a previous crash.
+        // The fake runner reports UnmountOutcome::Unmounted for them.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mounts_dir = dir.path().join("mounts");
+        std::fs::create_dir_all(mounts_dir.join("sftp-dev1")).unwrap();
+        std::fs::create_dir_all(mounts_dir.join("sftp-dev2")).unwrap();
+        // A non-sftp dir should be left alone.
+        let other = mounts_dir.join("not-sftp");
+        std::fs::create_dir_all(&other).unwrap();
+        let argv_log = Arc::new(Mutex::new(Vec::new()));
+        let runner = ScriptedRunner {
+            sshfs_outcome: MountOutcome::Mounted,
+            unmount_outcome: UnmountOutcome::Unmounted,
+            argv_log: argv_log.clone(),
+            stdin_log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let plugin = SftpPlugin::with_mounter(
+            Arc::new(crate::plugins::events::PluginEventBroadcaster::new(
+                8, "test",
+            )),
+            dir.path().to_path_buf(),
+            Arc::new(runner),
+        );
+        let released = plugin.startup_sweep();
+        assert_eq!(released.len(), 2, "two sftp-* dirs swept: {released:?}");
+        // Stale dirs removed after unmount.
+        assert!(!mounts_dir.join("sftp-dev1").exists());
+        assert!(!mounts_dir.join("sftp-dev2").exists());
+        // The unrelated dir is untouched.
+        assert!(other.exists());
+    }
+
+    #[test]
+    fn startup_sweep_safe_when_mounts_dir_missing() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        // No mounts/ subdir at all.
+        let plugin = SftpPlugin::with_mounter(
+            Arc::new(crate::plugins::events::PluginEventBroadcaster::new(
+                8, "test",
+            )),
+            dir.path().to_path_buf(),
+            Arc::new(ScriptedRunner::always_succeed()),
+        );
+        let released = plugin.startup_sweep();
+        assert!(released.is_empty());
+    }
+
+    #[test]
+    fn startup_sweep_safe_when_sshfs_missing() {
+        // sshfs is NOT on PATH: a startup sweep must still run for any
+        // stale mounts left by a previous daemon. (kdeconnect-kde's
+        // sweep is implicit in mounter construction; we make it explicit
+        // because the cleanup here is "fusermount the previous mount
+        // point", not "spawn sshfs again".)
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mounts_dir = dir.path().join("mounts");
+        std::fs::create_dir_all(mounts_dir.join("sftp-stale")).unwrap();
+        // A runner that reports nothing on PATH for sshfs but still
+        // answers fusermount calls.
+        struct NoSshfsRunner;
+        impl CommandRunner for NoSshfsRunner {
+            fn which(&self, name: &str) -> Option<PathBuf> {
+                if name == "sshfs" {
+                    None
+                } else {
+                    Some(PathBuf::from(format!("/usr/bin/{name}")))
+                }
+            }
+            fn run_with_stdin(
+                &self,
+                _program: &Path,
+                _args: &[OsString],
+                _stdin: Option<&str>,
+            ) -> crate::utils::errors::Result<CommandOutput> {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let plugin = SftpPlugin::with_mounter(
+            Arc::new(crate::plugins::events::PluginEventBroadcaster::new(
+                8, "test",
+            )),
+            dir.path().to_path_buf(),
+            Arc::new(NoSshfsRunner),
+        );
+        let released = plugin.startup_sweep();
+        assert_eq!(released.len(), 1);
+        assert!(!mounts_dir.join("sftp-stale").exists());
     }
 
     #[test]
@@ -859,9 +1115,15 @@ mod tests {
             .mount_device("device1", &plugin.get_connection("device1").unwrap())
             .await
             .expect("mount");
-        assert_eq!(plugin.get_mount_status("device1").state, MountState::Mounted);
+        assert_eq!(
+            plugin.get_mount_status("device1").state,
+            MountState::Mounted
+        );
         plugin.on_disconnected("device1");
         assert!(plugin.get_connection("device1").is_none());
-        assert_eq!(plugin.get_mount_status("device1").state, MountState::Unmounted);
+        assert_eq!(
+            plugin.get_mount_status("device1").state,
+            MountState::Unmounted
+        );
     }
 }

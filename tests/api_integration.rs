@@ -10,6 +10,7 @@ use rust_connect::api::build_router;
 use rust_connect::app::AppState;
 use rust_connect::config::settings::AppSettings;
 use rust_connect::device::{Device, DeviceType};
+use rust_connect::plugins::Plugin;
 
 async fn create_test_app() -> (Arc<AppState>, tempfile::TempDir, String) {
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -409,6 +410,101 @@ async fn test_unpair_device() {
             .pairing_handler
             .is_paired(&"unpair-meaaaaaaaaaaaaaaaaaaaaaaa".to_string())
             .await
+    );
+}
+
+/// Unpair must release SFTP credentials and any tracked mount, even
+/// when the device is not currently connected. Mirrors the lifecycle
+/// matrix in the lane brief.
+#[tokio::test]
+async fn test_unpair_drops_sftp_credentials() {
+    let (state, _temp, api_key) = create_test_app().await;
+    let device_id = "unpair-sftp-aaaaaaaaaaaaaaaaaaaaa";
+
+    // Plant pairing + SFTP creds as if the device had connected and
+    // sent an sftp packet.
+    state
+        .pairing_handler
+        .receive_pair_request(&device_id.to_string(), Some(1_700_000_000))
+        .await
+        .unwrap();
+    state
+        .pairing_handler
+        .accept_pairing(&device_id.to_string())
+        .await
+        .unwrap();
+    let pkt = rust_connect::protocol::types::Packet::new(
+        "kdeconnect.sftp".to_string(),
+        serde_json::json!({
+            "ip": "192.168.1.50",
+            "port": 1740,
+            "user": "kdeconnect",
+            "password": "device-secret-7c3",
+            "path": "/storage/emulated/0"
+        }),
+    );
+    state
+        .plugins
+        .sftp
+        .handle_packet(device_id, pkt)
+        .await
+        .expect("handle sftp packet");
+    assert!(state.plugins.sftp.get_connection(device_id).is_some());
+
+    let app = build_router(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/devices/{device_id}/unpair"))
+                .header("X-API-Key", &api_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // SFTP credentials and mount state must be gone after the unpair.
+    assert!(
+        state.plugins.sftp.get_connection(device_id).is_none(),
+        "unpair must drop SFTP credentials"
+    );
+    assert_eq!(
+        state.plugins.sftp.get_mount_status(device_id).state,
+        rust_connect::plugins::sftp::MountState::Unmounted
+    );
+}
+
+/// Daemon-shutdown cleanup: cleanup_all must release every tracked
+/// SFTP mount + drop every stored credential.
+#[tokio::test]
+async fn test_daemon_shutdown_releases_sftp() {
+    let (state, _temp, _api_key) = create_test_app().await;
+    let device_id = "shutdown-sftp-aaaaaaaaaaaaaaaaaa";
+    let pkt = rust_connect::protocol::types::Packet::new(
+        "kdeconnect.sftp".to_string(),
+        serde_json::json!({
+            "ip": "192.168.1.51",
+            "port": 1740,
+            "user": "kdeconnect",
+            "password": "shutdown-secret",
+            "path": "/"
+        }),
+    );
+    state
+        .plugins
+        .sftp
+        .handle_packet(device_id, pkt)
+        .await
+        .expect("handle sftp packet");
+    assert!(state.plugins.sftp.get_connection(device_id).is_some());
+
+    state.plugins.sftp.cleanup_all().await;
+    assert!(state.plugins.sftp.get_connection(device_id).is_none());
+    assert_eq!(
+        state.plugins.sftp.get_mount_status(device_id).state,
+        rust_connect::plugins::sftp::MountState::Unmounted
     );
 }
 

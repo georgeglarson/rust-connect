@@ -263,6 +263,11 @@ pub async fn unpair_device(
 
     notify_peer_unpair(&state, &device_id).await;
 
+    // Unpair tears down the trust relationship; any SFTP credentials
+    // and mount belong to the previous pairing. Drop them on the way
+    // out so a fresh pairing starts clean.
+    state.plugins.sftp.cleanup_device(&device_id).await;
+
     state
         .pairing_handler
         .unpair(&device_id)
@@ -357,6 +362,12 @@ pub async fn delete_device(
 
     // Notify the peer BEFORE tearing the link down (same as unpair_device).
     notify_peer_unpair(&state, &device_id).await;
+
+    // Clean up SFTP state before disconnect fires on_disconnected. The
+    // disconnect path also runs cleanup via the plugin's on_disconnected,
+    // but doing it here means the device's mount point is released even
+    // if the link teardown races with the registry removal.
+    state.plugins.sftp.cleanup_device(&device_id).await;
 
     if state.connection_manager.is_connected(&device_id).await {
         let generation = state.connection_manager.get_generation(&device_id).await;

@@ -133,6 +133,21 @@ pub async fn create_state(settings: AppSettings) -> Result<Arc<AppState>> {
     state.initialize().await?;
     load_persisted_data(&state).await;
 
+    // Startup sweep: any SFTP mounts left mounted by a previous crash
+    // must be released here, before the daemon accepts new connections.
+    // The sweep uses fusermount3 only — it does NOT require sshfs to be
+    // installed, so a fresh host that just installed the daemon still
+    // gets a clean restart.
+    let released = state.plugins.sftp.startup_sweep();
+    if !released.is_empty() {
+        info!(
+            count = released.len(),
+            mounts = ?released,
+            event = "sftp_startup_sweep",
+            "Released stale SFTP mounts from previous run"
+        );
+    }
+
     Ok(state)
 }
 

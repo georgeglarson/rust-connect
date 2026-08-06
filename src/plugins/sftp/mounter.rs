@@ -221,16 +221,21 @@ pub fn build_sshfs_args(req: &MountRequest) -> Vec<OsString> {
 /// The mounter holds no state of its own beyond its command runner and
 /// the sshfs binary path. Mount state (current mount per device) lives
 /// in the plugin — the mounter is stateless on purpose.
-pub struct Mounter<R: CommandRunner> {
-    runner: R,
+///
+/// The runner is stored as an `Arc<dyn CommandRunner>` — production gets
+/// `SystemCommandRunner`, tests inject a fake. The mounter is therefore
+/// not generic; the previous generic shape needed blanket impls for
+/// `Box<T>`/`Arc<T>` that were easy to trip over.
+pub struct Mounter {
+    runner: std::sync::Arc<dyn CommandRunner>,
     sshfs_path: Option<PathBuf>,
     /// First fusermount3 found; falls back to fusermount when absent.
     fusermount_path: Option<PathBuf>,
     fusermount3_path: Option<PathBuf>,
 }
 
-impl<R: CommandRunner> Mounter<R> {
-    pub fn new(runner: R) -> Self {
+impl Mounter {
+    pub fn new(runner: std::sync::Arc<dyn CommandRunner>) -> Self {
         let sshfs_path = runner.which("sshfs");
         let fusermount3_path = runner.which("fusermount3");
         let fusermount_path = runner.which("fusermount");
@@ -496,7 +501,7 @@ mod tests {
         let runner = SingleDirRunner {
             dir: bin_dir.clone(),
         };
-        let mounter = Mounter::new(runner);
+        let mounter = Mounter::new(std::sync::Arc::new(runner));
         assert!(
             mounter.is_available(),
             "fake sshfs + fusermount must make the mounter available"
@@ -534,7 +539,7 @@ mod tests {
         let runner = SingleDirRunner {
             dir: bin_dir.clone(),
         };
-        let mounter = Mounter::new(runner);
+        let mounter = Mounter::new(std::sync::Arc::new(runner));
         assert!(mounter.is_available());
 
         let mount_point = dir.path().join("mnt");
@@ -571,7 +576,7 @@ mod tests {
         let runner = SingleDirRunner {
             dir: bin_dir.clone(),
         };
-        let mounter = Mounter::new(runner);
+        let mounter = Mounter::new(std::sync::Arc::new(runner));
         assert!(
             mounter.is_available(),
             "fusermount fallback must keep the mounter available"
@@ -595,7 +600,7 @@ mod tests {
         write_fake_fusermount(&bin_dir, &um_log, "fusermount3");
 
         let runner = SingleDirRunner { dir: bin_dir };
-        let mounter = Mounter::new(runner);
+        let mounter = Mounter::new(std::sync::Arc::new(runner));
         assert!(
             !mounter.is_available(),
             "missing sshfs must make mounter unavailable"
@@ -630,7 +635,7 @@ mod tests {
         // tests don't race on process-global state.
         std::fs::write(dir.path().join("sshfs.fail"), "13").expect("write fail flag");
         let runner = SingleDirRunner { dir: bin_dir };
-        let mounter = Mounter::new(runner);
+        let mounter = Mounter::new(std::sync::Arc::new(runner));
         let req = MountRequest {
             mount_point: dir.path().join("mnt"),
             ..make_request()

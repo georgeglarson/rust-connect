@@ -68,6 +68,16 @@ impl Daemon {
 
         service_manager::stop_services(handles, &self.state).await;
 
+        // Release every active SFTP mount and drop every stored
+        // credential. The startup sweep will pick up anything we miss
+        // on the next boot — this is the "clean exit" leg. Runs AFTER
+        // stop_services so no new mount/unmount requests can race in.
+        self.state.plugins.sftp.cleanup_all().await;
+        info!(
+            event = "sftp_cleaned_up",
+            "Released SFTP mounts and credentials"
+        );
+
         info!(event = "daemon_stopped", "Daemon stopped successfully");
         Ok(())
     }
