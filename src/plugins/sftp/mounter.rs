@@ -425,7 +425,25 @@ mod tests {
             cmd.stdin(Stdio::piped());
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());
-            let mut child = cmd.spawn().expect("spawn fake");
+            // Observed under parallel test execution (integrator gate,
+            // 2026-08-06): spawn can hit ETXTBSY ("Text file busy") when
+            // the freshly written fake script is exec'd while another
+            // test's write of its own fake is in flight. Each test uses a
+            // unique TempDir, so the window is kernel-side and rare; retry
+            // briefly instead of flaking the suite.
+            let mut child = {
+                let mut attempts = 0;
+                loop {
+                    match cmd.spawn() {
+                        Ok(c) => break c,
+                        Err(e) if e.raw_os_error() == Some(26) && attempts < 5 => {
+                            attempts += 1;
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        Err(e) => panic!("spawn fake {}: {e}", program.display()),
+                    }
+                }
+            };
             if let Some(payload) = stdin_payload {
                 use std::io::Write;
                 if let Some(mut stdin) = child.stdin.take() {

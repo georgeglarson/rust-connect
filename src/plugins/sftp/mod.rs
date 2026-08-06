@@ -45,8 +45,8 @@ pub struct SftpConnectionInfo {
 
 /// `Debug` is hand-rolled to redact the password. The derived form would
 /// include the plaintext (sftp.rs:26-36 prior to this lane) and a single
-/// `{:?}` in a log line would leak the credential — see the regression
-/// test in `tests/credential_audit.rs`.
+/// `{:?}` in a log line would leak the credential — pinned by
+/// `sftp_connection_info_debug_redacts_password` in this module's tests.
 impl fmt::Debug for SftpConnectionInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SftpConnectionInfo")
