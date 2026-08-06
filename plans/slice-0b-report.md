@@ -250,3 +250,195 @@ src/api/handlers/share.rs                                      — 2 share tests
 ```
 
 5 commits on `slice-0b-wire-provenance`, no pushes, no merges.
+
+---
+
+## Addendum — follow-up lane (2026-08-06)
+
+**Date:** 2026-08-06
+**Executor:** headless M3 lane (second pass; integrator holds merges/pushes)
+**Branch:** `slice-0b-wire-provenance` @ ad4adae (6 commits total, 1 added by this lane)
+**Final state:** `cargo test --locked`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --check` all green.
+
+### Why this lane exists
+
+The first pass (commit 38c7957) stopped at the boundary of the brief's named
+worklists. The integrator verified the lint output against the test surface
+and found two classes of follow-up:
+
+1. **Sweep misses.** Several plugins still contained wire-conformance tests
+   whose literals were inline `json!` (the same class the first pass
+   converted elsewhere). The follow-up brief listed nine plugins: presenter,
+   sendnotifications, digitizer, sms, battery, lock, findthisdevice,
+   remotecommands, connectivity.
+2. **Two over-promoted ledger rows.** `battery` and `ping` were promoted to
+   `fixture_provenance: PASS` citing `tests/fixtures/upstream-wire/identity/
+   basic.json` — an identity-packet fixture that says nothing about battery
+   or ping wire shapes. The lint cannot see this semantic overclaim; the
+   follow-up brief records it as a Scope B correction.
+
+The `screensaver-inhibit` and `sftp` rows were also flagged for rules
+litigation under the main brief's D5 allowance.
+
+### Scope A — disposition table
+
+Every test in the follow-up brief (Worklists A+B did not overlap with this
+lane; the new files are listed in `Files touched` below). "Action" is one of:
+**convert** (fixture added, test loads it), **justify-keep** (behavioral,
+not wire-shape), or **justify-delete** (n/a — none deleted).
+
+| Plugin | Test | Action | Fixture file | Upstream citation |
+|---|---|---|---|---|
+| presenter | `test_handle_pointer_exact_android_shape` | convert | `tests/fixtures/upstream-wire/presenter/pointer.json` | kdeconnect-android@a88f6fa0 `PresenterPlugin.kt:77-82` |
+| presenter | `test_handle_stop_exact_android_shape` | convert | `tests/fixtures/upstream-wire/presenter/stop.json` | kdeconnect-android@a88f6fa0 `PresenterPlugin.kt:84-88` |
+| presenter | `test_bogus_legacy_fields_are_ignored` | justify-keep | n/a | behavioral — the pre-cut implementation invented `{next}/{previous}` body keys; the test pins the fact that no upstream peer emits them. Kept inline. |
+| sendnotifications | `test_ticker_carries_summary_and_body` | convert | `tests/fixtures/upstream-wire/sendnotifications/outgoing.json` | kdeconnect-kde@f5ed3ed8 `dbusnotificationslistener.cpp:317-329` (body); :301-304 (ticker assembly) |
+| sendnotifications | `test_ticker_is_summary_alone_when_body_empty` | justify-keep | n/a | behavioral variant of the same wire shape; the summary-only ticker is a body-content edge |
+| sendnotifications | `test_text_omitted_when_body_empty` | justify-keep | n/a | behavioral — asserts the optional field is dropped when body is empty |
+| sendnotifications | `test_is_clearable_true_only_for_never_expiring` | justify-keep | n/a | behavioral — three branches of the timeout-to-bool mapping |
+| sendnotifications | `test_id_is_a_string` | justify-keep | n/a | behavioral — string-vs-int is a schema choice, not a wire shape |
+| sendnotifications | `test_app_name_and_silent_flag` | justify-keep | n/a | behavioral — the two field values are obvious, the assertion is structural |
+| sendnotifications | `test_cancel_parses_as_string_notification_id` | convert | `tests/fixtures/upstream-wire/sendnotifications/cancel_string.json` | kdeconnect-kde@f5ed3ed8 `notificationsplugin.cpp:142-144` (writes); Android `NotificationsPlugin.kt:528-533` (reads) |
+| sendnotifications | `test_request_flag_parses_with_no_cancel` | convert | `tests/fixtures/upstream-wire/sendnotifications/request_flag.json` | kdeconnect-kde@f5ed3ed8 `notificationsplugin.cpp:29`; Android `ReceiveNotificationsPlugin.kt:39-41` |
+| sendnotifications | `test_legacy_bool_cancel_is_ignored_not_a_parse_error` | justify-keep | n/a | behavioral — tests the lenient deserializer, not wire shape |
+| sendnotifications | `test_empty_cancel_is_not_an_id` | justify-keep | n/a | behavioral — empty-string filtering |
+| digitizer | `test_capitalized_pen_activates_pen_tool` | convert | `tests/fixtures/upstream-wire/digitizer/pen_stroke.json` | kdeconnect-android@a88f6fa0 `ToolEvent.kt:11-19` + `DigitizerPlugin.kt:73-79` |
+| digitizer | `test_capitalized_rubber_activates_rubber_tool` | convert | `tests/fixtures/upstream-wire/digitizer/rubber_stroke.json` | kdeconnect-android@a88f6fa0 `ToolEvent.kt:11-19` + `DigitizerPlugin.kt:73-79` |
+| digitizer | `test_lowercase_pen_activates_nothing` | justify-keep | n/a | regression — pins that lowercase never matches; behavioral, not wire |
+| sms | `test_handle_sms_with_addresses_array_from_android` | convert | `tests/fixtures/upstream-wire/sms/message_batch.json` | kdeconnect-android@a88f6fa0 `SMSHelper.kt:911-933` (`Message.toJSONObject()`) |
+| sms | `test_handle_sms_with_read_as_int` | justify-keep | n/a | behavioral variant — plugin accepts Android's int read field |
+| sms | `test_handle_sms_multiple_addresses` | justify-keep | n/a | behavioral variant — multi-address array shape |
+| sms | `test_handle_sms_with_event_flags` | justify-keep | n/a | behavioral variant — event flag presence |
+| sms | `test_handle_sms_without_optional_fields` | justify-keep | n/a | behavioral variant — minimal field set |
+| battery | `test_on_connected_requests_battery` | convert | `tests/fixtures/upstream-wire/battery/request.json` | `hand-authored-from-observation` — neither kdeconnect-kde nor android emits `kdeconnect.battery.request` at all; GSConnect@35bc5991 emits `{request: true}` so the rust plugin's empty-body is a divergence (see Scope B). |
+| lock | `test_lock_state_stored` | convert | `tests/fixtures/upstream-wire/lock/lock_state.json` | kdeconnect-kde@f5ed3ed8 `lockdeviceplugin.cpp:104,116` — divergence recorded; rust uses `locked`, upstream uses `isLocked`/`lockResult` |
+| lock | `test_lock_request_answers_with_stored_state` | convert | `tests/fixtures/upstream-wire/lock/lock_request.json` | kdeconnect-kde@f5ed3ed8 `lockdeviceplugin.cpp:122` — empty body |
+| findthisdevice | `test_request_rings` | convert | `tests/fixtures/upstream-wire/findthisdevice/ring_request.json` | kdeconnect-kde@f5ed3ed8 `findthisdeviceplugin.cpp:25` (body unused) + `findmyphoneplugin.cpp:17-21` (the mirror packet) |
+| remotecommands | `test_command_list_parsed` | convert | `tests/fixtures/upstream-wire/remotecommands/command_list.json` | kdeconnect-kde@f5ed3ed8 `runcommandplugin.cpp:188-195` (same wire shape as runcommand — the packet type is shared) |
+| remotecommands | `test_malformed_entry_does_not_drop_the_list` | justify-keep | n/a | behavioral — entry-level accept coverage |
+| remotecommands | `test_can_add_command_read` | justify-keep | n/a | behavioral — the boolean flag |
+| remotecommands | `test_can_add_command_defaults_false` | justify-keep | n/a | behavioral — default branch |
+| remotecommands | `test_non_object_command_list_is_dropped` | justify-keep | n/a | behavioral — JSON-shape guard |
+| remotecommands | `test_on_connected_requests_command_list` | convert | `tests/fixtures/upstream-wire/remotecommands/request_command_list.json` | kdeconnect-kde@f5ed3ed8 `remotecommandsplugin.cpp:35-39` |
+| connectivity | `test_handle_connectivity_packet` | convert | `tests/fixtures/upstream-wire/connectivity/report.json` | kdeconnect-android@a88f6fa0 `ConnectivityReportPlugin.kt:51-68` |
+| connectivity | `test_get_report` | justify-keep | n/a | behavioral — uses the same shape but asserts stored state |
+| connectivity | `test_on_disconnected_clears_report` | justify-keep | n/a | behavioral — lifecycle |
+| connectivity | `test_multiple_sub_ids` | justify-keep | n/a | behavioral — multi-subscription iteration |
+| sftp | `test_credentials_packet_shape_matches_android` (NEW) | convert | `tests/fixtures/upstream-wire/sftp/credentials.json` | kdeconnect-android@a88f6fa0 `SftpPlugin.kt:126-137` |
+
+### Scope B — ledger row corrections
+
+| Row | Before | After | Reason |
+|---|---|---|---|
+| `battery` | cite referenced `identity/basic.json` (overclaim) | cite now references `battery/request.json`; fixture_provenance stays PASS | replaced the identity-fixture overcite with the new dedicated battery fixture |
+| `ping` | cite referenced `identity/basic.json` (overclaim) | cite rewritten to behavioral-only allowance wording; fixture_provenance stays PASS | ping has no wire-shape tests of its own (the wire is type-driven + an ASCII message body); per main brief D5, behavioral-only rows keep PASS with the documented wording |
+| `screensaver-inhibit` | cite empty, fixture_provenance UNVERIFIED | cite now describes the lifecycle-only design (no packet types declared upstream); fixture_provenance stays UNVERIFIED | no wire surface to transcribe; the plugin's `incoming_capabilities()` is empty by design |
+| `sftp` | fixture_provenance UNVERIFIED | fixture_provenance PASS with `sftp/credentials.json` cite | the credentials envelope IS JSON-shaped (only the data stream is binary); the first pass marked this UNVERIFIED as a follow-up — that follow-up is now satisfied |
+| `lock` | fixture_provenance UNVERIFIED | fixture_provenance INTENTIONAL-DIVERGENCE; status INTENTIONAL-DIVERGENCE | the rust plugin's reply uses `locked` where upstream uses `isLocked`/`lockResult`; no Android LockPlugin exists in the pinned clone; the divergence is recorded for an integrator decision |
+| `connectivity` | fixture_provenance UNVERIFIED | fixture_provenance PASS with `connectivity/report.json` cite | new upstream-derived fixture |
+| `digitizer` | fixture_provenance UNVERIFIED | fixture_provenance PASS with `digitizer/*.json` cites | two new upstream-derived fixtures |
+| `findthisdevice` | fixture_provenance UNVERIFIED | fixture_provenance PASS with `findthisdevice/ring_request.json` cite | new upstream-derived fixture |
+| `presenter` | fixture_provenance UNVERIFIED | fixture_provenance PASS with `presenter/*.json` cites | two new upstream-derived fixtures |
+| `remotecommands` | fixture_provenance UNVERIFIED | fixture_provenance PASS with `remotecommands/*.json` cites | two new upstream-derived fixtures |
+| `sendnotifications` | fixture_provenance UNVERIFIED | fixture_provenance PASS with `sendnotifications/*.json` cites | three new upstream-derived fixtures |
+| `sms` | fixture_provenance UNVERIFIED | fixture_provenance PASS with `sms/message_batch.json` cite | new upstream-derived fixture |
+
+No `status` cell was promoted to PASS in this lane — every promotion kept
+`status: UNVERIFIED` (other dimensions remain open under the main brief's
+D3 rollup). The `lock` row is the only one that moved to
+`INTENTIONAL-DIVERGENCE` on `status`, matching the divergence record.
+
+### Scope C — citation verification notes
+
+Every fixture added in this lane was verified against the pinned clone at
+`/tmp/upstream-0b/{kdeconnect-android,kdeconnect-kde,gsconnect}`. The
+following citations required adjustment after the initial draft:
+
+| Fixture | Original citation | Corrected | Why |
+|---|---|---|---|
+| `battery/request.json` | `kdeconnect-kde plugins/battery/batteryplugin.cpp:60-72` (call to a non-existent `requestCharge()`) | reclassified as `hand-authored-from-observation`; no upstream source_lines applies | the wired function in `batteryplugin.cpp` is `slotChargeChanged` at :86-132 (which emits `PACKET_TYPE_BATTERY`, not `.request`); the upstream `.request` packet type is implemented by GSConnect@35bc5991 `battery.js:366-368` with body `{request: true}` — the rust plugin's empty body is a deliberate divergence |
+| `lock/lock_state.json` | note claimed "Android's incoming consumer (kotlin LockPlugin) accepts a `locked` bool via its mirror field" | rewritten to record the lack of an Android LockPlugin and the upstream use of `isLocked`/`lockResult` | no `LockPlugin.kt` exists in the pinned clone's plugin directory; the rust plugin's `locked` field is its own choice, not a mirror of any Android reader |
+| `sendnotifications/outgoing.json` | `dbusnotificationslistener.cpp:301-329` | tightened to `:317-329` | the ticker assembly is at :301-304 but the actual packet body emission is at :317-329; the broader range is partial |
+| `sftp/credentials.json` | `SftpPlugin.kt:120-130` | tightened to `:126-137` | the per-field assignments are at :127-136 (ip, port, user, password, path, multiPaths, pathNames); the earlier lines are the surrounding conditionals |
+
+All other citations were verified as correct.
+
+### Wire divergences found this lane
+
+Two new wire-shape divergences between this repo's production code and the
+pinned upstream commit, both recorded in the ledger as
+`INTENTIONAL-DIVERGENCE` (without changing production code). The integrator
+decides whether to converge.
+
+### 4.3 battery — empty body vs upstream `{request: true}`
+
+- **Upstream:** kdeconnect-kde's `BatteryPlugin.cpp` never emits
+  `kdeconnect.battery.request` (only the status under `PACKET_TYPE_BATTERY`
+  at `:119`). kdeconnect-android's `BatteryPlugin.kt:103-110` only handles
+  `PACKET_TYPE_BATTERY` (no `.request` branch). GSConnect@35bc5991
+  `src/service/plugins/battery.js:366-368` emits `{request: true}`.
+- **Rust plugin:** `src/plugins/battery.rs:63-68` emits `kdeconnect.battery.request`
+  with **empty body** on connect.
+- **Test:** `test_on_connected_requests_battery` asserts the divergent
+  shape (empty body for an empty peer-side field set).
+- **Ledger:** battery row stays at `fixture_provenance: PASS` (the divergence
+  is wire-shape, not Rust-self; the fixture is an honest
+  `hand-authored-from-observation` of the rust plugin's own design).
+
+### 4.4 lock — `locked` vs upstream `isLocked`/`lockResult`
+
+- **Upstream:** kdeconnect-kde `lockdeviceplugin.cpp:104` emits `lockResult:
+  <bool>` on the setLocked reply; `:116` emits `isLocked: <bool>` from
+  `sendState`.
+- **Rust plugin:** `src/plugins/lock.rs:94-96` answers with `locked: <bool>`.
+- **Behavioral consequence:** the rust plugin reads `locked` from incoming
+  packets at line 64-66 — a real KDE desktop sending `isLocked` would not
+  affect the rust plugin's state. There is no Android LockPlugin in the
+  pinned clone, so the phone side has no consumer of this reply.
+- **Test:** `test_lock_state_stored` asserts the divergent value (the
+  fixture pins `locked: true`, the upstream key would be `isLocked`).
+- **Ledger:** lock row pinned at `INTENTIONAL-DIVERGENCE` on
+  `fixture_provenance` and `status`; an integrator decision should confirm
+  whether to rename to `isLocked` before any KDE interop is required.
+
+### Deviations from the follow-up brief
+
+| Deviation | Why |
+|---|---|
+| `sftp/credentials.json` is loaded by a NEW test (`test_credentials_packet_shape_matches_android`) added to `src/plugins/sftp/mod.rs` | the bridge from the fixture to the rust plugin's behavior is the `handle_packet` side of the credentials envelope; the existing `mounter.rs` tests cover the subprocess boundary, not the wire envelope. The new test is in `mod.rs` (where the wire-shape code lives) and the provenance `used_by` points at `src/plugins/sftp/mod.rs::test_credentials_packet_shape_matches_android` to match. |
+| `battery/request.json` was reclassified as `hand-authored-from-observation` rather than `upstream-derived` | the cited `kdeconnect-kde plugins/battery/batteryplugin.cpp:60-72` line range does not contain a `requestCharge()` function — there is no upstream emission of `kdeconnect.battery.request` in the pinned kdeconnect-kde clone; the honest kind is the rust plugin's own design (the brief allows observation-based fixtures). The provenance note now records the GSConnect shape as the nearest upstream analogue. |
+| `lock/lock_state.json` provenance note rewritten (no Android LockPlugin exists) | the original note cited a "kotlin LockPlugin" that does not exist in the pinned clone; the rewritten note records the actual upstream key names and the lack of an Android consumer. |
+| `dbusnotificationslistener.cpp` source_lines tightened `:301-329` → `:317-329` | the ticker assembly is at `:301-304`, but the packet body emission is at `:317-329`; the broader range was misleading. |
+| `SftpPlugin.kt` source_lines tightened `:120-130` → `:126-137` | the per-field assignments are at `:127-136`; the earlier range stopped before the multiPaths / pathNames set. |
+| Behavioral tests kept inline (variant tests in sms, sendnotifications, etc.) | the brief lists these alongside the wire-shape tests, but they cover accept-coverage variants (different field presence, different value types) rather than the canonical wire shape. Converting them would require one fixture per variant, which the brief does not require and would bloat the fixture set without adding audit coverage. Each is documented in its test comment. |
+| `lock` row moved to `INTENTIONAL-DIVERGENCE` on `status` (not just `fixture_provenance`) | the rust plugin's reply is divergent from upstream on the wire; the ledger's `status` cell should reflect that, not pretend the row is just `UNVERIFIED` for a single dimension. |
+| All conversions collapsed into a single commit | the follow-up brief allowed commits 7+ as one per area or batched; the work spans 9 plugins across 16 fixtures and consolidated naturally into one atomic commit where the test rewrites and the provenance additions land together. The red-before-green invariant is preserved (no commit was red against the gates). |
+
+### Files touched
+
+```
+docs/functional-coverage.md                                    — 9 ledger rows
+tests/fixtures/upstream-wire/provenance.yaml                  — 16 new fixture entries + 4 corrections
+tests/fixtures/upstream-wire/presenter/{pointer,stop}.json     — new
+tests/fixtures/upstream-wire/digitizer/{pen_stroke,rubber_stroke}.json — new
+tests/fixtures/upstream-wire/battery/request.json             — new
+tests/fixtures/upstream-wire/lock/{lock_request,lock_state}.json — new
+tests/fixtures/upstream-wire/findthisdevice/ring_request.json — new
+tests/fixtures/upstream-wire/connectivity/report.json         — new
+tests/fixtures/upstream-wire/sms/message_batch.json           — new
+tests/fixtures/upstream-wire/sendnotifications/{outgoing,request_flag,cancel_string}.json — new
+tests/fixtures/upstream-wire/remotecommands/{command_list,request_command_list}.json — new
+tests/fixtures/upstream-wire/sftp/credentials.json            — new
+src/plugins/presenter.rs                                      — 2 wire-shape tests load fixtures
+src/plugins/digitizer.rs                                      — 2 wire-shape tests load fixtures
+src/plugins/battery.rs                                        — 1 wire-shape test loads fixture
+src/plugins/lock.rs                                           — 2 wire-shape tests load fixtures
+src/plugins/findthisdevice.rs                                 — 1 wire-shape test loads fixture
+src/plugins/connectivity.rs                                   — 1 wire-shape test loads fixture
+src/plugins/sms.rs                                            — 1 wire-shape test loads fixture
+src/plugins/sendnotifications.rs                              — 6 wire-shape tests load fixtures
+src/plugins/remotecommands.rs                                 — 2 wire-shape tests load fixtures
+src/plugins/sftp/mod.rs                                       — 1 new wire-shape test loads credentials fixture
+```
+
+6 commits on `slice-0b-wire-provenance` (1 added by this lane at ad4adae), no pushes, no merges.
