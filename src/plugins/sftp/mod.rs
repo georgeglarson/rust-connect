@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::plugins::events::{PluginEvent, PluginEventBroadcaster};
 use crate::plugins::sftp::mounter::{MountOutcome, MountRequest, Mounter, UnmountOutcome};
@@ -354,6 +354,37 @@ impl SftpPlugin {
         }
     }
 
+    fn cleanup_mount_on_disconnect(&self, device_id: &str, live_mount: bool) {
+        let mp = mount_point_for(&self.data_dir, device_id);
+        if !live_mount {
+            self.set_mount_state(device_id, MountState::Unmounted);
+            debug!(
+                device_id = %device_id,
+                event = "sftp_disconnect_stale_state_cleared",
+                "Cleared stale SFTP mount state; nothing live to release"
+            );
+            return;
+        }
+
+        match self.mounter.unmount(&mp) {
+            Ok(UnmountOutcome::Unmounted) => {
+                self.set_mount_state(device_id, MountState::Unmounted);
+                info!(
+                    device_id = %device_id,
+                    event = "sftp_unmount_on_disconnect",
+                    "Released SFTP mount on disconnect"
+                );
+            }
+            Ok(UnmountOutcome::Failed(_)) | Err(_) => {
+                warn!(
+                    device_id = %device_id,
+                    event = "sftp_unmount_on_disconnect_failed",
+                    "Failed to release SFTP mount on disconnect; will retry on startup"
+                );
+            }
+        }
+    }
+
     fn broadcast_update(
         &self,
         device_id: &str,
@@ -380,6 +411,25 @@ fn mount_point_for(data_dir: &std::path::Path, device_id: &str) -> PathBuf {
     data_dir.join("mounts").join(format!("sftp-{device_id}"))
 }
 
+fn mount_point_is_live(path: &std::path::Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+            return false;
+        };
+        let target = path.to_string_lossy();
+        mountinfo.lines().any(|line| {
+            line.split_whitespace()
+                .nth(4)
+                .is_some_and(|mount_point| mount_point == target)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        path.exists()
+    }
+}
+
 #[async_trait::async_trait]
 impl Plugin for SftpPlugin {
     fn name(&self) -> &str {
@@ -402,32 +452,8 @@ impl Plugin for SftpPlugin {
         if let Ok(mut connections) = self.connections.write() {
             connections.remove(device_id);
         }
-        if let Ok(mut mounts) = self.mounts.write() {
-            mounts.remove(device_id);
-        }
-        // Best-effort unmount on disconnect. We log the outcome but
-        // don't surface it — the link is gone, callers can't act on a
-        // failure here. The mounter's own failure is captured in
-        // /proc/mounts and the next daemon's startup sweep handles it.
         let mp = mount_point_for(&self.data_dir, device_id);
-        if mp.exists() {
-            match self.mounter.unmount(&mp) {
-                Ok(UnmountOutcome::Unmounted) => {
-                    info!(
-                        device_id = %device_id,
-                        event = "sftp_unmount_on_disconnect",
-                        "Released SFTP mount on disconnect"
-                    );
-                }
-                Ok(UnmountOutcome::Failed(_)) | Err(_) => {
-                    warn!(
-                        device_id = %device_id,
-                        event = "sftp_unmount_on_disconnect_failed",
-                        "Failed to release SFTP mount on disconnect; will retry on startup"
-                    );
-                }
-            }
-        }
+        self.cleanup_mount_on_disconnect(device_id, mount_point_is_live(&mp));
     }
 
     async fn handle_packet(&self, device_id: &str, packet: Packet) -> Result<Option<Vec<Packet>>> {
@@ -1144,6 +1170,44 @@ mod tests {
             packet.body.get("startBrowsing"),
             Some(&serde_json::json!(true))
         );
+    }
+
+    #[tokio::test]
+    async fn disconnect_stale_record_without_live_mount_clears_without_unmount() {
+        let runner = ScriptedRunner::with_outcomes(
+            MountOutcome::Mounted,
+            UnmountOutcome::Failed("not mounted".to_string()),
+        );
+        let argv_log = runner.argv_log.clone();
+        let (plugin, _d) = test_plugin_with_runner(runner);
+        let mount_point = plugin.mount_point("stale");
+        std::fs::create_dir_all(&mount_point).expect("stale mount directory");
+        plugin.set_mount_state("stale", MountState::Mounted);
+
+        plugin.on_disconnected("stale");
+
+        assert!(argv_log.lock().unwrap().is_empty());
+        assert_eq!(
+            plugin.get_mount_status("stale").state,
+            MountState::Unmounted
+        );
+    }
+
+    #[test]
+    fn disconnect_failed_live_unmount_keeps_state_for_retry() {
+        let runner = ScriptedRunner::with_outcomes(
+            MountOutcome::Mounted,
+            UnmountOutcome::Failed("busy".to_string()),
+        );
+        let argv_log = runner.argv_log.clone();
+        let (plugin, _d) = test_plugin_with_runner(runner);
+        plugin.set_mount_state("live", MountState::Mounted);
+        std::fs::create_dir_all(plugin.mount_point("live")).expect("live mount directory");
+
+        plugin.cleanup_mount_on_disconnect("live", true);
+
+        assert_eq!(argv_log.lock().unwrap().len(), 1);
+        assert_eq!(plugin.get_mount_status("live").state, MountState::Mounted);
     }
 
     #[tokio::test]
