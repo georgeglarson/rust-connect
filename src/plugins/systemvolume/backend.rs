@@ -61,21 +61,25 @@ pub struct LocalSinkState {
 
 /// Delta from `pactl subscribe`. The subscription only emits a short event
 /// line; the actual state is re-queried via `list_sinks` so the plugin does
-/// not have to maintain a second source of truth.
+/// not have to maintain a second source of truth. Sink names are
+/// `Option<String>` because pipewire-pulse emits `Event 'change' on sink #N`
+/// without a quoted name; the name is informational only — the handler
+/// re-lists on every classified event regardless.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubscribeEvent {
     SinkAdded {
-        name: String,
+        name: Option<String>,
     },
     SinkRemoved {
-        name: String,
+        name: Option<String>,
     },
     SinkChanged {
-        name: String,
+        name: Option<String>,
     },
-    /// Sink switched to be the default output.
+    /// Default output may have moved (PulseAudio emits `on server` events
+    /// for this). The event line itself never carries a name.
     DefaultSinkChanged {
-        name: String,
+        name: Option<String>,
     },
     /// Any other event string we observed but did not classify. The
     /// plugin logs these once; the next list-sinks refresh still covers it.
@@ -426,11 +430,12 @@ impl VolumeBackend for PactlBackend {
 }
 
 /// One kafka-light handler: parse a single `pactl subscribe` line.
-/// Examples (per `pactl(1)`):
+/// Examples (per `pactl(1)` and live captures on PulseAudio + pipewire):
 ///   `Event 'change' on sink #0 'alsa_output.pci-0000_00_1f.3.analog-stereo'`
-///   `Event 'new' on sink #1 '...'`
-///   `Event 'remove' on sink #2 '...'`
-///   `Event 'change' on server` (server-side event, not a sink event)
+///   `Event 'change' on sink #2516` (pipewire-pulse omits the name)
+///   `Event 'new' on sink #1 '...'` / `Event 'remove' on sink #2 '...'`
+///   `Event 'change' on server` (default output may have moved)
+///   `Event 'change' on card #55` (pipewire-pulse suspended-sink changes)
 pub(crate) fn parse_subscribe_line(line: &str) -> Option<SubscribeEvent> {
     let line = line.trim();
     if !line.starts_with("Event ") {
@@ -440,33 +445,62 @@ pub(crate) fn parse_subscribe_line(line: &str) -> Option<SubscribeEvent> {
     let after_event = line.strip_prefix("Event ")?;
     let (event_type, rest) = quoted_field(after_event)?;
     let rest = rest.trim_start();
-    // rest = "on sink #N 'NAME'" or "on server" (or any other target).
+    // Target dialects (captured live 2026-08-06):
+    // - PulseAudio: `Event 'change' on sink #0 'NAME'`, `... on server`.
+    // - pipewire-pulse: `Event 'change' on sink #2516` WITHOUT a quoted
+    //   name, and volume/mute changes on SUSPENDED sinks arrive only as
+    //   `Event 'change' on card #N`. Card hotplug implies sink
+    //   add/remove, so every card event triggers a re-list too. The
+    //   handler re-queries the full list on any classified event, so
+    //   over-triggering is cheap and idempotent.
     let after_on = rest.strip_prefix("on ")?.trim_start();
-    let name = if let Some(after_sink) = after_on.strip_prefix("sink ") {
-        // after_sink = "#N 'NAME'"
+    if let Some(after_sink) = after_on.strip_prefix("sink ") {
+        // after_sink = "#N" or "#N 'NAME'" (name is optional).
         let after_sink = after_sink.trim_start();
         if !after_sink.starts_with('#') {
             return Some(SubscribeEvent::Unclassified {
                 line: line.to_string(),
             });
         }
-        let after_idx = after_sink.split_once(' ')?.1.trim_start();
-        let (name, _) = quoted_field(after_idx)?;
-        name.to_string()
-    } else {
-        // Not a sink event (server, client, source, sink-input, …).
-        return Some(SubscribeEvent::Unclassified {
-            line: line.to_string(),
-        });
-    };
-    match event_type {
-        "new" => Some(SubscribeEvent::SinkAdded { name }),
-        "remove" => Some(SubscribeEvent::SinkRemoved { name }),
-        "change" => Some(SubscribeEvent::SinkChanged { name }),
-        _ => Some(SubscribeEvent::Unclassified {
-            line: line.to_string(),
-        }),
+        let name = after_sink
+            .split_once(' ')
+            .map(|(_, tail)| tail.trim_start())
+            .and_then(|tail| quoted_field(tail).map(|(n, _)| n.to_string()));
+        return match event_type {
+            "new" => Some(SubscribeEvent::SinkAdded { name }),
+            "remove" => Some(SubscribeEvent::SinkRemoved { name }),
+            "change" => Some(SubscribeEvent::SinkChanged { name }),
+            _ => Some(SubscribeEvent::Unclassified {
+                line: line.to_string(),
+            }),
+        };
     }
+    if after_on.starts_with("server") {
+        // Default output may have moved; the re-list picks up the new
+        // default via `pactl get-default-sink`.
+        return match event_type {
+            "change" | "new" => Some(SubscribeEvent::DefaultSinkChanged { name: None }),
+            _ => Some(SubscribeEvent::Unclassified {
+                line: line.to_string(),
+            }),
+        };
+    }
+    if after_on
+        .strip_prefix("card ")
+        .map(str::trim_start)
+        .is_some_and(|s| s.starts_with('#'))
+    {
+        return match event_type {
+            "new" | "remove" | "change" => Some(SubscribeEvent::SinkChanged { name: None }),
+            _ => Some(SubscribeEvent::Unclassified {
+                line: line.to_string(),
+            }),
+        };
+    }
+    // client, source, sink-input, sample-cache, …
+    Some(SubscribeEvent::Unclassified {
+        line: line.to_string(),
+    })
 }
 
 /// Consume `Event 'X' on sink #N 'Y'` walking from the start. Returns the
@@ -684,9 +718,14 @@ trait AtomicBoolNotifyExt {
 
 impl AtomicBoolNotifyExt for Arc<AtomicBool> {
     async fn notified(&self) {
-        // The AtomicBool here is only a poison flag for completeness;
-        // the supervisor's loop has its own exit paths.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Resolve ONLY when the poison flag is actually raised. This arm of
+        // the reader's select! must stay pending for the lifetime of the
+        // subscription otherwise; returning early here kills the subscribe
+        // loop and puts the supervisor in a restart churn (caught live:
+        // a one-shot sleep made the reader exit ~10x/second).
+        while !self.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 
@@ -703,9 +742,44 @@ mod tests {
         let line = "Event 'change' on sink #0 'alsa_output.pci-0000_00_1f.3.analog-stereo'";
         match parse_subscribe_line(line).expect("parsed") {
             SubscribeEvent::SinkChanged { name } => {
-                assert_eq!(name, "alsa_output.pci-0000_00_1f.3.analog-stereo");
+                assert_eq!(
+                    name.as_deref(),
+                    Some("alsa_output.pci-0000_00_1f.3.analog-stereo")
+                );
             }
             other => panic!("expected SinkChanged, got {other:?}"),
+        }
+    }
+
+    /// pipewire-pulse dialect captured live 2026-08-06: no quoted name.
+    #[test]
+    fn parse_subscribe_change_event_pipewire_no_name() {
+        let line = "Event 'change' on sink #2516";
+        match parse_subscribe_line(line).expect("parsed") {
+            SubscribeEvent::SinkChanged { name } => assert_eq!(name, None),
+            other => panic!("expected SinkChanged, got {other:?}"),
+        }
+    }
+
+    /// pipewire-pulse reports volume/mute changes on suspended sinks only
+    /// as card events (captured live 2026-08-06); they must trigger a
+    /// re-list like sink events do.
+    #[test]
+    fn parse_subscribe_card_event_maps_to_sink_change() {
+        let line = "Event 'change' on card #55";
+        match parse_subscribe_line(line).expect("parsed") {
+            SubscribeEvent::SinkChanged { name } => assert_eq!(name, None),
+            other => panic!("expected SinkChanged, got {other:?}"),
+        }
+    }
+
+    /// PulseAudio emits `on server` when the default output moves.
+    #[test]
+    fn parse_subscribe_server_event_maps_to_default_change() {
+        let line = "Event 'change' on server";
+        match parse_subscribe_line(line).expect("parsed") {
+            SubscribeEvent::DefaultSinkChanged { name } => assert_eq!(name, None),
+            other => panic!("expected DefaultSinkChanged, got {other:?}"),
         }
     }
 
@@ -714,7 +788,7 @@ mod tests {
         let line = "Event 'new' on sink #42 'foo'";
         assert!(matches!(
             parse_subscribe_line(line).expect("parsed"),
-            SubscribeEvent::SinkAdded { name } if name == "foo"
+            SubscribeEvent::SinkAdded { name } if name.as_deref() == Some("foo")
         ));
     }
 
@@ -723,14 +797,14 @@ mod tests {
         let line = "Event 'remove' on sink #42 'foo'";
         assert!(matches!(
             parse_subscribe_line(line).expect("parsed"),
-            SubscribeEvent::SinkRemoved { name } if name == "foo"
+            SubscribeEvent::SinkRemoved { name } if name.as_deref() == Some("foo")
         ));
     }
 
     #[test]
     fn parse_subscribe_unclassified_event_passes_through() {
-        let line = "Event 'change' on server";
-        // server-side event is not a sink event; we surface it as Unclassified.
+        let line = "Event 'change' on client #3693";
+        // client events are not sink state; surface them as Unclassified.
         match parse_subscribe_line(line).expect("parsed") {
             SubscribeEvent::Unclassified { .. } => {}
             other => panic!("expected Unclassified, got {other:?}"),
@@ -866,6 +940,33 @@ mod tests {
         assert_eq!(states[1].enabled, Some(true));
     }
 
+    // ---------- shutdown flag ----------
+
+    /// Regression: `notified()` must stay pending while the flag is false.
+    /// The live defect was a one-shot sleep that resolved unconditionally,
+    /// killing the pactl subscribe reader ~10x/second.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_notified_stays_pending_until_flag_raised() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let waiter = flag.clone();
+        let handle = tokio::spawn(async move {
+            waiter.notified().await;
+        });
+        // Let the poll loop run several iterations; an early-returning
+        // notified() would finish the task immediately.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !handle.is_finished(),
+            "notified() must stay pending while the flag is false"
+        );
+        flag.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            handle.is_finished(),
+            "notified() must resolve once the flag is raised"
+        );
+    }
+
     // ---------- MockBackend ----------
 
     #[tokio::test]
@@ -909,10 +1010,10 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SubscribeEvent>();
         backend.start_subscribe(tx).await.expect("start");
         backend.push_event(SubscribeEvent::SinkAdded {
-            name: "x".to_string(),
+            name: Some("x".to_string()),
         });
         let ev = rx.recv().await.expect("event");
-        assert!(matches!(ev, SubscribeEvent::SinkAdded { name } if name == "x"));
+        assert!(matches!(ev, SubscribeEvent::SinkAdded { name } if name.as_deref() == Some("x")));
     }
 
     #[tokio::test]
