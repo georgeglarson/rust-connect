@@ -336,6 +336,20 @@ connections without stale state or resource growth.
 
 ### Task 2.0: Reconnect/recovery bug cluster (vk #1020) — sequenced first (George, 2026-08-06)
 
+> **Root cause (found live 2026-08-06 evening):** the cluster was a split
+> brain — an orphaned, directly-launched daemon (PPID 1, holding
+> 9090+1716) beside successive PORTLESS systemd daemons, all sharing one
+> data dir: two registries (API-vs-journal desync), both dialing the
+> phones (phones deduped duplicate links by closing one = the churn),
+> both running sftp cleanup (WARN spam). Remediated operationally (orphan
+> killed, single unit) and verified: 0 disconnect events over 7+ min / 6+
+> broadcast cycles. The acceptance criteria below now read as four
+> preventive hardening fixes (fail-fast bind, render-time cross-check,
+> bounded dead-link detection, idempotent cleanup) — brief:
+> `plans/task-2.0-hardening-brief.md`, branch
+> `task-2.0-reconnect-cluster`. The `sent:true`-on-dead-link defect is
+> the one symptom that was a genuine code gap, not a split-brain artifact.
+
 - **Location:** `src/device/lifecycle.rs`, `src/services/connection_orchestrator.rs`,
   `src/api/handlers/device.rs`, `src/protocol/connection_loop.rs`,
   `src/plugins/sftp/mod.rs`
