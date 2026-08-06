@@ -175,20 +175,20 @@ mod tests {
 
     /// EXACT body Android sends on an incoming call with contacts permission
     /// granted (kdeconnect-android .../telephony/TelephonyPlugin.kt:78,99,105).
+    /// Fixture: tests/fixtures/upstream-wire/telephony/ringing.json
+    ///   kdeconnect-android@a88f6fa0 TelephonyPlugin.kt:78,95,99,105
     #[tokio::test]
     async fn test_ringing_real_wire_shape() {
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/telephony/ringing.json");
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read telephony ringing fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
         let (plugin, _) = setup();
-        plugin
-            .handle_packet(
-                "device1",
-                telephony_packet(serde_json::json!({
-                    "event": "ringing",
-                    "phoneNumber": "+1234567890",
-                    "contactName": "John Doe"
-                })),
-            )
-            .await
-            .unwrap();
+        plugin.handle_packet("device1", telephony_packet(upstream_body)).await.unwrap();
         let calls = plugin.get_calls("device1");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].event, "ringing");

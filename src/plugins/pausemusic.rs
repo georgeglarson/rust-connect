@@ -546,10 +546,19 @@ mod tests {
         assert_eq!(backend.resumed().len(), 1);
     }
 
+    /// Fixture: tests/fixtures/upstream-wire/pausemusic/telephony_talking_cancel_string.json
+    ///   EXACT body the phone sends when a call ends (TelephonyPlugin.kt:
+    ///   114-115): the LAST event resent with isCancel as a JSON STRING.
     #[tokio::test]
     async fn test_cancel_string_true_resumes_exact_android_wire_shape() {
-        // EXACT body the phone sends when a call ends (TelephonyPlugin.kt:
-        // 114-115): the LAST event resent with isCancel as a JSON STRING.
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/pausemusic/telephony_talking_cancel_string.json");
+        let cancel_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read pausemusic cancel fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
         let backend = Arc::new(MockBackend::new(&["org.mpris.MediaPlayer2.brave"]));
         let plugin = PausemusicPlugin::new().with_backend(backend.clone());
         plugin
@@ -559,13 +568,7 @@ mod tests {
             )
             .await
             .unwrap();
-        plugin
-            .handle_packet(
-                "device1",
-                telephony_packet(serde_json::json!({ "event": "talking", "isCancel": "true" })),
-            )
-            .await
-            .unwrap();
+        plugin.handle_packet("device1", telephony_packet(cancel_body)).await.unwrap();
         assert_eq!(backend.resumed().len(), 1);
     }
 

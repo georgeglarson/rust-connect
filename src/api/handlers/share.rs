@@ -578,25 +578,42 @@ mod tests {
         assert_eq!(body.url, "https://kde.org/");
     }
 
+    /// Fixture: tests/fixtures/upstream-wire/share/text_share_request.json
+    ///   kdeconnect-android@a88f6fa0 SharePlugin.java:339-340 sets `text`
+    ///   (or `url`) on a kdeconnect.share.request packet; this is the
+    ///   bare shape with no payload.
     #[test]
     fn test_outgoing_text_packet_matches_upstream_shape() {
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/share/text_share_request.json");
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read text-share fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
         let packet = build_share_text_packet("remember the milk");
         assert_eq!(packet.packet_type, "kdeconnect.share.request");
-        assert_eq!(packet.body["text"], "remember the milk");
-        assert!(
-            packet.body.get("filename").is_none(),
-            "a text share must not look like a file share"
-        );
+        assert_eq!(packet.body, upstream_body);
         assert!(packet.payload_size.is_none());
         assert!(packet.payload_transfer_info.is_none());
     }
 
+    /// Fixture: tests/fixtures/upstream-wire/share/url_share_request.json
+    ///   kdeconnect-android@a88f6fa0 SharePlugin.java:339-340 — `url` form.
     #[test]
     fn test_outgoing_url_packet_matches_upstream_shape() {
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/share/url_share_request.json");
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read url-share fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
         let packet = build_share_url_packet("https://kde.org/");
         assert_eq!(packet.packet_type, "kdeconnect.share.request");
-        assert_eq!(packet.body["url"], "https://kde.org/");
-        assert!(packet.body.get("text").is_none());
+        assert_eq!(packet.body, upstream_body);
     }
 
     #[test]

@@ -808,19 +808,26 @@ mod tests {
         assert_eq!(plugin.events_received(), 1);
     }
 
+    /// Fixture: tests/fixtures/upstream-wire/mousepad/presenter_slide_keys.json
+    ///   kdeconnect-android@a88f6fa0 PresenterPlugin.kt:53-74 routes these
+    ///   through mousepad.request: PAGE_UP=8, PAGE_DOWN=9, F5=25, ESC=14.
+    ///   KeyListenerView.java:36-37,48,53 maps the keyEvent keyCodes.
     #[tokio::test]
     async fn test_handle_presenter_slide_keys_exact_wire_shape() {
-        // The exact bodies the phone presenter UI sends when its arrow
-        // buttons are tapped (kdeconnect-android PresenterPlugin.kt:53-74
-        // routes these through mousepad.request): PAGE_UP=8 (previous),
-        // PAGE_DOWN=9 (next), F5=25 (fullscreen), ESC=14 (end)
-        // (KeyListenerView.java:36-37,48,53).
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/mousepad/presenter_slide_keys.json");
+        let bodies: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read presenter fixture"),
+        )
+        .expect("parse fixture")
+        .as_array()
+        .expect("fixture is a JSON array")
+        .clone();
+
         let plugin = MousepadPlugin::new_without_input();
-        for code in [8, 9, 25, 14] {
-            let packet = Packet::new(
-                "kdeconnect.mousepad.request".to_string(),
-                serde_json::json!({ "specialKey": code }),
-            );
+        for body in bodies {
+            let code = body["specialKey"].as_i64().unwrap();
+            let packet = Packet::new("kdeconnect.mousepad.request".to_string(), body);
             assert!(
                 plugin.handle_packet("device1", packet).await.is_ok(),
                 "specialKey {code} must parse and be handled"

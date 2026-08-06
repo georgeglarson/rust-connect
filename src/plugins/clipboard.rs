@@ -842,33 +842,51 @@ mod tests {
 
     #[tokio::test]
     async fn test_local_change_packet_wire_shape() {
-        // kdeconnect.clipboard body is exactly {"content": ...} — no
-        // timestamp, no extra keys (kdeconnect-android ClipboardPlugin.kt:77-81,
-        // :151-160; kdeconnect-kde clipboardplugin.cpp:131-138).
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/clipboard/local_change.json");
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read clipboard fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
         let (plugin, _) = make_plugin();
         let packet = plugin
             .core
             .apply_local_change("copied text".to_string())
             .expect("new local content must produce a packet");
+        // kdeconnect.clipboard body is exactly {"content": ...} — no
+        // timestamp, no extra keys (kdeconnect-android ClipboardPlugin.kt:77-81,
+        // :151-160; kdeconnect-kde clipboardplugin.cpp:131-138).
         assert_eq!(packet.packet_type, "kdeconnect.clipboard");
-        assert_eq!(packet.body, serde_json::json!({ "content": "copied text" }));
+        assert_eq!(packet.body, upstream_body);
     }
 
     #[tokio::test]
     async fn test_on_connected_wire_shape() {
-        // clipboard.connect body is {"content", "timestamp"} — kdeconnect-android
-        // ClipboardPlugin.kt:93-97, :162-177; kdeconnect-kde
-        // clipboardplugin.cpp:148-151.
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/clipboard/connect.json");
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read clipboard connect fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
         let (plugin, _) = make_plugin();
-        plugin.core.apply_local_change("connect me".to_string());
+        // Use the fixture's literal content so the produced body matches
+        // the upstream-derived shape field-for-field.
+        plugin.core.apply_local_change(upstream_body["content"].as_str().unwrap().to_string());
 
         let packets = plugin.on_connected("dev-1");
         assert_eq!(packets.len(), 1);
+        // clipboard.connect body is {"content", "timestamp"} — kdeconnect-android
+        // ClipboardPlugin.kt:93-97, :162-177; kdeconnect-kde
+        // clipboardplugin.cpp:148-151.
         assert_eq!(packets[0].packet_type, "kdeconnect.clipboard.connect");
-        let body = &packets[0].body;
-        assert_eq!(body.get("content").unwrap(), "connect me");
-        assert!(body.get("timestamp").unwrap().as_i64().unwrap() > 0);
-        assert_eq!(body.as_object().unwrap().len(), 2);
+        // Compare key set + content; timestamp is a current ms (variable).
+        assert_eq!(packets[0].body["content"], upstream_body["content"]);
+        assert!(packets[0].body["timestamp"].as_i64().unwrap() > 0);
+        assert_eq!(packets[0].body.as_object().unwrap().len(), 2);
     }
 
     #[tokio::test]

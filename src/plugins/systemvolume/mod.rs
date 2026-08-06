@@ -1786,21 +1786,34 @@ mod tests {
 
     // ----- Upstream-pinned wire-shape fixtures -----
 
-    /// The first phone-driven requestSinks over a brand-new connect
-    /// pulls the upstream-published sinkList exactly (pulse.cpp:90-95).
+    /// Fixture: tests/fixtures/upstream-wire/systemvolume/sink_list.json
+    ///   The first phone-driven requestSinks over a brand-new connect
+    ///   pulls the upstream-published sinkList exactly (pulse.cpp:90-95).
+    ///   Field set per entry: name, description, volume, maxVolume, muted,
+    ///   enabled — all camelCase, types per the upstream source.
     #[tokio::test]
     async fn test_sink_list_packet_matches_upstream_shape() {
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/systemvolume/sink_list.json");
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read sink-list fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
+        let upstream_entry = &upstream_body["sinkList"][0];
+
         let sinks = vec![LocalSinkState {
-            name: "alsa_output.pci-0000_00_1f.3.analog-stereo".to_string(),
-            description: Some("Built-in Audio Analog Stereo".to_string()),
-            volume: Some(45_874),
-            max_volume: Some(65_536),
-            muted: Some(false),
-            enabled: Some(true),
+            name: upstream_entry["name"].as_str().unwrap().to_string(),
+            description: upstream_entry["description"].as_str().map(String::from),
+            volume: upstream_entry["volume"].as_i64(),
+            max_volume: upstream_entry["maxVolume"].as_i64(),
+            muted: upstream_entry["muted"].as_bool(),
+            enabled: upstream_entry["enabled"].as_bool(),
         }];
         let backend = MockBackend::new()
             .with_sinks(sinks.clone())
-            .with_default("alsa_output.pci-0000_00_1f.3.analog-stereo");
+            .with_default(&sinks[0].name);
         let plugin = SystemVolumePlugin::new();
         plugin.set_backend(backend).await;
         plugin.disable_watcher_for_test();
@@ -1815,21 +1828,7 @@ mod tests {
             .expect("sinkList")
             .as_array()
             .unwrap();
-        let entry = &list[0];
-        assert_eq!(
-            entry.get("name").and_then(|v| v.as_str()),
-            Some("alsa_output.pci-0000_00_1f.3.analog-stereo")
-        );
-        assert_eq!(
-            entry.get("description").and_then(|v| v.as_str()),
-            Some("Built-in Audio Analog Stereo")
-        );
-        assert_eq!(entry.get("volume").and_then(|v| v.as_i64()), Some(45_874));
-        assert_eq!(
-            entry.get("maxVolume").and_then(|v| v.as_i64()),
-            Some(65_536)
-        );
-        assert_eq!(entry.get("muted").and_then(|v| v.as_bool()), Some(false));
-        assert_eq!(entry.get("enabled").and_then(|v| v.as_bool()), Some(true));
+        // Field-for-field equality against the upstream-derived entry.
+        assert_eq!(list[0], *upstream_entry);
     }
 }

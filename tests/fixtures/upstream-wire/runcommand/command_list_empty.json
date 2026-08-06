@@ -3,6 +3,6 @@
   "type": "kdeconnect.runcommand",
   "body": {
     "commandList": "{}",
-    "canAddCommand": false
+    "canAddCommand": true
   }
 }

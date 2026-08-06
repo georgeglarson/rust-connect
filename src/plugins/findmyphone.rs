@@ -95,15 +95,24 @@ mod tests {
             .contains(&"kdeconnect.findmyphone.request".to_string()));
     }
 
+    /// Fixture: tests/fixtures/upstream-wire/findmyphone/ring_request.json
+    ///   kdeconnect-kde@f5ed3ed8 plugins/findmyphone/findmyphoneplugin.cpp:17-21
+    ///   sends the request with NO body fields; GSConnect
+    ///   src/service/plugins/findmyphone.js:93-98 also sends body: {}.
     #[tokio::test]
     async fn test_ring_request_wire_shape() {
-        // Upstream: kdeconnect-kde plugins/findmyphone/findmyphoneplugin.cpp:17-21
-        // sends the request with NO body fields; GSConnect
-        // src/service/plugins/findmyphone.js:93-98 sends body: {}.
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/findmyphone/ring_request.json");
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read findmyphone fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
         let plugin = FindMyPhonePlugin::new();
         let packet = plugin.ring_request();
         assert_eq!(packet.packet_type, "kdeconnect.findmyphone.request");
-        assert_eq!(packet.body, serde_json::json!({}));
+        assert_eq!(packet.body, upstream_body);
     }
 
     #[tokio::test]

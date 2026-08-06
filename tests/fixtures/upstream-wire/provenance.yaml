@@ -21,6 +21,21 @@
 #                                   hand from observing what an upstream peer
 #                                   sends; carries `note` with the
 #                                   observation evidence
+#
+# Transcript-replay fixture (not wire-shape; tracked here for the record):
+#
+#   tests/fixtures/redial_replaces.jsonl
+#     kind: hand-authored-from-observation
+#     recorded_date: 2026-08-06
+#     note: >
+#       Lives outside tests/fixtures/upstream-wire/ on purpose — the JSONL
+#       is a transcript replay fixture (drives src/protocol/replay.rs),
+#       not a wire-shape literal. Hand-authored; synthetic device IDs
+#       ("testphone-fixture-aa…"). Confirmed against the upstream identity
+#       packet shape in kdeconnect-kde@f5ed3ed8 core/deviceinfo.h:123-133
+#       and networkpacket.cpp:43-63. The first commit touching this file
+#       is c29795a (rust-connect: API-first KDE Connect reimplementation
+#       in Rust); no live capture ever replaced it.
 fixtures:
   - file: identity/basic.json
     kind: upstream-derived
@@ -85,3 +100,195 @@ fixtures:
     source_lines: "317-358"
     extraction_date: "2026-08-06"
     used_by: "src/plugins/mpris/mod.rs::test_now_playing_answer_wire_shape"
+
+  - file: clipboard/local_change.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/clipboard/ClipboardPlugin.kt
+    source_lines: "77-81"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/clipboard.rs::test_local_change_packet_wire_shape"
+
+  - file: clipboard/connect.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/clipboard/ClipboardPlugin.kt
+    source_lines: "93-97"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/clipboard.rs::test_on_connected_wire_shape"
+
+  - file: notification/reply_id_request.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt
+    source_lines: "251-262"
+    extraction_date: "2026-08-06"
+    note: "Phone-written; the rust daemon only RECEIVES this packet type."
+    used_by: "tests/notification_reply_tests.rs::test_reply_id_captured_from_request_reply_id"
+
+  - file: notification/reply_uuid_negative.json
+    kind: hand-authored-from-observation
+    extraction_date: "2026-08-06"
+    note: "Negative fixture — `replyUuid` is not a KDE Connect field. Documented because the original defect (rust reading its own invented field) was silent for months; this fixture pins the field name so a future reintroduction can't claim wire-shape parity."
+    used_by: "tests/notification_reply_tests.rs::test_invented_reply_uuid_field_is_not_accepted"
+
+  - file: notification/request_packet.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/notifications/notificationsplugin.cpp
+    source_lines: "29"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/notification.rs::test_on_connected_matches_upstream_request_packet"
+
+  - file: share/text_share_request.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/share/SharePlugin.java
+    source_lines: "339-341"
+    extraction_date: "2026-08-06"
+    used_by: "src/api/handlers/share.rs::test_outgoing_text_packet_matches_upstream_shape"
+
+  - file: share/url_share_request.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/share/SharePlugin.java
+    source_lines: "339-341"
+    extraction_date: "2026-08-06"
+    used_by: "src/api/handlers/share.rs::test_outgoing_url_packet_matches_upstream_shape"
+
+  - file: share/share_file_request.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/share/SharePlugin.java
+    source_lines: "268-269"
+    extraction_date: "2026-08-06"
+    note: "Reference fixture for the camelCase payload-shape conformance test (top-level payloadSize / payloadTransferInfo). Carries numberOfFiles=1 and totalPayloadSize=N per the android source."
+    used_by: ""
+
+  - file: runcommand/command_list_empty.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/runcommand/runcommandplugin.cpp
+    source_lines: "188-195"
+    extraction_date: "2026-08-06"
+    note: "Upstream sends canAddCommand=true; rust plugin intentionally sends false (one-way allowlist). Recorded as INTENTIONAL-DIVERGENCE in runcommand ledger row."
+    used_by: "src/plugins/runcommand.rs::test_advertisement_wire_shape_empty_allowlist"
+
+  - file: runcommand/command_list_populated.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/runcommand/runcommandplugin.cpp
+    source_lines: "188-195"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/runcommand.rs::test_advertisement_wire_shape_populated"
+
+  - file: runcommand/request_command_list.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/runcommand/RunCommandPlugin.java
+    source_lines: "258-262"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/runcommand.rs::test_request_command_list_exact_phone_shape"
+
+  - file: runcommand/request_key.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/runcommand/RunCommandPlugin.java
+    source_lines: "251-256"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/runcommand.rs::test_blocked_by_default_exact_phone_shape"
+
+  - file: findmyphone/ring_request.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/findmyphone/findmyphoneplugin.cpp
+    source_lines: "17-21"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/findmyphone.rs::test_ring_request_wire_shape"
+
+  - file: remotekeyboard/echo_ack.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/remotekeyboard/RemoteKeyboardPlugin.java
+    source_lines: "383-395"
+    extraction_date: "2026-08-06"
+    note: "Phone-written echo carrying isAck=true; the rust daemon RECEIVES this packet type."
+    used_by: "src/plugins/remotekeyboard.rs::test_android_echo_wire_shape"
+
+  - file: telephony/ringing.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/telephony/TelephonyPlugin.kt
+    source_lines: "78,95,99,105"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/telephony.rs::test_ringing_real_wire_shape"
+
+  - file: contacts/request_all_uids_timestamps.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/contacts/contactsplugin.cpp
+    source_lines: "169-176"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/contacts.rs::test_request_all_uids_wire_shape"
+
+  - file: contacts/request_vcards_by_uid.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/contacts/contactsplugin.cpp
+    source_lines: "178-185"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/contacts.rs::test_request_vcards_wire_shape"
+
+  - file: contacts/response_uids_timestamps.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/contacts/ContactsPlugin.kt
+    source_lines: "110-119"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/contacts.rs::test_handle_uids_timestamps_exact_phone_shape"
+
+  - file: mousepad/presenter_slide_keys.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/presenter/PresenterPlugin.kt
+    source_lines: "53-74"
+    extraction_date: "2026-08-06"
+    note: "Array of four bodies (PAGE_UP=8, PAGE_DOWN=9, F5=25, ESC=14) — the exact bodies the phone presenter UI sends through mousepad.request. KeyListenerView.java:36-37,48,53 maps Android KEYCODE_* to these wire integers."
+    used_by: "src/plugins/mousepad.rs::test_handle_presenter_slide_keys_exact_wire_shape"
+
+  - file: pausemusic/telephony_talking_cancel_string.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/telephony/TelephonyPlugin.kt
+    source_lines: "114-116"
+    extraction_date: "2026-08-06"
+    note: "Phone-written when a call ends — the LAST event resent with isCancel as a JSON STRING. Rust accepts bool | string | TRUE variants; the upstream wire is the STRING form."
+    used_by: "src/plugins/pausemusic.rs::test_cancel_string_true_resumes_exact_android_wire_shape"
+
+  - file: systemvolume/sink_list.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/systemvolume/pulse.cpp
+    source_lines: "90-104"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/systemvolume/mod.rs::test_sink_list_packet_matches_upstream_shape"

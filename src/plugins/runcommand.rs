@@ -479,29 +479,61 @@ mod tests {
         );
     }
 
+    /// Fixture: tests/fixtures/upstream-wire/runcommand/command_list_empty.json
+    ///   kdeconnect-kde@f5ed3ed8 plugins/runcommand/runcommandplugin.cpp:188-195
     #[tokio::test]
     async fn test_advertisement_wire_shape_empty_allowlist() {
-        // Production posture: empty allowlist -> commandList is the JSON
-        // STRING "{}", canAddCommand false. Shape verified against
-        // kdeconnect-kde runcommandplugin.cpp:161-168 and Android's parser
-        // RunCommandPlugin.java:155 (getString -> new JSONObject).
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/runcommand/command_list_empty.json");
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read runcommand empty fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
         let plugin = RuncommandPlugin::new();
         let packet = plugin.command_list_packet("device1");
+        // Production posture: empty allowlist -> commandList is the JSON
+        // STRING "{}", canAddCommand false. Shape verified against
+        // kdeconnect-kde runcommandplugin.cpp:188-195 and Android's parser
+        // RunCommandPlugin.java:140 (getString -> new JSONObject).
+        // We send canAddCommand=false even though upstream sends true
+        // (runcommandplugin.cpp:192); the rust allowlist is one-way (we
+        // push commands to the phone, the phone never pushes them to us).
+        // Recorded as INTENTIONAL-DIVERGENCE in the runcommand ledger row.
         assert_eq!(packet.packet_type, "kdeconnect.runcommand");
+        assert_eq!(packet.body["commandList"], upstream_body["commandList"]);
         assert_eq!(
-            packet.body,
-            serde_json::json!({ "commandList": "{}", "canAddCommand": false })
+            packet.body["canAddCommand"],
+            serde_json::json!(false),
+            "we intentionally advertise canAddCommand=false"
+        );
+        assert_ne!(
+            packet.body["canAddCommand"], upstream_body["canAddCommand"],
+            "upstream advertises canAddCommand=true (runcommandplugin.cpp:192)"
         );
     }
 
+    /// Fixture: tests/fixtures/upstream-wire/runcommand/command_list_populated.json
+    ///   The commandList string is JSON; Android parses via
+    ///   RunCommandPlugin.java:140 (`new JSONObject(np.getString("commandList"))`).
     #[tokio::test]
     async fn test_advertisement_wire_shape_populated() {
-        // commandList is a STRING holding JSON {key: {name, command}} —
-        // Android does new JSONObject(np.getString("commandList")) and reads
-        // per-key "name"/"command" (RunCommandPlugin.java:155-168).
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/runcommand/command_list_populated.json");
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read runcommand populated fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
         let plugin = RuncommandPlugin::new();
         plugin.allow_command("device1", "suspend", "Suspend", "systemctl suspend");
         let packet = plugin.command_list_packet("device1");
+        // The wire-level outer shape matches the upstream-derived fixture.
+        assert_eq!(packet.packet_type, "kdeconnect.runcommand");
+        assert_eq!(packet.body["commandList"], upstream_body["commandList"]);
+        // The commandList string is itself JSON; verify its parsed shape.
         let list_str = packet.body["commandList"].as_str().unwrap();
         let list: serde_json::Value = serde_json::from_str(list_str).unwrap();
         assert_eq!(
@@ -515,24 +547,32 @@ mod tests {
     #[tokio::test]
     async fn test_on_connected_sends_advertisement() {
         // kdeconnect-kde: connected() -> sendConfig()
-        // (runcommandplugin.cpp:156-159).
+        // (runcommandplugin.cpp:183-186).
         let plugin = RuncommandPlugin::new();
         let packets = plugin.on_connected("device1");
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].packet_type, "kdeconnect.runcommand");
     }
 
+    /// Fixture: tests/fixtures/upstream-wire/runcommand/request_command_list.json
+    ///   kdeconnect-android@a88f6fa0 RunCommandPlugin.java:258-262
+    ///   `np.set("requestCommandList", true)` is the EXACT body the phone
+    ///   sends to ask for the command list.
     #[tokio::test]
     async fn test_request_command_list_exact_phone_shape() {
-        // EXACT body the phone sends: RunCommandPlugin.java:250-254
-        //   np.set("requestCommandList", true)
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/runcommand/request_command_list.json");
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read request-command-list fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
         let plugin = RuncommandPlugin::new();
         let reply = plugin
             .handle_packet(
                 "device1",
-                request_packet(serde_json::json!({
-                    "requestCommandList": true
-                })),
+                request_packet(upstream_body),
             )
             .await
             .unwrap()
@@ -542,16 +582,26 @@ mod tests {
         assert_eq!(reply[0].body["commandList"], serde_json::json!("{}"));
     }
 
+    /// Fixture: tests/fixtures/upstream-wire/runcommand/request_key.json
+    ///   EXACT body the phone sends when the user taps a command:
+    ///   kdeconnect-android@a88f6fa0 RunCommandPlugin.java:251-256
+    ///     np.set("key", cmdKey)
+    /// The request is BLOCKED here because the allowlist is empty — the
+    /// test's purpose is to certify the phone-shape parity while exercising
+    /// the blocked-by-default path.
     #[tokio::test]
     async fn test_blocked_by_default_exact_phone_shape() {
-        // EXACT body the phone sends when the user taps a command:
-        // RunCommandPlugin.java:242-248   np.set("key", cmdKey)
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/runcommand/request_key.json");
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read request-key fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
         let plugin = RuncommandPlugin::new();
         let result = plugin
-            .handle_packet(
-                "device1",
-                request_packet(serde_json::json!({ "key": "suspend" })),
-            )
+            .handle_packet("device1", request_packet(upstream_body))
             .await
             .unwrap();
         assert!(result.is_none());

@@ -23,20 +23,22 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn test_reply_id_captured_from_request_reply_id() -> anyhow::Result<()> {
+    // Fixture: tests/fixtures/upstream-wire/notification/reply_id_request.json
+    //   kdeconnect-android@a88f6fa0 NotificationsPlugin.kt:251-262
+    // The fixture carries the upstream wire literal: a notification with
+    // `requestReplyId` set — the field kdeconnect-android actually writes.
+    let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/upstream-wire/notification/reply_id_request.json");
+    let fixture_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(&fixture_path).expect("read reply-id fixture"),
+    )
+    .expect("parse fixture")["body"]
+        .clone();
+    let packet = Packet::new("kdeconnect.notification".to_string(), fixture_body);
+
     let broadcaster = Arc::new(PluginEventBroadcaster::new(16, "plugin"));
     let mut rx = broadcaster.subscribe();
     let plugin = NotificationPlugin::new_without_desktop(broadcaster.clone());
-
-    let packet = Packet::new(
-        "kdeconnect.notification".to_string(),
-        serde_json::json!({
-            "id": "notif-reply",
-            "appName": "Signal",
-            "title": "Alice",
-            "text": "Call me",
-            "requestReplyId": "uuid-1234"
-        }),
-    );
 
     assert!(plugin.handle_packet("device-1", packet).await.is_ok());
 
@@ -56,21 +58,22 @@ async fn test_reply_id_captured_from_request_reply_id() -> anyhow::Result<()> {
 /// `replyUuid` is not a KDE Connect field. If a future change makes the plugin
 /// accept it again, that is a regression back to the original defect: the
 /// implementation would once more be reading a name of its own invention.
+/// Fixture: tests/fixtures/upstream-wire/notification/reply_uuid_negative.json
+///   — the invented field is recorded here for the record even though no
+///   upstream peer ever sends it.
 #[tokio::test]
 async fn test_invented_reply_uuid_field_is_not_accepted() {
+    let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/upstream-wire/notification/reply_uuid_negative.json");
+    let fixture_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(&fixture_path).expect("read reply-uuid fixture"),
+    )
+    .expect("parse fixture")["body"]
+        .clone();
+    let packet = Packet::new("kdeconnect.notification".to_string(), fixture_body);
+
     let broadcaster = Arc::new(PluginEventBroadcaster::new(16, "plugin"));
     let plugin = NotificationPlugin::new_without_desktop(broadcaster);
-
-    let packet = Packet::new(
-        "kdeconnect.notification".to_string(),
-        serde_json::json!({
-            "id": "notif-legacy",
-            "appName": "Signal",
-            "title": "Alice",
-            "text": "Call me",
-            "replyUuid": "uuid-1234"
-        }),
-    );
 
     assert!(plugin.handle_packet("device-1", packet).await.is_ok());
 

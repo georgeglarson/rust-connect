@@ -951,13 +951,23 @@ mod tests {
     /// and ReceiveNotificationsPlugin.kt:39-41 sets only `np["request"] = true`.
     /// We also sent `"cancel": false`, a boolean under the key the peer reads
     /// with `getString` (NotificationsPlugin.kt:529).
+    /// Fixture: tests/fixtures/upstream-wire/notification/request_packet.json
+    ///   kdeconnect-kde@f5ed3ed8 plugins/notifications/notificationsplugin.cpp:29
     #[tokio::test]
     async fn test_on_connected_matches_upstream_request_packet() {
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/notification/request_packet.json");
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read notification request fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
         let plugin = make_plugin();
         let packets = plugin.on_connected("devabcdef0123456789abcdef01234567");
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].packet_type, "kdeconnect.notification.request");
-        assert_eq!(packets[0].body["request"], serde_json::json!(true));
+        assert_eq!(packets[0].body, upstream_body);
         assert!(
             packets[0].body.get("cancel").is_none(),
             "`cancel` carries a notification-id string when present; a bool here is not a wire shape upstream produces"

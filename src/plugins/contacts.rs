@@ -372,46 +372,68 @@ mod tests {
         assert!(outgoing.contains(&"kdeconnect.contacts.request_vcards_by_uid".to_string()));
     }
 
+    /// Fixture: tests/fixtures/upstream-wire/contacts/request_all_uids_timestamps.json
+    ///   kdeconnect-kde@f5ed3ed8 plugins/contacts/contactsplugin.cpp:169-176
+    ///   sends the request with NO body fields.
     #[tokio::test]
     async fn test_request_all_uids_wire_shape() {
-        // Upstream: kdeconnect-kde contactsplugin.cpp:169-176 sends the
-        // request with NO body fields.
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/contacts/request_all_uids_timestamps.json");
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read contacts fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
         let plugin = ContactsPlugin::new();
         let packet = plugin.request_all_uids_timestamps();
         assert_eq!(
             packet.packet_type,
             "kdeconnect.contacts.request_all_uids_timestamps"
         );
-        assert_eq!(packet.body, serde_json::json!({}));
+        assert_eq!(packet.body, upstream_body);
     }
 
+    /// Fixture: tests/fixtures/upstream-wire/contacts/request_vcards_by_uid.json
+    ///   kdeconnect-kde@f5ed3ed8 plugins/contacts/contactsplugin.cpp:178-185
+    ///   sets the "uids" key to the list of uid strings.
     #[tokio::test]
     async fn test_request_vcards_wire_shape() {
-        // Upstream: kdeconnect-kde contactsplugin.cpp:178-185 sets the "uids"
-        // key to the list of uid strings.
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/contacts/request_vcards_by_uid.json");
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read contacts vcards fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
         let plugin = ContactsPlugin::new();
         let packet = plugin.request_vcards_by_uid(&["1".to_string(), "3".to_string()]);
         assert_eq!(
             packet.packet_type,
             "kdeconnect.contacts.request_vcards_by_uid"
         );
-        assert_eq!(packet.body, serde_json::json!({ "uids": ["1", "3"] }));
+        assert_eq!(packet.body, upstream_body);
     }
 
+    /// Fixture: tests/fixtures/upstream-wire/contacts/response_uids_timestamps.json
+    ///   EXACT body shape the phone sends, from kdeconnect-android
+    ///   ContactsPlugin.kt:110-119: a "uids" string list, plus one field per
+    ///   uid keyed BY the uid with the timestamp as a STRING.
     #[tokio::test]
     async fn test_handle_uids_timestamps_exact_phone_shape() {
-        // EXACT body shape the phone sends, from kdeconnect-android
-        // ContactsPlugin.kt:110-119: a "uids" string list, plus one field per
-        // uid keyed BY the uid with the timestamp as a STRING.
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/contacts/response_uids_timestamps.json");
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read contacts response fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
         let plugin = ContactsPlugin::new();
         let packet = Packet::new(
             "kdeconnect.contacts.response_uids_timestamps".to_string(),
-            serde_json::json!({
-                "uids": ["1", "3", "15"],
-                "1": "1721950000000",
-                "3": "1721950000001",
-                "15": "1721950000002"
-            }),
+            upstream_body,
         );
         let reply = plugin
             .handle_packet("device1", packet)
@@ -423,7 +445,6 @@ mod tests {
             reply[0].packet_type,
             "kdeconnect.contacts.request_vcards_by_uid"
         );
-        // All three uids are new, so all three are requested.
         let mut requested: Vec<String> =
             serde_json::from_value(reply[0].body["uids"].clone()).unwrap();
         requested.sort();

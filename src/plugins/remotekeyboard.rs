@@ -154,24 +154,21 @@ mod tests {
     /// (kdeconnect-android .../remotekeyboard/RemoteKeyboardPlugin.java:383-395:
     /// key always, the modifiers only when present, and isAck on every echo
     /// at :394).
+    /// Fixture: tests/fixtures/upstream-wire/remotekeyboard/echo_ack.json
+    ///   kdeconnect-android@a88f6fa0 RemoteKeyboardPlugin.java:383-395
     #[tokio::test]
     async fn test_android_echo_wire_shape() {
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/remotekeyboard/echo_ack.json");
+        let upstream_body: serde_json::Value = serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(&fixture_path).expect("read remotekeyboard echo fixture"),
+        )
+        .expect("parse fixture")["body"]
+            .clone();
+
         let (plugin, broadcaster) = setup();
         let mut rx = broadcaster.subscribe();
-        plugin
-            .handle_packet(
-                "device1",
-                echo_packet(serde_json::json!({
-                    "key": "a",
-                    "specialKey": 0,
-                    "shift": false,
-                    "ctrl": true,
-                    "alt": false,
-                    "isAck": true
-                })),
-            )
-            .await
-            .unwrap();
+        plugin.handle_packet("device1", echo_packet(upstream_body)).await.unwrap();
 
         match rx.recv().await.expect("Value expected to be present") {
             PluginEvent::RemoteKeyboardEcho {
