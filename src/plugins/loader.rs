@@ -28,7 +28,7 @@ pub fn load_default_plugins(
     PluginAccess {
         share: Arc::new(
             super::SharePlugin::new()
-                .with_cert_manager(cert_manager)
+                .with_cert_manager(cert_manager.clone())
                 .with_connection_manager(connection_manager.clone())
                 .with_events(plugin_events.clone()),
         ),
@@ -48,7 +48,12 @@ pub fn load_default_plugins(
             super::MprisPlugin::new(plugin_events.clone())
                 .with_connection_manager(connection_manager.clone()),
         ),
-        notification: Arc::new(super::NotificationPlugin::new(plugin_events.clone())),
+        notification: Arc::new(super::NotificationPlugin::with_storage(
+            plugin_events.clone(),
+            data_dir.clone(),
+            cert_manager.clone(),
+            connection_manager.clone(),
+        )),
         telephony: Arc::new(super::TelephonyPlugin::new(plugin_events.clone())),
         // Session D-Bus pause backend is enabled only at the production
         // entry point (bootstrap.rs create_state), same as clipboard/mpris.

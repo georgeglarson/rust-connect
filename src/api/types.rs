@@ -234,6 +234,12 @@ pub struct ReplyNotificationRequest {
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct NotificationActionRequest {
+    pub action: String,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ShareTextRequest {
     pub text: String,
 }

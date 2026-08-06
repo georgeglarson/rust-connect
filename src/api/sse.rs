@@ -19,7 +19,10 @@ use crate::plugins::PluginEvent;
 #[serde(untagged)]
 pub enum ServerEvent {
     Device(DeviceEvent),
-    Plugin(PluginEvent),
+    // Boxed: PluginEvent now carries optional icon URL fields and the SSE
+    // payload-by-value path inflated the enum to 304 bytes. Box keeps the
+    // hot variant (Device) small without changing serialization.
+    Plugin(Box<PluginEvent>),
 }
 
 pub async fn sse_events(
@@ -32,10 +35,10 @@ pub async fn sse_events(
     );
 
     let plugin_rx = state.plugin_events.subscribe();
-    let plugin_stream: futures::stream::BoxStream<'_, ServerEvent> = Box::pin(
-        BroadcastStream::new(plugin_rx)
-            .filter_map(|r| async move { r.ok().map(ServerEvent::Plugin) }),
-    );
+    let plugin_stream: futures::stream::BoxStream<'_, ServerEvent> =
+        Box::pin(BroadcastStream::new(plugin_rx).filter_map(|r| async move {
+            r.ok().map(|event| ServerEvent::Plugin(Box::new(event)))
+        }));
 
     let streams = select_all(vec![device_stream, plugin_stream]);
 

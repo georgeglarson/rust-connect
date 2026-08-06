@@ -1,0 +1,16 @@
+{
+  "id": 1760000000002,
+  "type": "kdeconnect.notification",
+  "body": {
+    "id": "0|org.thoughtcrime.securesms|42|null|10123",
+    "appName": "Signal",
+    "ticker": "Camille: made it",
+    "title": "Camille",
+    "text": "made it",
+    "isClearable": true,
+    "silent": false,
+    "actions": ["Mark as read"],
+    "requestReplyId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    "payloadHash": "fedcba9876543210fedcba9876543210"
+  }
+}

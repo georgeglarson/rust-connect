@@ -135,6 +135,52 @@ fixtures:
     note: "Negative fixture — `replyUuid` is not a KDE Connect field. Documented because the original defect (rust reading its own invented field) was silent for months; this fixture pins the field name so a future reintroduction can't claim wire-shape parity."
     used_by: "tests/notification_reply_tests.rs::test_invented_reply_uuid_field_is_not_accepted"
 
+  - file: notification/full_with_icon_actions_reply.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt
+    source_lines: "227-298,351-374,438-454"
+    extraction_date: "2026-08-06"
+    note: "Phone-origin: a fully-populated notification with icon payload, actions, and a repliable handle. Combined shape transcribed against the Android source for Task 1.4 wire conformance."
+    used_by: "src/plugins/notification.rs::test_initial_sync_fixture_is_idempotent,src/plugins/notification.rs::test_replacement_fixture_updates_actions_and_reply_identity_in_place,src/plugins/notification.rs::test_icon_hash_is_exposed_even_when_payload_is_not_available"
+
+  - file: notification/replacement.json
+    kind: hand-authored-from-observation
+    extraction_date: "2026-08-06"
+    note: "Hand-authored follow-up to full_with_icon_actions_reply.json — the SAME `id` field, different content. Mirrors the Android re-notification path: same key, updated ticker/text/replyId. Pins the replace-by-key contract for the desktop mirror."
+    used_by: "src/plugins/notification.rs::test_replacement_fixture_updates_actions_and_reply_identity_in_place"
+
+  - file: notification/action_request.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/notifications/notificationsplugin.cpp
+    source_lines: "177-185"
+    extraction_date: "2026-08-06"
+    note: "Desktop-originated action request — `kdeconnect.notification.action` carrying `key` (the Android notification id) and `action` (the button label)."
+    used_by: "src/api/handlers/plugins/notification.rs::test_notification_action_packet_matches_upstream_fixture"
+
+  - file: notification/reply_request.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/notifications/notificationsplugin.cpp
+    source_lines: "169-175"
+    extraction_date: "2026-08-06"
+    note: "Desktop-originated reply — `kdeconnect.notification.reply` carrying `requestReplyId` and `message`. Pairs with the inbound repliable notification fixture."
+    used_by: "src/api/handlers/plugins/notification.rs::test_notification_reply_packet_matches_upstream_fixture"
+
+  - file: notification/cancel.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt
+    source_lines: "135-141"
+    extraction_date: "2026-08-06"
+    note: "Phone-originated cancel — a kdeconnect.notification with isCancel:true and only the id. The field shape (just id, no content) is the lenient-cancel contract."
+    used_by: "src/plugins/notification.rs::test_cancel_for_unknown_id_is_accepted"
+
   - file: notification/request_packet.json
     kind: upstream-derived
     upstream_repo: kdeconnect-kde

@@ -50,6 +50,8 @@ use crate::device::types::{Device, DeviceState, DeviceType};
         handlers::send_notification,
         handlers::reply_notification,
         handlers::dismiss_notification,
+        handlers::activate_notification_action,
+        handlers::get_notification_icon,
         handlers::get_device_connectivity,
 
         handlers::request_sftp,
@@ -86,6 +88,7 @@ use crate::device::types::{Device, DeviceState, DeviceType};
         handlers::LocalSinksResponse,
         handlers::LocalSinkControlRequest,
         ReplyNotificationRequest,
+        NotificationActionRequest,
         ShareTextRequest,
         ShareUrlRequest,
         handlers::SendKeypressRequest,

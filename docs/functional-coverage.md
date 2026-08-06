@@ -272,9 +272,10 @@ feature_ledger:
     live_device: PASS
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/notification/{reply_id_request,request_packet}.json (NotificationsPlugin.kt:251-262 + kdeconnect-kde notificationsplugin.cpp:29); docs/live-validation.md 2026-08-02 Notification desktop->phone and mirror rows"
-    reason: "Slice 0B rollup (D3): hostile_input and environment are UNVERIFIED, blocking status=PASS. fixture_provenance promoted via the slice-0b notification fixtures (including the negative replyUuid fixture, hand-authored, marking the original replyUuid defect); remaining cells owned by Tasks 2.5, 4.1."
+    cite: "tests/fixtures/upstream-wire/notification/{reply_id_request,request_packet,full_with_icon_actions_reply,action_request,reply_request,cancel}.json (NotificationsPlugin.kt:227-298,351-374,438-454 + kdeconnect-kde notificationsplugin.cpp:29,142-185,218-238); docs/live-validation.md 2026-08-02 Notification desktop->phone and mirror rows"
+    reason: "Slice 1.4 follow-up: Task 1.4 closed the phone->desktop mirror — payload-receive + cache (bounded per-device, 512 KiB cap, MD5-keyed, TLS-pinned, 64-icon LRU eviction, owner=rust-connect), inline actions + reply routing with phone-issued requestReplyId, idempotent sync by Android key (replace, not append), and lenient cancel semantics — all pinned by upstream-derived fixtures. Slice 0B rollup (D3): hostile_input and environment remain UNVERIFIED, blocking status=PASS; api_surface now covers POST /api/v1/devices/{id}/notification/{nid}/action and GET /api/v1/devices/{id}/notification-icons/{hash}. Live_device covers the already-proven S21+A15 path; the new action/icon surface awaits the integrator's live run."
     owner: "Tasks 2.5 + 4.1"
+
 
   - feature: pausemusic
     rust_impl: true
@@ -401,8 +402,9 @@ feature_ledger:
     environment: UNVERIFIED
     status: UNVERIFIED
     cite: "tests/fixtures/upstream-wire/sendnotifications/{outgoing,request_flag,cancel_string}.json (kdeconnect-kde dbusnotificationslistener.cpp:317-329 for the outgoing body; notificationsplugin.cpp:29 for `{request: true}`; notificationsplugin.cpp:142-144 for the cancel-id string and the Android-side counterpart at NotificationsPlugin.kt:528-533)"
-    reason: "Slice 0B follow-up: fixture_provenance now PASS via the three upstream-derived wire fixtures. Behavioral tests for the legacy-bool-cancel and empty-cancel cases stay inline (they test the lenient deserializer, not wire shape). Remaining cells owned by Sprint 1 / Task 1.4 inline-action + reply/dismiss."
-    owner: "Task 1.4"
+    reason: "Slice 1.4 follow-up: sendnotifications direction was already conformant per the audit and stayed untouched (the brief says only touch if a finding forces it — none did). Behavioral tests for the legacy-bool-cancel and empty-cancel cases stay inline (they test the lenient deserializer, not wire shape). Remaining cells owned by Sprint 2 hostile-input audit (Task 2.5) and env-matrix expansion (Task 4.1)."
+    owner: "Tasks 2.5 + 4.1"
+
 
   - feature: sftp
     rust_impl: true

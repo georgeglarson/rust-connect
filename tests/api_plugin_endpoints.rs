@@ -516,6 +516,31 @@ async fn test_notification_dismiss_route_exists() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn test_notification_action_route_exists() {
+    let (state, _temp, api_key) = create_test_app().await;
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/devices/test-phoneaaaaaaaaaaaaaaaaaaaaaa/notification/notif-1/action")
+                .header("content-type", "application/json")
+                .header("X-API-Key", &api_key)
+                .body(Body::from(r#"{"action":"Mark as read"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "the phone-notification action route must be wired"
+    );
+}
+
 /// /api/v1/tools must report backend availability honestly. The default test
 /// app constructs AppState via `new_without_input`, which never calls
 /// `enable_session_backend` for clipboard/mpris/etc — so those tools should

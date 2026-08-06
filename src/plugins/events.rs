@@ -22,6 +22,8 @@ pub enum PluginEvent {
         conversation: Option<serde_json::Value>,
         group_name: Option<String>,
         reply_id: Option<String>,
+        icon_hash: Option<String>,
+        icon_url: Option<String>,
     },
     Battery {
         device_id: String,
@@ -134,6 +136,8 @@ mod tests {
             conversation: None,
             group_name: None,
             reply_id: None,
+            icon_hash: None,
+            icon_url: None,
         });
 
         let event = rx.recv().await.expect("Value expected to be present");
@@ -180,6 +184,11 @@ mod tests {
             conversation: None,
             group_name: None,
             reply_id: Some("reply-123".to_string()),
+            icon_hash: Some("0123456789abcdef0123456789abcdef".to_string()),
+            icon_url: Some(
+                "/api/v1/devices/phone-1/notification-icons/0123456789abcdef0123456789abcdef"
+                    .to_string(),
+            ),
         };
         let json = serde_json::to_string(&event).expect("Serialization of known types cannot fail");
         let parsed: PluginEvent =

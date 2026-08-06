@@ -1,0 +1,20 @@
+{
+  "id": 1760000000001,
+  "type": "kdeconnect.notification",
+  "body": {
+    "id": "0|org.thoughtcrime.securesms|42|null|10123",
+    "appName": "Signal",
+    "ticker": "Camille: on my way",
+    "title": "Camille",
+    "text": "on my way",
+    "isClearable": true,
+    "silent": true,
+    "actions": ["Mark as read", "Mute"],
+    "requestReplyId": "11111111-2222-3333-4444-555555555555",
+    "payloadHash": "0123456789abcdef0123456789abcdef"
+  },
+  "payloadSize": 67,
+  "payloadTransferInfo": {
+    "port": 1739
+  }
+}

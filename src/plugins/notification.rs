@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -18,6 +19,9 @@ use crate::utils::errors::Result;
 use super::plugin::Plugin;
 
 const MAX_NOTIFICATION_HISTORY: usize = 100;
+const MAX_ICONS_PER_DEVICE: usize = 64;
+const MAX_NOTIFICATION_ICON_BYTES: u64 = 512 * 1024;
+const ICON_DIR_NAME: &str = "notification-icons";
 
 /// Escape peer-controlled text for the freedesktop notification server, whose
 /// body is a limited HTML subset: unescaped title/text would let a paired
@@ -60,9 +64,13 @@ pub struct NotificationBody {
     /// keyed into the phone's `pendingIntents` map, NOT the notification id.
     #[serde(default)]
     pub request_reply_id: Option<String>,
+    /// MD5 of the PNG icon payload. Android sends this on every notification,
+    /// even when it omits a duplicate payload (NotificationsPlugin.kt:232-241).
+    #[serde(default)]
+    pub payload_hash: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationEntry {
     pub device_id: String,
@@ -76,6 +84,10 @@ pub struct NotificationEntry {
     pub conversation: Option<serde_json::Value>,
     pub group_name: Option<String>,
     pub reply_id: Option<String>,
+    /// Android's MD5 content key for the PNG icon, if one was announced.
+    pub icon_hash: Option<String>,
+    /// Authenticated API path serving the cached PNG, once available.
+    pub icon_url: Option<String>,
     pub received_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -90,6 +102,11 @@ pub struct NotificationPlugin {
     /// re-send posted a brand-new desktop popup (live: ~25 notifications
     /// ×12 re-syncs in 5 minutes, 2026-08-03).
     dedupe: Arc<RwLock<HashMap<(String, String), DedupeEntry>>>,
+    icon_root: PathBuf,
+    icon_lru: Arc<RwLock<HashMap<String, VecDeque<String>>>>,
+    max_icons_per_device: usize,
+    cert_manager: Option<Arc<crate::protocol::crypto::CertificateManager>>,
+    connection_manager: Option<Arc<crate::protocol::ConnectionManager>>,
 }
 
 /// The last desktop post for one (device, notification id).
@@ -162,6 +179,11 @@ impl NotificationPlugin {
                 MAX_NOTIFICATION_HISTORY,
             ))),
             dedupe: Arc::new(RwLock::new(HashMap::new())),
+            icon_root: std::env::temp_dir().join("rust-connect-notification-icons"),
+            icon_lru: Arc::new(RwLock::new(HashMap::new())),
+            max_icons_per_device: MAX_ICONS_PER_DEVICE,
+            cert_manager: None,
+            connection_manager: None,
         }
     }
 
@@ -175,7 +197,208 @@ impl NotificationPlugin {
                 MAX_NOTIFICATION_HISTORY,
             ))),
             dedupe: Arc::new(RwLock::new(HashMap::new())),
+            icon_root: std::env::temp_dir().join("rust-connect-notification-icons"),
+            icon_lru: Arc::new(RwLock::new(HashMap::new())),
+            max_icons_per_device: MAX_ICONS_PER_DEVICE,
+            cert_manager: None,
+            connection_manager: None,
         }
+    }
+
+    /// Production constructor: cache icons under the configured data directory
+    /// and receive their payloads over the same pinned TLS channel as shares.
+    pub fn with_storage(
+        plugin_events: Arc<PluginEventBroadcaster>,
+        data_dir: PathBuf,
+        cert_manager: Arc<crate::protocol::crypto::CertificateManager>,
+        connection_manager: Arc<crate::protocol::ConnectionManager>,
+    ) -> Self {
+        let mut plugin = Self::new(plugin_events);
+        plugin.icon_root = data_dir.join(ICON_DIR_NAME);
+        plugin.cert_manager = Some(cert_manager);
+        plugin.connection_manager = Some(connection_manager);
+        plugin.load_existing_icons();
+        plugin
+    }
+
+    fn valid_icon_hash(hash: &str) -> bool {
+        hash.len() == 32 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+
+    fn valid_device_component(device_id: &str) -> bool {
+        (32..=38).contains(&device_id.len())
+            && device_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    }
+
+    fn icon_path_unchecked(&self, device_id: &str, hash: &str) -> PathBuf {
+        self.icon_root
+            .join(device_id)
+            .join(hash.to_ascii_lowercase())
+    }
+
+    fn is_regular_icon(path: &Path) -> bool {
+        std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false)
+    }
+
+    fn icon_api_url(device_id: &str, hash: &str) -> String {
+        format!(
+            "/api/v1/devices/{device_id}/notification-icons/{}",
+            hash.to_ascii_lowercase()
+        )
+    }
+
+    /// Resolve a cached icon without trusting URL path components supplied by
+    /// the caller. The API handler serves only paths admitted here.
+    pub fn icon_path(&self, device_id: &str, hash: &str) -> Option<PathBuf> {
+        if !Self::valid_device_component(device_id) || !Self::valid_icon_hash(hash) {
+            return None;
+        }
+        let path = self.icon_path_unchecked(device_id, hash);
+        Self::is_regular_icon(&path).then_some(path)
+    }
+
+    fn record_icon(&self, device_id: &str, hash: &str) {
+        let normalized = hash.to_ascii_lowercase();
+        let evicted = {
+            let mut all = self.icon_lru.write().unwrap_or_else(|e| e.into_inner());
+            let queue = all.entry(device_id.to_string()).or_default();
+            queue.retain(|entry| entry != &normalized);
+            queue.push_back(normalized);
+            let mut evicted = Vec::new();
+            while queue.len() > self.max_icons_per_device {
+                if let Some(oldest) = queue.pop_front() {
+                    evicted.push(oldest);
+                }
+            }
+            evicted
+        };
+        for oldest in evicted {
+            let _ = std::fs::remove_file(self.icon_path_unchecked(device_id, &oldest));
+        }
+    }
+
+    /// Restore and enforce the per-device disk cap at startup. Modification
+    /// order is the persisted LRU approximation; symlinks and malformed names
+    /// are never admitted or served.
+    fn load_existing_icons(&self) {
+        let Ok(device_dirs) = std::fs::read_dir(&self.icon_root) else {
+            return;
+        };
+        for device_dir in device_dirs.flatten() {
+            let device_id = device_dir.file_name().to_string_lossy().into_owned();
+            if !Self::valid_device_component(&device_id)
+                || !device_dir.file_type().is_ok_and(|kind| kind.is_dir())
+            {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(device_dir.path()) else {
+                continue;
+            };
+            let mut icons: Vec<(std::time::SystemTime, String)> = files
+                .flatten()
+                .filter_map(|entry| {
+                    let hash = entry.file_name().to_string_lossy().into_owned();
+                    if !Self::valid_icon_hash(&hash)
+                        || !entry.file_type().is_ok_and(|kind| kind.is_file())
+                    {
+                        return None;
+                    }
+                    let modified = entry
+                        .metadata()
+                        .and_then(|metadata| metadata.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    Some((modified, hash.to_ascii_lowercase()))
+                })
+                .collect();
+            icons.sort_by_key(|(modified, _)| *modified);
+            while icons.len() > self.max_icons_per_device {
+                let (_, oldest) = icons.remove(0);
+                let _ = std::fs::remove_file(self.icon_path_unchecked(&device_id, &oldest));
+            }
+            if !icons.is_empty() {
+                self.icon_lru
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(device_id, icons.into_iter().map(|(_, hash)| hash).collect());
+            }
+        }
+    }
+
+    async fn receive_icon(
+        &self,
+        device_id: &str,
+        payload_hash: &str,
+        packet: &Packet,
+    ) -> Option<PathBuf> {
+        if !Self::valid_device_component(device_id) || !Self::valid_icon_hash(payload_hash) {
+            debug!(device_id = %device_id, payload_hash = %payload_hash, "Ignoring invalid notification icon key");
+            return None;
+        }
+
+        let path = self.icon_path_unchecked(device_id, payload_hash);
+        if Self::is_regular_icon(&path) {
+            self.record_icon(device_id, payload_hash);
+            return Some(path);
+        }
+
+        let payload_size = packet.payload_size?;
+        if payload_size == 0 || payload_size > MAX_NOTIFICATION_ICON_BYTES {
+            debug!(device_id = %device_id, payload_size, "Notification icon payload exceeds the bound");
+            return None;
+        }
+        let mut transfer_info: crate::protocol::payload_transfer::PayloadTransferInfo =
+            serde_json::from_value(packet.payload_transfer_info.clone()?).ok()?;
+        let cert_manager = self.cert_manager.clone()?;
+        let connection_manager = self.connection_manager.as_ref()?;
+        if transfer_info.ip.is_none() {
+            transfer_info.ip = connection_manager
+                .get_peer_addr(&device_id.to_string())
+                .await
+                .map(|address| address.ip().to_string());
+        }
+        transfer_info.ip.as_ref()?;
+
+        if let Some(parent) = path.parent() {
+            if tokio::fs::create_dir_all(parent).await.is_err() {
+                return None;
+            }
+        }
+        let transfer = crate::protocol::payload_transfer::PayloadTransfer::new(
+            cert_manager,
+            device_id.to_string(),
+        );
+        match transfer
+            .receive_file(&transfer_info, payload_size, &path)
+            .await
+        {
+            Ok(_) => {
+                self.record_icon(device_id, payload_hash);
+                Some(path)
+            }
+            Err(error) => {
+                debug!(device_id = %device_id, error = %error, "Failed to receive notification icon payload");
+                None
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn with_test_icon_store(mut self, data_dir: PathBuf, cap: usize) -> Self {
+        self.icon_root = data_dir.join(ICON_DIR_NAME);
+        self.max_icons_per_device = cap;
+        self
+    }
+
+    #[cfg(test)]
+    fn store_test_icon(&self, device_id: &str, hash: &str, bytes: &[u8]) {
+        let path = self.icon_path_unchecked(device_id, hash);
+        std::fs::create_dir_all(path.parent().expect("icon parent")).expect("create icon dir");
+        std::fs::write(path, bytes).expect("write icon");
+        self.record_icon(device_id, hash);
     }
 
     /// Decide the desktop action for an incoming (non-cancel) notification
@@ -260,6 +483,19 @@ impl NotificationPlugin {
             .and_then(|e| e.reply_id.clone())
     }
 
+    /// Whether the current replacement of a notification exposes this action.
+    pub fn has_action(&self, device_id: &str, notification_id: &str, action: &str) -> bool {
+        let history = self.history.read().unwrap_or_else(|e| e.into_inner());
+        history.iter().rev().any(|entry| {
+            entry.device_id == device_id
+                && entry.id == notification_id
+                && entry
+                    .actions
+                    .as_ref()
+                    .is_some_and(|actions| actions.iter().any(|candidate| candidate == action))
+        })
+    }
+
     /// Drops a notification from history and announces the dismissal, for a
     /// dismissal the desktop initiated. Returns whether it was actually held.
     ///
@@ -300,6 +536,8 @@ impl NotificationPlugin {
             conversation: None,
             group_name: None,
             reply_id: None,
+            icon_hash: None,
+            icon_url: None,
         });
 
         removed
@@ -358,14 +596,42 @@ impl Plugin for NotificationPlugin {
             let conversation = body.conversation.clone();
             let group_name = body.group_name.clone();
             let reply_id = body.request_reply_id.clone();
+            let icon_hash = body
+                .payload_hash
+                .as_deref()
+                .filter(|hash| Self::valid_icon_hash(hash))
+                .map(|hash| hash.to_ascii_lowercase());
+            let icon_path = match icon_hash.as_deref() {
+                Some(hash) => self.receive_icon(device_id, hash, &packet).await,
+                None => None,
+            };
+            let icon_url = icon_path
+                .as_ref()
+                .and(icon_hash.as_deref())
+                .map(|hash| Self::icon_api_url(device_id, hash));
 
             if is_cancel {
-                info!(
-                    device_id = %device_id,
-                    notification_id = id,
-                    event = "notification_cancelled",
-                    "Notification cancelled by device"
-                );
+                let removed_from_history = {
+                    let mut history = self.history.write().unwrap_or_else(|e| e.into_inner());
+                    let before = history.len();
+                    history.retain(|entry| !(entry.device_id == device_id && entry.id == id));
+                    history.len() != before
+                };
+                let desktop_id = self.dedupe_take(device_id, id);
+
+                if removed_from_history {
+                    info!(
+                        device_id = %device_id,
+                        notification_id = id,
+                        event = "notification_cancelled",
+                        "Notification cancelled by device"
+                    );
+                }
+
+                // Always broadcast the cancel so an SSE consumer with a different
+                // view of history still sees the dismissal. The broadcast and
+                // the desktop popup close are best-effort; repeating the
+                // cancel for an unknown key is harmless upstream shape.
                 self.plugin_events.broadcast(PluginEvent::Notification {
                     device_id: device_id.to_string(),
                     id: id.to_string(),
@@ -383,20 +649,10 @@ impl Plugin for NotificationPlugin {
                     conversation: conversation.clone(),
                     group_name: group_name.clone(),
                     reply_id: None,
+                    icon_hash: None,
+                    icon_url: None,
                 });
-                // A cancel says the phone dismissed this notification, so drop
-                // it from history rather than appending a content-free row.
-                // History is what /api/v1/notifications renders: appending
-                // made dismissed notifications keep showing up alongside blank
-                // entries, and a repeatedly-cancelled id added a row each time
-                // (seen live 2026-07-30 — 12 of 36 entries were blank cancels,
-                // one id cancelled four times). The cancel still goes out as a
-                // live event above; only the stored state changes here.
-                if let Ok(mut history) = self.history.write() {
-                    history.retain(|e| !(e.device_id == device_id && e.id == id));
-                }
-                // Close the desktop popup we posted for this id, if any.
-                if let Some(replaces_id) = self.dedupe_take(device_id, id) {
+                if let Some(replaces_id) = desktop_id.filter(|id| *id != 0) {
                     close_desktop_notification(replaces_id).await;
                 }
                 return Ok(None);
@@ -457,6 +713,11 @@ impl Plugin for NotificationPlugin {
                         device_id.to_string(),
                     ))
                     .timeout(notify_rust::Timeout::Milliseconds(5000));
+                if let Some(path) = icon_path.as_ref().and_then(|path| path.to_str()) {
+                    // KDE sets the downloaded PNG as the notification pixmap
+                    // (notification.cpp:141-146,177-185).
+                    builder.image_path(path);
+                }
                 if let DesktopAction::Replace(replaces_id) = action {
                     builder.id(replaces_id);
                 }
@@ -493,9 +754,18 @@ impl Plugin for NotificationPlugin {
                 conversation: conversation.clone(),
                 group_name: group_name.clone(),
                 reply_id: reply_id.clone(),
+                icon_hash: icon_hash.clone(),
+                icon_url: icon_url.clone(),
             });
 
             if let Ok(mut history) = self.history.write() {
+                // Android's notification key is the stable identity
+                // (NotificationsPlugin.kt:220-225,251). Initial sync re-sends
+                // the same keys, and updates reuse them, so the desktop state is
+                // replace-by-(device,key), not an append-only event log.
+                if !id.is_empty() {
+                    history.retain(|entry| !(entry.device_id == device_id && entry.id == id));
+                }
                 history.push_back(NotificationEntry {
                     device_id: device_id.to_string(),
                     id: id.to_string(),
@@ -508,6 +778,8 @@ impl Plugin for NotificationPlugin {
                     conversation,
                     group_name,
                     reply_id,
+                    icon_hash,
+                    icon_url,
                     received_at: chrono::Utc::now(),
                 });
                 while history.len() > MAX_NOTIFICATION_HISTORY {
@@ -527,6 +799,19 @@ mod tests {
 
     fn make_plugin() -> NotificationPlugin {
         NotificationPlugin::new_without_desktop(Arc::new(PluginEventBroadcaster::new(16, "plugin")))
+    }
+
+    /// A red test that awaits an event must fail fast, not hang the whole
+    /// suite forever (a 2h-hung red test stalled the Task 1.4 lane on
+    /// 2026-08-06). Every SSE await goes through this guard.
+    async fn recv_event(
+        rx: &mut tokio::sync::broadcast::Receiver<PluginEvent>,
+        label: &str,
+    ) -> PluginEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{label}: timed out waiting for the event"))
+            .unwrap_or_else(|e| panic!("{label}: broadcast channel closed: {e:?}"))
     }
 
     #[test]
@@ -559,7 +844,7 @@ mod tests {
         );
         assert!(plugin.handle_packet("phone-1", packet).await.is_ok());
 
-        let event = rx.recv().await.expect("Value expected to be present");
+        let event = recv_event(&mut rx, "expected notification event").await;
         match event {
             PluginEvent::Notification { title, text, .. } => {
                 assert_eq!(title, "<b>hi</b>");
@@ -602,7 +887,7 @@ mod tests {
         );
         assert!(plugin.handle_packet("phone-1", packet).await.is_ok());
 
-        let event = rx.recv().await.expect("Value expected to be present");
+        let event = recv_event(&mut rx, "expected notification event").await;
         match event {
             PluginEvent::Notification {
                 device_id,
@@ -650,7 +935,7 @@ mod tests {
         );
         assert!(plugin.handle_packet("phone-2", packet).await.is_ok());
 
-        let event = rx.recv().await.expect("Value expected to be present");
+        let event = recv_event(&mut rx, "expected notification event").await;
         match event {
             PluginEvent::Notification {
                 device_id,
@@ -692,7 +977,7 @@ mod tests {
         let packet = Packet::new("kdeconnect.notification".to_string(), serde_json::json!({}));
         assert!(plugin.handle_packet("test", packet).await.is_ok());
 
-        let event = rx.recv().await.expect("Value expected to be present");
+        let event = recv_event(&mut rx, "expected notification event").await;
         match event {
             PluginEvent::Notification {
                 id,
@@ -800,7 +1085,7 @@ mod tests {
         assert!(plugin.handle_packet("test", packet).await.is_ok());
 
         // Verify cancel event was broadcast with "unknown" defaults
-        let event = rx.recv().await.expect("Value expected to be present");
+        let event = recv_event(&mut rx, "expected notification event").await;
         match event {
             PluginEvent::Notification {
                 id,
@@ -1077,6 +1362,18 @@ mod cancel_semantics_tests {
         NotificationPlugin::new_without_desktop(Arc::new(PluginEventBroadcaster::new(16, "plugin")))
     }
 
+    /// Red tests that await an event must fail fast, not hang the suite
+    /// (see the identical guard in `mod tests`).
+    async fn recv_event(
+        rx: &mut tokio::sync::broadcast::Receiver<PluginEvent>,
+        label: &str,
+    ) -> PluginEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{label}: timed out waiting for the event"))
+            .unwrap_or_else(|e| panic!("{label}: broadcast channel closed: {e:?}"))
+    }
+
     async fn post(plugin: &NotificationPlugin, dev: &str, id: &str, cancel: bool) {
         let mut body =
             serde_json::json!({ "id": id, "appName": "Signal", "title": "t", "text": "x" });
@@ -1133,6 +1430,32 @@ mod cancel_semantics_tests {
             plugin.get_history(Some(dev), usize::MAX).is_empty(),
             "four cancels of one notification must leave nothing behind"
         );
+    }
+
+    /// A cancel for a notification we never held still surfaces as an SSE
+    /// event (consumers may have a divergent history view) but must not
+    /// error. Mirrors the lenient-cancel decision already on the wire.
+    #[tokio::test]
+    async fn test_cancel_for_unknown_id_is_accepted() {
+        let broadcaster = Arc::new(PluginEventBroadcaster::new(16, "plugin"));
+        let mut rx = broadcaster.subscribe();
+        let plugin = NotificationPlugin::new_without_desktop(broadcaster.clone());
+        let dev = "devabcdef0123456789abcdef01234567";
+
+        post(&plugin, dev, "never-seen", true).await;
+
+        match recv_event(&mut rx, "the cancel event must still reach SSE").await {
+            PluginEvent::Notification {
+                device_id,
+                is_cancel,
+                ..
+            } => {
+                assert_eq!(device_id, dev);
+                assert!(is_cancel);
+            }
+            _ => panic!("Wrong event type"),
+        }
+        assert!(plugin.get_history(Some(dev), usize::MAX).is_empty());
     }
 
     /// A cancel names one notification on one device. It must not disturb the
@@ -1192,11 +1515,11 @@ mod cancel_semantics_tests {
             )
             .await
             .unwrap();
-        let _posted = rx.recv().await.expect("the posted notification event");
+        let _posted = recv_event(&mut rx, "the posted notification event").await;
 
         plugin.dismiss(dev, "notif-x");
 
-        match rx.recv().await.expect("the dismiss event") {
+        match recv_event(&mut rx, "the dismiss event").await {
             PluginEvent::Notification {
                 device_id,
                 id,
@@ -1334,6 +1657,147 @@ mod cancel_semantics_tests {
             plugin.dedupe_track(dev, "n1", sig),
             DesktopAction::Post,
             "after a dismiss the entry is gone: identical content posts fresh"
+        );
+    }
+}
+
+#[cfg(test)]
+mod task_1_4_icon_tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    fn fixture(name: &str) -> Packet {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/notification")
+            .join(name);
+        serde_json::from_str(&std::fs::read_to_string(path).expect("read notification fixture"))
+            .expect("parse notification fixture")
+    }
+
+    #[tokio::test]
+    async fn test_icon_hash_is_exposed_even_when_payload_is_not_available() {
+        let plugin = NotificationPlugin::new_without_desktop(Arc::new(
+            PluginEventBroadcaster::new(16, "plugin"),
+        ));
+        let dev = "devabcdef0123456789abcdef01234567";
+        plugin
+            .handle_packet(dev, fixture("full_with_icon_actions_reply.json"))
+            .await
+            .unwrap();
+
+        let entry = plugin
+            .get_history(Some(dev), usize::MAX)
+            .into_iter()
+            .next()
+            .expect("notification stored");
+        assert_eq!(
+            entry.icon_hash.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert!(
+            entry.icon_url.is_none(),
+            "no payload cache means no API URL"
+        );
+    }
+
+    #[test]
+    fn test_icon_cache_enforces_per_device_cap() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let plugin = NotificationPlugin::new_without_desktop(Arc::new(
+            PluginEventBroadcaster::new(16, "plugin"),
+        ))
+        .with_test_icon_store(temp.path().to_path_buf(), 2);
+        let dev = "devabcdef0123456789abcdef01234567";
+        let first = "0123456789abcdef0123456789abcdef";
+        let second = "11111111111111111111111111111111";
+        let third = "22222222222222222222222222222222";
+
+        plugin.store_test_icon(dev, first, b"png-1");
+        plugin.store_test_icon(dev, second, b"png-2");
+        plugin.store_test_icon(dev, third, b"png-3");
+
+        assert!(
+            plugin.icon_path(dev, first).is_none(),
+            "oldest icon evicted"
+        );
+        assert!(plugin.icon_path(dev, second).is_some());
+        assert!(plugin.icon_path(dev, third).is_some());
+    }
+}
+
+#[cfg(test)]
+mod task_1_4_state_tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    fn fixture(name: &str) -> Packet {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/notification")
+            .join(name);
+        serde_json::from_str(&std::fs::read_to_string(path).expect("read notification fixture"))
+            .expect("parse notification fixture")
+    }
+
+    fn plugin() -> NotificationPlugin {
+        NotificationPlugin::new_without_desktop(Arc::new(PluginEventBroadcaster::new(16, "plugin")))
+    }
+
+    #[tokio::test]
+    async fn test_initial_sync_fixture_is_idempotent() {
+        let plugin = plugin();
+        let dev = "devabcdef0123456789abcdef01234567";
+        let packet = fixture("full_with_icon_actions_reply.json");
+
+        plugin.handle_packet(dev, packet.clone()).await.unwrap();
+        plugin.handle_packet(dev, packet).await.unwrap();
+
+        let history = plugin.get_history(Some(dev), usize::MAX);
+        assert_eq!(
+            history.len(),
+            1,
+            "a repeated full-sync item replaces by key"
+        );
+        assert_eq!(
+            history[0].actions.as_deref(),
+            Some(&["Mark as read".to_string(), "Mute".to_string()][..])
+        );
+        assert_eq!(
+            history[0].reply_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replacement_fixture_updates_actions_and_reply_identity_in_place() {
+        let plugin = plugin();
+        let dev = "devabcdef0123456789abcdef01234567";
+
+        plugin
+            .handle_packet(dev, fixture("full_with_icon_actions_reply.json"))
+            .await
+            .unwrap();
+        plugin
+            .handle_packet(dev, fixture("replacement.json"))
+            .await
+            .unwrap();
+
+        let history = plugin.get_history(Some(dev), usize::MAX);
+        assert_eq!(history.len(), 1, "same phone key must update, not append");
+        assert_eq!(history[0].text, "made it");
+        assert_eq!(
+            history[0].actions.as_deref(),
+            Some(&["Mark as read".to_string()][..])
+        );
+        assert_eq!(
+            plugin
+                .reply_handle(dev, "0|org.thoughtcrime.securesms|42|null|10123")
+                .as_deref(),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            "reply-by-notification-id must route through the replacement's current phone handle"
         );
     }
 }

@@ -225,10 +225,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(handlers::reply_notification),
         )
         .route(
+            "/api/v1/devices/:device_id/notification/:notification_id/action",
+            post(handlers::activate_notification_action),
+        )
+        .route(
             "/api/v1/devices/:device_id/notification/:notification_id/dismiss",
             post(handlers::dismiss_notification),
         )
         .route("/api/v1/notifications", get(handlers::get_notifications))
+        .route(
+            "/api/v1/devices/:device_id/notification-icons/:icon_hash",
+            get(handlers::get_notification_icon),
+        )
         .route("/api/v1/events", get(crate::api::sse::sse_events))
         .layer(middleware::from_fn_with_state(
             state.clone(),

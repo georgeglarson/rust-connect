@@ -109,6 +109,19 @@ pub async fn send_notification(
     }))))
 }
 
+pub(crate) fn build_notification_reply_packet(
+    reply_handle: &str,
+    message: &str,
+) -> crate::protocol::types::Packet {
+    crate::protocol::types::Packet::new(
+        "kdeconnect.notification.reply".to_string(),
+        serde_json::json!({
+            "requestReplyId": reply_handle,
+            "message": message,
+        }),
+    )
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/devices/{device_id}/notification/{notification_id}/reply",
@@ -154,13 +167,7 @@ pub async fn reply_notification(
             )))
         })?;
 
-    let packet = crate::protocol::types::Packet::new(
-        "kdeconnect.notification.reply".to_string(),
-        serde_json::json!({
-            "requestReplyId": reply_handle,
-            "message": body.message
-        }),
-    );
+    let packet = build_notification_reply_packet(&reply_handle, &body.message);
 
     state
         .connection_manager
@@ -174,6 +181,154 @@ pub async fn reply_notification(
         "message": body.message,
         "sent": true
     }))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/devices/{device_id}/notification-icons/{icon_hash}",
+    tag = "notifications",
+    params(
+        ("device_id" = String, Path, description = "Device unique identifier"),
+        ("icon_hash" = String, Path, description = "MD5 hash of the icon payload (Android payloadHash)")
+    ),
+    responses(
+        (status = 200, description = "Cached icon PNG", content_type = "image/png"),
+        (status = 400, description = "Invalid device id or hash"),
+        (status = 401, description = "Invalid or missing API key", body = ApiError),
+        (status = 404, description = "No cached icon for that hash"),
+    ),
+    security(("api_key" = []))
+)]
+pub async fn get_notification_icon(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((device_id, icon_hash)): axum::extract::Path<(String, String)>,
+) -> Result<axum::response::Response, (axum::http::StatusCode, Json<ApiError>)> {
+    validate_device_id(&device_id).map_err(api_err)?;
+    let Some(path) = state.plugins.notification.icon_path(&device_id, &icon_hash) else {
+        return Err(api_err(Error::not_found(
+            "notification icon",
+            Some(format!("{device_id}/{icon_hash}")),
+        )));
+    };
+    let bytes = tokio::fs::read(&path).await.map_err(|error| {
+        api_err(Error::io(
+            format!("Failed to read cached icon: {error}"),
+            Some(path.display().to_string()),
+        ))
+    })?;
+    let response = axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "image/png")
+        .body(axum::body::Body::from(bytes))
+        .map_err(|error| {
+            api_err(Error::Internal(format!(
+                "Failed to build icon response: {error}"
+            )))
+        })?;
+    Ok(response)
+}
+
+pub(crate) fn build_notification_action_packet(
+    notification_id: &str,
+    action: &str,
+) -> crate::protocol::types::Packet {
+    crate::protocol::types::Packet::new(
+        "kdeconnect.notification.action".to_string(),
+        serde_json::json!({
+            "key": notification_id,
+            "action": action,
+        }),
+    )
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/devices/{device_id}/notification/{notification_id}/action",
+    tag = "notifications",
+    params(
+        ("device_id" = String, Path, description = "Device unique identifier"),
+        ("notification_id" = String, Path, description = "Notification ID whose action should run")
+    ),
+    request_body = NotificationActionRequest,
+    responses(
+        (status = 200, description = "Notification action sent to device", body = ApiResponse),
+        (status = 400, description = "Unknown action or disconnected device", body = ApiError),
+        (status = 401, description = "Invalid or missing API key", body = ApiError),
+    ),
+    security(("api_key" = []))
+)]
+pub async fn activate_notification_action(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((device_id, notification_id)): axum::extract::Path<(String, String)>,
+    Json(body): Json<NotificationActionRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+    validate_device_id(&device_id).map_err(api_err)?;
+
+    if !state.connection_manager.is_connected(&device_id).await {
+        return Err(api_err(Error::InvalidRequest(
+            "Device is not connected".to_string(),
+        )));
+    }
+
+    if !state
+        .plugins
+        .notification
+        .has_action(&device_id, &notification_id, &body.action)
+    {
+        return Err(api_err(Error::InvalidRequest(format!(
+            "Notification {notification_id} does not expose action {:?}",
+            body.action
+        ))));
+    }
+
+    let packet = build_notification_action_packet(&notification_id, &body.action);
+    state
+        .connection_manager
+        .send_packet(&device_id, &packet)
+        .await
+        .map_err(api_err)?;
+
+    Ok(Json(ApiResponse::ok(serde_json::json!({
+        "device_id": device_id,
+        "notification_id": notification_id,
+        "action": body.action,
+        "sent": true,
+    }))))
+}
+
+#[cfg(test)]
+mod task_1_4_wire_tests {
+    use super::*;
+
+    #[test]
+    fn test_notification_action_packet_matches_upstream_fixture() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/notification/action_request.json");
+        let expected: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read action fixture"))
+                .expect("parse action fixture");
+
+        let packet = build_notification_action_packet(
+            "0|org.thoughtcrime.securesms|42|null|10123",
+            "Mark as read",
+        );
+        assert_eq!(packet.packet_type, "kdeconnect.notification.action");
+        assert_eq!(packet.body, expected);
+    }
+
+    #[test]
+    fn test_notification_reply_packet_matches_upstream_fixture() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/upstream-wire/notification/reply_request.json");
+        let expected: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read reply fixture"))
+                .expect("parse reply fixture");
+
+        let packet =
+            build_notification_reply_packet("11111111-2222-3333-4444-555555555555", "see you soon");
+        assert_eq!(packet.packet_type, "kdeconnect.notification.reply");
+        assert_eq!(packet.body, expected);
+    }
 }
 
 #[utoipa::path(
