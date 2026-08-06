@@ -341,31 +341,36 @@ mod tests {
 
     /// EXACT body a tablet sends for a pen stroke: `tool` is the Kotlin enum
     /// name, capitalized (kdeconnect-android .../digitizer/ToolEvent.kt:17-20,
-    /// DigitizerPlugin.kt:69).
+    /// DigitizerPlugin.kt:69). The values come from the upstream-derived
+    /// fixture tests/fixtures/upstream-wire/digitizer/pen_stroke.json.
     #[tokio::test]
     async fn test_capitalized_pen_activates_pen_tool() {
-        let body = serde_json::json!({
-            "touching": true,
-            "tool": "Pen",
-            "x": 100,
-            "y": 200,
-            "pressure": 0.5
-        });
+        let body: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/upstream-wire/digitizer/pen_stroke.json"),
+            )
+            .expect("digitizer/pen_stroke.json"),
+        )
+        .expect("digitizer/pen_stroke.json parses");
         let events = build_digitizer_events(&body, 1000, 1000);
         assert_eq!(key_value(&events, KeyCode::BTN_TOOL_PEN.0), Some(1));
         assert_eq!(key_value(&events, KeyCode::BTN_TOOL_RUBBER.0), Some(0));
     }
 
     /// The eraser end of the stylus (ToolEvent.kt:19 `Rubber`; kdeconnect-kde
-    /// plugins/digitizer/toolevent.h:13 TOOL_RUBBER "Rubber").
+    /// plugins/digitizer/toolevent.h:13 TOOL_RUBBER "Rubber"). Values from
+    /// tests/fixtures/upstream-wire/digitizer/rubber_stroke.json.
     #[tokio::test]
     async fn test_capitalized_rubber_activates_rubber_tool() {
-        let body = serde_json::json!({
-            "touching": true,
-            "tool": "Rubber",
-            "x": 10,
-            "y": 20
-        });
+        let body: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/upstream-wire/digitizer/rubber_stroke.json"),
+            )
+            .expect("digitizer/rubber_stroke.json"),
+        )
+        .expect("digitizer/rubber_stroke.json parses");
         let events = build_digitizer_events(&body, 1000, 1000);
         assert_eq!(key_value(&events, KeyCode::BTN_TOOL_PEN.0), Some(0));
         assert_eq!(key_value(&events, KeyCode::BTN_TOOL_RUBBER.0), Some(1));

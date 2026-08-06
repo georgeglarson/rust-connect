@@ -333,14 +333,23 @@ mod tests {
         body.get(key).and_then(|v| v.as_str())
     }
 
-    /// Upstream builds the ticker as summary + ": " + body
-    /// (kdeconnect-kde plugins/sendnotifications/dbusnotificationslistener.cpp:301-304).
-    /// Android renders ONLY the ticker
-    /// (.../receivenotifications/ReceiveNotificationsPlugin.kt:80,82,88), so a
-    /// body missing from the ticker never reaches the phone.
+    /// Loads the upstream-derived fixture literal at
+    /// tests/fixtures/upstream-wire/sendnotifications/outgoing.json (cited
+    /// against kdeconnect-kde dbusnotificationslistener.cpp:317-329) and
+    /// asserts the rust plugin's body matches it field-for-field.
     #[tokio::test]
     async fn test_ticker_carries_summary_and_body() {
+        let expected: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/upstream-wire/sendnotifications/outgoing.json"),
+            )
+            .expect("sendnotifications/outgoing.json"),
+        )
+        .expect("sendnotifications/outgoing.json parses");
+
         let body = build_notification_body(42, "Signal", "Camille", "on my way", 5000);
+        assert_eq!(body, expected);
         assert_eq!(field(&body, "ticker"), Some("Camille: on my way"));
         assert_eq!(field(&body, "title"), Some("Camille"));
         assert_eq!(field(&body, "text"), Some("on my way"));
@@ -423,14 +432,20 @@ mod notification_request_tests {
     /// with `np.set<QString>(QStringLiteral("cancel"), internalId)`
     /// (plugins/notifications/notificationsplugin.cpp:143) and kdeconnect-android
     /// reads it with `np.getString("cancel")`
-    /// (.../plugins/notifications/NotificationsPlugin.kt:529). The id below is an
-    /// Android StatusBarNotification key, the shape those ids really take.
+    /// (.../plugins/notifications/NotificationsPlugin.kt:529). The id below is
+    /// the upstream-derived fixture literal at
+    /// tests/fixtures/upstream-wire/sendnotifications/cancel_string.json.
     #[test]
     fn test_cancel_parses_as_string_notification_id() {
-        let packet = Packet::new(
-            "kdeconnect.notification.request".to_string(),
-            serde_json::json!({ "cancel": "0|com.sec.android.daemonapp|5|null|10203" }),
-        );
+        let body: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/upstream-wire/sendnotifications/cancel_string.json"),
+            )
+            .expect("sendnotifications/cancel_string.json"),
+        )
+        .expect("sendnotifications/cancel_string.json parses");
+        let packet = Packet::new("kdeconnect.notification.request".to_string(), body);
         let req: NotificationRequest = packet.body_as("notification request").unwrap();
         assert_eq!(
             req.cancel.as_deref(),
@@ -440,13 +455,19 @@ mod notification_request_tests {
     }
 
     /// The resend-everything flag. kdeconnect-kde notificationsplugin.cpp:29 and
-    /// ReceiveNotificationsPlugin.kt:39-41 both send exactly this body.
+    /// ReceiveNotificationsPlugin.kt:39-41 both send exactly this body. Fixture
+    /// at tests/fixtures/upstream-wire/sendnotifications/request_flag.json.
     #[test]
     fn test_request_flag_parses_with_no_cancel() {
-        let packet = Packet::new(
-            "kdeconnect.notification.request".to_string(),
-            serde_json::json!({ "request": true }),
-        );
+        let body: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/upstream-wire/sendnotifications/request_flag.json"),
+            )
+            .expect("sendnotifications/request_flag.json"),
+        )
+        .expect("sendnotifications/request_flag.json parses");
+        let packet = Packet::new("kdeconnect.notification.request".to_string(), body);
         let req: NotificationRequest = packet.body_as("notification request").unwrap();
         assert_eq!(req.request, Some(true));
         assert_eq!(req.cancel, None);

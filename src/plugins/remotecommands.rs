@@ -179,22 +179,25 @@ mod tests {
         Packet::new("kdeconnect.runcommand".to_string(), body)
     }
 
-    /// EXACT advertisement shape: `commandList` is a JSON STRING holding a
-    /// map of key -> {name, command}, and `canAddCommand` rides along
-    /// (kdeconnect-kde plugins/runcommand/runcommandplugin.cpp:164-165;
-    /// kdeconnect-android RunCommandPlugin.java parses commandList as a
-    /// string too).
+    /// Loads the upstream-derived fixture literal at
+    /// tests/fixtures/upstream-wire/remotecommands/command_list.json (cited
+    /// against kdeconnect-kde plugins/runcommand/runcommandplugin.cpp:188-195).
+    /// `commandList` is a JSON STRING holding a map of key -> {name, command},
+    /// and `canAddCommand` rides along. The fixture is the same wire shape as
+    /// runcommand/command_list_populated.json (same packet type, same source).
     #[tokio::test]
     async fn test_command_list_parsed() {
         let (plugin, _) = setup();
-        plugin
-            .handle_packet(
-                "device1",
-                runcommand_packet(serde_json::json!({
-                    "commandList": "{\"abc\":{\"name\":\"Lock\",\"command\":\"loginctl lock-session\"}}",
-                    "canAddCommand": true
-                })),
+        let body: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/upstream-wire/remotecommands/command_list.json"),
             )
+            .expect("remotecommands/command_list.json"),
+        )
+        .expect("remotecommands/command_list.json parses");
+        plugin
+            .handle_packet("device1", runcommand_packet(body))
             .await
             .unwrap();
 
@@ -290,21 +293,25 @@ mod tests {
         assert_eq!(commands.len(), 1);
     }
 
-    /// The advertisement is sent on connect (runcommandplugin.cpp:156-159);
-    /// we ask for it with requestCommandList (remotecommandsplugin.cpp:37-38).
+    /// The rust plugin asks for the command list on connect with
+    /// `requestCommandList: true` (kdeconnect-kde
+    /// plugins/remotecommands/remotecommandsplugin.cpp:37 — the wire fixture
+    /// is tests/fixtures/upstream-wire/remotecommands/request_command_list.json).
     #[tokio::test]
     async fn test_on_connected_requests_command_list() {
         let (plugin, _) = setup();
         let packets = plugin.on_connected("device1");
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].packet_type, "kdeconnect.runcommand.request");
-        assert_eq!(
-            packets[0]
-                .body
-                .get("requestCommandList")
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
+        let expected_body: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/upstream-wire/remotecommands/request_command_list.json"),
+            )
+            .expect("remotecommands/request_command_list.json"),
+        )
+        .expect("remotecommands/request_command_list.json parses");
+        assert_eq!(packets[0].body, expected_body);
     }
 
     #[tokio::test]

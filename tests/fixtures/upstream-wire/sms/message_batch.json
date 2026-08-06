@@ -1,0 +1,17 @@
+{
+  "messages": [
+    {
+      "addresses": [
+        { "address": "+1234567890" }
+      ],
+      "body": "Hello from Android",
+      "date": 1700000000000,
+      "type": 1,
+      "read": 0,
+      "threadID": 100,
+      "uID": 1,
+      "event": 0,
+      "subscriptionID": 1
+    }
+  ]
+}

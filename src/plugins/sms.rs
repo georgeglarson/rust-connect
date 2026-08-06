@@ -316,21 +316,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_sms_with_addresses_array_from_android() {
-        // kdeconnect-android sends "addresses" as a JSON array, not a string
-        // See SMSHelper.kt toJSONObject() line 911-933
+        // Upstream wire literal — see fixture provenance
+        // tests/fixtures/upstream-wire/provenance.yaml: sms/message_batch.json
+        // cited against kdeconnect-android SMSHelper.kt:911-933
+        // (Message.toJSONObject() emits the {addresses, body, date, type,
+        // read, threadID, uID, event, subscriptionID} shape).
         let plugin = SmsPlugin::new();
 
-        let body_json = serde_json::json!({"messages": [{
-            "messageID": 1,
-            "threadID": 100,
-            "addresses": [{"address": "+1234567890"}],
-            "body": "Hello from Android",
-            "date": 1700000000000i64,
-            "type": 1,
-            "read": 0
-        }]});
+        let body: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/upstream-wire/sms/message_batch.json"),
+            )
+            .expect("sms/message_batch.json"),
+        )
+        .expect("sms/message_batch.json parses");
 
-        let packet = Packet::new("kdeconnect.sms.messages".to_string(), body_json);
+        let packet = Packet::new("kdeconnect.sms.messages".to_string(), body);
         let result = plugin.handle_packet("test", packet).await;
         assert!(
             result.is_ok(),

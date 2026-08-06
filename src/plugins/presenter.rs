@@ -255,25 +255,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_pointer_exact_android_shape() {
-        // Exact body the Android app sends:
-        // kdeconnect-android PresenterPlugin.kt:77-82 — {"dx": float, "dy": float}.
+        // Upstream wire literal — see fixture provenance
+        // tests/fixtures/upstream-wire/provenance.yaml: presenter/pointer.json
+        // cited against kdeconnect-android PresenterPlugin.kt:77-82.
         let plugin = PresenterPlugin::new_without_input();
-        let packet = Packet::new(
-            "kdeconnect.presenter".to_string(),
-            serde_json::json!({ "dx": 0.0123, "dy": -0.0456 }),
-        );
+        let body: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/upstream-wire/presenter/pointer.json"),
+            )
+            .expect("presenter/pointer.json"),
+        )
+        .expect("presenter/pointer.json parses");
+        let packet = Packet::new("kdeconnect.presenter".to_string(), body);
         assert!(plugin.handle_packet("device1", packet).await.is_ok());
         assert_eq!(plugin.events_received(), 1);
     }
 
     #[tokio::test]
     async fn test_handle_stop_exact_android_shape() {
-        // kdeconnect-android PresenterPlugin.kt:84-88 — {"stop": true}.
+        // Upstream wire literal — see fixture provenance
+        // tests/fixtures/upstream-wire/provenance.yaml: presenter/stop.json
+        // cited against kdeconnect-android PresenterPlugin.kt:84-88.
         let plugin = PresenterPlugin::new_without_input();
-        let packet = Packet::new(
-            "kdeconnect.presenter".to_string(),
-            serde_json::json!({ "stop": true }),
-        );
+        let body: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/upstream-wire/presenter/stop.json"),
+            )
+            .expect("presenter/stop.json"),
+        )
+        .expect("presenter/stop.json parses");
+        let packet = Packet::new("kdeconnect.presenter".to_string(), body);
         assert!(plugin.handle_packet("device1", packet).await.is_ok());
         assert_eq!(plugin.events_received(), 1);
     }

@@ -112,8 +112,8 @@ feature_ledger:
     live_device: PASS
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/identity/basic.json (basic identity wire shape used by battery plugin); docs/live-validation.md 2026-08-02 Battery row (live 90%, charging); docs/parity-checklist.md Discovery/Lifecycle CONFORMANT"
-    reason: "Slice 0B rollup (D3): hostile_input and environment are UNVERIFIED, blocking status=PASS. fixture_provenance promoted to PASS via the slice-0b upstream-wire fixtures; the remaining two cells are owned by the Sprint 2 hostile-input audit (Task 2.5) and the env matrix expansion (Task 4.1)."
+    cite: "tests/fixtures/upstream-wire/battery/request.json (Slice 0B follow-up: rust plugin's kdeconnect.battery.request body, an empty object — divergence from GSConnect@{request: true} recorded in the fixture provenance); docs/live-validation.md 2026-08-02 Battery row (live 90%, charging); docs/parity-checklist.md Discovery/Lifecycle CONFORMANT"
+    reason: "Slice 0B rollup (D3): hostile_input and environment are UNVERIFIED, blocking status=PASS. fixture_provenance promoted to PASS via the new battery/request.json fixture (replaces the prior identity/basic.json overcite); the remaining two cells are owned by the Sprint 2 hostile-input audit (Task 2.5) and the env matrix expansion (Task 4.1)."
     owner: "Tasks 2.5 + 4.1"
 
   - feature: clipboard
@@ -140,13 +140,13 @@ feature_ledger:
     api_surface: PASS
     lifecycle: PASS
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: PASS
     live_device: PASS
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "docs/live-validation.md 2026-08-02 Connectivity row"
-    reason: "Slice 0B rollup (D3): hostile_input, fixture_provenance, and environment are UNVERIFIED, blocking status=PASS. No upstream-wire fixture yet for connectivity_report — the wire shape is a JSON object published by upstream's NetworkPacket wrapper; Task 0.4 follow-up to transcribe when the plugin's wire test is added."
-    owner: "Task 0.4 follow-up (fixture_provenance); Tasks 2.5, 4.1 (the other two)"
+    cite: "tests/fixtures/upstream-wire/connectivity/report.json (kdeconnect-android ConnectivityReportPlugin.kt:51-68 — phone publishes signalStrengths dict keyed by subscriptionID). docs/live-validation.md 2026-08-02 Connectivity row"
+    reason: "Slice 0B follow-up: fixture_provenance promoted to PASS via the upstream-derived signalStrengths fixture. The remaining two cells are owned by the Sprint 2 hostile-input audit (Task 2.5) and the env matrix expansion (Task 4.1)."
+    owner: "Tasks 2.5 + 4.1"
 
   - feature: contacts
     rust_impl: true
@@ -172,12 +172,12 @@ feature_ledger:
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment"
+    cite: "tests/fixtures/upstream-wire/digitizer/{pen_stroke,rubber_stroke}.json (kdeconnect-android ToolEvent.kt:11-19, DigitizerPlugin.kt:73-79 — tool enum serializes via Kotlin .name = 'Pen'/'Rubber'; digitizer works only on a tablet, this is the Android emulator path)"
+    reason: "Slice 0B follow-up: fixture_provenance now PASS via the two upstream-derived stroke fixtures (the wire-cap test pins the case-sensitive 'Pen'/'Rubber' literals — the lowercase variant is a deliberate negative). Remaining cells owned by Sprint 3 / Task 3.1 alignment."
     owner: "Task 3.1"
 
   - feature: findmyphone
@@ -204,12 +204,12 @@ feature_ledger:
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: PASS
     live_device: NOT-APPLICABLE
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 1 / Task 1.6 verification"
+    cite: "tests/fixtures/upstream-wire/findthisdevice/ring_request.json (kdeconnect-kde plugins/findthisdevice/findthisdeviceplugin.cpp:25; the desktop-side mirror of findmyphoneplugin.cpp:17-21 — empty body, body unused)"
+    reason: "Slice 0B follow-up: fixture_provenance now PASS via the upstream-derived ring_request fixture (mirrors the findmyphone plugin; the wire shape is the same empty-body Packet::new(..., {})). Remaining cells owned by Sprint 1 / Task 1.6 verification."
     owner: "Task 1.6"
 
   - feature: lock
@@ -220,12 +220,12 @@ feature_ledger:
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: INTENTIONAL-DIVERGENCE
     live_device: NOT-APPLICABLE
     environment: UNVERIFIED
-    status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 1 / Task 1.6 verification"
+    status: INTENTIONAL-DIVERGENCE
+    cite: "tests/fixtures/upstream-wire/lock/{lock_request,lock_state}.json (kdeconnect-kde plugins/lockdevice/lockdeviceplugin.cpp:104,116,122). The rust plugin's reply body uses `locked: <bool>` (src/plugins/lock.rs:94-96); upstream uses `isLocked`/`lockResult` (lockdeviceplugin.cpp:104,116). The decision to keep the rust plugin's shorter field name is documented in the lock_state fixture provenance. No Android LockPlugin exists in the pinned clone (lock is desktop-originated; the bearer side has no Android consumer for this type)."
+    reason: "Slice 0B promotion: two upstream-derived fixtures now load in src/plugins/lock.rs. fixture_provenance pinned at INTENTIONAL-DIVERGENCE because the rust plugin's reply field name (`locked`) does not match the upstream key (`isLocked`). The remaining cells are owned by Sprint 1 / Task 1.6 verification."
     owner: "Task 1.6"
 
   - feature: mousepad
@@ -304,8 +304,8 @@ feature_ledger:
     live_device: PASS
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/identity/basic.json (the discovery-broadcast identity shape used by the ping flow); docs/live-validation.md 2026-08-02 Ping row"
-    reason: "Slice 0B rollup (D3): environment is UNVERIFIED, blocking status=PASS. The ping packet itself is empty-body (kdeconnect-kde plugins/ping/pingplugin.cpp + PingPlugin.kt:54-58) so fixture_provenance promotes via the identity fixture; the open cell is owned by Task 4.1."
+    cite: "ping has no wire-shape tests of its own — the daemon emits a fixed byte payload (an ASCII message) and the wire envelope is type-driven with no JSON body. Behavioral-only allowance applied per main brief D5 (see slice-0b follow-up report § Addendum, ledger note). docs/live-validation.md 2026-08-02 Ping row; the upstream packet sends any string in the body (kdeconnect-kde plugins/ping/pingplugin.cpp / Android PingPlugin.kt:54-58)."
+    reason: "Slice 0B rollup (D3): environment is UNVERIFIED, blocking status=PASS. fixture_provenance keeps PASS under the D5 behavioral-only allowance (no wire-shape tests to convert). The open cell is owned by Task 4.1."
     owner: "Task 4.1"
 
   - feature: presenter
@@ -316,12 +316,12 @@ feature_ledger:
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment"
+    cite: "tests/fixtures/upstream-wire/presenter/{pointer,stop}.json (kdeconnect-android PresenterPlugin.kt:77-82,84-88 — dx/dy floats for relative pointer, stop:true to end the stroke)"
+    reason: "Slice 0B follow-up: fixture_provenance now PASS via the two upstream-derived pointer fixtures. The bogus-legacy-fields test (src/plugins/presenter.rs:282) is a behavioral negative test — kept inline. Remaining cells owned by Sprint 3 / Task 3.1 alignment."
     owner: "Task 3.1"
 
   - feature: remotecommands
@@ -332,12 +332,12 @@ feature_ledger:
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: PASS
     live_device: NOT-APPLICABLE
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 1 / Task 1.2 authorization model pending"
+    cite: "tests/fixtures/upstream-wire/remotecommands/{command_list,request_command_list}.json (kdeconnect-kde plugins/runcommand/runcommandplugin.cpp:188-195 emits the commandList envelope; plugins/remotecommands/remotecommandsplugin.cpp:35-39 emits `{requestCommandList: true}` on connect; the same wire types are shared with the runcommand plugin)"
+    reason: "Slice 0B follow-up: fixture_provenance now PASS via the two upstream-derived wire fixtures. The five behavioral variants (malformed entry, canAddCommand read, defaults, non-object commandList rejected, disconnect-clears) are kept inline — they test accept-coverage, not wire shape. Remaining cells owned by Sprint 1 / Task 1.2 authorization model."
     owner: "Task 1.2"
 
   - feature: remotekeyboard
@@ -384,8 +384,8 @@ feature_ledger:
     live_device: NOT-APPLICABLE
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment"
+    cite: "kdeconnect-kde plugins/screensaver-inhibit/ declares no packet types — the rust plugin's incoming_capabilities() is empty (src/plugins/screensaver_inhibit.rs::Plugin::incoming_capabilities). Behavioral-only; no wire-shape literal transcribable (per main brief D5)"
+    reason: "unclassified — Sprint 3 / Task 3.1 alignment; lifecycle-only plugin, no wire surface to convert"
     owner: "Task 3.1"
 
   - feature: sendnotifications
@@ -396,12 +396,12 @@ feature_ledger:
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: PASS
     live_device: NOT-APPLICABLE
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite:
-    reason: "Sprint 1 / Task 1.4 inline-action + reply/dismiss pending"
+    cite: "tests/fixtures/upstream-wire/sendnotifications/{outgoing,request_flag,cancel_string}.json (kdeconnect-kde dbusnotificationslistener.cpp:317-329 for the outgoing body; notificationsplugin.cpp:29 for `{request: true}`; notificationsplugin.cpp:142-144 for the cancel-id string and the Android-side counterpart at NotificationsPlugin.kt:528-533)"
+    reason: "Slice 0B follow-up: fixture_provenance now PASS via the three upstream-derived wire fixtures. Behavioral tests for the legacy-bool-cancel and empty-cancel cases stay inline (they test the lenient deserializer, not wire shape). Remaining cells owned by Sprint 1 / Task 1.4 inline-action + reply/dismiss."
     owner: "Task 1.4"
 
   - feature: sftp
@@ -412,13 +412,13 @@ feature_ledger:
     api_surface: PASS
     lifecycle: PASS
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: PASS
     live_device: PASS
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "lane-4-sftp-lifecycle tests: src/plugins/sftp/mounter.rs (argv/stdin/password redaction), src/plugins/sftp/mod.rs (state machine + Debug redaction + cleanup + startup_sweep), tests/api_integration.rs (sftp mount/unmount/info + tools + unpair-drops-creds + shutdown-drops-creds). Upstream: kdeconnect-kde @ f5ed3ed8 plugins/sftp/mounter.cpp:72,93-95,99-100,103-105,114,204; plugins/sftp/sftpplugin.cpp:88-104,136-163. Live: docs/live-validation.md 2026-08-06 entry 'SFTP desktop browsing lifecycle (Galaxy A15)' — request/creds-no-password/mount/browse/copy/unmount/reconnect/disconnect-cleanup all observed on a paired A15 under the hardened systemd unit."
-    reason: "Slice 0B rollup (D3): hostile_input, fixture_provenance, environment UNVERIFIED, blocking status=PASS. Sprint 1 / Task 1.3 done incl. live-device validation on one phone; the sftp plugin has no slice-0b upstream-wire fixtures yet (its protocol is request/response with binary payload, not the simple JSON shape) — Task 0.4 follow-up to transcribe the request body shape from sftpplugin.cpp:88-104."
-    owner: "Task 1.3 + Task 0.4 follow-up (fixture_provenance); Tasks 2.5, 4.1 (the rest)"
+    cite: "tests/fixtures/upstream-wire/sftp/credentials.json (kdeconnect-android SftpPlugin.kt:126-137 — credentials packet body, transcribed in the Slice 0B follow-up). The binary payload stream rides on a separate channel and is not asserted here. Lane-4-lifecycle tests: src/plugins/sftp/mounter.rs (argv/stdin/password redaction), src/plugins/sftp/mod.rs (state machine + Debug redaction + cleanup + startup_sweep + credentials_packet_shape_matches_android), tests/api_integration.rs (sftp mount/unmount/info + tools + unpair-drops-creds + shutdown-drops-creds). Upstream: kdeconnect-kde @ f5ed3ed8 plugins/sftp/mounter.cpp:72,93-95,99-100,103-105,114,204; plugins/sftp/sftpplugin.cpp:88-104,136-163. Live: docs/live-validation.md 2026-08-06 entry 'SFTP desktop browsing lifecycle (Galaxy A15)' — request/creds-no-password/mount/browse/copy/unmount/reconnect/disconnect-cleanup all observed on a paired A15 under the hardened systemd unit."
+    reason: "Slice 0B rollup (D3): hostile_input and environment are UNVERIFIED, blocking status=PASS. fixture_provenance promoted to PASS via the new sftp/credentials.json fixture (replaces the prior UNVERIFIED status — the credentials packet IS JSON-shaped, only the data stream is binary). The remaining two cells are owned by the Sprint 2 hostile-input audit (Task 2.5) and the env matrix expansion (Task 4.1)."
+    owner: "Tasks 2.5 + 4.1"
 
   - feature: share
     rust_impl: true
@@ -444,12 +444,12 @@ feature_ledger:
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment"
+    cite: "tests/fixtures/upstream-wire/sms/message_batch.json (kdeconnect-android SMSHelper.kt:911-933 — Message.toJSONObject() emits the {addresses, body, date, type, read, threadID, uID, event, subscriptionID, attachments} shape; the rust SmsMessage struct mirrors those camelCase keys)"
+    reason: "Slice 0B follow-up: fixture_provenance now PASS via the upstream-derived message-batch fixture. The four accept-coverage variants (read-as-int, multiple addresses, event flags, minimal fields) test the plugin's tolerant parser; they keep inline json! because they assert accept behavior, not wire shape. Remaining cells owned by Sprint 3 / Task 3.1 alignment."
     owner: "Task 3.1"
 
   - feature: systemvolume

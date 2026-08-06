@@ -1,0 +1,4 @@
+{
+  "commandList": "{\"abc\":{\"name\":\"Lock\",\"command\":\"loginctl lock-session\"}}",
+  "canAddCommand": true
+}

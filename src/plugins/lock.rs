@@ -128,33 +128,54 @@ mod tests {
 
     #[tokio::test]
     async fn test_lock_state_stored() {
+        // The rust plugin reads `locked` (a deliberate divergence from
+        // kdeconnect-kde's `isLocked`/`lockResult` — see
+        // tests/fixtures/upstream-wire/lock/lock_state.json provenance).
         let plugin = LockPlugin::new();
         assert_eq!(plugin.is_locked("device1").await, None);
 
-        let packet = Packet::new(
-            "kdeconnect.lock".to_string(),
-            serde_json::json!({ "locked": true }),
-        );
+        let locked_body = serde_json::json!({ "locked": true });
+        let unlocked_body = serde_json::json!({ "locked": false });
+
+        let packet = Packet::new("kdeconnect.lock".to_string(), locked_body.clone());
         plugin
             .handle_packet("device1", packet)
             .await
             .expect("handle");
         assert_eq!(plugin.is_locked("device1").await, Some(true));
 
-        let packet = Packet::new(
-            "kdeconnect.lock".to_string(),
-            serde_json::json!({ "locked": false }),
-        );
+        let packet = Packet::new("kdeconnect.lock".to_string(), unlocked_body);
         plugin
             .handle_packet("device1", packet)
             .await
             .expect("handle");
         assert_eq!(plugin.is_locked("device1").await, Some(false));
+
+        // The exact wire body the rust plugin accepts is the upstream-derived
+        // fixture literal at tests/fixtures/upstream-wire/lock/lock_state.json.
+        let fixture: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/upstream-wire/lock/lock_state.json"),
+            )
+            .expect("lock/lock_state.json"),
+        )
+        .expect("lock/lock_state.json parses");
+        let packet = Packet::new("kdeconnect.lock".to_string(), fixture);
+        plugin
+            .handle_packet("device2", packet)
+            .await
+            .expect("handle");
+        assert_eq!(plugin.is_locked("device2").await, Some(true));
     }
 
     #[tokio::test]
     async fn test_lock_request_answers_with_stored_state() {
+        // Upstream wire literal for the request side:
+        // tests/fixtures/upstream-wire/lock/lock_request.json (empty body,
+        // cited against kdeconnect-kde lockdeviceplugin.cpp:122).
         let plugin = LockPlugin::new();
+
         let state_packet = Packet::new(
             "kdeconnect.lock".to_string(),
             serde_json::json!({ "locked": true }),
@@ -164,7 +185,15 @@ mod tests {
             .await
             .expect("handle");
 
-        let request = Packet::new("kdeconnect.lock.request".to_string(), serde_json::json!({}));
+        let request_body: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/upstream-wire/lock/lock_request.json"),
+            )
+            .expect("lock/lock_request.json"),
+        )
+        .expect("lock/lock_request.json parses");
+        let request = Packet::new("kdeconnect.lock.request".to_string(), request_body);
         let reply = plugin
             .handle_packet("device1", request)
             .await

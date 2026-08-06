@@ -144,18 +144,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_connectivity_packet() {
+        // Upstream wire literal — see fixture provenance
+        // tests/fixtures/upstream-wire/provenance.yaml: connectivity/report.json
+        // cited against kdeconnect-android ConnectivityReportPlugin.kt:51-68.
         let plugin = ConnectivityPlugin::new();
-        let packet = Packet::new(
-            "kdeconnect.connectivity_report".to_string(),
-            serde_json::json!({
-                "signalStrengths": {
-                    "6": {
-                        "signalStrength": 4,
-                        "networkType": "LTE"
-                    }
-                }
-            }),
-        );
+        let body: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/upstream-wire/connectivity/report.json"),
+            )
+            .expect("connectivity/report.json"),
+        )
+        .expect("connectivity/report.json parses");
+        let packet = Packet::new("kdeconnect.connectivity_report".to_string(), body);
         assert!(plugin.handle_packet("device1", packet).await.is_ok());
     }
 

@@ -340,11 +340,19 @@ mod tests {
     }
 
     fn request_packet() -> Packet {
-        // Exact wire shape: empty body (findmyphoneplugin.cpp:17-21).
-        Packet::new(
-            "kdeconnect.findmyphone.request".to_string(),
-            serde_json::json!({}),
+        // Upstream wire literal — empty body (the desktop-side mirror of
+        // findmyphoneplugin.cpp:17-21; findthisdeviceplugin.cpp:25 takes the
+        // packet as unused). The fixture that pins this is
+        // tests/fixtures/upstream-wire/findthisdevice/ring_request.json.
+        let body: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/upstream-wire/findthisdevice/ring_request.json"),
+            )
+            .expect("findthisdevice/ring_request.json"),
         )
+        .expect("findthisdevice/ring_request.json parses");
+        Packet::new("kdeconnect.findmyphone.request".to_string(), body)
     }
 
     async fn wait_until<F: FnMut() -> bool>(mut cond: F) -> bool {

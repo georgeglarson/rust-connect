@@ -1070,6 +1070,58 @@ mod tests {
         assert_eq!(info.password, "secretpassword");
     }
 
+    /// The exact wire envelope the Android app sends — every key the rust
+    /// plugin reads (ip, port, user, password, path, multiPaths, pathNames)
+    /// is present and matches the upstream-derived fixture at
+    /// tests/fixtures/upstream-wire/sftp/credentials.json (cited against
+    /// kdeconnect-android SftpPlugin.kt:126-137). The binary payload stream
+    /// rides on a separate channel and is not asserted here.
+    #[tokio::test]
+    async fn test_credentials_packet_shape_matches_android() {
+        let (plugin, _d) = test_plugin_with_runner(ScriptedRunner::always_succeed());
+        let body: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/upstream-wire/sftp/credentials.json"),
+            )
+            .expect("sftp/credentials.json"),
+        )
+        .expect("sftp/credentials.json parses");
+
+        let packet = Packet::new("kdeconnect.sftp".to_string(), body.clone());
+        plugin
+            .handle_packet("device1", packet)
+            .await
+            .expect("handle_packet");
+
+        let info = plugin
+            .get_connection("device1")
+            .expect("Value expected to be present");
+        assert_eq!(info.ip, body["ip"].as_str().expect("ip"));
+        assert_eq!(info.port, body["port"].as_u64().expect("port") as u16);
+        assert_eq!(info.user, body["user"].as_str().expect("user"));
+        assert_eq!(info.password, body["password"].as_str().expect("password"));
+        assert_eq!(info.path, body["path"].as_str().expect("path"));
+        assert_eq!(
+            info.multi_paths,
+            body["multiPaths"]
+                .as_array()
+                .expect("multiPaths")
+                .iter()
+                .map(|v| v.as_str().expect("multiPaths entry").to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            info.path_names,
+            body["pathNames"]
+                .as_array()
+                .expect("pathNames")
+                .iter()
+                .map(|v| v.as_str().expect("pathNames entry").to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn handle_sftp_error_does_not_store() {
         let (plugin, _d) = test_plugin_with_runner(ScriptedRunner::always_succeed());

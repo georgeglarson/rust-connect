@@ -292,3 +292,154 @@ fixtures:
     source_lines: "90-104"
     extraction_date: "2026-08-06"
     used_by: "src/plugins/systemvolume/mod.rs::test_sink_list_packet_matches_upstream_shape"
+
+  # --- Slice 0B follow-up (2026-08-06) ---
+
+  - file: presenter/pointer.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/presenter/PresenterPlugin.kt
+    source_lines: "77-82"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/presenter.rs::test_handle_pointer_exact_android_shape"
+
+  - file: presenter/stop.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/presenter/PresenterPlugin.kt
+    source_lines: "84-88"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/presenter.rs::test_handle_stop_exact_android_shape"
+
+  - file: digitizer/pen_stroke.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/digitizer/ToolEvent.kt
+    source_lines: "11-19,68-75"
+    extraction_date: "2026-08-06"
+    note: "ToolEvent.kt:18-19 declares `enum class Tool { Pen, Rubber }`; DigitizerPlugin.kt:73-79 sets `packet[tool] = it.name`. Confirmed uppercase spellings match."
+    used_by: "src/plugins/digitizer.rs::test_capitalized_pen_activates_pen_tool"
+
+  - file: digitizer/rubber_stroke.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/digitizer/ToolEvent.kt
+    source_lines: "11-19,68-75"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/digitizer.rs::test_capitalized_rubber_activates_rubber_tool"
+
+  - file: battery/request.json
+    kind: hand-authored-from-observation
+    extraction_date: "2026-08-06"
+    note: "Rust plugin emits `kdeconnect.battery.request` with EMPTY body on connect (src/plugins/battery.rs:63-68). Upstream behavior varies: kdeconnect-kde's batteryplugin.cpp never emits a request packet (only the status under PACKET_TYPE_BATTERY at :119), and kdeconnect-android's BatteryPlugin.kt:103-110 only handles PACKET_TYPE_BATTERY (no .request branch). GSConnect@35bc5991 battery.js:366-368 emits `{request: true}` — both bodies are equivalent wire signals. The rust plugin's empty-body choice is recorded; if a real phone peer rejects empty bodies, the divergence belongs in an INTEGRATOR decision, not a code fix."
+    used_by: "src/plugins/battery.rs::test_on_connected_requests_battery"
+
+  - file: lock/lock_request.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/lockdevice/lockdeviceplugin.cpp
+    source_lines: "122"
+    extraction_date: "2026-08-06"
+    note: "kdeconnect-kde's lockdevice plugin:122 sends `kdeconnect.lock.request` with `requestLocked: null`; the request is type-driven (empty body)."
+    used_by: "src/plugins/lock.rs::test_lock_request_answers_with_stored_state"
+
+  - file: lock/lock_state.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/lockdevice/lockdeviceplugin.cpp
+    source_lines: "104,116"
+    extraction_date: "2026-08-06"
+    note: "INTENTIONAL-DIVERGENCE. kdeconnect-kde's lock device emits `lockResult: <bool>` (setLocked reply at :104) or `isLocked: <bool>` (sendState at :116). The rust plugin answers with `locked: <bool>` (src/plugins/lock.rs:94-96) — no upstream field literally matches. There is no Android LockPlugin in the pinned clone (lock is desktop-originated; the Android side has no consumer). The rust plugin's `locked` is a deliberate choice and is now recorded as INTENTIONAL-DIVERGENCE on the lock ledger row; an integrator should confirm whether the rename to `isLocked` is wanted before any KDE interop matters."
+    used_by: "src/plugins/lock.rs::test_lock_state_stored"
+
+  - file: findthisdevice/ring_request.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/findthisdevice/findthisdeviceplugin.cpp
+    source_lines: "17-21,25"
+    extraction_date: "2026-08-06"
+    note: "Empty body — body is unused upstream (findthisdeviceplugin.cpp:25 takes the packet as unused); this is the desktop-side mirror of findmyphoneplugin.cpp:17-21."
+    used_by: "src/plugins/findthisdevice.rs::test_request_rings"
+
+  - file: connectivity/report.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/connectivityreport/ConnectivityReportPlugin.kt
+    source_lines: "51-68"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/connectivity.rs::test_handle_connectivity_packet"
+
+  - file: sms/message_batch.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/helpers/SMSHelper.kt
+    source_lines: "911-933"
+    extraction_date: "2026-08-06"
+    note: "Message.toJSONObject() emits the {addresses, body, date, type, read, threadID, uID, event, subscriptionID, attachments} shape. The rust SmsMessage struct mirrors those camelCase keys."
+    used_by: "src/plugins/sms.rs::test_handle_sms_with_addresses_array_from_android"
+
+  - file: sendnotifications/outgoing.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/sendnotifications/dbusnotificationslistener.cpp
+    source_lines: "317-329"
+    extraction_date: "2026-08-06"
+    note: "Upstream builds `kdeconnect.notification` with id/appName/ticker/title/isClearable/silent and an optional `text` when body is non-empty. The rust `build_notification_body` produces the same shape. The ticker is summary + ': ' + body (dbusnotificationslistener.cpp:301-304) — Android renders ONLY the ticker (kdeconnect-android .../receivenotifications/ReceiveNotificationsPlugin.kt:80,82,88)."
+    used_by: "src/plugins/sendnotifications.rs::test_ticker_carries_summary_and_body"
+
+  - file: sendnotifications/request_flag.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/notifications/notificationsplugin.cpp
+    source_lines: "29"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/sendnotifications.rs::test_request_flag_parses_with_no_cancel"
+
+  - file: sendnotifications/cancel_string.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/notifications/notificationsplugin.cpp
+    source_lines: "142-144"
+    extraction_date: "2026-08-06"
+    note: "kdeconnect-kde dismisses with `np.set<QString>(cancel, internalId)`. Android reads it with `np.getString(cancel)` (NotificationsPlugin.kt:530). The id is a JSON STRING, never a bool."
+    used_by: "src/plugins/sendnotifications.rs::test_cancel_parses_as_string_notification_id"
+
+  - file: remotecommands/command_list.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/runcommand/runcommandplugin.cpp
+    source_lines: "188-195"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/remotecommands.rs::test_command_list_parsed"
+
+  - file: remotecommands/request_command_list.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-kde
+    pinned_commit: f5ed3ed843032f61c25d7c1b589cff97ffc2edaa
+    source_file: plugins/remotecommands/remotecommandsplugin.cpp
+    source_lines: "34-37"
+    extraction_date: "2026-08-06"
+    used_by: "src/plugins/remotecommands.rs::test_on_connected_requests_command_list"
+
+  - file: sftp/credentials.json
+    kind: upstream-derived
+    upstream_repo: kdeconnect-android
+    pinned_commit: a88f6fa0000773dd3fd0787640ad9c4dfb4af681
+    source_file: src/main/java/org/kde/kdeconnect/plugins/sftp/SftpPlugin.kt
+    source_lines: "126-137"
+    extraction_date: "2026-08-06"
+    note: "SftpPlugin.kt:126-137 sets `ip/port/user/password/path/multiPaths/pathNames` on the kdeconnect.sftp packet in response to a `kdeconnect.sftp.request` with `startBrowsing: true`. The binary payload stream rides on a separate channel — this fixture captures the JSON credentials envelope only. The Rust plugin's sftp mounter consumes the same keys (src/plugins/sftp/mounter.rs). The fixture exists to make the wire shape auditable; the send-receipt cycle is exercised by the lane-4 lifecycle tests (see sftp ledger row)."
+    used_by: "src/plugins/sftp/mod.rs::test_credentials_packet_shape_matches_android"
