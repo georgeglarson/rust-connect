@@ -621,17 +621,17 @@ feature_ledger:
     rust_impl: true
     upstream: kdeconnect-kde
     upstream_ref: "core/device.cpp:319-328"
-    desktop_effect: FAIL
-    api_surface: FAIL
-    lifecycle: FAIL
+    desktop_effect: UNVERIFIED
+    api_surface: UNVERIFIED
+    lifecycle: UNVERIFIED
     hostile_input: PASS
     fixture_provenance: UNVERIFIED
     live_device: UNVERIFIED
     environment: UNVERIFIED
-    status: INTENTIONAL-DIVERGENCE
-    cite: "docs/parity-checklist.md Gaps #3"
-    reason: "rust upsert overwrites unconditionally; kde applies only when both lists non-empty. Real peers always send caps today, so the divergence is not currently reachable from production."
-    owner: "Sprint 2 / Task 2.1"
+    status: UNVERIFIED
+    cite: "Task 2.1 (vk #997): src/device/registry.rs:64-78 upsert_device now guards the capability copy behind `!incoming.is_empty() && !outgoing.is_empty()`, matching kde's Device::updateDeviceInfo condition (core/device.cpp:321) exactly. Three tests in device_record_accuracy_tests pin it: empty-both (must not clobber), one-empty-one-populated (must not clobber either list, matching kde's all-or-nothing pair update), both-non-empty (must still update, the negative-space check). Red pre-fix: the first two failed with the known caps showing up empty/wrong; captured in the commit body."
+    reason: "Fixed 2026-08-09 (Task 2.1) — no longer an intentional divergence, matches kde's exact condition. desktop_effect/api_surface/lifecycle/live_device/environment stay UNVERIFIED: this is registry-level unit coverage, not a live hostile-input soak against a real hand-crafted UDP identity (the plan's own validation note; integrator's job). fixture_provenance stays UNVERIFIED — behavioral registry-state fix, no upstream-wire fixture applies."
+    owner: "Sprint 2 / Task 2.1 (live hostile-input soak = integrator)"
 
   # Upstream-only roles seeded UNVERIFIED. Each role appears under exactly
   # one implementation; Sprint 3 / Task 3.1 decides which map to Rust code,
@@ -1991,7 +1991,6 @@ ledger row that resolves it:
 | Gap | Source row | Tracker |
 |---|---|---|
 | Broadcast-forever cadence | feature_ledger discovery-broadcast-cadence | Task 2.2 |
-| Capability overwrite on empty identity | feature_ledger cap-overwrite-on-empty-identity | Task 2.1 |
 | UDP receive buffer 64 KiB | feature_ledger udp-receive-buffer | Task 2.1 |
 | Network-change re-broadcast trigger | feature_ledger discovery-network-change-rebroadcast | Task 2.2 |
 

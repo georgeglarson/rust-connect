@@ -3,7 +3,8 @@
 Audit date: 2026-08-04. Revised 2026-08-04: gaps 1/2/4/5 fixed 2026-08-04
 (gap-1/2/4/5 rows updated to CONFORMANT). Revised 2026-08-09 (Task 2.1,
 vk #997): Robustness gap 2 (payload accept timeout) fixed, row updated to
-CONFORMANT*. Sources:
+CONFORMANT*; gap 3 (capability overwrite on empty-cap identity) fixed,
+row updated to CONFORMANT. Sources:
 
 - **kde** = kdeconnect-kde, local clone `~/repos/kdeconnect-kde` (paths relative to it).
 - **android** = kdeconnect-android. `docs/reference/LanLinkProvider.java` and
@@ -105,7 +106,7 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 |---|---|---|---|---|
 | Plugin init on connect for paired devices | Plugin `connected()` hook (`core/device.cpp:160,184`) | Plugins reloaded, no init packets sent (M `Device.kt#315-350,656`) | **CONFORMANT** (kde-style) — init packets on connect-if-paired and on pair completion | `src/protocol/listener.rs:267-277`, `src/protocol/connection_loop.rs:109,183` |
 | Capabilities advertised in every identity | `core/deviceinfo.h:123-133` | M `DeviceInfo.kt#64-65` | **CONFORMANT** | `src/protocol/types.rs` (`Identity`) |
-| Capability update applied only when both lists non-empty | `core/device.cpp:319-328` | `updateDeviceInfo` on change (M `Device.kt#383-405`) | **DIVERGENT** — upsert overwrites caps from any identity, including empty ones (mDNS resolve path is guarded separately) | `src/device/registry.rs:64-68`, `src/services/service_manager.rs` (mDNS guard) |
+| Capability update applied only when both lists non-empty | `core/device.cpp:319-328` | `updateDeviceInfo` on change (M `Device.kt#383-405`) | **CONFORMANT** — upsert only updates capabilities when both the incoming and outgoing lists on the new identity are non-empty, matching kde's `!isEmpty() && !isEmpty()` guard exactly | `src/device/registry.rs:64-78`, `src/services/service_manager.rs` (mDNS guard) |
 | Send-side capability gating (refuse types the peer didn't advertise) | `core/device.cpp:358-363` | Absent | **UNIMPLEMENTED** (kde-only; peer would ignore the packet anyway) | — |
 | Reachable = has live link | `core/device.cpp:110-113,291-294,348-351` | M `Device.kt#312-313,362-368` | **CONFORMANT** | `src/device/lifecycle` |
 | Unreachable + unpaired devices purged | `core/daemon.cpp:268-270` | (registry model) | **CONFORMANT\*** — registry persists them (history-first model) | `src/device/registry.rs` |
@@ -130,11 +131,6 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 
 ### Robustness
 
-3. **Capability overwrite on empty-cap identity.** kde applies capability
-   updates only when both lists are non-empty (`core/device.cpp:319-328`);
-   rust upsert overwrites unconditionally (`src/device/registry.rs:64-68`).
-   Only reachable with a hand-crafted identity today (real peers always send
-   caps; the mDNS path is guarded separately).
 4. **UDP receive buffer 64 KiB** vs android's 512 KiB
    (`src/protocol/discovery.rs:136`). An identity with a very large
    capability list would be truncated and dropped.

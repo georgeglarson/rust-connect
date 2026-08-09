@@ -64,8 +64,21 @@ impl DeviceRegistry {
                 existing.name = device.name;
                 existing.device_type = device.device_type;
                 existing.protocol_version = device.protocol_version;
-                existing.incoming_capabilities = device.incoming_capabilities;
-                existing.outgoing_capabilities = device.outgoing_capabilities;
+                // kde applies a capability update only when BOTH incoming
+                // AND outgoing lists on the new identity are non-empty
+                // (core/device.cpp:319-328, Device::updateDeviceInfo —
+                // `if (!newDeviceInfo.incomingCapabilities.isEmpty() &&
+                // !newDeviceInfo.outgoingCapabilities.isEmpty())`). Real
+                // peers always send both; this guards against a
+                // hand-crafted or buggy identity with an empty capability
+                // list wiping out capabilities already learned (adversary
+                // class A/B — parity-checklist.md § Robustness gap 3).
+                if !device.incoming_capabilities.is_empty()
+                    && !device.outgoing_capabilities.is_empty()
+                {
+                    existing.incoming_capabilities = device.incoming_capabilities;
+                    existing.outgoing_capabilities = device.outgoing_capabilities;
+                }
                 // Discovery re-announces carry no address of their own; don't
                 // erase one we already learned.
                 if device.address.is_some() {
@@ -704,6 +717,100 @@ mod device_record_accuracy_tests {
         assert_eq!(got.protocol_version, 9);
         assert_eq!(got.incoming_capabilities, vec!["kdeconnect.notification"]);
         assert_eq!(got.outgoing_capabilities, vec!["kdeconnect.battery"]);
+        Ok(())
+    }
+
+    /// Gap 3 (parity-checklist.md § Robustness, vk #997): kde only applies
+    /// a capability update when BOTH the new incoming AND outgoing lists
+    /// are non-empty (core/device.cpp:319-328). A hand-crafted or buggy
+    /// identity carrying an empty capability list must not wipe out
+    /// capabilities already learned from a real one. Real peers always
+    /// send both (this is hostile-input hardening, adversary class A/B —
+    /// reachable via a crafted UDP identity, not via normal operation).
+    #[tokio::test]
+    async fn test_upsert_empty_capabilities_do_not_clobber_known_ones() -> anyhow::Result<()> {
+        let registry = DeviceRegistry::new();
+        let mut known = dev("aaaabbbbccccddddeeeeffff00003333");
+        known.incoming_capabilities = vec!["kdeconnect.notification".to_string()];
+        known.outgoing_capabilities = vec!["kdeconnect.battery".to_string()];
+        registry.add(known).await?;
+
+        let mut empty_caps = dev("aaaabbbbccccddddeeeeffff00003333");
+        empty_caps.name = "test phone (renamed)".to_string();
+        empty_caps.incoming_capabilities = vec![];
+        empty_caps.outgoing_capabilities = vec![];
+        registry.upsert_device(empty_caps).await?;
+
+        let got = registry
+            .get(&"aaaabbbbccccddddeeeeffff00003333".to_string())
+            .await?;
+        // Other identity-derived fields still refresh normally...
+        assert_eq!(got.name, "test phone (renamed)");
+        // ...but capabilities survive the empty-cap identity.
+        assert_eq!(
+            got.incoming_capabilities,
+            vec!["kdeconnect.notification"],
+            "empty incoming capabilities on the new identity must not clobber known ones"
+        );
+        assert_eq!(
+            got.outgoing_capabilities,
+            vec!["kdeconnect.battery"],
+            "empty outgoing capabilities on the new identity must not clobber known ones"
+        );
+        Ok(())
+    }
+
+    /// The guard is BOTH-empty, not either — kde's condition is `!A.isEmpty()
+    /// && !B.isEmpty()`, so an identity with ONE list populated and the
+    /// other empty also fails the condition and must not update either
+    /// list (not just the empty one) — matching kde's all-or-nothing pair
+    /// update, not a per-field one.
+    #[tokio::test]
+    async fn test_upsert_one_empty_one_populated_still_does_not_update() -> anyhow::Result<()> {
+        let registry = DeviceRegistry::new();
+        let mut known = dev("aaaabbbbccccddddeeeeffff00004444");
+        known.incoming_capabilities = vec!["kdeconnect.notification".to_string()];
+        known.outgoing_capabilities = vec!["kdeconnect.battery".to_string()];
+        registry.add(known).await?;
+
+        let mut half_empty = dev("aaaabbbbccccddddeeeeffff00004444");
+        half_empty.incoming_capabilities = vec!["kdeconnect.ping".to_string()];
+        half_empty.outgoing_capabilities = vec![]; // outgoing empty
+        registry.upsert_device(half_empty).await?;
+
+        let got = registry
+            .get(&"aaaabbbbccccddddeeeeffff00004444".to_string())
+            .await?;
+        assert_eq!(
+            got.incoming_capabilities,
+            vec!["kdeconnect.notification"],
+            "incoming must not update either, even though it was itself non-empty"
+        );
+        assert_eq!(got.outgoing_capabilities, vec!["kdeconnect.battery"]);
+        Ok(())
+    }
+
+    /// Both non-empty is the normal case and must still update — this is
+    /// the guard's negative-space check, pinning that the fix doesn't
+    /// accidentally freeze capabilities forever.
+    #[tokio::test]
+    async fn test_upsert_both_non_empty_still_updates() -> anyhow::Result<()> {
+        let registry = DeviceRegistry::new();
+        let mut known = dev("aaaabbbbccccddddeeeeffff00005555");
+        known.incoming_capabilities = vec!["kdeconnect.notification".to_string()];
+        known.outgoing_capabilities = vec!["kdeconnect.battery".to_string()];
+        registry.add(known).await?;
+
+        let mut fresh = dev("aaaabbbbccccddddeeeeffff00005555");
+        fresh.incoming_capabilities = vec!["kdeconnect.ping".to_string()];
+        fresh.outgoing_capabilities = vec!["kdeconnect.sms".to_string()];
+        registry.upsert_device(fresh).await?;
+
+        let got = registry
+            .get(&"aaaabbbbccccddddeeeeffff00005555".to_string())
+            .await?;
+        assert_eq!(got.incoming_capabilities, vec!["kdeconnect.ping"]);
+        assert_eq!(got.outgoing_capabilities, vec!["kdeconnect.sms"]);
         Ok(())
     }
 
