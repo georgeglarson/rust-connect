@@ -540,18 +540,18 @@ feature_ledger:
   - feature: payload-accept-timeout
     rust_impl: true
     upstream: kdeconnect-kde
-    upstream_ref: "compositeuploadjob.cpp:35-37"
-    desktop_effect: FAIL
-    api_surface: FAIL
-    lifecycle: FAIL
+    upstream_ref: "compositeuploadjob.cpp:35-37,231-242"
+    desktop_effect: UNVERIFIED
+    api_surface: UNVERIFIED
+    lifecycle: UNVERIFIED
     hostile_input: PASS
     fixture_provenance: UNVERIFIED
     live_device: UNVERIFIED
     environment: UNVERIFIED
-    status: INTENTIONAL-DIVERGENCE
-    cite: "docs/parity-checklist.md Gaps #2"
-    reason: "300 s vs 30 s (kde) / 10 s (android). Over-lenient; tracked for fix."
-    owner: "Sprint 2 / Task 2.1"
+    status: UNVERIFIED
+    cite: "Task 2.1 (vk #997): src/protocol/payload_transfer.rs:41 ACCEPT_TIMEOUT now 30s, matching kde compositeuploadjob.cpp:35-37,231-242 (m_timeout.setInterval(30000); timeoutTriggered() closes the port and fails the job). test_accept_timeout_matches_kde_desktop_reference pins the value; test_accept_times_out_at_the_new_bound_not_the_old_one is a time-paused behavioral test proving a stalled accept actually times out at ~30s, not 300s (captured red pre-fix: failure message showed elapsed 300s)."
+    reason: "Fixed 2026-08-09 (Task 2.1) — no longer an intentional divergence, the constant now matches kde, the desktop reference (android's 10s still differs, noted in parity-checklist.md as CONFORMANT*). desktop_effect/api_surface/lifecycle/live_device/environment stay UNVERIFIED pending a live soak (the plan's own validation note, integrator's job); fixture_provenance stays UNVERIFIED since this is a behavioral timing fix, not a wire-shape one — no upstream-wire fixture applies."
+    owner: "Sprint 2 / Task 2.1 (live soak = integrator)"
 
   - feature: tls-role-inversion
     rust_impl: true
@@ -1993,7 +1993,6 @@ ledger row that resolves it:
 | Broadcast-forever cadence | feature_ledger discovery-broadcast-cadence | Task 2.2 |
 | Capability overwrite on empty identity | feature_ledger cap-overwrite-on-empty-identity | Task 2.1 |
 | UDP receive buffer 64 KiB | feature_ledger udp-receive-buffer | Task 2.1 |
-| Payload accept timeout 300 s | feature_ledger payload-accept-timeout | Task 2.1 |
 | Network-change re-broadcast trigger | feature_ledger discovery-network-change-rebroadcast | Task 2.2 |
 
 Any new intentional divergence added to the ledger must carry a `reason`

@@ -1,7 +1,9 @@
 # Behavioral parity checklist — rust-connect vs the reference implementations
 
 Audit date: 2026-08-04. Revised 2026-08-04: gaps 1/2/4/5 fixed 2026-08-04
-(gap-1/2/4/5 rows updated to CONFORMANT). Sources:
+(gap-1/2/4/5 rows updated to CONFORMANT). Revised 2026-08-09 (Task 2.1,
+vk #997): Robustness gap 2 (payload accept timeout) fixed, row updated to
+CONFORMANT*. Sources:
 
 - **kde** = kdeconnect-kde, local clone `~/repos/kdeconnect-kde` (paths relative to it).
 - **android** = kdeconnect-android. `docs/reference/LanLinkProvider.java` and
@@ -91,7 +93,7 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 |---|---|---|---|---|
 | `payloadTransferInfo` port range 1739-1764 | `compositeuploadjob.h:69-70` | V `LanLinkProvider.java:66` | **CONFORMANT** | `src/protocol/payload_transfer.rs:29-30` |
 | Payload sockets are TLS; sender = TLS server, receiver = TLS client, trusted-device context | `landevicelink.cpp:113-129`, `compositeuploadjob.cpp:168-170` | M `LanLink.java#205,254` | **CONFORMANT** | `src/protocol/payload_transfer.rs` (`connect_receiver`, `send_file`) |
-| Accept timeout (sender waiting for receiver) | 30 s (`compositeuploadjob.cpp:35-37,231-242`) | 10 s (M `LanLink.java#200`) | **DIVERGENT** — 300 s | `src/protocol/payload_transfer.rs:32` |
+| Accept timeout (sender waiting for receiver) | 30 s (`compositeuploadjob.cpp:35-37,231-242`) | 10 s (M `LanLink.java#200`) | **CONFORMANT\*** — 30 s, matching kde (the desktop reference); android's 10 s differs | `src/protocol/payload_transfer.rs:41` |
 | Receiver connect timeout | Absent (Qt default) | (platform default) | **CONFORMANT\*** — explicit 30 s | `src/protocol/payload_transfer.rs:31,215` |
 | payloadSize vs actual bytes: short read → error + delete; over-read tolerated | `core/filetransferjob.cpp:111-122` | Any mismatch → delete + throw (M `CompositeReceiveFileJob.java#158-163`) | **CONFORMANT\*** — reads exactly N; short = error + delete; over silently truncated at N | `src/protocol/payload_transfer.rs:245,263-270` |
 | payloadSize = -1 endless-stream sentinel | Supported (`core/networkpacket.h:85`, `filetransferjob.cpp:109-110`) | Not used by android share (mismatch errors anyway) | **UNIMPLEMENTED** — `payloadSize` is `Option<u64>`; -1 not representable | `src/protocol/types.rs:225` |
@@ -128,9 +130,6 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 
 ### Robustness
 
-2. **Payload accept timeout 300 s** vs 30 s (kde) / 10 s (android)
-   (`src/protocol/payload_transfer.rs:32`). Over-lenient: a wedged sender
-   holds a transfer slot 10-30× longer than either reference.
 3. **Capability overwrite on empty-cap identity.** kde applies capability
    updates only when both lists are non-empty (`core/device.cpp:319-328`);
    rust upsert overwrites unconditionally (`src/device/registry.rs:64-68`).
