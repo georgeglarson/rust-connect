@@ -17,6 +17,18 @@ use crate::protocol::packet::PacketSerializer;
 use crate::protocol::types::{Identity, MAX_PORT, MIN_PORT};
 use crate::utils::errors::{Error, Result};
 
+/// Target UDP receive-buffer capacity (parity-checklist.md § Robustness
+/// gap 4). Matches android's `LanLinkProvider.java:69`. Used both as the
+/// requested SO_RCVBUF (kernel queue capacity — see the comment at the
+/// `set_recv_buffer_size` call site for why that's the real fix here,
+/// not single-datagram size) and as the userspace read buffer in
+/// `listen()`. The read buffer was already comfortably above the max
+/// possible IPv4 UDP payload (65507 bytes) at its old 64 KiB size, so
+/// raising it changes no observable truncation behavior for real
+/// traffic; it's raised anyway to match this constant and remove any
+/// doubt for a future reader.
+const RECV_BUFFER_SIZE: usize = 512 * 1024;
+
 /// Discovery service
 ///
 /// Handles broadcasting identity packets and listening for other devices.
@@ -71,6 +83,47 @@ impl DiscoveryService {
         socket
             .set_reuse_address(true)
             .map_err(|e| Error::DiscoveryError(format!("Failed to set SO_REUSEADDR: {}", e)))?;
+
+        // Kernel receive-QUEUE capacity (parity-checklist.md § Robustness
+        // gap 4; android LanLinkProvider.java:69 sets 512 KiB). This is
+        // NOT about the size of any single datagram — IPv4 caps a UDP
+        // payload at 65507 bytes regardless of any buffer setting (65535
+        // max IP total length - 20 byte IP header - 8 byte UDP header;
+        // the kernel refuses to even send anything past that with
+        // EMSGSIZE, verified empirically). It IS about how many
+        // already-arrived-but-not-yet-read datagrams the kernel will
+        // queue before dropping new ones — under a burst (several devices
+        // broadcasting near-simultaneously, or a retry storm) a bigger
+        // queue survives more of it. The OS default here
+        // (`net.core.rmem_default`, ~208 KiB) sits below android's 512
+        // KiB target; we were relying on it implicitly instead of setting
+        // our own, unlike android. A failure to raise it is logged, not
+        // fatal — discovery still works with a smaller queue, just with
+        // less burst headroom.
+        if let Err(e) = socket.set_recv_buffer_size(RECV_BUFFER_SIZE) {
+            warn!(
+                error = %e,
+                requested = RECV_BUFFER_SIZE,
+                event = "discovery_rcvbuf_not_set",
+                "Could not raise the UDP receive buffer; falling back to the OS default"
+            );
+        } else if let Ok(effective) = socket.recv_buffer_size() {
+            // Linux clamps the request to net.core.rmem_max and reports the
+            // (doubled) result via getsockopt — setsockopt itself succeeds
+            // silently even when clamped (socket(7)). On hosts with a low
+            // rmem_max the effective queue is smaller than requested; say
+            // so once at startup instead of leaving burst-drop behavior
+            // unexplained (PR #12 review).
+            if effective < RECV_BUFFER_SIZE {
+                warn!(
+                    requested = RECV_BUFFER_SIZE,
+                    effective = effective,
+                    event = "discovery_rcvbuf_clamped",
+                    "Kernel clamped the UDP receive buffer below the requested \
+                     size (net.core.rmem_max); burst broadcasts may drop earlier"
+                );
+            }
+        }
 
         socket
             .set_nonblocking(true)
@@ -137,7 +190,7 @@ impl DiscoveryService {
     /// * `Ok((Identity, SocketAddr))` - Received identity and sender address
     /// * `Err(Error)` - Failed to receive or parse packet
     pub async fn listen(&self) -> Result<(Identity, SocketAddr)> {
-        let mut buf = vec![0u8; 65536];
+        let mut buf = vec![0u8; RECV_BUFFER_SIZE];
 
         let (len, addr) = self
             .socket
@@ -386,6 +439,153 @@ mod tests {
     async fn test_discovery_service_creation() {
         let service = create_test_service("Test Device").await;
         assert!(service.is_ok());
+    }
+
+    /// Gap 4 (parity-checklist.md § Robustness, vk #997): android sets
+    /// SO_RCVBUF to 512 KiB (LanLinkProvider.java:69) so its receive
+    /// queue survives a burst of near-simultaneous broadcasts; rust used
+    /// to rely on the OS default (`net.core.rmem_default`, ~208 KiB on a
+    /// typical Linux host — below android's target). Deterministic:
+    /// wraps the already-constructed socket with `socket2::SockRef`
+    /// (works on any `AsFd` type, no ownership needed) and reads back
+    /// SO_RCVBUF via `getsockopt`, so this doesn't depend on burst timing
+    /// or kernel-specific queue-drop behavior the way a live-burst test
+    /// would.
+    #[tokio::test]
+    async fn test_recv_buffer_size_matches_android_target() {
+        let identity = create_test_identity("RcvBuf Test");
+        let port = find_unused_port().await;
+        let service = DiscoveryService::new(identity, 5, port)
+            .await
+            .expect("DiscoveryService::new must succeed");
+
+        let actual = socket2::SockRef::from(&service.socket)
+            .recv_buffer_size()
+            .expect("getsockopt(SO_RCVBUF) must succeed");
+        // Linux clamps SO_RCVBUF requests to net.core.rmem_max (and
+        // getsockopt reports double the clamped value — socket(7)), so on
+        // a host with rmem_max < 512 KiB the full target is unreachable
+        // no matter what we request. Assert against the honest bound for
+        // THIS host: the requested size, or the host ceiling if that is
+        // lower (PR #12 review). On an unclamped host this is exactly the
+        // 512 KiB assertion; on a clamped host it still proves our
+        // request went through rather than silently riding rmem_default.
+        let host_ceiling = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(RECV_BUFFER_SIZE);
+        let expected = RECV_BUFFER_SIZE.min(host_ceiling);
+        assert!(
+            actual >= expected,
+            "SO_RCVBUF must reach min(requested {RECV_BUFFER_SIZE}, rmem_max \
+             {host_ceiling}) = {expected} bytes (android's 512 KiB target, \
+             LanLinkProvider.java:69), got {actual}"
+        );
+    }
+
+    /// Gap 4's named validation: an oversized live identity injection.
+    ///
+    /// IMPORTANT finding, verified empirically this session (a Python
+    /// `socket.sendto()` past 65507 bytes on loopback fails immediately
+    /// with `EMSGSIZE`, confirmed byte-exact at the boundary): IPv4 caps
+    /// a single UDP datagram's payload at 65507 bytes (65535 max IP
+    /// total length - 20 byte minimum IP header - 8 byte UDP header),
+    /// full stop, regardless of ANY receive-buffer setting. The OLD 64
+    /// KiB (65536-byte) read buffer was therefore already bigger than
+    /// the largest datagram IPv4 can ever deliver — it could not
+    /// actually truncate any real identity packet, and this test would
+    /// pass on the pre-fix buffer size exactly as it does post-fix (NOT
+    /// red-before-green for the byte-count itself; see gap 4 in
+    /// plans/task-2.1-report.md for the full finding). What this test
+    /// DOES prove, faithfully: the largest datagram IPv4 UDP can ever
+    /// carry — the real practical worst case, not a synthetic threshold
+    /// — round-trips correctly end-to-end over a live socket, through
+    /// the actual production `DiscoveryService::new` construction path
+    /// (SO_RCVBUF included), with a real (if synthetic) huge capability
+    /// list.
+    #[tokio::test]
+    async fn test_receives_largest_possible_udp_identity_with_huge_capability_list() {
+        const IPV4_MAX_UDP_PAYLOAD: usize = 65_507;
+
+        let listener_identity = create_test_identity("Listener");
+        let listener_port = find_unused_port().await;
+        let service = DiscoveryService::new(listener_identity, 5, listener_port)
+            .await
+            .expect("DiscoveryService::new must succeed");
+        let listener_addr = service
+            .socket
+            .local_addr()
+            .expect("Value expected to be present");
+
+        let sender = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("Value expected to be present");
+
+        // Pad the capability list until the serialized packet sits as
+        // close to the 65507-byte IPv4 ceiling as comfortably achievable.
+        // Note this is LESS than the old 65536-byte (64 KiB) buffer, not
+        // more — see this test's doc comment above.
+        let mut caps = Vec::new();
+        let mut sender_identity = create_test_identity("Big Capability List");
+        loop {
+            caps.push(format!(
+                "kdeconnect.synthetic.capability.number.{}",
+                caps.len()
+            ));
+            let candidate = Identity::new(
+                sender_identity.device_id.clone(),
+                sender_identity.device_name.clone(),
+                DeviceType::Desktop,
+                caps.clone(),
+                vec!["kdeconnect.ping".to_string()],
+            );
+            let packet_len = crate::protocol::packet::PacketSerializer::serialize(
+                &candidate.to_packet().expect("identity to_packet"),
+            )
+            .expect("serialize")
+            .len();
+            sender_identity = candidate;
+            if packet_len > 65_400 {
+                break;
+            }
+        }
+
+        let wire_bytes = crate::protocol::packet::PacketSerializer::serialize(
+            &sender_identity.to_packet().expect("identity to_packet"),
+        )
+        .expect("serialize");
+        // Confirms the loop above actually got close to the ceiling —
+        // NOT ">64 KiB (65536 bytes)": that threshold is unreachable by
+        // construction, since IPV4_MAX_UDP_PAYLOAD (65507) is itself
+        // smaller than 65536. This is the empirical finding stated in
+        // this test's doc comment, made mechanical: an assertion of
+        // "> 65536" here would never be satisfiable for any real IPv4
+        // UDP datagram, on any host.
+        assert!(
+            wire_bytes.len() > 65_000,
+            "test identity must sit close to the IPv4 ceiling to be a meaningful \
+             stress case; got {} bytes",
+            wire_bytes.len()
+        );
+        assert!(
+            wire_bytes.len() <= IPV4_MAX_UDP_PAYLOAD,
+            "test identity must stay within IPv4's own UDP payload ceiling \
+             ({IPV4_MAX_UDP_PAYLOAD} bytes); got {} bytes",
+            wire_bytes.len()
+        );
+
+        sender
+            .send_to(&wire_bytes, listener_addr)
+            .await
+            .expect("send_to must succeed for a datagram under the IPv4 ceiling");
+
+        let (received, _addr) = tokio::time::timeout(Duration::from_secs(2), service.listen())
+            .await
+            .expect("listen must not time out on a maximal-size identity")
+            .expect("listen must accept the oversized identity, not truncate or reject it");
+
+        assert_eq!(received.device_name, "Big Capability List");
+        assert_eq!(received.incoming_capabilities, caps);
     }
 
     #[tokio::test]

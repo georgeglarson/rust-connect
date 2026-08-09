@@ -189,6 +189,25 @@ impl Device {
         }
     }
 
+    /// Apply a capability update from a fresh identity, with kde's guard:
+    /// the update lands only when BOTH incoming AND outgoing lists are
+    /// non-empty (core/device.cpp:319-328, Device::updateDeviceInfo). Real
+    /// peers always send both; a hand-crafted or buggy identity carrying an
+    /// empty list must not wipe capabilities already learned (adversary
+    /// class A/B — parity-checklist.md § Robustness gap 3, vk #997).
+    ///
+    /// This is THE single guard site — both identity-update paths
+    /// (`DeviceRegistry::upsert_device` for UDP discovery re-announces and
+    /// `DeviceLifecycle::ensure_and_transition` for connection-time
+    /// reconnects) route through it. PR #12 review caught the lifecycle
+    /// path bypassing the guard when it lived inline in the registry.
+    pub fn apply_capability_update(&mut self, incoming: Vec<String>, outgoing: Vec<String>) {
+        if !incoming.is_empty() && !outgoing.is_empty() {
+            self.incoming_capabilities = incoming;
+            self.outgoing_capabilities = outgoing;
+        }
+    }
+
     /// Carry the identity packet's advertised capabilities onto the device.
     ///
     /// Both lists arrive on every identity exchange (`protocol::types::Identity`)

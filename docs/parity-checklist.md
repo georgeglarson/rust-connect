@@ -1,7 +1,12 @@
 # Behavioral parity checklist — rust-connect vs the reference implementations
 
 Audit date: 2026-08-04. Revised 2026-08-04: gaps 1/2/4/5 fixed 2026-08-04
-(gap-1/2/4/5 rows updated to CONFORMANT). Sources:
+(gap-1/2/4/5 rows updated to CONFORMANT). Revised 2026-08-09 (Task 2.1,
+vk #997): Robustness gap 2 (payload accept timeout) fixed, row updated to
+CONFORMANT*; gap 3 (capability overwrite on empty-cap identity) fixed,
+row updated to CONFORMANT; gap 4 (UDP receive buffer) fixed, row updated
+to CONFORMANT* — see that row's note on what SO_RCVBUF actually protects
+against. Sources:
 
 - **kde** = kdeconnect-kde, local clone `~/repos/kdeconnect-kde` (paths relative to it).
 - **android** = kdeconnect-android. `docs/reference/LanLinkProvider.java` and
@@ -27,7 +32,7 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 | Broadcast destination | 255.255.255.255 per-interface (source-bound) + custom devices (`lanlinkprovider.cpp:207-248`) | 255.255.255.255 (trusted nets only) + custom devices (V `LanLinkProvider.java:474-481`) | **CONFORMANT\*** — 255.255.255.255 only, single socket; no per-interface binding, no custom-device list (manual connect via API instead) | `src/protocol/discovery.rs:97` |
 | Ports: UDP 1716, TCP first-free 1716-1764 | `lanlinkprovider.h:67-69`, `lanlinkprovider.cpp:139-147` | V `LanLinkProvider.java:64-65,454-470` | **CONFORMANT** | `src/protocol/types.rs:15-23`, `src/protocol/listener.rs` `bind_port` |
 | Oversized identity fallback (re-send with emptied capabilities) | On `DatagramTooLargeError` (`lanlinkprovider.cpp:259-269`) | Absent | **UNIMPLEMENTED** (kde-only behavior) | — |
-| UDP receive buffer | (Qt datagram) | 512 KiB (V `LanLinkProvider.java:69`) | **DIVERGENT** — 64 KiB; a >64 KiB identity is truncated and dropped | `src/protocol/discovery.rs:136` |
+| UDP receive buffer | (Qt datagram) | 512 KiB (V `LanLinkProvider.java:69`) | **CONFORMANT\*** — SO_RCVBUF explicitly raised to 512 KiB matching android's target (Task 2.1, vk #997). Finding: the original "truncated and dropped" framing doesn't hold for real IPv4 traffic — a single UDP datagram is capped at 65507 bytes by IPv4 itself (verified empirically: `sendto()` past that fails with `EMSGSIZE`), which the OLD 65536-byte read buffer already covered. What SO_RCVBUF actually protects against is receive-QUEUE drops under a burst of near-simultaneous datagrams, not single-datagram truncation — see plans/task-2.1-report.md gap 4 | `src/protocol/discovery.rs` (`RECV_BUFFER_SIZE`, `DiscoveryService::new`) |
 | Receiver dials sender's TCP port on UDP identity (any device, not paired-only) | `lanlinkprovider.cpp:331-339` | V `LanLinkProvider.java:236-252` | **CONFORMANT** | `src/services/service_manager.rs:149` |
 | Received identity tcpPort outside 1716-1764 dropped | `lanlinkprovider.cpp:316-320` | V `LanLinkProvider.java:236-243` | **CONFORMANT** | `src/protocol/discovery.rs:177-182` |
 | Reverse-connection fallback (dial fails → send UDP identity back) | `lanlinkprovider.cpp:343-354,395-399` | Absent | **UNIMPLEMENTED** (kde-only) | — |
@@ -91,7 +96,7 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 |---|---|---|---|---|
 | `payloadTransferInfo` port range 1739-1764 | `compositeuploadjob.h:69-70` | V `LanLinkProvider.java:66` | **CONFORMANT** | `src/protocol/payload_transfer.rs:29-30` |
 | Payload sockets are TLS; sender = TLS server, receiver = TLS client, trusted-device context | `landevicelink.cpp:113-129`, `compositeuploadjob.cpp:168-170` | M `LanLink.java#205,254` | **CONFORMANT** | `src/protocol/payload_transfer.rs` (`connect_receiver`, `send_file`) |
-| Accept timeout (sender waiting for receiver) | 30 s (`compositeuploadjob.cpp:35-37,231-242`) | 10 s (M `LanLink.java#200`) | **DIVERGENT** — 300 s | `src/protocol/payload_transfer.rs:32` |
+| Accept timeout (sender waiting for receiver) | 30 s (`compositeuploadjob.cpp:35-37,231-242`) | 10 s (M `LanLink.java#200`) | **CONFORMANT\*** — 30 s, matching kde (the desktop reference); android's 10 s differs | `src/protocol/payload_transfer.rs:41` |
 | Receiver connect timeout | Absent (Qt default) | (platform default) | **CONFORMANT\*** — explicit 30 s | `src/protocol/payload_transfer.rs:31,215` |
 | payloadSize vs actual bytes: short read → error + delete; over-read tolerated | `core/filetransferjob.cpp:111-122` | Any mismatch → delete + throw (M `CompositeReceiveFileJob.java#158-163`) | **CONFORMANT\*** — reads exactly N; short = error + delete; over silently truncated at N | `src/protocol/payload_transfer.rs:245,263-270` |
 | payloadSize = -1 endless-stream sentinel | Supported (`core/networkpacket.h:85`, `filetransferjob.cpp:109-110`) | Not used by android share (mismatch errors anyway) | **UNIMPLEMENTED** — `payloadSize` is `Option<u64>`; -1 not representable | `src/protocol/types.rs:225` |
@@ -103,7 +108,7 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 |---|---|---|---|---|
 | Plugin init on connect for paired devices | Plugin `connected()` hook (`core/device.cpp:160,184`) | Plugins reloaded, no init packets sent (M `Device.kt#315-350,656`) | **CONFORMANT** (kde-style) — init packets on connect-if-paired and on pair completion | `src/protocol/listener.rs:267-277`, `src/protocol/connection_loop.rs:109,183` |
 | Capabilities advertised in every identity | `core/deviceinfo.h:123-133` | M `DeviceInfo.kt#64-65` | **CONFORMANT** | `src/protocol/types.rs` (`Identity`) |
-| Capability update applied only when both lists non-empty | `core/device.cpp:319-328` | `updateDeviceInfo` on change (M `Device.kt#383-405`) | **DIVERGENT** — upsert overwrites caps from any identity, including empty ones (mDNS resolve path is guarded separately) | `src/device/registry.rs:64-68`, `src/services/service_manager.rs` (mDNS guard) |
+| Capability update applied only when both lists non-empty | `core/device.cpp:319-328` | `updateDeviceInfo` on change (M `Device.kt#383-405`) | **CONFORMANT** — upsert only updates capabilities when both the incoming and outgoing lists on the new identity are non-empty, matching kde's `!isEmpty() && !isEmpty()` guard exactly | `src/device/registry.rs:64-78`, `src/services/service_manager.rs` (mDNS guard) |
 | Send-side capability gating (refuse types the peer didn't advertise) | `core/device.cpp:358-363` | Absent | **UNIMPLEMENTED** (kde-only; peer would ignore the packet anyway) | — |
 | Reachable = has live link | `core/device.cpp:110-113,291-294,348-351` | M `Device.kt#312-313,362-368` | **CONFORMANT** | `src/device/lifecycle` |
 | Unreachable + unpaired devices purged | `core/daemon.cpp:268-270` | (registry model) | **CONFORMANT\*** — registry persists them (history-first model) | `src/device/registry.rs` |
@@ -128,17 +133,7 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 
 ### Robustness
 
-2. **Payload accept timeout 300 s** vs 30 s (kde) / 10 s (android)
-   (`src/protocol/payload_transfer.rs:32`). Over-lenient: a wedged sender
-   holds a transfer slot 10-30× longer than either reference.
-3. **Capability overwrite on empty-cap identity.** kde applies capability
-   updates only when both lists are non-empty (`core/device.cpp:319-328`);
-   rust upsert overwrites unconditionally (`src/device/registry.rs:64-68`).
-   Only reachable with a hand-crafted identity today (real peers always send
-   caps; the mDNS path is guarded separately).
-4. **UDP receive buffer 64 KiB** vs android's 512 KiB
-   (`src/protocol/discovery.rs:136`). An identity with a very large
-   capability list would be truncated and dropped.
+(All Robustness gaps 2/3/4 resolved as of 2026-08-09, Task 2.1.)
 
 ### Cosmetic / interop edge
 

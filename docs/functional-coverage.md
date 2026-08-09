@@ -525,33 +525,33 @@ feature_ledger:
     rust_impl: true
     upstream: kdeconnect-android
     upstream_ref: "LanLinkProvider.java:69"
-    desktop_effect: FAIL
-    api_surface: FAIL
-    lifecycle: FAIL
+    desktop_effect: UNVERIFIED
+    api_surface: UNVERIFIED
+    lifecycle: UNVERIFIED
     hostile_input: PASS
     fixture_provenance: UNVERIFIED
     live_device: UNVERIFIED
     environment: UNVERIFIED
-    status: INTENTIONAL-DIVERGENCE
-    cite: "docs/parity-checklist.md Gaps #4"
-    reason: "64 KiB instead of android 512 KiB; oversized identity truncates and drops. Need vk-backed decision."
-    owner: "Sprint 2 / Task 2.1"
+    status: UNVERIFIED
+    cite: "Task 2.1 (vk #997): src/protocol/discovery.rs RECV_BUFFER_SIZE (524288, matching LanLinkProvider.java:69) is now set explicitly as SO_RCVBUF via socket2's set_recv_buffer_size, and used as the userspace read-buffer size in listen(). test_recv_buffer_size_matches_android_target reads SO_RCVBUF back via socket2::SockRef (deterministic, getsockopt-based) and pins it >= 524288; captured red pre-fix (got 212992, the OS default net.core.rmem_default). test_receives_largest_possible_udp_identity_with_huge_capability_list sends the largest datagram IPv4 UDP can carry (65507 bytes, the hard IPv4 ceiling — verified empirically this session that anything past it fails sendto() with EMSGSIZE) end-to-end through the real DiscoveryService::new construction path and confirms it parses/registers correctly."
+    reason: "Fixed 2026-08-09 (Task 2.1) — no longer an intentional divergence. IMPORTANT FINDING recorded here and in parity-checklist.md: the original diagnosis (\"oversized identity truncates and drops\" due to the 64 KiB read buffer) does not hold for real IPv4 traffic — a single UDP datagram is capped at 65507 bytes by IPv4 itself, which the OLD 65536-byte (64 KiB) buffer already covered with room to spare. What SO_RCVBUF (now explicitly set, previously left at the OS default) actually protects against is receive-QUEUE depth under a burst of near-simultaneous datagrams, matching android's real intent more precisely than the checklist's original framing. desktop_effect/api_surface/lifecycle/live_device/environment stay UNVERIFIED pending a live multi-device burst soak (the plan's own validation note; integrator's job)."
+    owner: "Sprint 2 / Task 2.1 (live burst soak = integrator)"
 
   - feature: payload-accept-timeout
     rust_impl: true
     upstream: kdeconnect-kde
-    upstream_ref: "compositeuploadjob.cpp:35-37"
-    desktop_effect: FAIL
-    api_surface: FAIL
-    lifecycle: FAIL
+    upstream_ref: "compositeuploadjob.cpp:35-37,231-242"
+    desktop_effect: UNVERIFIED
+    api_surface: UNVERIFIED
+    lifecycle: UNVERIFIED
     hostile_input: PASS
     fixture_provenance: UNVERIFIED
     live_device: UNVERIFIED
     environment: UNVERIFIED
-    status: INTENTIONAL-DIVERGENCE
-    cite: "docs/parity-checklist.md Gaps #2"
-    reason: "300 s vs 30 s (kde) / 10 s (android). Over-lenient; tracked for fix."
-    owner: "Sprint 2 / Task 2.1"
+    status: UNVERIFIED
+    cite: "Task 2.1 (vk #997): src/protocol/payload_transfer.rs:41 ACCEPT_TIMEOUT now 30s, matching kde compositeuploadjob.cpp:35-37,231-242 (m_timeout.setInterval(30000); timeoutTriggered() closes the port and fails the job). test_accept_timeout_matches_kde_desktop_reference pins the value; test_accept_times_out_at_the_new_bound_not_the_old_one is a time-paused behavioral test proving a stalled accept actually times out at ~30s, not 300s (captured red pre-fix: failure message showed elapsed 300s)."
+    reason: "Fixed 2026-08-09 (Task 2.1) — no longer an intentional divergence, the constant now matches kde, the desktop reference (android's 10s still differs, noted in parity-checklist.md as CONFORMANT*). desktop_effect/api_surface/lifecycle/live_device/environment stay UNVERIFIED pending a live soak (the plan's own validation note, integrator's job); fixture_provenance stays UNVERIFIED since this is a behavioral timing fix, not a wire-shape one — no upstream-wire fixture applies."
+    owner: "Sprint 2 / Task 2.1 (live soak = integrator)"
 
   - feature: tls-role-inversion
     rust_impl: true
@@ -621,17 +621,17 @@ feature_ledger:
     rust_impl: true
     upstream: kdeconnect-kde
     upstream_ref: "core/device.cpp:319-328"
-    desktop_effect: FAIL
-    api_surface: FAIL
-    lifecycle: FAIL
+    desktop_effect: UNVERIFIED
+    api_surface: UNVERIFIED
+    lifecycle: UNVERIFIED
     hostile_input: PASS
     fixture_provenance: UNVERIFIED
     live_device: UNVERIFIED
     environment: UNVERIFIED
-    status: INTENTIONAL-DIVERGENCE
-    cite: "docs/parity-checklist.md Gaps #3"
-    reason: "rust upsert overwrites unconditionally; kde applies only when both lists non-empty. Real peers always send caps today, so the divergence is not currently reachable from production."
-    owner: "Sprint 2 / Task 2.1"
+    status: UNVERIFIED
+    cite: "Task 2.1 (vk #997): src/device/registry.rs:64-78 upsert_device now guards the capability copy behind `!incoming.is_empty() && !outgoing.is_empty()`, matching kde's Device::updateDeviceInfo condition (core/device.cpp:321) exactly. Three tests in device_record_accuracy_tests pin it: empty-both (must not clobber), one-empty-one-populated (must not clobber either list, matching kde's all-or-nothing pair update), both-non-empty (must still update, the negative-space check). Red pre-fix: the first two failed with the known caps showing up empty/wrong; captured in the commit body."
+    reason: "Fixed 2026-08-09 (Task 2.1) — no longer an intentional divergence, matches kde's exact condition. desktop_effect/api_surface/lifecycle/live_device/environment stay UNVERIFIED: this is registry-level unit coverage, not a live hostile-input soak against a real hand-crafted UDP identity (the plan's own validation note; integrator's job). fixture_provenance stays UNVERIFIED — behavioral registry-state fix, no upstream-wire fixture applies."
+    owner: "Sprint 2 / Task 2.1 (live hostile-input soak = integrator)"
 
   # Upstream-only roles seeded UNVERIFIED. Each role appears under exactly
   # one implementation; Sprint 3 / Task 3.1 decides which map to Rust code,
@@ -1991,9 +1991,6 @@ ledger row that resolves it:
 | Gap | Source row | Tracker |
 |---|---|---|
 | Broadcast-forever cadence | feature_ledger discovery-broadcast-cadence | Task 2.2 |
-| Capability overwrite on empty identity | feature_ledger cap-overwrite-on-empty-identity | Task 2.1 |
-| UDP receive buffer 64 KiB | feature_ledger udp-receive-buffer | Task 2.1 |
-| Payload accept timeout 300 s | feature_ledger payload-accept-timeout | Task 2.1 |
 | Network-change re-broadcast trigger | feature_ledger discovery-network-change-rebroadcast | Task 2.2 |
 
 Any new intentional divergence added to the ledger must carry a `reason`

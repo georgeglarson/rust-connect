@@ -29,7 +29,16 @@ use crate::utils::errors::{Error, Result};
 const TRANSFER_MIN_PORT: u16 = 1739;
 const TRANSFER_MAX_PORT: u16 = 1764;
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// How long the sender waits for the receiver to connect to the
+/// advertised transfer port before giving up. Aligned to kde's
+/// `CompositeUploadJob` timer (`compositeuploadjob.cpp:35-37` —
+/// `m_timeout.setInterval(30000)`; `:231-242` `timeoutTriggered()` closes
+/// the listening port and fails the job) rather than android's 10s
+/// (`LanLink.java#200`): kde is the desktop reference, and this is a
+/// desktop-peer daemon like it. The prior 300s left a wedged sender
+/// holding a transfer slot 10x longer than either reference (parity-
+/// checklist.md § Payload transfers, gap 2).
+const ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const IO_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// Floor on the TOTAL transfer deadline. Small payloads get at least this
 /// long no matter what the rate calculation says.
@@ -537,6 +546,56 @@ mod tests {
         assert!(info.port >= TRANSFER_MIN_PORT && info.port <= TRANSFER_MAX_PORT);
 
         handle.abort();
+    }
+
+    /// Gap 2 (parity-checklist.md § Payload transfers): pins the value
+    /// itself. kde's CompositeUploadJob timer is 30000ms
+    /// (compositeuploadjob.cpp:36); rust-connect matches kde, the desktop
+    /// reference, rather than android's 10s.
+    #[test]
+    fn test_accept_timeout_matches_kde_desktop_reference() {
+        assert_eq!(ACCEPT_TIMEOUT, std::time::Duration::from_secs(30));
+    }
+
+    /// Gap 2 behavioral: a sender with nobody connecting must time out at
+    /// (approximately) the configured bound, not hang forever and not sit
+    /// at the old 300s bound. Time-paused so the test doesn't burn 30 real
+    /// seconds; tokio's paused-clock auto-advance fast-forwards through
+    /// the real TcpListener::accept() (which never resolves — nothing
+    /// connects) once nothing else in the runtime can make progress,
+    /// exactly the scenario `tokio::time::timeout` around a stalled I/O
+    /// future is meant to be tested under.
+    #[tokio::test(start_paused = true)]
+    async fn test_accept_times_out_at_the_new_bound_not_the_old_one() {
+        let (transfer, temp) = setup();
+        let file_path = temp.path().join("test.txt");
+        tokio::fs::write(&file_path, b"hello")
+            .await
+            .expect("write test file");
+
+        let (_info, handle) = transfer
+            .send_file(&file_path)
+            .await
+            .expect("send_file must set up the listener");
+        // Nobody connects to the advertised port — the spawned task's
+        // accept() call must eventually time out on its own.
+        let started = tokio::time::Instant::now();
+        let result = handle.await.expect("send task must not panic");
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "an accept with nobody connecting must time out, not hang forever"
+        );
+        // A generous margin over the 30s bound, but nowhere near the old
+        // 300s one — this is what actually distinguishes "fixed" from
+        // "still 300s" under a paused clock, where a wrong-but-internally-
+        // consistent bound would otherwise pass trivially.
+        assert!(
+            elapsed <= std::time::Duration::from_secs(35),
+            "accept must time out within ~30s (kde compositeuploadjob.cpp:36), \
+             not the old 300s bound; elapsed {elapsed:?}"
+        );
     }
 
     #[tokio::test]
