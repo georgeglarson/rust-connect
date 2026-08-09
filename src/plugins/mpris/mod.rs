@@ -2127,7 +2127,10 @@ mod tests {
         // Body keys, byte-for-byte upstream.
         assert_eq!(pkt.body, upstream_body);
         // Envelope.
-        assert_eq!(pkt.payload_size, Some(upstream_size));
+        assert_eq!(
+            pkt.payload_size,
+            Some(crate::protocol::types::PayloadSize::Known(upstream_size))
+        );
         let info = pkt
             .payload_transfer_info
             .as_ref()

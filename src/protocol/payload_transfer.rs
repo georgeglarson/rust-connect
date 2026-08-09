@@ -338,6 +338,117 @@ impl PayloadTransfer {
         Ok((bytes, destination))
     }
 
+    /// Receive an endless-stream payload (`payloadSize: -1`,
+    /// `core/networkpacket.h:85`) with no declared byte count: read until
+    /// the sender's clean TLS EOF instead of an exact `.take(N)`. Bounded
+    /// by `max_bytes` regardless — a stream that never ends can't fill the
+    /// disk. This is an intentional DIVERGENCE from upstream:
+    /// `filetransferjob.cpp:108-122` has no incomplete-file check for a
+    /// stream and keeps reading (and keeps) whatever arrives, unbounded;
+    /// this project's standing DoS posture (`max_file_size_bytes` already
+    /// caps every other transfer) applies here too — see
+    /// parity-checklist.md gap 7's documented divergence. A peer that
+    /// keeps sending past `max_bytes` gets an error and the partial file
+    /// deleted, same failure shape as a truncated known-size transfer.
+    async fn receive_into_streaming(
+        tls_stream: tls::TlsStream,
+        mut file: tokio::fs::File,
+        max_bytes: u64,
+        dest_path: &std::path::Path,
+    ) -> Result<u64> {
+        // Read one byte past the cap: a peer that stops EXACTLY at
+        // max_bytes (clean EOF) must be told apart from one still sending
+        // — capping the reader at max_bytes itself would silently accept
+        // the (max_bytes+1)-th byte as "not there yet".
+        let probe_limit = max_bytes.saturating_add(1);
+        let mut limited = tls_stream.take(probe_limit);
+        let bytes_written = match copy_with_idle_timeout(
+            &mut limited,
+            &mut file,
+            "receive",
+            IO_IDLE_TIMEOUT,
+            total_deadline_for(max_bytes),
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(dest_path).await;
+                return Err(e);
+            }
+        };
+
+        if bytes_written > max_bytes {
+            drop(file);
+            let _ = tokio::fs::remove_file(dest_path).await;
+            return Err(Error::ConnectionError(format!(
+                "Endless-stream payload exceeded the {} byte cap — partial file deleted",
+                max_bytes
+            )));
+        }
+
+        if let Err(error) = file.flush().await {
+            drop(file);
+            let _ = tokio::fs::remove_file(dest_path).await;
+            return Err(Error::io(
+                format!("Failed to flush received payload: {error}"),
+                Some(dest_path.display().to_string()),
+            ));
+        }
+
+        info!(
+            bytes = bytes_written,
+            path = %dest_path.display(),
+            event = "payload_received_stream",
+            "Received endless-stream payload over TLS (clean EOF)"
+        );
+
+        Ok(bytes_written)
+    }
+
+    /// Streaming counterpart to `receive_file`: no declared size, refuses
+    /// any existing destination entry.
+    pub async fn receive_file_streaming(
+        &self,
+        transfer_info: &PayloadTransferInfo,
+        max_bytes: u64,
+        dest_path: &std::path::Path,
+    ) -> Result<u64> {
+        let file = create_destination(dest_path).await?;
+        let tls_stream = match self.connect_receiver(transfer_info).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(dest_path).await;
+                return Err(error);
+            }
+        };
+        Self::receive_into_streaming(tls_stream, file, max_bytes, dest_path).await
+    }
+
+    /// Streaming counterpart to `receive_file_unique`: no declared size,
+    /// collision-resolved destination path.
+    pub async fn receive_file_unique_streaming(
+        &self,
+        transfer_info: &PayloadTransferInfo,
+        max_bytes: u64,
+        desired_path: &std::path::Path,
+    ) -> Result<(u64, std::path::PathBuf)> {
+        let (file, destination) = create_unique_destination(desired_path).await?;
+        let tls_stream = match self.connect_receiver(transfer_info).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&destination).await;
+                return Err(error);
+            }
+        };
+        let bytes =
+            Self::receive_into_streaming(tls_stream, file, max_bytes, &destination).await?;
+        Ok((bytes, destination))
+    }
+
     pub async fn send_file(
         &self,
         file_path: &std::path::Path,
@@ -399,6 +510,29 @@ impl PayloadTransfer {
                             Error::ConnectionTimeout("Timed out flushing payload".to_string())
                         })?
                         .map_err(|e| Error::io(format!("Failed to flush payload: {}", e), None))?;
+                    // Send the TLS close_notify alert instead of just letting
+                    // the socket drop. Without it a receiver sees "peer
+                    // closed connection without sending TLS close_notify"
+                    // (rustls's truncation-attack guard) instead of a clean
+                    // EOF. A Known-size receive never noticed — its `.take(N)`
+                    // is satisfied before the connection close matters — but
+                    // the payloadSize=-1 endless-stream receive (gap 7) has
+                    // no declared length and depends entirely on a genuine
+                    // clean EOF to know the sender is done. Best-effort: the
+                    // payload itself already transferred, so a shutdown
+                    // hiccup here is logged, not fatal.
+                    match tokio::time::timeout(CONNECT_TIMEOUT, stream.shutdown()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => debug!(
+                            error = %e,
+                            event = "payload_send_shutdown_failed",
+                            "Failed to cleanly shut down payload TLS stream (payload already sent)"
+                        ),
+                        Err(_) => debug!(
+                            event = "payload_send_shutdown_timeout",
+                            "Timed out shutting down payload TLS stream (payload already sent)"
+                        ),
+                    }
                     info!(
                         bytes = bytes_sent,
                         event = "payload_sent",
@@ -928,6 +1062,77 @@ mod tls_tests {
         assert!(
             !dest.exists(),
             "partial file must be deleted after truncation"
+        );
+    }
+
+    /// Gap 7 (parity-checklist.md § Payload transfers, vk #998 Task 2.3):
+    /// the streaming receive path — no declared size, read to clean EOF,
+    /// bounded by `max_bytes`.
+    async fn roundtrip_streaming(content: &[u8], max_bytes: u64) -> (Result<u64>, Vec<u8>, PathBuf) {
+        let (cm_a, cm_b, t_a, t_b) = paired_pair();
+
+        let src = t_a.path().join("src.bin");
+        tokio::fs::write(&src, content).await.expect("write src");
+
+        let sender = PayloadTransfer::new(cm_a, RECEIVER_ID.to_string());
+        let (mut info, send_handle) = sender.send_file(&src).await.expect("send_file");
+        info.ip = Some("127.0.0.1".to_string());
+
+        let dest = t_b.path().join("dest.bin");
+        let receiver = PayloadTransfer::new(cm_b, SENDER_ID.to_string());
+        let result = receiver
+            .receive_file_streaming(&info, max_bytes, &dest)
+            .await;
+
+        let send_result = tokio::time::timeout(std::time::Duration::from_secs(5), send_handle)
+            .await
+            .expect("send task join");
+        let _ = send_result;
+
+        let got = tokio::fs::read(&dest).await.unwrap_or_default();
+        (result, got, dest)
+    }
+
+    #[tokio::test]
+    async fn test_streaming_receive_clean_eof_lands_complete_byte_identical() {
+        let content: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let (result, got, _dest) =
+            roundtrip_streaming(&content, /* max_bytes */ 1024 * 1024).await;
+        assert_eq!(
+            result.expect("streaming receive must succeed on clean EOF"),
+            content.len() as u64
+        );
+        assert_eq!(
+            got, content,
+            "endless-stream payload must arrive byte-identical on clean EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_receive_exactly_at_cap_succeeds() {
+        // The peer stops EXACTLY at max_bytes with a clean EOF — this must
+        // NOT be treated as "exceeded the cap" (off-by-one guard).
+        let content = vec![0x11u8; 4096];
+        let (result, got, _dest) = roundtrip_streaming(&content, 4096).await;
+        assert_eq!(result.expect("exactly-at-cap must succeed"), 4096);
+        assert_eq!(got.len(), 4096);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_receive_exceeding_cap_errors_and_deletes_partial() {
+        // A stream that keeps sending past max_bytes must be cut off,
+        // erred, and its partial file deleted — our standing DoS posture
+        // beats upstream's keep-the-extra behavior (filetransferjob.cpp
+        // has no cap for the -1 case at all).
+        let content = vec![0x22u8; 4096];
+        let (result, _got, dest) = roundtrip_streaming(&content, 1024).await;
+        assert!(
+            result.is_err(),
+            "a stream exceeding the cap must error, not silently truncate"
+        );
+        assert!(
+            !dest.exists(),
+            "partial file must be deleted when the stream exceeds the cap"
         );
     }
 }

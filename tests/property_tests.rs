@@ -1,5 +1,12 @@
 use proptest::prelude::*;
-use rust_connect::protocol::{Packet, PacketSerializer};
+use rust_connect::protocol::{Packet, PacketSerializer, PayloadSize};
+
+fn arbitrary_payload_size() -> impl Strategy<Value = PayloadSize> {
+    prop_oneof![
+        any::<u64>().prop_map(PayloadSize::Known),
+        Just(PayloadSize::Stream),
+    ]
+}
 
 fn arbitrary_json_value() -> impl Strategy<Value = serde_json::Value> {
     let leaf = prop_oneof![
@@ -25,7 +32,7 @@ fn property_serialize_deserialize_roundtrip() {
         pt in "kdeconnect\\.[a-z._]{1,50}",
         body in body_strat,
         id in any::<i64>(),
-        payload_size in prop::option::of(any::<u64>()),
+        payload_size in prop::option::of(arbitrary_payload_size()),
     )| {
         let packet = Packet {
             id,

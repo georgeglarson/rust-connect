@@ -218,6 +218,12 @@ fixtures:
     extraction_date: "2026-08-06"
     used_by: "src/api/handlers/share.rs::test_outgoing_url_packet_matches_upstream_shape"
 
+  - file: share/payload_size_endless_stream.json
+    kind: hand-authored-from-observation
+    extraction_date: "2026-08-09"
+    note: "Not a literal capture (no upstream fixture of a live -1 transfer was available). Hand-authored from reading networkpacket.h line 85 (qint64 payloadSize, -1 means an endless stream) and filetransferjob.cpp lines 108-110 (the sender may not know how much it will send; the receiver has no incomplete-file check for this case) in the local kdeconnect-kde clone at fedfa289. Task 2.3, vk #998, parity-checklist.md gap 7."
+    used_by: "src/protocol/types.rs::test_payload_size_deserializes_endless_stream_sentinel"
+
   - file: share/share_file_request.json
     kind: upstream-derived
     upstream_repo: kdeconnect-android
