@@ -269,6 +269,15 @@ impl Plugin for SendNotificationsPlugin {
         vec!["kdeconnect.notification".to_string()]
     }
 
+    // Task 1.7: this plugin has no swappable Option<Arc<dyn Backend>> the
+    // way clipboard/mpris/systemvolume/pausemusic/screensaver_inhibit do —
+    // watcher_started IS the availability signal, set true only once
+    // try_start_watcher has a connection_manager AND a tokio runtime, and
+    // reset false if the spawned D-Bus monitor task fails.
+    fn is_backend_available(&self) -> bool {
+        self.watcher_started.load(Ordering::SeqCst)
+    }
+
     async fn handle_packet(&self, device_id: &str, packet: Packet) -> Result<Option<Vec<Packet>>> {
         if packet.packet_type != "kdeconnect.notification.request" {
             return Ok(None);
@@ -426,6 +435,21 @@ mod notification_request_tests {
             Arc::new(PairingHandler::new(cert_manager)),
         );
         (plugin, temp_dir)
+    }
+
+    /// Task 1.7: is_backend_available must reflect watcher_started, not
+    /// the Plugin trait's default `true` — this plugin has no injectable
+    /// backend mock (unlike clipboard/mpris/systemvolume/pausemusic/
+    /// screensaver_inhibit), so the field is driven directly rather than
+    /// starting the real watcher (which touches a live D-Bus connection
+    /// this test must not depend on).
+    #[test]
+    fn test_is_backend_available_reflects_watcher_started() {
+        let (plugin, _temp) = make_plugin();
+        assert!(!plugin.is_backend_available());
+
+        plugin.watcher_started.store(true, Ordering::SeqCst);
+        assert!(plugin.is_backend_available());
     }
 
     /// `cancel` carries a notification id as a STRING. kdeconnect-kde writes it

@@ -138,6 +138,11 @@ impl Plugin for ScreensaverInhibitPlugin {
         vec![]
     }
 
+    // Task 1.7: same pattern as clipboard.rs/mpris/mod.rs.
+    fn is_backend_available(&self) -> bool {
+        self.backend().is_some()
+    }
+
     fn on_connected(&self, device_id: &str) -> Vec<Packet> {
         let Some(backend) = self.backend() else {
             debug!(
@@ -313,6 +318,22 @@ mod tests {
         assert_eq!(plugin.name(), "screensaver-inhibit");
         assert!(plugin.incoming_capabilities().is_empty());
         assert!(plugin.outgoing_capabilities().is_empty());
+    }
+
+    /// Task 1.7: is_backend_available must reflect the injected backend,
+    /// not the Plugin trait's default `true`. Same pattern as
+    /// clipboard.rs/mpris/mod.rs. This plugin advertises no incoming
+    /// capabilities of its own, so /api/v1/tools never surfaces it either
+    /// way — the override is still correct on principle and future-proofs
+    /// against that changing.
+    #[tokio::test]
+    async fn test_is_backend_available_reflects_injected_backend() {
+        let plugin = ScreensaverInhibitPlugin::new();
+        assert!(!plugin.is_backend_available());
+
+        let backend = Arc::new(MockBackend::new());
+        let plugin = plugin.with_backend(backend);
+        assert!(plugin.is_backend_available());
     }
 
     #[tokio::test]

@@ -370,6 +370,15 @@ impl Plugin for PausemusicPlugin {
         vec![]
     }
 
+    // Task 1.7: the single advertised capability (kdeconnect.telephony) is
+    // the pause leg — the mute leg (self.volume_backend) rides the same
+    // wire event but has no capability string of its own, so this reflects
+    // the primary MPRIS pause backend only, same pattern as
+    // clipboard.rs/mpris/mod.rs's is_backend_available.
+    fn is_backend_available(&self) -> bool {
+        self.backend.read().map(|b| b.is_some()).unwrap_or(false)
+    }
+
     fn on_disconnected(&self, device_id: &str) {
         // Upstream loses pausedSources when the per-device plugin is
         // destroyed — no resume, players stay paused. Match that.
@@ -647,6 +656,19 @@ mod tests {
             vec!["kdeconnect.telephony".to_string()]
         );
         assert!(plugin.outgoing_capabilities().is_empty());
+    }
+
+    /// Task 1.7: is_backend_available must reflect the primary MPRIS
+    /// pause backend, not the Plugin trait's default `true`. Same pattern
+    /// as clipboard.rs/mpris/mod.rs.
+    #[tokio::test]
+    async fn test_is_backend_available_reflects_media_backend() {
+        let plugin = PausemusicPlugin::new();
+        assert!(!plugin.is_backend_available());
+
+        let backend = Arc::new(MockBackend::new(&[]));
+        let plugin = plugin.with_backend(backend);
+        assert!(plugin.is_backend_available());
     }
 
     #[tokio::test]

@@ -304,6 +304,24 @@ pub async fn list_tools(
         }
     }
 
+    // Two plugins can declare the same incoming capability (pausemusic and
+    // telephony both consume kdeconnect.telephony), which pushes the same
+    // tool twice — from a HashMap-ordered registry walk, so the duplicates
+    // land in nondeterministic order and can disagree on `available` (each
+    // copy reflects its own plugin's backend). Collapse by name: the tool
+    // is available if ANY plugin serving that capability is (a degraded
+    // secondary consumer must not shadow a healthy primary), and sort so
+    // the catalog is stable across requests.
+    tools.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    tools.dedup_by(|dup, kept| {
+        if dup.name == kept.name {
+            kept.available = kept.available || dup.available;
+            true
+        } else {
+            false
+        }
+    });
+
     let count = tools.len();
     Ok(Json(ApiResponse::ok(ToolsResponse { tools, count })))
 }

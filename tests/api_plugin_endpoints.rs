@@ -602,3 +602,55 @@ async fn test_list_tools_marks_degraded_backends() {
         "ping has no separable backend and must remain available"
     );
 }
+
+/// /api/v1/tools must list each tool exactly once, in deterministic order.
+///
+/// pausemusic and telephony both declare `kdeconnect.telephony` as an
+/// incoming capability, so a naive per-plugin/per-capability push emits
+/// `get_telephony` twice — from a HashMap-ordered registry walk, so the
+/// duplicates land in nondeterministic order, and (post Task 1.7's
+/// availability overrides) the two copies can even disagree on
+/// `available`. A client keying tools by name gets a coin-flip.
+#[tokio::test]
+async fn test_list_tools_has_no_duplicates_and_is_sorted() {
+    let (state, _temp, api_key) = create_test_app().await;
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/tools")
+                .header("X-API-Key", &api_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let tools = json["data"]["tools"]
+        .as_array()
+        .expect("tools must be an array");
+
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|t| t["name"].as_str().expect("tool name is a string"))
+        .collect();
+
+    let mut deduped = names.clone();
+    deduped.sort_unstable();
+    deduped.dedup();
+    assert_eq!(
+        names.len(),
+        deduped.len(),
+        "duplicate tool names in /api/v1/tools: {names:?}"
+    );
+
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "tools must be sorted by name: {names:?}");
+}
