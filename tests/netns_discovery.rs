@@ -95,7 +95,14 @@ fn preconditions_met(test_name: &str) -> bool {
     // container can lack CAP_NET_ADMIN / CAP_SYS_ADMIN) — probe the real
     // operation rather than trusting the uid, so such environments get
     // the documented visible skip instead of a panic (PR #13 review).
-    let probe = format!("rcprobe-{}", std::process::id());
+    // SEQ-suffixed: the three tests run concurrently and all call this
+    // gate — a shared probe name collides ("File exists") and silently
+    // skips a valid test (PR #13 review, on the previous fixup).
+    let probe = format!(
+        "rcprobe-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::SeqCst)
+    );
     let created = Command::new("ip")
         .args(["netns", "add", &probe])
         .output()
