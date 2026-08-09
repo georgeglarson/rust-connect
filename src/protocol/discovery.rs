@@ -28,6 +28,20 @@ use crate::utils::errors::{Error, Result};
 /// doubt for a future reader.
 const RECV_BUFFER_SIZE: usize = 512 * 1024;
 
+/// EMSGSIZE, the OS error a UDP send raises when a datagram is rejected as
+/// too large: errno 90 on Linux, errno 40 on macOS/FreeBSD (outpost is the
+/// fleet's only BSD-kernel host — see AGENTS.md's fleet roster). Rust's
+/// stable `std::io::ErrorKind` has no dedicated variant for this, so match
+/// the raw errno on both kernels this daemon ships on rather than string-
+/// matching `to_string()`. Upstream's own comment names this as a
+/// macOS/FreeBSD-specific MTU behavior for BROADCASTS specifically; Linux
+/// can also hit it, but only past IPv4's hard 65507-byte UDP payload
+/// ceiling (parity-checklist.md § Discovery "UDP receive buffer" row) —
+/// either way, the fix is the same retry.
+fn is_message_too_large(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(90) | Some(40))
+}
+
 /// Discovery service
 ///
 /// Handles broadcasting identity packets and listening for other devices.
@@ -150,7 +164,13 @@ impl DiscoveryService {
 
     /// Broadcast this device's identity
     ///
-    /// Sends identity packet to broadcast address.
+    /// Sends identity packet to broadcast address. On macOS/FreeBSD, UDP
+    /// broadcasts larger than the interface MTU get dropped by the kernel
+    /// (`DatagramTooLargeError` upstream) — kde's fallback
+    /// (`lanlinkprovider.cpp:259-269`, parity-checklist.md gap 6) strips
+    /// both capability lists and resends the smaller identity. See
+    /// `is_message_too_large` for why the same retry also matters on
+    /// Linux for a sufficiently huge capability list.
     ///
     /// # Returns
     /// * `Ok(())` - Broadcast successful
@@ -159,10 +179,43 @@ impl DiscoveryService {
         let packet = self.identity.to_packet()?;
         let bytes = PacketSerializer::serialize(&packet)?;
 
-        self.socket
-            .send_to(&bytes, self.broadcast_addr)
-            .await
-            .map_err(|e| Error::DiscoveryError(format!("Failed to send broadcast: {}", e)))?;
+        if let Err(e) = self.socket.send_to(&bytes, self.broadcast_addr).await {
+            if !is_message_too_large(&e) {
+                return Err(Error::DiscoveryError(format!(
+                    "Failed to send broadcast: {}",
+                    e
+                )));
+            }
+
+            warn!(
+                error = %e,
+                event = "identity_broadcast_oversized",
+                "Identity packet rejected as too large for a UDP broadcast; \
+                 retrying with capabilities stripped (kde lanlinkprovider.cpp:259-269)"
+            );
+
+            // kde's guard on the RECEIVE side (Task 2.1's
+            // apply_capability_update, device/types.rs) only applies an
+            // identity's capabilities when BOTH lists are non-empty —
+            // that's what makes stripping our OWN capabilities here safe
+            // to receive: a peer that already knows our real capabilities
+            // keeps them instead of having this smaller retry wipe them.
+            let mut stripped = self.identity.clone();
+            stripped.incoming_capabilities.clear();
+            stripped.outgoing_capabilities.clear();
+            let small_packet = stripped.to_packet()?;
+            let small_bytes = PacketSerializer::serialize(&small_packet)?;
+
+            self.socket
+                .send_to(&small_bytes, self.broadcast_addr)
+                .await
+                .map_err(|e| {
+                    Error::DiscoveryError(format!(
+                        "Failed to send broadcast (retry with emptied capabilities): {}",
+                        e
+                    ))
+                })?;
+        }
 
         debug!(
             device_id = %self.identity.device_id,
@@ -518,6 +571,165 @@ mod tests {
         // Should not error
         let result = service.broadcast().await;
         assert!(result.is_ok());
+    }
+
+    /// Gap 6 (parity-checklist.md § Discovery, vk #998 Task 2.3): the
+    /// EMSGSIZE errno predicate, tested directly against constructed
+    /// `io::Error`s rather than a live send — deterministic and portable,
+    /// no dependency on any host actually hitting the condition.
+    #[test]
+    fn test_is_message_too_large_matches_linux_and_macos_emsgsize() {
+        assert!(is_message_too_large(
+            &std::io::Error::from_raw_os_error(90) // Linux EMSGSIZE
+        ));
+        assert!(is_message_too_large(
+            &std::io::Error::from_raw_os_error(40) // macOS/FreeBSD EMSGSIZE
+        ));
+    }
+
+    /// Non-EMSGSIZE errors must NOT trigger the retry — one send, the
+    /// original error surfaced unchanged, exactly as before this gap.
+    #[test]
+    fn test_is_message_too_large_rejects_other_errors() {
+        assert!(!is_message_too_large(&std::io::Error::from_raw_os_error(
+            13 // EACCES
+        )));
+        assert!(!is_message_too_large(&std::io::Error::from_raw_os_error(
+            111 // ECONNREFUSED
+        )));
+        assert!(!is_message_too_large(&std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "generic error with no errno"
+        )));
+    }
+
+    /// Gap 6 behavioral: a REAL EMSGSIZE, not a mock. IPv4 caps a single
+    /// UDP datagram's payload at 65507 bytes full stop (verified
+    /// empirically in Task 2.1 — see RECV_BUFFER_SIZE's doc comment and
+    /// `test_receives_largest_possible_udp_identity_with_huge_capability_list`
+    /// above), regardless of destination or platform — so an identity
+    /// built past that ceiling fails `send_to` with a genuine EMSGSIZE on
+    /// this host exactly as it would on outpost's BSD kernel, no injection
+    /// or mock needed. The retry must fire, strip both capability lists,
+    /// and land exactly one (smaller) datagram at the broadcast address —
+    /// the oversized send never left the socket, so the capture socket
+    /// only ever sees the successful retry.
+    #[tokio::test]
+    async fn test_broadcast_retries_with_emptied_capabilities_on_oversized_identity() {
+        const IPV4_MAX_UDP_PAYLOAD: usize = 65_507;
+
+        let mut caps = Vec::new();
+        let mut identity = create_test_identity("Oversized Broadcaster");
+        loop {
+            caps.push(format!("kdeconnect.synthetic.capability.number.{}", caps.len()));
+            let candidate = Identity::new(
+                identity.device_id.clone(),
+                identity.device_name.clone(),
+                DeviceType::Desktop,
+                caps.clone(),
+                caps.clone(),
+            );
+            let packet_len = crate::protocol::packet::PacketSerializer::serialize(
+                &candidate.to_packet().expect("identity to_packet"),
+            )
+            .expect("serialize")
+            .len();
+            identity = candidate;
+            if packet_len > IPV4_MAX_UDP_PAYLOAD {
+                break;
+            }
+        }
+        assert!(
+            !identity.incoming_capabilities.is_empty(),
+            "sanity: the oversized identity must actually carry capabilities to strip"
+        );
+
+        let mut service = create_test_service("placeholder")
+            .await
+            .expect("Value expected to be present");
+        service.identity = identity;
+
+        let capture = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("Value expected to be present");
+        service.broadcast_addr = capture
+            .local_addr()
+            .expect("Value expected to be present");
+
+        service
+            .broadcast()
+            .await
+            .expect("broadcast must retry and succeed, not surface the oversized send's error");
+
+        let mut buf = vec![0u8; RECV_BUFFER_SIZE];
+        let (len, _addr) = tokio::time::timeout(Duration::from_secs(2), capture.recv_from(&mut buf))
+            .await
+            .expect("the retried, smaller datagram must arrive")
+            .expect("recv_from must succeed");
+
+        let received = crate::protocol::packet::PacketSerializer::deserialize(&buf[..len])
+            .expect("retried datagram must deserialize");
+        let received_identity =
+            Identity::from_packet(received).expect("retried datagram must be a valid identity");
+        assert!(
+            received_identity.incoming_capabilities.is_empty(),
+            "retry must strip incomingCapabilities"
+        );
+        assert!(
+            received_identity.outgoing_capabilities.is_empty(),
+            "retry must strip outgoingCapabilities"
+        );
+        assert_eq!(received_identity.device_name, "Oversized Broadcaster");
+
+        // Exactly one datagram — the oversized send never left the
+        // socket, so a regression that fires the retry twice (or the
+        // original oversized identity somehow shrinking enough to also
+        // go out) would show up here as a second arrival.
+        let second = tokio::time::timeout(Duration::from_millis(200), capture.recv_from(&mut buf))
+            .await;
+        assert!(
+            second.is_err(),
+            "exactly one datagram must land — the oversized send must never actually go out"
+        );
+    }
+
+    /// Regression pin: a normally-sized identity must broadcast once, with
+    /// its capabilities intact — the retry path must never fire when
+    /// nothing is oversized.
+    #[tokio::test]
+    async fn test_broadcast_normal_identity_unaffected() {
+        let service = create_test_service("Normal Broadcaster")
+            .await
+            .expect("Value expected to be present");
+
+        let capture = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("Value expected to be present");
+        let mut service = service;
+        service.broadcast_addr = capture
+            .local_addr()
+            .expect("Value expected to be present");
+
+        service.broadcast().await.expect("broadcast must succeed");
+
+        let mut buf = vec![0u8; RECV_BUFFER_SIZE];
+        let (len, _addr) = tokio::time::timeout(Duration::from_secs(2), capture.recv_from(&mut buf))
+            .await
+            .expect("the datagram must arrive")
+            .expect("recv_from must succeed");
+        let received = crate::protocol::packet::PacketSerializer::deserialize(&buf[..len])
+            .expect("must deserialize");
+        let received_identity =
+            Identity::from_packet(received).expect("must be a valid identity");
+        assert_eq!(
+            received_identity.incoming_capabilities,
+            vec!["kdeconnect.ping".to_string()],
+            "an un-oversized identity's capabilities must arrive intact"
+        );
+
+        let second = tokio::time::timeout(Duration::from_millis(200), capture.recv_from(&mut buf))
+            .await;
+        assert!(second.is_err(), "exactly one datagram, no spurious retry");
     }
 
     #[tokio::test]
