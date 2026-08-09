@@ -240,8 +240,8 @@ feature_ledger:
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/mousepad/presenter_slide_keys.json (kdeconnect-android PresenterPlugin.kt:53-74 + KeyListenerView.java:36-37,48,53)"
-    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived presenter_slide_keys fixture. Remaining cells owned by Sprint 1 / Task 1.6 absolute-axes verification."
+    cite: "tests/fixtures/upstream-wire/mousepad/presenter_slide_keys.json (kdeconnect-android PresenterPlugin.kt:53-74 + KeyListenerView.java:36-37,48,53); Task 1.6 Backend A absolute-axes implementation cites kdeconnect-kde x11remoteinput.cpp:191-206 + waylandremoteinput.cpp:394-401,521-524 (see the mousepad-absolute environment-matrix row)"
+    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived presenter_slide_keys fixture. Task 1.6 Backend A closed the absolute-positioning code gap (src/plugins/mousepad.rs AbsoluteInputDevice); remaining cells (desktop_effect, api_surface, lifecycle, hostile_input, live_device, environment) are still UNVERIFIED — they need a real X11/Wayland session and a live phone, not just the kernel-level uinput readback Task 1.6 added (tests/mousepad_uinput_absolute.rs)."
     owner: "Task 1.6"
 
   - feature: mpris
@@ -1807,15 +1807,15 @@ environment_matrix:
   - feature: mousepad-absolute
     rust_impl: true
     clipboard-x11: NOT-APPLICABLE
-    clipboard-wayland: UNVERIFIED
+    clipboard-wayland: NOT-APPLICABLE
     uinput: UNVERIFIED
     audio: NOT-APPLICABLE
     session_dbus: NOT-APPLICABLE
     notification_server: NOT-APPLICABLE
     status: UNVERIFIED
-    cite:
-    reason: "absolute-axis support is a known gap; Task 1.6 verification on uinput pending"
-    owner: "Task 1.6"
+    cite: "src/plugins/mousepad.rs AbsoluteInputDevice + absolute_position/scale_abs_coord (Task 1.6 Backend A, vk #1010); tests/mousepad_uinput_absolute.rs live-verifies real ABS_X/ABS_Y + SYN_REPORT events reach the kernel through a second, lazily-created uinput device; upstream absolute-warp semantics cited in scale_abs_coord's divergence doc are kdeconnect-kde x11remoteinput.cpp:194-197 (XWarpPointer) and waylandremoteinput.cpp:394-401,521-524 (pointerMotionAbsolute)"
+    reason: "The absolute-axis code gap is closed: a fixed-range (0..65535) ABS_X/ABS_Y uinput device, scaled/clamped wire coordinates, kernel-level injection live-verified in this environment. `uinput` and `status` stay UNVERIFIED rather than PASS: no real X11/Wayland session ran here, so whether libinput actually maps the device's fixed range across a real screen and the cursor visibly warps is unconfirmed — that desktop_effect confirmation is the integrator's job (docs/live-validation.md is where it lands)."
+    owner: "Task 1.6 integrator (live-desktop confirmation)"
 
   - feature: mpris-control
     rust_impl: true
