@@ -170,7 +170,7 @@ async fn run_if_watcher(tx: UnboundedSender<()>, shutdown: CancellationToken) {
 /// Reads CLOCK_BOOTTIME via a raw `clock_gettime(2)` call — see the
 /// module doc for why this, not `std::time::Instant`, is the clock this
 /// watchdog needs.
-fn read_boottime() -> Duration {
+fn read_boottime() -> Option<Duration> {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -180,11 +180,24 @@ fn read_boottime() -> Duration {
     // 2.6.39, long predating anything this daemon targets.
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
     if rc != 0 {
-        // Essentially unreachable on Linux; degrade quietly rather than
-        // panic — the watchdog simply won't detect a jump this cycle.
-        return Duration::ZERO;
+        // Essentially unreachable on Linux (EFAULT/EINVAL only, both
+        // deterministic) — but the failure must NOT be smuggled out as a
+        // zero reading: a single zero stamped into `last_boottime` makes
+        // the next healthy cycle compute a huge phantom boottime delta,
+        // i.e. a FALSE resume event and a spurious re-announce (PR #13
+        // review). None tells the watchdog to skip the whole cycle
+        // instead.
+        warn!(
+            errno = std::io::Error::last_os_error().raw_os_error(),
+            event = "suspend_watchdog_clock_failed",
+            "clock_gettime(CLOCK_BOOTTIME) failed; skipping this watchdog cycle"
+        );
+        return None;
     }
-    Duration::new(ts.tv_sec.max(0) as u64, ts.tv_nsec.max(0) as u32)
+    Some(Duration::new(
+        ts.tv_sec.max(0) as u64,
+        ts.tv_nsec.max(0) as u32,
+    ))
 }
 
 /// Suspend/resume source: compares CLOCK_BOOTTIME's elapsed delta against
@@ -192,7 +205,17 @@ fn read_boottime() -> Duration {
 /// The gap between them is exactly the suspended duration — see the
 /// module doc.
 async fn suspend_watchdog(tx: UnboundedSender<()>, shutdown: CancellationToken) {
-    let mut last_boottime = read_boottime();
+    let Some(mut last_boottime) = read_boottime() else {
+        // No usable boottime clock at all — the watchdog cannot work.
+        // Degrade explicitly (network-change events still cover most
+        // resume cases via DHCP re-acquisition) rather than run on
+        // garbage baselines.
+        warn!(
+            event = "suspend_watchdog_disabled",
+            "CLOCK_BOOTTIME unavailable; suspend/resume detection disabled"
+        );
+        return;
+    };
     let mut last_monotonic = std::time::Instant::now();
 
     loop {
@@ -201,7 +224,12 @@ async fn suspend_watchdog(tx: UnboundedSender<()>, shutdown: CancellationToken) 
             _ = shutdown.cancelled() => return,
         }
 
-        let now_boottime = read_boottime();
+        // A failed read skips the WHOLE cycle — neither baseline is
+        // updated, so the next healthy read spans two poll intervals on
+        // BOTH clocks consistently and the suspend math stays exact.
+        let Some(now_boottime) = read_boottime() else {
+            continue;
+        };
         let now_monotonic = std::time::Instant::now();
         let boottime_elapsed = now_boottime.saturating_sub(last_boottime);
         let monotonic_elapsed = now_monotonic.duration_since(last_monotonic);
