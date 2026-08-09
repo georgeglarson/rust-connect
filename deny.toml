@@ -13,6 +13,13 @@ ignore = [
     # notify-rust, not compiled on Linux/macOS targets.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # paste (via if-watch -> netlink-packet-core, Task 2.2 vk #994):
+    # build-time proc-macro codegen only, never in the runtime attack
+    # surface. The advisory itself states "No safe upgrade is available!"
+    # — the author archived the crate but it isn't vulnerable, just
+    # unmaintained. Re-check when netlink-packet-core drops it (a fork,
+    # pastey, already exists as the suggested replacement upstream).
+    "RUSTSEC-2024-0436",
 ]
 
 [licenses]

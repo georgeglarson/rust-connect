@@ -94,6 +94,15 @@ tokio-stream = { version = "0.1.18", features = ["sync"] }
 socket2 = "0.6.3"
 # mDNS (DNS-SD) discovery: pure-Rust responder + browser, no system avahi.
 mdns-sd = "0.20"
+# Network interface/address change watching (Task 2.2, vk #994): purpose-
+# built for exactly this (used by libp2p et al.), tokio-native — no
+# competing async runtime. On Linux it's a thin wrapper over rtnetlink;
+# using it directly instead of hand-rolling netlink message parsing keeps
+# the marginal dependency footprint to 7 new crates (if-watch,
+# netlink-{packet-core,packet-route,proto,sys}, rtnetlink, paste) — see
+# plans/task-2.2-report.md for the alternatives considered and the
+# dependency-tree diff that backs this pick.
+if-watch = { version = "3", default-features = false, features = ["tokio"] }
 tracing-appender = "0.2.4"
 evdev = "0.13"
 moka = { version = "0.12", features = ["sync"] }
