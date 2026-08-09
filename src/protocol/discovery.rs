@@ -10,8 +10,7 @@
 use socket2::{Domain, Protocol, Socket, Type as SockType};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::net::UdpSocket;
-use tokio::time::{interval, Duration};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::protocol::packet::PacketSerializer;
 use crate::protocol::types::{Identity, MAX_PORT, MIN_PORT};
@@ -36,7 +35,6 @@ pub struct DiscoveryService {
     pub socket: UdpSocket,
     pub identity: Identity,
     pub broadcast_addr: SocketAddr,
-    pub broadcast_interval: Duration,
 }
 
 impl DiscoveryService {
@@ -44,7 +42,7 @@ impl DiscoveryService {
     ///
     /// # Arguments
     /// * `identity` - This device's identity
-    /// * `broadcast_interval` - How often to broadcast (in seconds)
+    /// * `udp_port` - Port to bind and broadcast on
     ///
     /// # Returns
     /// * `Ok(DiscoveryService)` - New discovery service
@@ -66,15 +64,11 @@ impl DiscoveryService {
     ///     vec![],
     /// );
     ///
-    /// let service = DiscoveryService::new(identity, 5, DEFAULT_UDP_PORT).await?;
+    /// let service = DiscoveryService::new(identity, DEFAULT_UDP_PORT).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn new(
-        identity: Identity,
-        broadcast_interval_secs: u64,
-        udp_port: u16,
-    ) -> Result<Self> {
+    pub async fn new(identity: Identity, udp_port: u16) -> Result<Self> {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), udp_port);
 
         let socket = Socket::new(Domain::IPV4, SockType::DGRAM, Some(Protocol::UDP))
@@ -143,7 +137,6 @@ impl DiscoveryService {
 
         info!(
             port = udp_port,
-            interval_secs = broadcast_interval_secs,
             event = "discovery_service_created",
             "Discovery service initialized"
         );
@@ -152,7 +145,6 @@ impl DiscoveryService {
             socket,
             identity,
             broadcast_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), udp_port),
-            broadcast_interval: Duration::from_secs(broadcast_interval_secs),
         })
     }
 
@@ -260,72 +252,6 @@ impl DiscoveryService {
         Ok((identity, addr))
     }
 
-    /// Start broadcasting periodically
-    ///
-    /// Broadcasts identity at configured interval until cancelled.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use rust_connect::protocol::discovery::DiscoveryService;
-    /// # use rust_connect::protocol::types::{Identity, DEFAULT_UDP_PORT};
-    /// # use rust_connect::device::types::DeviceType;
-    /// # use tokio_util::sync::CancellationToken;
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let identity = Identity::new(
-    /// #     "my-device-id".to_string(),
-    /// #     "My Device".to_string(),
-    /// #     DeviceType::Desktop,
-    /// #     vec![],
-    /// #     vec![],
-    /// # );
-    /// # let service = DiscoveryService::new(identity, 5, DEFAULT_UDP_PORT).await?;
-    /// // Start broadcasting in background
-    /// let cancel = CancellationToken::new();
-    /// tokio::spawn(async move {
-    ///     service.start_broadcasting(cancel).await;
-    /// });
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn start_broadcasting(&self, cancel: tokio_util::sync::CancellationToken) {
-        let mut ticker = interval(self.broadcast_interval);
-
-        info!(
-            interval_secs = self.broadcast_interval.as_secs(),
-            event = "broadcasting_started",
-            "Started periodic broadcasting"
-        );
-
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    if let Err(e) = self.broadcast().await {
-                        error!(
-                            error = %e,
-                            event = "broadcast_failed",
-                            "Failed to broadcast identity"
-                        );
-                    }
-                    let jitter_ms = (self.broadcast_interval.as_millis() as u64) / 2;
-                    let jitter = if jitter_ms > 0 {
-                        rand::random::<u64>() % jitter_ms
-                    } else {
-                        0
-                    };
-                    tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
-                }
-                _ = cancel.cancelled() => {
-                    info!(
-                        event = "broadcasting_stopped",
-                        "Stopped broadcasting (cancelled)"
-                    );
-                    return;
-                }
-            }
-        }
-    }
-
     /// Start listening for devices
     ///
     /// Continuously listens for identity packets and calls the callback
@@ -348,7 +274,7 @@ impl DiscoveryService {
     /// #     vec![],
     /// #     vec![],
     /// # );
-    /// # let service = DiscoveryService::new(identity, 5, DEFAULT_UDP_PORT).await?;
+    /// # let service = DiscoveryService::new(identity, DEFAULT_UDP_PORT).await?;
     /// // Start listening in background
     /// tokio::spawn(async move {
     ///     service.start_listening(|identity, addr| {
@@ -388,11 +314,6 @@ impl DiscoveryService {
     pub fn identity(&self) -> &Identity {
         &self.identity
     }
-
-    /// Get the broadcast interval
-    pub fn broadcast_interval(&self) -> Duration {
-        self.broadcast_interval
-    }
 }
 
 #[cfg(test)]
@@ -401,6 +322,7 @@ mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
     use crate::device::types::DeviceType;
+    use tokio::time::Duration;
 
     fn create_test_identity(name: &str) -> Identity {
         Identity::new(
@@ -431,7 +353,6 @@ mod tests {
             socket,
             identity,
             broadcast_addr,
-            broadcast_interval: Duration::from_secs(5),
         })
     }
 
@@ -455,7 +376,7 @@ mod tests {
     async fn test_recv_buffer_size_matches_android_target() {
         let identity = create_test_identity("RcvBuf Test");
         let port = find_unused_port().await;
-        let service = DiscoveryService::new(identity, 5, port)
+        let service = DiscoveryService::new(identity, port)
             .await
             .expect("DiscoveryService::new must succeed");
 
@@ -509,7 +430,7 @@ mod tests {
 
         let listener_identity = create_test_identity("Listener");
         let listener_port = find_unused_port().await;
-        let service = DiscoveryService::new(listener_identity, 5, listener_port)
+        let service = DiscoveryService::new(listener_identity, listener_port)
             .await
             .expect("DiscoveryService::new must succeed");
         let listener_addr = service
@@ -608,15 +529,6 @@ mod tests {
         assert_eq!(service.identity().device_name, "Test Device");
     }
 
-    #[tokio::test]
-    async fn test_broadcast_interval() {
-        let service = create_test_service("Test Device")
-            .await
-            .expect("Value expected to be present");
-
-        assert_eq!(service.broadcast_interval(), Duration::from_secs(5));
-    }
-
     // Integration test: Two services discovering each other
     #[tokio::test]
     async fn test_mutual_discovery() {
@@ -689,7 +601,7 @@ mod tests {
         let identity = create_test_identity("Port Test");
         let configured_port = find_unused_port().await;
 
-        let service = DiscoveryService::new(identity, 5, configured_port)
+        let service = DiscoveryService::new(identity, configured_port)
             .await
             .expect("Value expected to be present");
 

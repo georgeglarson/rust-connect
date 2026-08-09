@@ -53,10 +53,6 @@ const KNOWN_FIELDS: &[(&str, &str)] = &[
         "src/bootstrap.rs:68 (init_logging_from_env)",
     ),
     (
-        "broadcast_interval_secs",
-        "src/services/service_manager.rs:96 (DiscoveryService::new)",
-    ),
-    (
         "api_enabled",
         "src/services/service_manager.rs:275 (gates whether the REST server starts at all)",
     ),

@@ -143,7 +143,6 @@ async fn test_broadcast_roundtrip_between_two_services() {
         socket: udp,
         identity: id.clone(),
         broadcast_addr: "127.0.0.1:9".parse().unwrap(),
-        broadcast_interval: tokio::time::Duration::from_secs(5),
     };
 
     let port2 = 0u16;
@@ -167,7 +166,6 @@ async fn test_broadcast_roundtrip_between_two_services() {
         socket: udp2,
         identity: id2,
         broadcast_addr: "127.0.0.1:9".parse().unwrap(),
-        broadcast_interval: tokio::time::Duration::from_secs(5),
     };
 
     let service2_addr = service2.socket.local_addr().unwrap();

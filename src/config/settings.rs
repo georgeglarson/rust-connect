@@ -10,7 +10,6 @@ use crate::utils::errors::{Error, Result};
 
 const DEFAULT_DEVICE_NAME: &str = "Rust Connect Device";
 const DEFAULT_LOG_LEVEL: &str = "info";
-const DEFAULT_BROADCAST_INTERVAL_SECS: u64 = 60;
 const DEFAULT_LOG_MAX_FILES: usize = 24;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 0;
 const DEFAULT_UI_ENABLED: bool = true;
@@ -26,7 +25,6 @@ pub struct AppSettings {
     pub data_dir: PathBuf,
     pub log_level: String,
     pub log_max_files: usize,
-    pub broadcast_interval_secs: u64,
     pub api_enabled: bool,
     pub api_port: u16,
     /// Address the REST API binds to. Defaults to loopback-only
@@ -58,7 +56,6 @@ impl Default for AppSettings {
             data_dir: data_dir.clone(),
             log_level: DEFAULT_LOG_LEVEL.to_string(),
             log_max_files: DEFAULT_LOG_MAX_FILES,
-            broadcast_interval_secs: DEFAULT_BROADCAST_INTERVAL_SECS,
             api_enabled: true,
             api_port: 9090,
             api_bind: DEFAULT_API_BIND.to_string(),
@@ -246,11 +243,6 @@ impl AppSettings {
 
     /// Validates configuration values and returns clear errors for invalid settings.
     pub fn validate(&self) -> Result<()> {
-        if self.broadcast_interval_secs == 0 {
-            return Err(Error::ConfigError(
-                "broadcast_interval_secs must be > 0 (would flood network)".to_string(),
-            ));
-        }
         if self.api_port == 0 {
             return Err(Error::ConfigError(
                 "api_port must be > 0 (port 0 is unpredictable)".to_string(),
@@ -284,7 +276,6 @@ mod tests {
         let settings = AppSettings::default();
         assert_eq!(settings.tcp_port, DEFAULT_TCP_PORT);
         assert_eq!(settings.udp_port, DEFAULT_UDP_PORT);
-        assert_eq!(settings.broadcast_interval_secs, 60);
         assert!(settings.api_enabled);
         assert!(settings.api_keys.is_empty());
         // Secure-by-default: loopback-only bind, no cross-origin access.
@@ -363,10 +354,6 @@ mod tests {
 
         assert_eq!(loaded.device_name, settings.device_name);
         assert_eq!(loaded.tcp_port, settings.tcp_port);
-        assert_eq!(
-            loaded.broadcast_interval_secs,
-            settings.broadcast_interval_secs
-        );
     }
 
     #[test]
@@ -542,12 +529,6 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_zero_values() {
-        let settings = AppSettings {
-            broadcast_interval_secs: 0,
-            ..Default::default()
-        };
-        assert!(settings.validate().is_err());
-
         let settings = AppSettings {
             api_port: 0,
             ..Default::default()

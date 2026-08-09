@@ -35,7 +35,7 @@
 //!     vec!["kdeconnect.ping".to_string()],
 //! );
 //!
-//! let service = DiscoveryService::new(identity, 5, DEFAULT_UDP_PORT).await?;
+//! let service = DiscoveryService::new(identity, DEFAULT_UDP_PORT).await?;
 //! service.broadcast().await?;
 //! # Ok(())
 //! # }

@@ -2,6 +2,7 @@
 //!
 //! Single Responsibility: Start and stop long-running services (discovery, TCP listener, API).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
@@ -21,7 +22,6 @@ pub struct ServiceHandles {
 
 /// Handles for the discovery service.
 pub struct DiscoveryHandles {
-    pub broadcast_handle: tokio::task::JoinHandle<()>,
     pub listen_handle: tokio::task::JoinHandle<()>,
     /// mDNS announce + browse (None when the mDNS daemon failed to start —
     /// UDP broadcast discovery still stands).
@@ -30,6 +30,10 @@ pub struct DiscoveryHandles {
     /// address changes and suspend/resume, re-announcing on each debounced
     /// event.
     pub network_change_handle: tokio::task::JoinHandle<()>,
+    /// Bounded UDP-broadcast fallback (Task 2.2 piece 3, vk #994): fills
+    /// the gap when mDNS is down and no device is connected. See
+    /// `services::broadcast_fallback` module docs for the policy.
+    pub fallback_handle: tokio::task::JoinHandle<()>,
 }
 
 /// Starts all services and returns their handles.
@@ -69,12 +73,12 @@ pub async fn start_services(
 /// Stops all services and persists state to disk.
 pub async fn stop_services(handles: ServiceHandles, state: &Arc<AppState>) {
     let timeout = std::time::Duration::from_secs(5);
-    let _ = tokio::time::timeout(timeout, handles.discovery.broadcast_handle).await;
     let _ = tokio::time::timeout(timeout, handles.discovery.listen_handle).await;
     if let Some(h) = handles.discovery.mdns_handle {
         let _ = tokio::time::timeout(timeout, h).await;
     }
     let _ = tokio::time::timeout(timeout, handles.discovery.network_change_handle).await;
+    let _ = tokio::time::timeout(timeout, handles.discovery.fallback_handle).await;
     if let Some(h) = handles.tcp {
         let _ = tokio::time::timeout(timeout, h).await;
     }
@@ -95,14 +99,8 @@ async fn start_discovery(
     identity: Identity,
     shutdown: CancellationToken,
 ) -> Result<DiscoveryHandles> {
-    let discovery = Arc::new(
-        DiscoveryService::new(
-            identity.clone(),
-            state.settings.broadcast_interval_secs,
-            state.settings.udp_port,
-        )
-        .await?,
-    );
+    let discovery =
+        Arc::new(DiscoveryService::new(identity.clone(), state.settings.udp_port).await?);
 
     info!(event = "discovery_ready", "Discovery service initialized");
 
@@ -113,19 +111,6 @@ async fn start_discovery(
             .start_listening(move |remote_identity, addr| {
                 on_device_discovered(state_clone.clone(), remote_identity, addr)
             })
-            .await;
-    });
-
-    let discovery_broadcast = discovery.clone();
-    // Discovery broadcast runs for the daemon's whole lifetime — KDE Connect
-    // peers rely on continuous broadcast to find additional devices. It stops
-    // only at shutdown. (It used to be cancelled on the first connection to
-    // mask the April pairing-storm bug; the fix is correct pairing, not a
-    // mute discovery service.)
-    let broadcast_shutdown = shutdown.clone();
-    let broadcast_handle = tokio::spawn(async move {
-        discovery_broadcast
-            .start_broadcasting(broadcast_shutdown)
             .await;
     });
 
@@ -141,24 +126,57 @@ async fn start_discovery(
                 None
             }
         };
+
+    // Tracks mDNS health for the broadcast-fallback policy (Task 2.2
+    // piece 3, vk #994 — see services::broadcast_fallback module docs).
+    // Starts false when mDNS failed to start at all; flipped false again
+    // below if its run task ever exits before shutdown was requested.
+    let mdns_healthy = Arc::new(AtomicBool::new(mdns.is_some()));
+
     let mdns_handle = mdns.clone().map(|mdns| {
         let state_clone = state.clone();
         let mdns_shutdown = shutdown.clone();
+        let mdns_healthy = mdns_healthy.clone();
         tokio::spawn(async move {
             mdns.run(
                 move |identity, addr| on_mdns_device_resolved(state_clone.clone(), identity, addr),
-                mdns_shutdown,
+                mdns_shutdown.clone(),
             )
             .await;
+            if !mdns_shutdown.is_cancelled() {
+                // The run loop only returns early (before shutdown was
+                // requested) when browsing failed to start or the daemon
+                // channel closed — i.e. mDNS died on its own. See
+                // MdnsDiscoveryService::run's doc comment for the exact
+                // exit paths.
+                mdns_healthy.store(false, Ordering::Relaxed);
+                warn!(
+                    event = "mdns_died",
+                    "mDNS discovery stopped unexpectedly; UDP broadcast fallback will engage"
+                );
+            }
         })
     });
+
+    // Announce on start (upstream behavior: kdeconnect-kde
+    // lanlinkprovider.cpp:149; kdeconnect-android LanLinkProvider.java:567).
+    // mDNS's own "announce on start" already happened inside
+    // MdnsDiscoveryService::new above (registers immediately); this is the
+    // UDP leg's counterpart. Best-effort — a failure here doesn't block
+    // startup, matching how every other discovery-channel failure degrades
+    // in this function.
+    if let Err(e) = discovery.broadcast().await {
+        warn!(
+            error = %e,
+            event = "startup_broadcast_failed",
+            "Failed to send the startup UDP broadcast"
+        );
+    }
 
     // Network-change reactor (Task 2.2, vk #994): re-announce (UDP
     // broadcast once + mDNS reannounce) on a debounced network-change
     // event, closing the mdns_discovery.rs "restart announcing on network
-    // change" TODO. Runs ALONGSIDE the periodic broadcast for now — Task
-    // 2.2 piece 3 replaces that periodic loop with the bounded fallback
-    // policy.
+    // change" TODO.
     let network_change_handle =
         crate::services::discovery_coordinator::spawn_network_change_reactor(
             discovery.clone(),
@@ -167,11 +185,27 @@ async fn start_discovery(
             shutdown.clone(),
         );
 
+    // Bounded UDP-broadcast fallback (Task 2.2 piece 3, vk #994):
+    // broadcasts on a backoff schedule ONLY while mDNS is down and no
+    // device is connected. Replaces the old unconditional 60s-forever
+    // broadcast loop (parity-checklist.md "Broadcast cadence" row) — a
+    // healthy host now broadcasts only on start and on network change,
+    // matching both references, with this as the documented divergence
+    // covering mDNS absence. See services::broadcast_fallback module
+    // docs for the full policy and its rationale.
+    let fallback_handle =
+        tokio::spawn(crate::services::broadcast_fallback::run_broadcast_fallback(
+            discovery.clone(),
+            mdns_healthy,
+            state.connection_manager.clone(),
+            shutdown.clone(),
+        ));
+
     Ok(DiscoveryHandles {
-        broadcast_handle,
         listen_handle,
         mdns_handle,
         network_change_handle,
+        fallback_handle,
     })
 }
 
