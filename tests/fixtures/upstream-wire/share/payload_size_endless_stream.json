@@ -1,0 +1,11 @@
+{
+  "id": 1754400000002,
+  "type": "kdeconnect.share.request",
+  "body": {
+    "filename": "stream.bin"
+  },
+  "payloadSize": -1,
+  "payloadTransferInfo": {
+    "port": 1739
+  }
+}

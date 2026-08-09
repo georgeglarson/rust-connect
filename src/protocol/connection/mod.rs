@@ -41,6 +41,27 @@ pub struct ConnectionManager {
     pub incoming_caps: Arc<std::sync::RwLock<Vec<String>>>,
     pub outgoing_caps: Arc<std::sync::RwLock<Vec<String>>>,
     pub(crate) generations: Arc<RwLock<HashMap<DeviceId, u64>>>,
+    /// The actual bound TCP port, once known (Task 2.3 gap A plumbing):
+    /// `get_identity()` uses this instead of always advertising
+    /// `DEFAULT_TCP_PORT`, which matters for the reverse-connection
+    /// fallback's UDP identity — Android silently drops a tcpPort outside
+    /// 1716-1764 (live-proven 2026-07-29), and if the daemon actually
+    /// bound a DIFFERENT free port in that range (1716 taken), the
+    /// fallback identity must carry the real one. `None` (the default for
+    /// any caller that never calls `set_tcp_port`, e.g. tests) preserves
+    /// the prior DEFAULT_TCP_PORT behavior exactly.
+    pub(crate) tcp_port: Arc<std::sync::RwLock<Option<u16>>>,
+    /// Peer's last-known advertised `incomingCapabilities` (Task 2.3 gap D;
+    /// `core/device.cpp:358-363` `Device::sendPacket`). Populated on a
+    /// fresh identity exchange (`accept_incoming`, `connect_to_device`)
+    /// with the SAME non-empty-both guard as
+    /// `Device::apply_capability_update` (device/types.rs) — a
+    /// legitimately empty pre-exchange identity, or a hostile empty-caps
+    /// one, must not erase capabilities already learned. No entry means
+    /// "unknown" (never gates) rather than "empty" (would gate
+    /// everything) — see `record_peer_capabilities` and `send_packet`'s
+    /// gate for why that distinction is load-bearing for the pairing flow.
+    pub(crate) peer_capabilities: Arc<RwLock<HashMap<DeviceId, Vec<String>>>>,
 }
 
 /// Android caps identity/packet lines at 512 KiB (LanLinkProvider.java:68,
@@ -175,6 +196,8 @@ impl ConnectionManager {
             incoming_caps: Arc::new(std::sync::RwLock::new(vec![])),
             outgoing_caps: Arc::new(std::sync::RwLock::new(vec![])),
             generations: Arc::new(RwLock::new(HashMap::new())),
+            tcp_port: Arc::new(std::sync::RwLock::new(None)),
+            peer_capabilities: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -214,6 +237,14 @@ impl ConnectionManager {
         *self.device_name.write().unwrap_or_else(|e| e.into_inner()) = device_name.to_string();
     }
 
+    /// Records the ACTUAL bound TCP port, once `listener::bind_port` has
+    /// resolved it (Task 2.3 gap A plumbing — see the `tcp_port` field's
+    /// doc). Call once at startup, after binding, alongside
+    /// `set_device_identity`/`set_capabilities`.
+    pub fn set_tcp_port(&self, port: u16) {
+        *self.tcp_port.write().unwrap_or_else(|e| e.into_inner()) = Some(port);
+    }
+
     pub fn get_identity(&self) -> Option<Identity> {
         let device_id = self
             .device_id
@@ -228,7 +259,7 @@ impl ConnectionManager {
         if device_id.is_empty() {
             return None;
         }
-        Some(Identity::new(
+        let mut identity = Identity::new(
             device_id,
             device_name,
             crate::device::types::DeviceType::Desktop,
@@ -240,7 +271,32 @@ impl ConnectionManager {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
-        ))
+        );
+        if let Some(port) = *self.tcp_port.read().unwrap_or_else(|e| e.into_inner()) {
+            identity.tcp_port = Some(port);
+        }
+        Some(identity)
+    }
+
+    /// Records the peer's advertised `incomingCapabilities` from a fresh
+    /// identity exchange, applying the same non-empty-both guard as
+    /// `Device::apply_capability_update` (device/types.rs): the update
+    /// lands only when BOTH the incoming and outgoing lists on the new
+    /// identity are non-empty. Real peers always send both; a legitimately
+    /// empty pre-exchange identity, or a hostile empty-caps one, must not
+    /// erase (or falsely establish) gating capabilities. Feeds
+    /// `send_packet`'s gate (Task 2.3 gap D, `core/device.cpp:358-363`).
+    pub(crate) async fn record_peer_capabilities(
+        &self,
+        device_id: &DeviceId,
+        incoming: &[String],
+        outgoing: &[String],
+    ) {
+        if incoming.is_empty() || outgoing.is_empty() {
+            return;
+        }
+        let mut caps = self.peer_capabilities.write().await;
+        caps.insert(device_id.clone(), incoming.to_vec());
     }
 
     pub async fn send_packet(&self, device_id: &DeviceId, packet: &Packet) -> Result<()> {
@@ -257,6 +313,37 @@ impl ConnectionManager {
                 Error::ConnectionError(format!("No connection for device: {}", device_id))
             })?
         };
+
+        // Send-side capability gating (Task 2.3 gap D, `core/device.cpp:
+        // 358-363` `Device::sendPacket`): kdeconnect.identity and
+        // kdeconnect.pair are exempt exactly as upstream exempts
+        // isProtocolPacket(); everything else is refused when the peer's
+        // last-known incomingCapabilities are NON-EMPTY and don't list
+        // this packet type. A device we've never exchanged capabilities
+        // with (no map entry — legitimately empty pre-identity-exchange,
+        // e.g. mid-pairing) is NOT gated: upstream gates unconditionally
+        // because its caps always arrive with identity, but ordering here
+        // isn't guaranteed the same way, and gating on unknown caps would
+        // silently start failing plugin sends in the existing pairing-flow
+        // test suite (see record_peer_capabilities's doc + the brief's
+        // named call).
+        if !packet.is_identity() && !packet.is_pair() {
+            let caps = self.peer_capabilities.read().await;
+            if let Some(incoming) = caps.get(device_id) {
+                if !incoming.iter().any(|c| c == &packet.packet_type) {
+                    warn!(
+                        device_id = %device_id,
+                        packet_type = %packet.packet_type,
+                        event = "capability_not_supported",
+                        "Refusing to send a packet type the peer hasn't advertised support for"
+                    );
+                    return Err(Error::CapabilityNotSupported {
+                        device_id: device_id.clone(),
+                        packet_type: packet.packet_type.clone(),
+                    });
+                }
+            }
+        }
 
         let bytes = PacketSerializer::serialize(packet)?;
         trace!(

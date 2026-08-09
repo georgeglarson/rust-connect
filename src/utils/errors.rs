@@ -48,6 +48,19 @@ pub enum Error {
     #[error("Certificate error: {0}")]
     CertificateError(String),
 
+    /// Send-side capability gating (parity-checklist.md § Lifecycle,
+    /// `core/device.cpp:358-363` `Device::sendPacket`): the peer's last-
+    /// known `incomingCapabilities` don't list this packet type. Refusing
+    /// honestly (a typed 4xx) instead of a silent no-op — Android would
+    /// ignore the packet anyway, so this turns a fake success into a
+    /// truthful error, matching this project's standing stance against
+    /// silent drops.
+    #[error("Peer {device_id} does not support packet type {packet_type}")]
+    CapabilityNotSupported {
+        device_id: String,
+        packet_type: String,
+    },
+
     // Device Errors
     #[error("Device not found: {0}")]
     DeviceNotFound(String),
@@ -154,6 +167,7 @@ pub enum ErrorCode {
     PacketTooLarge,
     TlsError,
     CertificateError,
+    CapabilityNotSupported,
 
     // Device
     DeviceNotFound,
@@ -215,6 +229,7 @@ impl ErrorCode {
             Self::PacketTooLarge => "PACKET_TOO_LARGE",
             Self::TlsError => "TLS_ERROR",
             Self::CertificateError => "CERTIFICATE_ERROR",
+            Self::CapabilityNotSupported => "CAPABILITY_NOT_SUPPORTED",
             Self::DeviceNotFound => "DEVICE_NOT_FOUND",
             Self::DeviceAlreadyExists => "DEVICE_ALREADY_EXISTS",
             Self::InvalidStateTransition => "INVALID_STATE_TRANSITION",
@@ -249,7 +264,10 @@ impl ErrorCode {
             Self::NotFound | Self::DeviceNotFound | Self::PluginNotFound | Self::FileNotFound => {
                 404
             }
-            Self::InvalidRequest | Self::InvalidPacket | Self::InvalidConfigValue => 400,
+            Self::InvalidRequest
+            | Self::InvalidPacket
+            | Self::InvalidConfigValue
+            | Self::CapabilityNotSupported => 400,
             Self::DeviceAlreadyExists => 409,
             Self::PairingTimeout
             | Self::ConnectionError
@@ -302,6 +320,7 @@ impl Error {
             Self::PacketTooLarge { .. } => ErrorCode::PacketTooLarge,
             Self::TlsError(_) => ErrorCode::TlsError,
             Self::CertificateError(_) => ErrorCode::CertificateError,
+            Self::CapabilityNotSupported { .. } => ErrorCode::CapabilityNotSupported,
             Self::DeviceNotFound(_) => ErrorCode::DeviceNotFound,
             Self::DeviceAlreadyExists(_) => ErrorCode::DeviceAlreadyExists,
             Self::InvalidStateTransition { .. } => ErrorCode::InvalidStateTransition,
@@ -374,6 +393,7 @@ mod tests {
             ErrorCode::PacketTooLarge.as_str(),
             ErrorCode::TlsError.as_str(),
             ErrorCode::CertificateError.as_str(),
+            ErrorCode::CapabilityNotSupported.as_str(),
             ErrorCode::DeviceNotFound.as_str(),
             ErrorCode::DeviceAlreadyExists.as_str(),
             ErrorCode::InvalidStateTransition.as_str(),
@@ -413,6 +433,24 @@ mod tests {
         assert_eq!(ErrorCode::ConnectionError.http_status(), 503);
         assert_eq!(ErrorCode::DiscoveryError.http_status(), 500);
         assert_eq!(ErrorCode::InternalError.http_status(), 500);
+        // Gap 8 (parity-checklist.md § Lifecycle, vk #998 Task 2.3):
+        // capability gating refuses honestly with a 4xx, not a 500 —
+        // that's what makes it reach the API as a typed client error.
+        assert_eq!(ErrorCode::CapabilityNotSupported.http_status(), 400);
+    }
+
+    /// Gap 8: the error message names the offending packet type — the
+    /// brief's "body naming the type" requirement, verified at the
+    /// message layer (the API test in tests/protocol_integration.rs
+    /// verifies the same fact end to end through the HTTP body).
+    #[test]
+    fn test_capability_not_supported_message_names_the_type() {
+        let err = Error::CapabilityNotSupported {
+            device_id: "phoneaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            packet_type: "kdeconnect.mousepad.request".to_string(),
+        };
+        assert!(err.to_string().contains("kdeconnect.mousepad.request"));
+        assert_eq!(err.code().http_status(), 400);
     }
 
     #[test]
@@ -430,6 +468,10 @@ mod tests {
             },
             Error::TlsError("".into()),
             Error::CertificateError("".into()),
+            Error::CapabilityNotSupported {
+                device_id: "".into(),
+                packet_type: "".into(),
+            },
             Error::DeviceNotFound("".into()),
             Error::DeviceAlreadyExists("".into()),
             Error::InvalidStateTransition {

@@ -633,6 +633,70 @@ feature_ledger:
     reason: "Fixed 2026-08-09 (Task 2.1) — no longer an intentional divergence, matches kde's exact condition. desktop_effect/api_surface/lifecycle/live_device/environment stay UNVERIFIED: this is registry-level unit coverage, not a live hostile-input soak against a real hand-crafted UDP identity (the plan's own validation note; integrator's job). fixture_provenance stays UNVERIFIED — behavioral registry-state fix, no upstream-wire fixture applies."
     owner: "Sprint 2 / Task 2.1 (live hostile-input soak = integrator)"
 
+  - feature: reverse-connection-fallback
+    rust_impl: true
+    upstream: kdeconnect-kde
+    upstream_ref: "lanlinkprovider.cpp:343-354,395-399"
+    desktop_effect: UNVERIFIED
+    api_surface: NOT-APPLICABLE
+    lifecycle: UNVERIFIED
+    hostile_input: UNVERIFIED
+    fixture_provenance: UNVERIFIED
+    live_device: UNVERIFIED
+    environment: UNVERIFIED
+    status: UNVERIFIED
+    cite: "Task 2.3 (vk #998): src/protocol/connection/outbound.rs send_reverse_connection_fallback, called from connect_to_device at both failure legs (TCP connect error/timeout; plaintext-identity write/flush failure). test_reverse_fallback_sends_valid_udp_shaped_identity pins the sent identity's shape (tcpPort present, in 1716-1764); test_connect_to_device_dial_failure_sends_reverse_fallback_once proves leg 1 against a real ECONNREFUSED, exactly once, original error still returned; test_connect_to_device_write_failure_triggers_the_write_failure_branch proves leg 2's branch fires on a real ECONNRESET; test_connect_to_device_success_sends_no_fallback is the regression pin."
+    reason: "Fixed 2026-08-09 (Task 2.3) — no longer UNIMPLEMENTED (parity-checklist.md gap 5). desktop_effect/lifecycle/hostile_input/live_device/environment stay UNVERIFIED: unit-level TCP-failure simulation, not a live soak against a real kdeconnectd/Android peer behind asymmetric reachability (the plan's own validation note; integrator's job). api_surface is NOT-APPLICABLE — this fires inside the outbound connection path, not behind any REST/CLI surface."
+    owner: "Sprint 2 / Task 2.3 (live asymmetric-reachability soak = integrator)"
+
+  - feature: oversized-identity-empty-caps-retry
+    rust_impl: true
+    upstream: kdeconnect-kde
+    upstream_ref: "lanlinkprovider.cpp:259-269"
+    desktop_effect: UNVERIFIED
+    api_surface: NOT-APPLICABLE
+    lifecycle: UNVERIFIED
+    hostile_input: PASS
+    fixture_provenance: UNVERIFIED
+    live_device: UNVERIFIED
+    environment: UNVERIFIED
+    status: UNVERIFIED
+    cite: "Task 2.3 (vk #998): src/protocol/discovery.rs is_message_too_large (errno 90 Linux / 40 macOS-FreeBSD) + DiscoveryService::broadcast's retry. test_broadcast_retries_with_emptied_capabilities_on_oversized_identity forces a REAL EMSGSIZE (an identity built past IPv4's 65507-byte UDP ceiling, no mock) and confirms the retried datagram lands with both capability lists empty, exactly once; test_broadcast_normal_identity_unaffected is the regression pin; test_is_message_too_large_rejects_other_errors confirms non-EMSGSIZE errors are not retried."
+    reason: "Fixed 2026-08-09 (Task 2.3) — no longer UNIMPLEMENTED (parity-checklist.md gap 6). hostile_input: PASS on the strength of the real-EMSGSIZE adversarial test. desktop_effect/lifecycle/live_device/environment stay UNVERIFIED — no live macOS/FreeBSD (outpost) capture of an actual MTU-triggered broadcast drop yet, only the equivalent IPv4-ceiling trigger reachable from this Linux dev host. api_surface is NOT-APPLICABLE — internal to the discovery broadcast loop."
+    owner: "Sprint 2 / Task 2.3 (live outpost/BSD MTU-drop capture = integrator)"
+
+  - feature: payload-size-endless-stream
+    rust_impl: true
+    upstream: kdeconnect-kde
+    upstream_ref: "core/networkpacket.h:85, filetransferjob.cpp:108-122"
+    desktop_effect: UNVERIFIED
+    api_surface: UNVERIFIED
+    lifecycle: NOT-APPLICABLE
+    hostile_input: PASS
+    fixture_provenance: PASS
+    live_device: UNVERIFIED
+    environment: UNVERIFIED
+    status: UNVERIFIED
+    cite: "Task 2.3 (vk #998): tests/fixtures/upstream-wire/share/payload_size_endless_stream.json (hand-authored from networkpacket.h:85 + filetransferjob.cpp:108-110, no live -1 capture available — see provenance.yaml); src/protocol/types.rs PayloadSize enum. test_payload_size_deserializes_endless_stream_sentinel loads the fixture; test_payload_size_stream_round_trips_back_to_negative_one; test_payload_size_negative_two_rejected is the adversarial case. src/protocol/payload_transfer.rs receive_file_streaming/_unique_streaming: test_streaming_receive_clean_eof_lands_complete_byte_identical, test_streaming_receive_exactly_at_cap_succeeds (off-by-one guard), test_streaming_receive_exceeding_cap_errors_and_deletes_partial (the adversarial unbounded-stream case, our DoS-posture divergence from upstream's uncapped keep-the-extra behavior)."
+    reason: "Fixed 2026-08-09 (Task 2.3) — no longer UNIMPLEMENTED (parity-checklist.md gap 7). hostile_input + fixture_provenance: PASS. desktop_effect/api_surface/live_device/environment stay UNVERIFIED: unit + fixture-level coverage, not a live transfer against a real kdeconnectd peer actually using payloadSize=-1 (the plan's own validation note; integrator's job — Android's share plugin never sends the sentinel, so this needs a kdeconnectd peer specifically). lifecycle is NOT-APPLICABLE — a per-transfer wire/streaming behavior, not a connect/pair/disconnect one."
+    owner: "Sprint 2 / Task 2.3 (live kdeconnectd -1 transfer capture = integrator)"
+
+  - feature: send-side-capability-gating
+    rust_impl: true
+    upstream: kdeconnect-kde
+    upstream_ref: "core/device.cpp:358-363"
+    desktop_effect: UNVERIFIED
+    api_surface: UNVERIFIED
+    lifecycle: UNVERIFIED
+    hostile_input: PASS
+    fixture_provenance: UNVERIFIED
+    live_device: UNVERIFIED
+    environment: UNVERIFIED
+    status: UNVERIFIED
+    cite: "Task 2.3 (vk #998): src/protocol/connection/mod.rs send_packet's gate + record_peer_capabilities (peer_capabilities map, same non-empty-both guard as Device::apply_capability_update); src/utils/errors.rs Error::CapabilityNotSupported (HTTP 400). test_send_packet_refuses_unsupported_capability is the adversarial/hostile case (send a type the peer never advertised, typed 4xx error); test_send_packet_exempts_identity_and_pair; test_send_packet_allows_when_peer_capabilities_unknown (the brief's named pairing-flow ordering case); test_capability_update_re_allows_previously_refused_type; test_capability_gating_wired_from_real_identity_exchange proves the production wiring end to end against a real connect_to_device handshake."
+    reason: "Fixed 2026-08-09 (Task 2.3) — no longer UNIMPLEMENTED (parity-checklist.md gap 8). hostile_input: PASS on the refusal test. desktop_effect/api_surface/lifecycle/live_device/environment stay UNVERIFIED: unit-level coverage through send_packet directly and one real-TLS-handshake wiring test, not a live axum-router round trip returning the 4xx over HTTP, nor a live-device soak (the plan's own validation note; integrator's job)."
+    owner: "Sprint 2 / Task 2.3 (live API round-trip + device soak = integrator)"
+
   # Upstream-only roles seeded UNVERIFIED. Each role appears under exactly
   # one implementation; Sprint 3 / Task 3.1 decides which map to Rust code,
   # which become intentional divergences, and which become out-of-scope.

@@ -33,8 +33,8 @@ pub use packet::PacketSerializer;
 pub use pairing::{PairState, PairingHandler};
 pub use router::PacketRouter;
 pub use types::{
-    ConnectionInfo, Identity, Packet, PairingRequest, DEFAULT_TCP_PORT, DEFAULT_UDP_PORT,
-    PROTOCOL_VERSION,
+    ConnectionInfo, Identity, Packet, PairingRequest, PayloadSize, DEFAULT_TCP_PORT,
+    DEFAULT_UDP_PORT, PROTOCOL_VERSION,
 };
 
 /// Android `isPrivateAddress` (NetworkHelper.kt): loopback, site-local,

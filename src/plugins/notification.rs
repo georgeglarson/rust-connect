@@ -345,7 +345,13 @@ impl NotificationPlugin {
             return Some(path);
         }
 
-        let payload_size = packet.payload_size?;
+        // Icon transfers don't support the payloadSize=-1 endless-stream
+        // sentinel (android's share plugin, which this mirrors, never uses
+        // it either) — a stream declines exactly like a missing
+        // payloadSize (parity-checklist.md gap 7; out of scope for icons).
+        let payload_size = packet
+            .payload_size
+            .and_then(crate::protocol::types::PayloadSize::known)?;
         if payload_size == 0 || payload_size > MAX_NOTIFICATION_ICON_BYTES {
             debug!(device_id = %device_id, payload_size, "Notification icon payload exceeds the bound");
             return None;

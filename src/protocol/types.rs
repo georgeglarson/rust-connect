@@ -231,6 +231,99 @@ impl Identity {
     }
 }
 
+/// Wire representation of `payloadSize`: a non-negative byte count, or the
+/// kde-only `-1` "endless stream" sentinel (`core/networkpacket.h:85`,
+/// `qint64 payloadSize`, `-1` means the sender doesn't know how much it
+/// will send; `filetransferjob.cpp:108-110` receives it by streaming to a
+/// clean EOF instead of checking a declared count). Before this type
+/// existed `Packet.payload_size` was `Option<u64>`, so a kdeconnect-kde
+/// peer sending the sentinel failed deserialization of the WHOLE packet,
+/// not just the transfer (parity-checklist.md gap 7's live defect). Any
+/// value other than a non-negative integer or exactly `-1` is rejected —
+/// same lenient-but-bounded posture as `deserialize_lenient_i64` above for
+/// `id`. We never SEND `-1` (no producer; `with_payload_size` stays `u64`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadSize {
+    Known(u64),
+    /// `payloadSize: -1` — endless stream, no declared byte count.
+    Stream,
+}
+
+impl PayloadSize {
+    /// The declared byte count, or `None` for the endless-stream sentinel.
+    /// Callers with no streaming support (e.g. the notification plugin's
+    /// bounded icon transfer) use this to decline exactly as they would a
+    /// missing `payloadSize`.
+    pub fn known(self) -> Option<u64> {
+        match self {
+            Self::Known(n) => Some(n),
+            Self::Stream => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PayloadSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Known(n) => write!(f, "{n}"),
+            Self::Stream => write!(f, "-1 (stream)"),
+        }
+    }
+}
+
+impl Serialize for PayloadSize {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            // -1 must round-trip: a kde peer re-reads what we relay.
+            Self::Known(n) => serializer.serialize_u64(*n),
+            Self::Stream => serializer.serialize_i64(-1),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PayloadSize {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        // Route through i64 FIRST (as the property test caught): a `Known`
+        // value near u64::MAX is a legal payload size but doesn't fit in
+        // i64, so it must fall through to the u64 parse below rather than
+        // erroring — this is exactly the class of bug
+        // `deserialize_lenient_i64` (this file, `id`) exists to avoid by
+        // going through `serde_json::Value` instead of a single fixed
+        // numeric type.
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    if i == -1 {
+                        return Ok(Self::Stream);
+                    }
+                    if i >= 0 {
+                        return Ok(Self::Known(i as u64));
+                    }
+                    return Err(Error::custom(format!(
+                        "payloadSize must be a non-negative integer or -1 (endless stream), got {i}"
+                    )));
+                }
+                if let Some(u) = n.as_u64() {
+                    return Ok(Self::Known(u));
+                }
+                Err(Error::custom(format!(
+                    "payloadSize must be an integer, got {n}"
+                )))
+            }
+            other => Err(Error::custom(format!(
+                "payloadSize must be a number, got {other}"
+            ))),
+        }
+    }
+}
+
 /// KDE Connect packet
 ///
 /// All communication uses this packet format.
@@ -245,7 +338,7 @@ pub struct Packet {
     pub body: serde_json::Value,
 
     #[serde(skip_serializing_if = "Option::is_none", rename = "payloadSize")]
-    pub payload_size: Option<u64>,
+    pub payload_size: Option<PayloadSize>,
 
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -266,7 +359,7 @@ impl Packet {
     }
 
     pub fn with_payload_size(mut self, size: u64) -> Self {
-        self.payload_size = Some(size);
+        self.payload_size = Some(PayloadSize::Known(size));
         self
     }
 
@@ -585,11 +678,133 @@ mod tests {
     fn test_packet_payload_fields_deserialize_android_wire_format() {
         let wire = r#"{"id":1,"type":"kdeconnect.share.request","body":{},"payloadSize":1024,"payloadTransferInfo":{"port":1739}}"#;
         let packet: Packet = serde_json::from_str(wire).expect("deserialize android wire format");
-        assert_eq!(packet.payload_size, Some(1024));
+        assert_eq!(packet.payload_size, Some(PayloadSize::Known(1024)));
         assert_eq!(
             packet.payload_transfer_info,
             Some(serde_json::json!({"port": 1739}))
         );
+    }
+
+    // Gap 7 (parity-checklist.md § Payload transfers, vk #998 Task 2.3):
+    // kdeconnect-kde's payloadSize=-1 endless-stream sentinel
+    // (core/networkpacket.h:85) used to fail deserialization of the WHOLE
+    // packet, not just the transfer, because `payload_size` was
+    // `Option<u64>`. Fixture: tests/fixtures/upstream-wire/share/
+    // payload_size_endless_stream.json (hand-authored from source; see
+    // provenance.yaml).
+    #[test]
+    fn test_payload_size_deserializes_endless_stream_sentinel() {
+        let fixture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/upstream-wire/share/payload_size_endless_stream.json"
+        ))
+        .expect("fixture must be readable");
+        let packet: Packet =
+            serde_json::from_str(&fixture).expect("payloadSize: -1 must deserialize the packet");
+        assert_eq!(packet.payload_size, Some(PayloadSize::Stream));
+    }
+
+    #[test]
+    fn test_payload_size_stream_round_trips_back_to_negative_one() {
+        // KDE peers re-read what we relay: -1 in, -1 out.
+        let packet = Packet::new(
+            "kdeconnect.share.request".to_string(),
+            serde_json::json!({}),
+        );
+        let mut packet = packet;
+        packet.payload_size = Some(PayloadSize::Stream);
+        let json = serde_json::to_string(&packet).expect("serialize");
+        assert!(
+            json.contains("\"payloadSize\":-1"),
+            "wire json must carry -1, got: {json}"
+        );
+        let round_tripped: Packet = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped.payload_size, Some(PayloadSize::Stream));
+    }
+
+    #[test]
+    fn test_payload_size_negative_two_rejected() {
+        let wire = r#"{"id":1,"type":"kdeconnect.share.request","body":{},"payloadSize":-2}"#;
+        let result: std::result::Result<Packet, _> = serde_json::from_str(wire);
+        assert!(
+            result.is_err(),
+            "payloadSize values other than -1 must be rejected, not silently accepted"
+        );
+    }
+
+    /// Non-integer wire values for `payloadSize` (a JSON string, a float)
+    /// are hostile or broken input, not a lenient-coercion case — no
+    /// reference implementation ever emits them (qint64 on the wire in
+    /// kde, long in Android). Both must reject. An explicit `null` is the
+    /// one lenient case: serde's `Option` semantics read it as the field
+    /// being absent, which is safe ("no payload") and pinned here so a
+    /// future deserializer change doesn't flip it silently. (Bot round,
+    /// PR #14.)
+    #[test]
+    fn test_payload_size_non_integer_values_rejected() {
+        for (wire, what) in [
+            (
+                r#"{"id":1,"type":"kdeconnect.share.request","body":{},"payloadSize":"1024"}"#,
+                "a JSON string",
+            ),
+            (
+                r#"{"id":1,"type":"kdeconnect.share.request","body":{},"payloadSize":3.5}"#,
+                "a float",
+            ),
+        ] {
+            let result: std::result::Result<Packet, _> = serde_json::from_str(wire);
+            assert!(
+                result.is_err(),
+                "payloadSize as {what} must be rejected, got {result:?}"
+            );
+        }
+
+        let null_wire =
+            r#"{"id":1,"type":"kdeconnect.share.request","body":{},"payloadSize":null}"#;
+        let packet: Packet = serde_json::from_str(null_wire)
+            .expect("explicit null payloadSize must parse (absent-field semantics)");
+        assert_eq!(
+            packet.payload_size, None,
+            "explicit null payloadSize reads as absent, never as a transfer"
+        );
+    }
+
+    // Regression: the property test (tests/property_tests.rs) caught this
+    // dead — a Known value above i64::MAX (still a perfectly legal u64
+    // payload size) failed to round-trip because the first deserialize
+    // implementation routed every value through i64 first. Fixed by
+    // parsing via serde_json::Value and falling back to as_u64().
+    #[test]
+    fn test_payload_size_known_value_above_i64_max_round_trips() {
+        let packet = Packet::new("kdeconnect.ping".to_string(), serde_json::json!({}))
+            .with_payload_size(9_223_372_036_854_775_808u64); // i64::MAX + 1
+        let json = serde_json::to_string(&packet).expect("serialize");
+        let round_tripped: Packet = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(
+            round_tripped.payload_size,
+            Some(PayloadSize::Known(9_223_372_036_854_775_808u64))
+        );
+    }
+
+    #[test]
+    fn test_payload_size_known_value_unaffected() {
+        let packet = Packet::new("kdeconnect.ping".to_string(), serde_json::json!({}))
+            .with_payload_size(4096);
+        assert_eq!(packet.payload_size, Some(PayloadSize::Known(4096)));
+        assert_eq!(packet.payload_size.and_then(PayloadSize::known), Some(4096));
+        assert_eq!(PayloadSize::Stream.known(), None);
+    }
+
+    #[test]
+    fn test_packet_with_no_payload_size_field_deserializes_as_none() {
+        // A missing `payloadSize` key (e.g. kdeconnect.ping) must still
+        // deserialize to `None`, same as before this type existed — the
+        // custom `Deserialize for PayloadSize` only runs when the field is
+        // PRESENT; serde's field-level `Option<T>` handling (recognizing
+        // the field type syntactically) still supplies `None` on absence.
+        let wire = r#"{"id":1,"type":"kdeconnect.ping","body":{}}"#;
+        let packet: Packet = serde_json::from_str(wire).expect("deserialize");
+        assert_eq!(packet.payload_size, None);
     }
 
     // Conformance: tcpPort MUST be present in the UDP broadcast identity but

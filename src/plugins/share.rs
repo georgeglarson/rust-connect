@@ -425,10 +425,12 @@ impl SharePlugin {
         device_id: String,
         filename: String,
         transfer_info: PayloadTransferInfo,
-        payload_size: u64,
+        payload_size: crate::protocol::types::PayloadSize,
         max_file_size_bytes: u64,
         cert_manager: Arc<crate::protocol::crypto::CertificateManager>,
     ) {
+        use crate::protocol::types::PayloadSize;
+
         let safe_filename = match Self::sanitize_filename(&filename) {
             Some(name) => name,
             None => {
@@ -437,17 +439,22 @@ impl SharePlugin {
             }
         };
 
-        // The declared payloadSize is the ONLY size bound — it caps both the
-        // pre-transfer check and the actual byte count read off the wire.
-        if payload_size > max_file_size_bytes {
-            warn!(
-                filename = %filename,
-                size = payload_size,
-                limit = max_file_size_bytes,
-                event = "share_file_too_large",
-                "File exceeds size limit"
-            );
-            return;
+        // The declared payloadSize is the ONLY pre-flight size bound for a
+        // Known transfer. A Stream (payloadSize: -1, parity-checklist.md
+        // gap 7) has no declared size to check up front — max_file_size_bytes
+        // instead becomes the resource bound the RECEIVE enforces as it
+        // reads (see receive_file_unique_streaming).
+        if let PayloadSize::Known(size) = payload_size {
+            if size > max_file_size_bytes {
+                warn!(
+                    filename = %filename,
+                    size = size,
+                    limit = max_file_size_bytes,
+                    event = "share_file_too_large",
+                    "File exceeds size limit"
+                );
+                return;
+            }
         }
 
         let dest_path = download_dir.join(&safe_filename);
@@ -458,10 +465,25 @@ impl SharePlugin {
         }
 
         let transfer = PayloadTransfer::new(cert_manager, device_id.clone());
-        match transfer
-            .receive_file_unique(&transfer_info, payload_size, &dest_path)
-            .await
-        {
+        let result = match payload_size {
+            PayloadSize::Known(size) => {
+                transfer
+                    .receive_file_unique(&transfer_info, size, &dest_path)
+                    .await
+            }
+            PayloadSize::Stream => {
+                info!(
+                    filename = %filename,
+                    max_bytes = max_file_size_bytes,
+                    event = "share_endless_stream_transfer",
+                    "Receiving a payloadSize=-1 endless-stream payload (kde sentinel)"
+                );
+                transfer
+                    .receive_file_unique_streaming(&transfer_info, max_file_size_bytes, &dest_path)
+                    .await
+            }
+        };
+        match result {
             Ok((bytes, received_path)) => {
                 let received_name = received_path
                     .strip_prefix(&download_dir)
@@ -726,7 +748,7 @@ impl Plugin for SharePlugin {
                     info!(
                         ip = ?transfer_info.ip,
                         port = transfer_info.port,
-                        payload_size = payload_size,
+                        payload_size = %payload_size,
                         event = "share_payload_transfer",
                         "Starting file receive via payload transfer"
                     );
