@@ -164,19 +164,29 @@ impl PausemusicPlugin {
         // duplicating it — the detection logic (pactl on PATH + answers
         // get-default-sink) has one home; the connection itself stays
         // separate per plugin, same as the MPRIS backend above.
-        match backend::detect() {
-            Some(volume_backend) => {
-                info!(
-                    event = "pausemusic_volume_backend_ready",
-                    "System-volume mute backend enabled"
-                );
-                self.set_volume_backend(Arc::new(volume_backend));
-            }
-            None => {
-                warn!(
-                    event = "pausemusic_volume_backend_unavailable",
-                    "No pactl backend for pausemusic mute. Mute action degraded to a no-op."
-                );
+        //
+        // Gated on ACTION_MUTE (PR #11 review): detect() runs pactl
+        // synchronously, and while the mute action is hardcoded off the
+        // backend is unreachable from handle_packet — probing anyway
+        // spends a subprocess at every enable and can log a misleading
+        // "mute degraded" warning for an action that is disabled, not
+        // degraded. Tests bypass this gate via set_volume_backend
+        // directly, so the mechanism stays fully covered.
+        if ACTION_MUTE {
+            match backend::detect() {
+                Some(volume_backend) => {
+                    info!(
+                        event = "pausemusic_volume_backend_ready",
+                        "System-volume mute backend enabled"
+                    );
+                    self.set_volume_backend(Arc::new(volume_backend));
+                }
+                None => {
+                    warn!(
+                        event = "pausemusic_volume_backend_unavailable",
+                        "No pactl backend for pausemusic mute. Mute action degraded to a no-op."
+                    );
+                }
             }
         }
     }

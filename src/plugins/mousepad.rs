@@ -672,6 +672,13 @@ pub struct MousepadPlugin {
     /// Lazily created on the first absolute-positioning packet — see
     /// `AbsoluteInputDevice`'s doc.
     abs_input_device: Mutex<Option<AbsoluteInputDevice>>,
+    /// Whether the lazy `abs_input_device` creation has been tried.
+    /// `None` in the cell alone can't distinguish "never tried" from
+    /// "tried and failed", and without the distinction a host with no
+    /// usable `/dev/uinput` re-opens the device and re-warns on EVERY
+    /// absolute packet a peer streams (PR #11 review). One attempt per
+    /// plugin instance, matching `input_device`'s decided-once semantics.
+    abs_device_attempted: std::sync::atomic::AtomicBool,
     /// Whether this instance may open real uinput devices at all.
     /// `new_without_input()` sets this false: unlike `input_device` (which
     /// is decided once at construction and never retried), the absolute
@@ -707,6 +714,7 @@ impl MousepadPlugin {
             events_received: AtomicUsize::new(0),
             input_device: Mutex::new(input_device),
             abs_input_device: Mutex::new(None),
+            abs_device_attempted: std::sync::atomic::AtomicBool::new(false),
             uinput_enabled: true,
         }
     }
@@ -719,6 +727,7 @@ impl MousepadPlugin {
             events_received: AtomicUsize::new(0),
             input_device: Mutex::new(None),
             abs_input_device: Mutex::new(None),
+            abs_device_attempted: std::sync::atomic::AtomicBool::new(false),
             uinput_enabled: false,
         }
     }
@@ -738,7 +747,11 @@ impl MousepadPlugin {
         let Ok(mut guard) = self.abs_input_device.lock() else {
             return;
         };
-        if guard.is_none() {
+        if guard.is_none()
+            && !self
+                .abs_device_attempted
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             *guard = AbsoluteInputDevice::new();
             if guard.is_some() {
                 info!(

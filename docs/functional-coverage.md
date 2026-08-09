@@ -1797,7 +1797,9 @@ environment_matrix:
     clipboard-wayland: UNVERIFIED
     uinput: NOT-APPLICABLE
     audio: NOT-APPLICABLE
-    session_dbus: PASS
+    # Neither clipboard backend touches the session bus (wl-clipboard /
+    # xclip subprocesses only) — PR #11 review caught the unsupported PASS.
+    session_dbus: NOT-APPLICABLE
     notification_server: NOT-APPLICABLE
     status: UNVERIFIED
     cite: "Task 1.6 Backend C, vk #1010: tests/clipboard_x11.rs live-verifies X11Clipboard (xclip) against a real Xvfb X server in both directions — backend write is read back via an independent xclip call, and an independent xclip write is picked up by the backend's watcher (poll fallback here; no clipnotify on this host, see src/plugins/clipboard.rs module doc for the clipnotify-vs-poll divergence from upstream's QClipboard/GtkClipboard signals)"

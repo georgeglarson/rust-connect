@@ -141,11 +141,25 @@ async fn x11_backend_roundtrips_with_independent_xclip() {
         .await
         .expect("join xclip_write");
 
-    let received = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("watcher must observe the external change within 5s")
-        .expect("watcher channel must not close");
-    assert_eq!(received, "set externally");
+    // The poll watcher's first tick pushes whatever the clipboard already
+    // holds ("hello from rust-connect" from step 1, if it beats the
+    // xclip_write above) — drain until the expected value arrives instead
+    // of asserting on the first message (PR #11 review: the first-recv
+    // assert was a timing-dependent flake).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let received = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("watcher must observe the external change within 5s")
+            .expect("watcher channel must not close");
+        if received == "set externally" {
+            break;
+        }
+        assert_eq!(
+            received, "hello from rust-connect",
+            "watcher emitted content nothing in this test ever set"
+        );
+    }
 
     drop(xvfb);
 }
