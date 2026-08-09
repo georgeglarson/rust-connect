@@ -732,6 +732,43 @@ mod tests {
         );
     }
 
+    /// Non-integer wire values for `payloadSize` (a JSON string, a float)
+    /// are hostile or broken input, not a lenient-coercion case — no
+    /// reference implementation ever emits them (qint64 on the wire in
+    /// kde, long in Android). Both must reject. An explicit `null` is the
+    /// one lenient case: serde's `Option` semantics read it as the field
+    /// being absent, which is safe ("no payload") and pinned here so a
+    /// future deserializer change doesn't flip it silently. (Bot round,
+    /// PR #14.)
+    #[test]
+    fn test_payload_size_non_integer_values_rejected() {
+        for (wire, what) in [
+            (
+                r#"{"id":1,"type":"kdeconnect.share.request","body":{},"payloadSize":"1024"}"#,
+                "a JSON string",
+            ),
+            (
+                r#"{"id":1,"type":"kdeconnect.share.request","body":{},"payloadSize":3.5}"#,
+                "a float",
+            ),
+        ] {
+            let result: std::result::Result<Packet, _> = serde_json::from_str(wire);
+            assert!(
+                result.is_err(),
+                "payloadSize as {what} must be rejected, got {result:?}"
+            );
+        }
+
+        let null_wire =
+            r#"{"id":1,"type":"kdeconnect.share.request","body":{},"payloadSize":null}"#;
+        let packet: Packet = serde_json::from_str(null_wire)
+            .expect("explicit null payloadSize must parse (absent-field semantics)");
+        assert_eq!(
+            packet.payload_size, None,
+            "explicit null payloadSize reads as absent, never as a transfer"
+        );
+    }
+
     // Regression: the property test (tests/property_tests.rs) caught this
     // dead — a Known value above i64::MAX (still a perfectly legal u64
     // payload size) failed to round-trip because the first deserialize

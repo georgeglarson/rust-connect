@@ -420,7 +420,14 @@ async fn send_reverse_connection_fallback(
             return;
         }
     };
-    let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+    // Bind in the peer's address family: an `0.0.0.0` socket cannot
+    // `send_to` an IPv6 target (the fallback would silently no-op on v6
+    // links — bot round, PR #14).
+    let bind_addr: SocketAddr = match peer_ip {
+        std::net::IpAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+        std::net::IpAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
         Ok(s) => s,
         Err(e) => {
             warn!(
@@ -458,7 +465,7 @@ mod tests {
     use super::*;
     use crate::device::types::DeviceType;
     use crate::protocol::crypto::CertificateManager;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn test_identity() -> Identity {
         Identity::new(
@@ -505,6 +512,39 @@ mod tests {
             (crate::protocol::types::MIN_PORT..=crate::protocol::types::MAX_PORT)
                 .contains(&tcp_port),
             "tcpPort must be in kdeconnect's 1716-1764 range, got {tcp_port}"
+        );
+    }
+
+    /// An IPv6 peer must receive the fallback too: a socket bound to
+    /// `0.0.0.0` cannot `send_to` a v6 target, so the bind must follow the
+    /// peer's address family (bot round, PR #14 — same defect class as the
+    /// cypher round-1 IPv6 `format!` fix in connection_orchestrator).
+    #[tokio::test]
+    async fn test_reverse_fallback_reaches_an_ipv6_peer() {
+        let capture = match tokio::net::UdpSocket::bind("[::1]:0").await {
+            Ok(s) => s,
+            // Host without IPv6 loopback (some CI containers): nothing to
+            // test — the v4 leg is covered above.
+            Err(_) => return,
+        };
+        let capture_port = capture.local_addr().expect("local_addr").port();
+
+        let identity = test_identity();
+        send_reverse_connection_fallback(&identity, Ipv6Addr::LOCALHOST.into(), capture_port).await;
+
+        let mut buf = vec![0u8; 65536];
+        let (len, _addr) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            capture.recv_from(&mut buf),
+        )
+        .await
+        .expect("the fallback datagram must arrive on the v6 capture socket")
+        .expect("recv_from");
+
+        let packet = PacketSerializer::deserialize(&buf[..len]).expect("must deserialize");
+        assert!(
+            packet.is_identity(),
+            "fallback must send an identity packet"
         );
     }
 
