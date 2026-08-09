@@ -6,7 +6,11 @@ vk #997): Robustness gap 2 (payload accept timeout) fixed, row updated to
 CONFORMANT*; gap 3 (capability overwrite on empty-cap identity) fixed,
 row updated to CONFORMANT; gap 4 (UDP receive buffer) fixed, row updated
 to CONFORMANT* — see that row's note on what SO_RCVBUF actually protects
-against. Sources:
+against. Revised 2026-08-09 (Task 2.3, vk #998): the four remaining
+Cosmetic / interop edge gaps (5-8) all fixed — reverse-connection
+fallback, oversized-identity empty-caps retry, `payloadSize = -1`
+endless-stream sentinel, send-side capability gating. Rows updated
+below; no open gaps remain. Sources:
 
 - **kde** = kdeconnect-kde, local clone `~/repos/kdeconnect-kde` (paths relative to it).
 - **android** = kdeconnect-android. `docs/reference/LanLinkProvider.java` and
@@ -31,11 +35,11 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 | Immediate re-broadcast on network change | Yes (`lanlinkprovider.cpp:180-194`) | Yes (V `LanLinkProvider.java:572-584`) | **CONFORMANT** — a netlink-backed watcher (interface/address changes, resume-from-suspend) debounces into one event that broadcasts once + re-announces mDNS | `src/services/network_watcher.rs`, `src/services/discovery_coordinator.rs` |
 | Broadcast destination | 255.255.255.255 per-interface (source-bound) + custom devices (`lanlinkprovider.cpp:207-248`) | 255.255.255.255 (trusted nets only) + custom devices (V `LanLinkProvider.java:474-481`) | **CONFORMANT\*** — 255.255.255.255 only, single socket; no per-interface binding, no custom-device list (manual connect via API instead) | `src/protocol/discovery.rs:97` |
 | Ports: UDP 1716, TCP first-free 1716-1764 | `lanlinkprovider.h:67-69`, `lanlinkprovider.cpp:139-147` | V `LanLinkProvider.java:64-65,454-470` | **CONFORMANT** | `src/protocol/types.rs:15-23`, `src/protocol/listener.rs` `bind_port` |
-| Oversized identity fallback (re-send with emptied capabilities) | On `DatagramTooLargeError` (`lanlinkprovider.cpp:259-269`) | Absent | **UNIMPLEMENTED** (kde-only behavior) | — |
+| Oversized identity fallback (re-send with emptied capabilities) | On `DatagramTooLargeError` (`lanlinkprovider.cpp:259-269`) | Absent | **CONFORMANT** (kde-only behavior, fixed Task 2.3) — retries on EMSGSIZE (errno 90 Linux / 40 macOS-FreeBSD) with both capability lists emptied | `src/protocol/discovery.rs` (`is_message_too_large`, `DiscoveryService::broadcast`) |
 | UDP receive buffer | (Qt datagram) | 512 KiB (V `LanLinkProvider.java:69`) | **CONFORMANT\*** — SO_RCVBUF explicitly raised to 512 KiB matching android's target (Task 2.1, vk #997). Finding: the original "truncated and dropped" framing doesn't hold for real IPv4 traffic — a single UDP datagram is capped at 65507 bytes by IPv4 itself (verified empirically: `sendto()` past that fails with `EMSGSIZE`), which the OLD 65536-byte read buffer already covered. What SO_RCVBUF actually protects against is receive-QUEUE drops under a burst of near-simultaneous datagrams, not single-datagram truncation — see plans/task-2.1-report.md gap 4 | `src/protocol/discovery.rs` (`RECV_BUFFER_SIZE`, `DiscoveryService::new`) |
 | Receiver dials sender's TCP port on UDP identity (any device, not paired-only) | `lanlinkprovider.cpp:331-339` | V `LanLinkProvider.java:236-252` | **CONFORMANT** | `src/services/service_manager.rs:149` |
 | Received identity tcpPort outside 1716-1764 dropped | `lanlinkprovider.cpp:316-320` | V `LanLinkProvider.java:236-243` | **CONFORMANT** | `src/protocol/discovery.rs:177-182` |
-| Reverse-connection fallback (dial fails → send UDP identity back) | `lanlinkprovider.cpp:343-354,395-399` | Absent | **UNIMPLEMENTED** (kde-only) | — |
+| Reverse-connection fallback (dial fails → send UDP identity back) | `lanlinkprovider.cpp:343-354,395-399` | Absent | **CONFORMANT** (kde-only, fixed Task 2.3) — both failure legs (TCP connect error/timeout; plaintext-identity write/flush failure) send our identity back as a UDP unicast, fires at most once per failed dial | `src/protocol/connection/outbound.rs` (`connect_to_device`, `send_reverse_connection_fallback`) |
 | mDNS service type `_kdeconnect._udp(.local)` | `core/backends/lan/mdnshdiscovery.cpp:15`, `avahidiscovery.cpp:16` | `MdnsDiscovery.kt` `SERVICE_TYPE` | **CONFORMANT** | `src/protocol/mdns_discovery.rs:40` |
 | mDNS instance = deviceId, port = TCP port, TXT id/name/type/protocol | `mdnshdiscovery.cpp:18-24`, `avahidiscovery.cpp:136-149` | `MdnsDiscovery.kt` `createNsdServiceInfo` | **CONFORMANT** | `src/protocol/mdns_discovery.rs` `MdnsDiscoveryService::new` |
 | mDNS resolve behavior | Send UDP identity to resolved address; v8 dial-direct is their TODO (`mdnshdiscovery.cpp:31-36`) | Same (M `MdnsDiscovery.kt` `onServiceResolved` + TODO) | **CONFORMANT** — implements the v8 dial-direct path both refs defer to a TODO | `src/services/service_manager.rs:158` |
@@ -99,7 +103,7 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 | Accept timeout (sender waiting for receiver) | 30 s (`compositeuploadjob.cpp:35-37,231-242`) | 10 s (M `LanLink.java#200`) | **CONFORMANT\*** — 30 s, matching kde (the desktop reference); android's 10 s differs | `src/protocol/payload_transfer.rs:41` |
 | Receiver connect timeout | Absent (Qt default) | (platform default) | **CONFORMANT\*** — explicit 30 s | `src/protocol/payload_transfer.rs:31,215` |
 | payloadSize vs actual bytes: short read → error + delete; over-read tolerated | `core/filetransferjob.cpp:111-122` | Any mismatch → delete + throw (M `CompositeReceiveFileJob.java#158-163`) | **CONFORMANT\*** — reads exactly N; short = error + delete; over silently truncated at N | `src/protocol/payload_transfer.rs:245,263-270` |
-| payloadSize = -1 endless-stream sentinel | Supported (`core/networkpacket.h:85`, `filetransferjob.cpp:109-110`) | Not used by android share (mismatch errors anyway) | **UNIMPLEMENTED** — `payloadSize` is `Option<u64>`; -1 not representable | `src/protocol/types.rs:225` |
+| payloadSize = -1 endless-stream sentinel | Supported (`core/networkpacket.h:85`, `filetransferjob.cpp:109-110`) | Not used by android share (mismatch errors anyway) | **CONFORMANT\*** (fixed Task 2.3) — new `PayloadSize` enum (`Known`/`Stream`) accepts and round-trips `-1`; receive streams to a clean EOF. DIVERGENCE: bounded by `max_file_size_bytes` (exceeding it errors + deletes the partial) where upstream has no cap at all and keeps whatever arrives — our standing DoS posture wins | `src/protocol/types.rs` (`PayloadSize`), `src/protocol/payload_transfer.rs` (`receive_file_streaming`, `receive_file_unique_streaming`) |
 | `{port}`-only payloadTransferInfo → address from the live link | (receiver dials sender's link address) | M `LanLink.java#248-261` | **CONFORMANT** | `src/plugins/share.rs` (`resolve_transfer_info`) |
 
 ## Lifecycle
@@ -109,7 +113,7 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 | Plugin init on connect for paired devices | Plugin `connected()` hook (`core/device.cpp:160,184`) | Plugins reloaded, no init packets sent (M `Device.kt#315-350,656`) | **CONFORMANT** (kde-style) — init packets on connect-if-paired and on pair completion | `src/protocol/listener.rs:267-277`, `src/protocol/connection_loop.rs:109,183` |
 | Capabilities advertised in every identity | `core/deviceinfo.h:123-133` | M `DeviceInfo.kt#64-65` | **CONFORMANT** | `src/protocol/types.rs` (`Identity`) |
 | Capability update applied only when both lists non-empty | `core/device.cpp:319-328` | `updateDeviceInfo` on change (M `Device.kt#383-405`) | **CONFORMANT** — upsert only updates capabilities when both the incoming and outgoing lists on the new identity are non-empty, matching kde's `!isEmpty() && !isEmpty()` guard exactly | `src/device/registry.rs:64-78`, `src/services/service_manager.rs` (mDNS guard) |
-| Send-side capability gating (refuse types the peer didn't advertise) | `core/device.cpp:358-363` | Absent | **UNIMPLEMENTED** (kde-only; peer would ignore the packet anyway) | — |
+| Send-side capability gating (refuse types the peer didn't advertise) | `core/device.cpp:358-363` | Absent | **CONFORMANT\*** (kde-only, fixed Task 2.3) — `kdeconnect.identity`/`kdeconnect.pair` exempt, refuses honestly with a typed 4xx (not a silent drop). DIVERGENCE: gates only when the peer's known capabilities are NON-EMPTY (upstream gates unconditionally); a device with no exchanged capabilities yet is not gated, to avoid breaking send calls made during the pairing-flow window | `src/protocol/connection/mod.rs` (`send_packet`, `record_peer_capabilities`) |
 | Reachable = has live link | `core/device.cpp:110-113,291-294,348-351` | M `Device.kt#312-313,362-368` | **CONFORMANT** | `src/device/lifecycle` |
 | Unreachable + unpaired devices purged | `core/daemon.cpp:268-270` | (registry model) | **CONFORMANT\*** — registry persists them (history-first model) | `src/device/registry.rs` |
 
@@ -127,7 +131,13 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 > gap 1 (broadcast-forever cadence) and Cosmetic gap 5 (no network-change
 > re-broadcast trigger) — see the Discovery table's "Broadcast cadence" and
 > "Immediate re-broadcast on network change" rows above, both now
-> CONFORMANT. Renumbered again below to only the still-open gaps.
+> CONFORMANT.
+>
+> Also fixed since (2026-08-09, Task 2.3, vk #998): the former Cosmetic
+> gaps 5-8 (reverse-connection fallback, oversized-identity empty-caps
+> retry, `payloadSize = -1`, send-side capability gating) — see the
+> Discovery, Payload transfers, and Lifecycle tables above, all now
+> CONFORMANT or CONFORMANT\*. No open gaps remain.
 
 ### User-visible breakage
 
@@ -139,13 +149,7 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 
 ### Cosmetic / interop edge
 
-5. No reverse-connection fallback when a dial fails (kde-only,
-   `lanlinkprovider.cpp:343-354`).
-6. No oversized-identity emptied-caps fallback (kde-only,
-   `lanlinkprovider.cpp:259-269`).
-7. `payloadSize = -1` endless-stream sentinel unsupported (kde-only,
-   `core/networkpacket.h:85`); rust uses `Option<u64>`.
-8. No send-side capability gating (kde-only, `core/device.cpp:360-363`).
+(All Cosmetic / interop edge gaps 5-8 resolved as of 2026-08-09, Task 2.3.)
 
 ---
 
