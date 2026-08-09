@@ -17,7 +17,7 @@ Commits, in order:
 **Change:** `ACCEPT_TIMEOUT` `300s → 30s` (`src/protocol/payload_transfer.rs:41`). Swept for other 300s references (tests, docs, retry math) — none beyond the constant itself and the two checklist mentions.
 
 **Red evidence** (captured pre-fix, constant reverted to 300):
-```
+```text
 left: 300s
 right: 30s
 ...
@@ -41,7 +41,7 @@ Both lists must be non-empty — an all-or-nothing pair update, not two independ
 **Reachability, unchanged from the checklist:** real peers always send both capability lists; this is hostile-input hardening (adversary class A/B — a hand-crafted or malfunctioning identity), not a normal-operation behavior change.
 
 **Red evidence** (captured pre-fix, guard reverted to unconditional overwrite):
-```
+```text
 left: []
 right: ["kdeconnect.notification"]
 ...
@@ -61,7 +61,7 @@ What actually matters, and what android's SO_RCVBUF setting genuinely protects a
 **Change:** explicit `set_recv_buffer_size(RECV_BUFFER_SIZE)` (524288, via socket2) in `DiscoveryService::new` (`src/protocol/discovery.rs`), matching android's real target. A failure to raise it logs a warning, not fatal. Also raised the userspace read buffer to the same constant per the brief's literal instruction — this changes no observable truncation behavior for real traffic (documented plainly in the constant's own doc comment) but matches what the constant now claims and removes ambiguity for a future reader.
 
 **Red evidence, SO_RCVBUF (the fix that's actually load-bearing)** — captured pre-fix, `set_recv_buffer_size` call removed:
-```
+```text
 SO_RCVBUF must be at least 524288 bytes (android's 512 KiB target, LanLinkProvider.java:69), got 212992
 ```
 (212992 is exactly `net.core.rmem_default`.) `test_recv_buffer_size_matches_android_target` wraps the constructed socket with `socket2::SockRef` (works on any `AsFd` type, no ownership transfer needed) and reads SO_RCVBUF back via `getsockopt` — fully deterministic, no burst-timing dependency, no flakiness risk. Post-fix: passes.

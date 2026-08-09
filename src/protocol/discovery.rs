@@ -107,6 +107,22 @@ impl DiscoveryService {
                 event = "discovery_rcvbuf_not_set",
                 "Could not raise the UDP receive buffer; falling back to the OS default"
             );
+        } else if let Ok(effective) = socket.recv_buffer_size() {
+            // Linux clamps the request to net.core.rmem_max and reports the
+            // (doubled) result via getsockopt — setsockopt itself succeeds
+            // silently even when clamped (socket(7)). On hosts with a low
+            // rmem_max the effective queue is smaller than requested; say
+            // so once at startup instead of leaving burst-drop behavior
+            // unexplained (PR #12 review).
+            if effective < RECV_BUFFER_SIZE {
+                warn!(
+                    requested = RECV_BUFFER_SIZE,
+                    effective = effective,
+                    event = "discovery_rcvbuf_clamped",
+                    "Kernel clamped the UDP receive buffer below the requested \
+                     size (net.core.rmem_max); burst broadcasts may drop earlier"
+                );
+            }
         }
 
         socket
@@ -446,10 +462,24 @@ mod tests {
         let actual = socket2::SockRef::from(&service.socket)
             .recv_buffer_size()
             .expect("getsockopt(SO_RCVBUF) must succeed");
+        // Linux clamps SO_RCVBUF requests to net.core.rmem_max (and
+        // getsockopt reports double the clamped value — socket(7)), so on
+        // a host with rmem_max < 512 KiB the full target is unreachable
+        // no matter what we request. Assert against the honest bound for
+        // THIS host: the requested size, or the host ceiling if that is
+        // lower (PR #12 review). On an unclamped host this is exactly the
+        // 512 KiB assertion; on a clamped host it still proves our
+        // request went through rather than silently riding rmem_default.
+        let host_ceiling = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(RECV_BUFFER_SIZE);
+        let expected = RECV_BUFFER_SIZE.min(host_ceiling);
         assert!(
-            actual >= RECV_BUFFER_SIZE,
-            "SO_RCVBUF must be at least {RECV_BUFFER_SIZE} bytes (android's 512 KiB \
-             target, LanLinkProvider.java:69), got {actual}"
+            actual >= expected,
+            "SO_RCVBUF must reach min(requested {RECV_BUFFER_SIZE}, rmem_max \
+             {host_ceiling}) = {expected} bytes (android's 512 KiB target, \
+             LanLinkProvider.java:69), got {actual}"
         );
     }
 

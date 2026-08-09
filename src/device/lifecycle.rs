@@ -143,8 +143,15 @@ impl LifecycleManager {
                 existing.name = identity.device_name.clone();
                 existing.device_type = DeviceType::parse_device_type(&identity.device_type);
                 existing.protocol_version = identity.protocol_version;
-                existing.incoming_capabilities = identity.incoming_capabilities.clone();
-                existing.outgoing_capabilities = identity.outgoing_capabilities.clone();
+                // Same empty-cap guard as the UDP-discovery site — this
+                // reconnect path bypassed it when the guard lived inline
+                // in upsert_device (PR #12 review finding): a crafted
+                // empty-cap identity arriving over the connection path
+                // could still wipe learned capabilities.
+                existing.apply_capability_update(
+                    identity.incoming_capabilities.clone(),
+                    identity.outgoing_capabilities.clone(),
+                );
                 existing.update_last_seen();
                 self.registry.update(existing).await?;
             }
@@ -788,6 +795,41 @@ mod inbound_capability_tests {
             vec!["kdeconnect.notification"],
             "a reconnect carries a current identity; the record must adopt it"
         );
+        Ok(())
+    }
+
+    /// Gap 3's guard must hold on THIS path too (PR #12 review): the
+    /// reconnect leg assigned both capability lists directly, bypassing the
+    /// empty-cap guard that upsert_device applies — so a crafted empty-cap
+    /// identity arriving over the connection path could still wipe learned
+    /// capabilities. Both identity-update paths now route through
+    /// Device::apply_capability_update.
+    #[tokio::test]
+    async fn test_reconnect_empty_capabilities_do_not_clobber_known_ones() -> anyhow::Result<()> {
+        let (registry, _b, manager) = setup();
+        let id = "aaaabbbbccccddddeeeeffff00008888".to_string();
+
+        // Learn real capabilities first (the normal reconnect above).
+        manager
+            .ensure_and_transition(&id, &identity(&id), DeviceState::Connected)
+            .await?;
+        assert!(!registry.get(&id).await?.incoming_capabilities.is_empty());
+
+        // A crafted identity with empty capability lists reconnects.
+        let mut hostile = identity(&id);
+        hostile.incoming_capabilities = Vec::new();
+        hostile.outgoing_capabilities = Vec::new();
+        manager
+            .ensure_and_transition(&id, &hostile, DeviceState::Connected)
+            .await?;
+
+        let got = registry.get(&id).await?;
+        assert_eq!(
+            got.incoming_capabilities,
+            vec!["kdeconnect.notification"],
+            "an empty-cap identity must not wipe learned capabilities (kde core/device.cpp:319-328)"
+        );
+        assert_eq!(got.outgoing_capabilities, vec!["kdeconnect.battery"]);
         Ok(())
     }
 }

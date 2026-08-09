@@ -64,21 +64,15 @@ impl DeviceRegistry {
                 existing.name = device.name;
                 existing.device_type = device.device_type;
                 existing.protocol_version = device.protocol_version;
-                // kde applies a capability update only when BOTH incoming
-                // AND outgoing lists on the new identity are non-empty
-                // (core/device.cpp:319-328, Device::updateDeviceInfo —
-                // `if (!newDeviceInfo.incomingCapabilities.isEmpty() &&
-                // !newDeviceInfo.outgoingCapabilities.isEmpty())`). Real
-                // peers always send both; this guards against a
-                // hand-crafted or buggy identity with an empty capability
-                // list wiping out capabilities already learned (adversary
-                // class A/B — parity-checklist.md § Robustness gap 3).
-                if !device.incoming_capabilities.is_empty()
-                    && !device.outgoing_capabilities.is_empty()
-                {
-                    existing.incoming_capabilities = device.incoming_capabilities;
-                    existing.outgoing_capabilities = device.outgoing_capabilities;
-                }
+                // kde's empty-cap guard lives in ONE place —
+                // Device::apply_capability_update (types.rs) — shared with
+                // the lifecycle reconnect path. See its doc for the
+                // upstream cite and the PR #12 finding that split-site
+                // guards invite.
+                existing.apply_capability_update(
+                    device.incoming_capabilities,
+                    device.outgoing_capabilities,
+                );
                 // Discovery re-announces carry no address of their own; don't
                 // erase one we already learned.
                 if device.address.is_some() {
