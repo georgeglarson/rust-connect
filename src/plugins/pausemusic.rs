@@ -30,10 +30,21 @@
 //!   never resumed.
 //!
 //! Fixed upstream DEFAULTS, no config surface: pause-on-ring
-//! (conditionTalking=false), actionPause=true, actionResume=true.
-//! NOT implemented: actionMute (upstream default false) — muting PulseAudio
-//!   sinks has no infra in this codebase (systemvolume is a state-tracking
-//!   shell) and a default-off knob doesn't justify shelling out to pactl.
+//! (conditionTalking=false), actionPause=true, actionResume=true,
+//! actionMute=false (`ACTION_MUTE` below — Task 1.6 Backend B, vk #1010).
+//! actionMute now HAS a real backend (src/plugins/systemvolume/backend.rs's
+//! `VolumeBackend`, the same pactl-based provider the systemvolume plugin
+//! uses): `mute_for`/`unmute_for` mute every currently-unmuted sink on call
+//! start and restore exactly the ones we muted on cancel, mirroring
+//! pausemusicplugin.cpp:48-57 (mute) and :85-97 (unmute + unconditional
+//! bookkeeping clear). The mechanism is unconditional and fully tested;
+//! only the `handle_packet` call sites are gated by `ACTION_MUTE`, which
+//! stays hardcoded to upstream's own shipped default (off) because this
+//! codebase has no per-plugin config surface to let a user turn it on —
+//! adding one here, with nothing yet able to read it, is exactly the
+//! Task-1.7-class dead-knob the plan warns against. Flipping the constant
+//! (or wiring a real config surface, Task 1.7) is the entire activation
+//! path.
 //! NOT resumed on disconnect: upstream's per-device plugin instance is
 //! destroyed on disconnect, losing pausedSources — players stay paused.
 //! Our on_disconnected clears the list without resuming to match.
@@ -57,6 +68,12 @@ use crate::utils::errors::Result;
 
 use super::mpris::{is_ignored_service, MPRIS_SERVICE_PREFIX};
 use super::plugin::Plugin;
+use super::systemvolume::backend::{self, VolumeBackend};
+
+/// Whether the mute action fires at all. Fixed to upstream's own shipped
+/// default — see the module doc's "Fixed upstream DEFAULTS" paragraph for
+/// why this is a hardcoded constant rather than a config field.
+const ACTION_MUTE: bool = false;
 
 /// The media-control seam. The real impl talks MPRIS over the session bus;
 /// tests drive a mock. Mirrors MprisPlugin's backend split: `connect()` is
@@ -87,6 +104,14 @@ pub struct PausemusicPlugin {
     /// because upstream's plugin instance is per-device: one phone's cancel
     /// must not resume (or forget) what another phone's call paused.
     paused: StdRwLock<HashMap<String, Vec<String>>>,
+    /// System-volume backend for the mute action (Task 1.6 Backend B). A
+    /// separate connection from `backend`'s MPRIS one, same "each plugin
+    /// owns its own backend" convention `ZbusPauseBackend`'s own doc
+    /// describes (mirrors the mpris plugin's independent connection too).
+    volume_backend: StdRwLock<Option<Arc<dyn VolumeBackend>>>,
+    /// device_id → sink names we muted for that device's call. Mirrors
+    /// `paused`'s per-device shape and reasoning exactly.
+    muted: StdRwLock<HashMap<String, Vec<String>>>,
     /// Serializes the pause and cancel critical sections. Without it a
     /// cancel handled while `pause_playing` is still awaiting sees an empty
     /// list and no-ops, after which the pause records anyway — players
@@ -106,6 +131,8 @@ impl PausemusicPlugin {
         Self {
             backend: StdRwLock::new(None),
             paused: StdRwLock::new(HashMap::new()),
+            volume_backend: StdRwLock::new(None),
+            muted: StdRwLock::new(HashMap::new()),
             call_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -131,11 +158,38 @@ impl PausemusicPlugin {
                 );
             }
         }
+
+        // System-volume mute backend (Task 1.6 Backend B). Reuses the
+        // systemvolume plugin's own pactl detection rather than
+        // duplicating it — the detection logic (pactl on PATH + answers
+        // get-default-sink) has one home; the connection itself stays
+        // separate per plugin, same as the MPRIS backend above.
+        match backend::detect() {
+            Some(volume_backend) => {
+                info!(
+                    event = "pausemusic_volume_backend_ready",
+                    "System-volume mute backend enabled"
+                );
+                self.set_volume_backend(Arc::new(volume_backend));
+            }
+            None => {
+                warn!(
+                    event = "pausemusic_volume_backend_unavailable",
+                    "No pactl backend for pausemusic mute. Mute action degraded to a no-op."
+                );
+            }
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn with_backend(self, backend: Arc<dyn MediaPauseBackend>) -> Self {
         self.set_backend(backend);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_volume_backend(self, backend: Arc<dyn VolumeBackend>) -> Self {
+        self.set_volume_backend(backend);
         self
     }
 
@@ -151,6 +205,20 @@ impl PausemusicPlugin {
             .clone()
     }
 
+    fn set_volume_backend(&self, backend: Arc<dyn VolumeBackend>) {
+        *self
+            .volume_backend
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(backend);
+    }
+
+    fn volume_backend(&self) -> Option<Arc<dyn VolumeBackend>> {
+        self.volume_backend
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Bus names currently recorded as paused-by-us for a device.
     #[cfg(test)]
     pub(crate) fn paused_for(&self, device_id: &str) -> Vec<String> {
@@ -160,6 +228,117 @@ impl PausemusicPlugin {
             .get(device_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Sink names currently recorded as muted-by-us for a device.
+    #[cfg(test)]
+    pub(crate) fn muted_for(&self, device_id: &str) -> Vec<String> {
+        self.muted
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Mutes every currently-unmuted sink and records their names for
+    /// `unmute_for` — mirrors pausemusicplugin.cpp:48-57 (`if
+    /// (!sink->isMuted()) { sink->setMuted(true); mutedSinks.insert(...);
+    /// }`). Best-effort like the pause path: a missing backend or a
+    /// `list_sinks`/`set_muted` failure logs and degrades, never errors
+    /// the packet handler.
+    ///
+    /// Unconditional on purpose — NOT gated by `ACTION_MUTE` itself, so
+    /// tests can exercise the mechanism directly regardless of the
+    /// production default. `handle_packet`'s call sites are the only
+    /// `ACTION_MUTE` gate.
+    async fn mute_for(&self, device_id: &str) {
+        let Some(backend) = self.volume_backend() else {
+            debug!(
+                device_id = %device_id,
+                event = "pausemusic_no_volume_backend",
+                "Call started but no volume backend; nothing muted"
+            );
+            return;
+        };
+        let sinks = match backend.list_sinks().await {
+            Ok(sinks) => sinks,
+            Err(e) => {
+                warn!(
+                    device_id = %device_id,
+                    error = %e,
+                    event = "pausemusic_list_sinks_failed",
+                    "Cannot list sinks for mute"
+                );
+                return;
+            }
+        };
+
+        let mut muted_names = Vec::new();
+        for sink in sinks {
+            if sink.muted == Some(true) {
+                continue; // already muted — pausemusicplugin.cpp:52
+            }
+            if backend.set_muted(&sink.name, true).await.is_ok() {
+                muted_names.push(sink.name);
+            }
+        }
+
+        if muted_names.is_empty() {
+            return;
+        }
+        info!(
+            device_id = %device_id,
+            sinks = ?muted_names,
+            event = "pausemusic_muted",
+            "Call started, muted system audio sinks"
+        );
+        let mut muted = self.muted.write().unwrap_or_else(|e| e.into_inner());
+        let entry = muted.entry(device_id.to_string()).or_default();
+        for name in muted_names {
+            if !entry.contains(&name) {
+                entry.push(name);
+            }
+        }
+    }
+
+    /// Unmutes exactly the sinks WE muted for this device's call, then
+    /// forgets them regardless of whether the backend calls succeeded —
+    /// mirrors pausemusicplugin.cpp:85-97: the unmute happens (autoResume
+    /// is hardcoded true here, same as the pause/resume path above having
+    /// no separate toggle), and `mutedSinks.clear()` runs unconditionally
+    /// either way. A second call with nothing recorded is a no-op — no
+    /// double-restore.
+    async fn unmute_for(&self, device_id: &str) {
+        let sinks = self
+            .muted
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(device_id)
+            .unwrap_or_default();
+        if sinks.is_empty() {
+            return;
+        }
+        match self.volume_backend() {
+            Some(backend) => {
+                info!(
+                    device_id = %device_id,
+                    sinks = ?sinks,
+                    event = "pausemusic_unmuted",
+                    "Call ended, unmuting sinks we muted"
+                );
+                for name in &sinks {
+                    let _ = backend.set_muted(name, false).await;
+                }
+            }
+            None => {
+                debug!(
+                    device_id = %device_id,
+                    event = "pausemusic_no_volume_backend",
+                    "Call ended but no volume backend; sinks stay muted"
+                );
+            }
+        }
     }
 }
 
@@ -214,6 +393,15 @@ impl Plugin for PausemusicPlugin {
             // Serialized against the pause branch: a cancel that arrives
             // mid-pause waits for the record, then resumes it.
             let _guard = self.call_lock.lock().await;
+
+            // Mute and pause are independent legs, matching upstream's two
+            // separate conditionals inside the same branch
+            // (pausemusicplugin.cpp:85-97 vs :99-107) — unmute must run
+            // even when nothing was paused.
+            if ACTION_MUTE {
+                self.unmute_for(device_id).await;
+            }
+
             let services = self
                 .paused
                 .write()
@@ -252,6 +440,13 @@ impl Plugin for PausemusicPlugin {
         // Call started: pause everything Playing, remember what we acted on.
         // Serialized against the cancel branch (see call_lock).
         let _guard = self.call_lock.lock().await;
+
+        // Mute is an independent leg from pause (pausemusicplugin.cpp:47-57
+        // vs :59-82, both inside the same pauseConditionFulfilled branch).
+        if ACTION_MUTE {
+            self.mute_for(device_id).await;
+        }
+
         match self.backend() {
             Some(backend) => {
                 let acted = backend.pause_playing().await;
@@ -391,6 +586,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
     use super::*;
+    use crate::plugins::systemvolume::backend::{LocalSinkState, MockBackend as VolumeMockBackend};
 
     struct MockBackend {
         playing: Vec<String>,
@@ -733,5 +929,184 @@ mod tests {
             vec![vec!["org.mpris.MediaPlayer2.brave".to_string()]]
         );
         assert!(plugin.paused_for("device1").is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Mute state machine (Task 1.6 Backend B, vk #1010). `mute_for` /
+    // `unmute_for` are unconditional — not gated by ACTION_MUTE
+    // themselves, only handle_packet's call sites are — so these drive
+    // the mechanism directly, matching how `is_cancel` above is tested
+    // as a pure function rather than only through handle_packet.
+    // -----------------------------------------------------------------
+
+    fn sink(name: &str, muted: bool) -> LocalSinkState {
+        LocalSinkState {
+            name: name.to_string(),
+            muted: Some(muted),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mute_for_mutes_unmuted_sinks_and_skips_already_muted() {
+        // pausemusicplugin.cpp:50-56: iterate every sink, mute + record
+        // only the ones that were NOT already muted.
+        let volume = VolumeMockBackend::new();
+        volume.with_sinks(vec![sink("speakers", false), sink("headset", true)]);
+        let plugin = PausemusicPlugin::new().with_volume_backend(volume.clone());
+
+        plugin.mute_for("device1").await;
+
+        assert_eq!(plugin.muted_for("device1"), vec!["speakers".to_string()]);
+        assert!(
+            volume.calls().iter().any(|c| c.contains("speakers")),
+            "the unmuted sink must have been acted on: {:?}",
+            volume.calls()
+        );
+        assert!(
+            !volume.calls().iter().any(|c| c.contains("headset")),
+            "the already-muted sink must not be touched: {:?}",
+            volume.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unmute_for_restores_exactly_what_we_muted_then_forgets() {
+        let volume = VolumeMockBackend::new();
+        volume.with_sinks(vec![sink("speakers", false)]);
+        let plugin = PausemusicPlugin::new().with_volume_backend(volume.clone());
+
+        plugin.mute_for("device1").await;
+        assert_eq!(plugin.muted_for("device1"), vec!["speakers".to_string()]);
+
+        plugin.unmute_for("device1").await;
+
+        assert!(
+            plugin.muted_for("device1").is_empty(),
+            "restored sinks must be forgotten"
+        );
+        let sinks = volume.list_sinks().await.unwrap();
+        let speakers = sinks.iter().find(|s| s.name == "speakers").unwrap();
+        assert_eq!(
+            speakers.muted,
+            Some(false),
+            "the mock's recorded sink state must reflect the restore"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unmute_without_prior_mute_is_noop() {
+        let volume = VolumeMockBackend::new();
+        volume.with_sinks(vec![sink("speakers", false)]);
+        let plugin = PausemusicPlugin::new().with_volume_backend(volume.clone());
+
+        plugin.unmute_for("device1").await;
+
+        assert!(plugin.muted_for("device1").is_empty());
+        assert!(
+            volume.calls().is_empty(),
+            "no backend call when nothing was recorded as muted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_double_unmute_does_not_restore_twice() {
+        // No double-restore: the second unmute_for for the same device
+        // must be a pure no-op — the record was already consumed.
+        let volume = VolumeMockBackend::new();
+        volume.with_sinks(vec![sink("speakers", false)]);
+        let plugin = PausemusicPlugin::new().with_volume_backend(volume.clone());
+
+        plugin.mute_for("device1").await;
+        plugin.unmute_for("device1").await;
+        let calls_after_first_unmute = volume.calls().len();
+
+        plugin.unmute_for("device1").await;
+
+        assert_eq!(
+            volume.calls().len(),
+            calls_after_first_unmute,
+            "a second unmute_for must not issue any further backend calls"
+        );
+        assert!(plugin.muted_for("device1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mute_and_pause_interact_independently() {
+        // Mute and pause are independent legs (pausemusicplugin.cpp:47-57
+        // vs :59-82, both inside the SAME pauseConditionFulfilled branch):
+        // driving both for the same call must populate and restore both
+        // records without either disturbing the other.
+        let media = Arc::new(MockBackend::new(&["org.mpris.MediaPlayer2.brave"]));
+        let volume = VolumeMockBackend::new();
+        volume.with_sinks(vec![sink("speakers", false)]);
+        let plugin = PausemusicPlugin::new()
+            .with_backend(media.clone())
+            .with_volume_backend(volume.clone());
+
+        plugin
+            .handle_packet(
+                "device1",
+                telephony_packet(serde_json::json!({ "event": "ringing" })),
+            )
+            .await
+            .unwrap();
+        plugin.mute_for("device1").await;
+
+        assert_eq!(
+            plugin.paused_for("device1"),
+            vec!["org.mpris.MediaPlayer2.brave".to_string()]
+        );
+        assert_eq!(plugin.muted_for("device1"), vec!["speakers".to_string()]);
+
+        plugin
+            .handle_packet(
+                "device1",
+                telephony_packet(serde_json::json!({ "event": "ringing", "isCancel": true })),
+            )
+            .await
+            .unwrap();
+        plugin.unmute_for("device1").await;
+
+        assert!(plugin.paused_for("device1").is_empty());
+        assert!(plugin.muted_for("device1").is_empty());
+        assert_eq!(
+            media.resumed(),
+            vec![vec!["org.mpris.MediaPlayer2.brave".to_string()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mute_disabled_by_default_matches_upstream() {
+        // Pins ACTION_MUTE's real production value: with a working volume
+        // backend attached, a real ringing event through handle_packet
+        // must NOT touch it at all — upstream's own actionMute default is
+        // false (pausemusicplugin.cpp:43), and this codebase has no
+        // config surface to turn it on (see module doc).
+        let volume = VolumeMockBackend::new();
+        volume.with_sinks(vec![sink("speakers", false)]);
+        let plugin = PausemusicPlugin::new().with_volume_backend(volume.clone());
+
+        plugin
+            .handle_packet(
+                "device1",
+                telephony_packet(serde_json::json!({ "event": "ringing" })),
+            )
+            .await
+            .unwrap();
+
+        assert!(plugin.muted_for("device1").is_empty());
+        assert!(
+            volume.calls().is_empty(),
+            "ACTION_MUTE=false must keep handle_packet from ever touching the volume backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_volume_backend_degrades_cleanly() {
+        let plugin = PausemusicPlugin::new();
+        plugin.mute_for("device1").await;
+        assert!(plugin.muted_for("device1").is_empty());
+        plugin.unmute_for("device1").await; // no panic with nothing recorded
     }
 }

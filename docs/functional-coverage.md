@@ -289,8 +289,8 @@ feature_ledger:
     live_device: NOT-APPLICABLE
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/pausemusic/telephony_talking_cancel_string.json (kdeconnect-android TelephonyPlugin.kt:114-116)"
-    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived telephony cancel fixture (pausemusic observes telephony events). Remaining cells owned by Sprint 1 / Task 1.6 mute-vs-pause policy."
+    cite: "tests/fixtures/upstream-wire/pausemusic/telephony_talking_cancel_string.json (kdeconnect-android TelephonyPlugin.kt:114-116); Task 1.6 Backend B mute mechanism cites kdeconnect-kde pausemusicplugin.cpp:43-57,85-97 (actionMute default + mute/unmute + unconditional bookkeeping clear)"
+    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived telephony cancel fixture (pausemusic observes telephony events). Task 1.6 Backend B closed the mute-vs-pause policy gap: mute_for/unmute_for mute-and-restore via the systemvolume VolumeBackend (src/plugins/systemvolume/backend.rs), unit-tested (mute on ring, restore on end, no double-restore, independent of pause). Decision: ACTION_MUTE stays hardcoded to upstream's own default (off) — this codebase has no per-plugin config surface to let a user enable it (adding one with no reader would be a Task-1.7-class dead knob); flipping the constant is the entire activation path. Remaining cells (desktop_effect, api_surface, lifecycle, hostile_input, environment) still need a live call + real media player, per the plan's Task 1.6 validation note."
     owner: "Task 1.6"
 
   - feature: ping
