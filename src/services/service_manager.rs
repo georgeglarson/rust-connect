@@ -26,6 +26,10 @@ pub struct DiscoveryHandles {
     /// mDNS announce + browse (None when the mDNS daemon failed to start —
     /// UDP broadcast discovery still stands).
     pub mdns_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Network-change reactor (Task 2.2, vk #994): watches for interface/
+    /// address changes and suspend/resume, re-announcing on each debounced
+    /// event.
+    pub network_change_handle: tokio::task::JoinHandle<()>,
 }
 
 /// Starts all services and returns their handles.
@@ -70,6 +74,7 @@ pub async fn stop_services(handles: ServiceHandles, state: &Arc<AppState>) {
     if let Some(h) = handles.discovery.mdns_handle {
         let _ = tokio::time::timeout(timeout, h).await;
     }
+    let _ = tokio::time::timeout(timeout, handles.discovery.network_change_handle).await;
     if let Some(h) = handles.tcp {
         let _ = tokio::time::timeout(timeout, h).await;
     }
@@ -128,32 +133,45 @@ async fn start_discovery(
     // (see protocol::mdns_discovery docs). A resolve is fed into the same
     // dial path a received UDP identity takes. Failure to start mDNS (no
     // multicast on the host) degrades to UDP-only — never fatal.
-    // TODO: once mDNS is live-validated against real hardware, revisit the
-    // UDP broadcast cadence (60s default today) — with mDNS healthy it
-    // becomes a fallback, not the rediscovery path.
-    let mdns_handle = match crate::protocol::mdns_discovery::MdnsDiscoveryService::new(&identity) {
-        Ok(mdns) => {
-            let state_clone = state.clone();
-            Some(tokio::spawn(async move {
-                mdns.run(
-                    move |identity, addr| {
-                        on_mdns_device_resolved(state_clone.clone(), identity, addr)
-                    },
-                    shutdown,
-                )
-                .await;
-            }))
-        }
-        Err(e) => {
-            warn!(error = %e, event = "mdns_start_failed", "mDNS discovery unavailable, continuing with UDP broadcast only");
-            None
-        }
-    };
+    let mdns: Option<Arc<crate::protocol::mdns_discovery::MdnsDiscoveryService>> =
+        match crate::protocol::mdns_discovery::MdnsDiscoveryService::new(&identity) {
+            Ok(mdns) => Some(Arc::new(mdns)),
+            Err(e) => {
+                warn!(error = %e, event = "mdns_start_failed", "mDNS discovery unavailable, continuing with UDP broadcast only");
+                None
+            }
+        };
+    let mdns_handle = mdns.clone().map(|mdns| {
+        let state_clone = state.clone();
+        let mdns_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            mdns.run(
+                move |identity, addr| on_mdns_device_resolved(state_clone.clone(), identity, addr),
+                mdns_shutdown,
+            )
+            .await;
+        })
+    });
+
+    // Network-change reactor (Task 2.2, vk #994): re-announce (UDP
+    // broadcast once + mDNS reannounce) on a debounced network-change
+    // event, closing the mdns_discovery.rs "restart announcing on network
+    // change" TODO. Runs ALONGSIDE the periodic broadcast for now — Task
+    // 2.2 piece 3 replaces that periodic loop with the bounded fallback
+    // policy.
+    let network_change_handle =
+        crate::services::discovery_coordinator::spawn_network_change_reactor(
+            discovery.clone(),
+            mdns,
+            identity,
+            shutdown.clone(),
+        );
 
     Ok(DiscoveryHandles {
         broadcast_handle,
         listen_handle,
         mdns_handle,
+        network_change_handle,
     })
 }
 

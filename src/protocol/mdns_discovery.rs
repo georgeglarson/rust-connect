@@ -43,7 +43,60 @@ pub const SERVICE_TYPE: &str = "_kdeconnect._udp.local.";
 pub struct MdnsDiscoveryService {
     daemon: Arc<ServiceDaemon>,
     /// Our registered service's fullname, needed to unregister cleanly.
-    fullname: String,
+    /// `RwLock`, not a plain field: `reannounce` (Task 2.2) is called from
+    /// a network-change-handling task concurrently with `run`'s own browse
+    /// loop, both holding only a shared reference to the SAME instance —
+    /// same interior-mutability shape every other backend-bearing plugin
+    /// in this codebase uses for state shared across tasks.
+    fullname: std::sync::RwLock<String>,
+}
+
+/// Builds the `ServiceInfo` for `identity`, exactly as the references
+/// announce (module docs): instance name = device id, port = our TCP
+/// listener port, TXT records `id`/`name`/`type`/`protocol`.
+///
+/// `enable_addr_auto()` matters beyond initial registration: `mdns-sd`'s
+/// own daemon polls the host's interfaces on a timer
+/// (`ServiceDaemon::set_ip_check_interval`,
+/// `IP_CHECK_INTERVAL_IN_SECS_DEFAULT` = 5s, verified in the vendored
+/// source) and automatically re-announces any `addr_auto`-enabled service
+/// when it finds a new address — so this crate ALREADY self-heals address
+/// changes within 5 seconds on its own, with zero code here. What that
+/// doesn't give us is IMMEDIACY (there's no public "check now" API, only
+/// "change the future polling interval") or the UDP broadcast leg, which
+/// has no auto-refresh mechanism of its own at all — see
+/// `MdnsDiscoveryService::reannounce` and `discovery_coordinator.rs`.
+fn build_service_info(identity: &Identity) -> Result<ServiceInfo> {
+    let port = identity.tcp_port.unwrap_or(DEFAULT_TCP_PORT);
+    let host_name = format!(
+        "{}.local.",
+        hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "rust-connect".to_string())
+    );
+    // TXT records, exactly the references' set (module docs).
+    let protocol = identity.protocol_version.to_string();
+    let properties = [
+        ("id", identity.device_id.as_str()),
+        ("name", identity.device_name.as_str()),
+        ("type", identity.device_type.as_str()),
+        ("protocol", protocol.as_str()),
+    ];
+
+    let mut service_info = ServiceInfo::new(
+        SERVICE_TYPE,
+        &identity.device_id,
+        &host_name,
+        "",
+        port,
+        &properties[..],
+    )
+    .map_err(|e| Error::DiscoveryError(format!("Failed to build mDNS service info: {}", e)))?;
+    // Announce on whatever addresses the host has right now, AND keep
+    // following changes afterward — see this function's doc comment.
+    service_info = service_info.enable_addr_auto();
+    Ok(service_info)
 }
 
 impl MdnsDiscoveryService {
@@ -54,37 +107,8 @@ impl MdnsDiscoveryService {
         let daemon = ServiceDaemon::new()
             .map_err(|e| Error::DiscoveryError(format!("Failed to start mDNS daemon: {}", e)))?;
 
+        let service_info = build_service_info(identity)?;
         let port = identity.tcp_port.unwrap_or(DEFAULT_TCP_PORT);
-        let host_name = format!(
-            "{}.local.",
-            hostname::get()
-                .ok()
-                .and_then(|h| h.into_string().ok())
-                .unwrap_or_else(|| "rust-connect".to_string())
-        );
-        // TXT records, exactly the references' set (module docs).
-        let protocol = identity.protocol_version.to_string();
-        let properties = [
-            ("id", identity.device_id.as_str()),
-            ("name", identity.device_name.as_str()),
-            ("type", identity.device_type.as_str()),
-            ("protocol", protocol.as_str()),
-        ];
-
-        let mut service_info = ServiceInfo::new(
-            SERVICE_TYPE,
-            &identity.device_id,
-            &host_name,
-            "",
-            port,
-            &properties[..],
-        )
-        .map_err(|e| Error::DiscoveryError(format!("Failed to build mDNS service info: {}", e)))?;
-        // Announce on whatever addresses the host has, and follow interface
-        // changes (the references restart announcing on network change —
-        // mdnshdiscovery.cpp:58-63).
-        service_info = service_info.enable_addr_auto();
-
         let fullname = service_info.get_fullname().to_string();
         daemon.register(service_info).map_err(|e| {
             Error::DiscoveryError(format!("Failed to register mDNS service: {}", e))
@@ -99,15 +123,61 @@ impl MdnsDiscoveryService {
 
         Ok(Self {
             daemon: Arc::new(daemon),
-            fullname,
+            fullname: std::sync::RwLock::new(fullname),
         })
+    }
+
+    /// Re-announce `identity` on network change (Task 2.2, vk #994; the
+    /// TODO this closes — both references restart announcing on network
+    /// change, `mdnshdiscovery.cpp:149,192` /
+    /// `LanLinkProvider.java:567,572-584`). Unregisters the current
+    /// announcement (sends mDNS goodbye packets) then registers fresh
+    /// `ServiceInfo` on the SAME daemon — the daemon and its browse loop
+    /// keep running throughout, only the announcement itself restarts.
+    /// This is a latency improvement over `mdns-sd`'s own 5-second
+    /// auto-poll (`build_service_info`'s doc comment), not a fix for a
+    /// total absence of self-healing — that already exists.
+    pub fn reannounce(&self, identity: &Identity) -> Result<()> {
+        let current_fullname = self
+            .fullname
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Err(e) = self.daemon.unregister(&current_fullname) {
+            warn!(
+                error = %e,
+                event = "mdns_reannounce_unregister_failed",
+                "Failed to unregister mDNS service before re-announcing; \
+                 continuing to register the fresh announcement anyway"
+            );
+        }
+
+        let service_info = build_service_info(identity)?;
+        let fullname = service_info.get_fullname().to_string();
+        self.daemon.register(service_info).map_err(|e| {
+            Error::DiscoveryError(format!(
+                "Failed to re-register mDNS service on network change: {}",
+                e
+            ))
+        })?;
+        *self.fullname.write().unwrap_or_else(|e| e.into_inner()) = fullname.clone();
+
+        info!(
+            fullname = %fullname,
+            event = "mdns_reannounced",
+            "Re-announced identity via mDNS after a network change"
+        );
+        Ok(())
     }
 
     /// Browse for peers until `shutdown` is cancelled, then unregister our
     /// announcement and shut the daemon down. Every resolved service is
     /// converted to the SAME `(Identity, SocketAddr)` shape a received UDP
-    /// identity arrives in and handed to `on_resolved`.
-    pub async fn run<F>(self, on_resolved: F, shutdown: CancellationToken)
+    /// identity arrives in and handed to `on_resolved`. Takes `&self`, not
+    /// `self`, so a caller can hold the SAME `Arc<MdnsDiscoveryService>`
+    /// and call `reannounce` concurrently (Task 2.2) — previously this
+    /// consumed `self`, which made that impossible.
+    pub async fn run<F>(&self, on_resolved: F, shutdown: CancellationToken)
     where
         F: Fn(Identity, SocketAddr),
     {
@@ -165,7 +235,12 @@ impl MdnsDiscoveryService {
 
     /// Unregister our announcement (sends mDNS goodbye packets).
     pub fn stop_announcing(&self) {
-        if let Err(e) = self.daemon.unregister(&self.fullname) {
+        let fullname = self
+            .fullname
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Err(e) = self.daemon.unregister(&fullname) {
             warn!(error = %e, event = "mdns_unregister_failed", "Failed to unregister mDNS service");
         }
     }
@@ -419,19 +494,29 @@ mod tests {
         let identity = our_identity();
         let service = MdnsDiscoveryService::new(&identity).expect("announce must succeed");
         assert_eq!(
-            service.fullname,
+            *service.fullname.read().expect("read fullname"),
             format!("{}.{}", identity.device_id, SERVICE_TYPE),
             "the instance name must be the device id"
         );
 
+        // `run` takes `&self` (Task 2.2: a caller needs to hold the same
+        // instance to call `reannounce` concurrently), so the spawned
+        // 'static future needs an owned handle to borrow from.
+        let service = Arc::new(service);
+        let run_service = service.clone();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let shutdown = CancellationToken::new();
-        let browser = tokio::spawn(service.run(
-            move |identity, addr| {
-                let _ = tx.send((identity, addr));
-            },
-            shutdown.clone(),
-        ));
+        let run_shutdown = shutdown.clone();
+        let browser = tokio::spawn(async move {
+            run_service
+                .run(
+                    move |identity, addr| {
+                        let _ = tx.send((identity, addr));
+                    },
+                    run_shutdown,
+                )
+                .await;
+        });
 
         let (discovered, addr) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
@@ -455,6 +540,76 @@ mod tests {
             "the resolved address must be a LAN address, got {}",
             addr.ip()
         );
+
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), browser)
+            .await
+            .expect("browsing must stop on shutdown")
+            .expect("join");
+    }
+
+    /// Task 2.2 (vk #994): `reannounce` must cause a REAL, observable
+    /// re-announcement — not just update internal bookkeeping. Proven by
+    /// changing the identity's device name and confirming a browser
+    /// resolves the NEW name after `reannounce`, attributable specifically
+    /// to the explicit call (mdns-sd's own internal 5s auto-poll only
+    /// refreshes addresses on the already-registered ServiceInfo; it has
+    /// no way to pick up a changed device name on its own).
+    #[tokio::test]
+    async fn test_reannounce_publishes_a_real_update() {
+        let identity = our_identity();
+        let service = Arc::new(MdnsDiscoveryService::new(&identity).expect("announce"));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+        let run_service = service.clone();
+        let run_shutdown = shutdown.clone();
+        let browser = tokio::spawn(async move {
+            run_service
+                .run(
+                    move |identity, addr| {
+                        let _ = tx.send((identity, addr));
+                    },
+                    run_shutdown,
+                )
+                .await;
+        });
+
+        // Drain the initial announcement first so it can't be mistaken
+        // for the post-reannounce one.
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if let Some((identity, _)) = rx.recv().await {
+                    if identity.device_id == our_identity().device_id {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("initial announcement must be resolved within 15s");
+
+        let mut renamed = identity.clone();
+        renamed.device_name = "mDNS Test Device (renamed)".to_string();
+        service
+            .reannounce(&renamed)
+            .expect("reannounce must succeed");
+
+        let (discovered, _addr) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if let Some((identity, addr)) = rx.recv().await {
+                    if identity.device_id == our_identity().device_id
+                        && identity.device_name == "mDNS Test Device (renamed)"
+                    {
+                        break (identity, addr);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the reannounced identity must be resolved within 15s");
+
+        assert_eq!(discovered.device_name, "mDNS Test Device (renamed)");
 
         shutdown.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(5), browser)
