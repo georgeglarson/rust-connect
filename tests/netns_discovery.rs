@@ -11,14 +11,16 @@
 //! silent CI coverage — a developer or CI run without root sees an
 //! explicit skip line, not a suite that quietly ran zero assertions.
 //!
-//! Run explicitly as root:
+//! Run explicitly as root (integrator-verified form — a bare
+//! `sudo -E cargo` hits the rustup SHIM as root, which has no default
+//! toolchain configured and fails before compiling anything):
 //! ```text
-//! sudo -E $(command -v cargo) test --test netns_discovery --locked
+//! TOOLBIN=$(dirname "$(rustup which rustc)") && \
+//!   sudo env PATH="$TOOLBIN:$PATH" HOME="$HOME" CARGO_HOME="$HOME/.cargo" \
+//!   "$TOOLBIN/cargo" test --test netns_discovery --locked
 //! ```
-//! (`-E` preserves `CARGO_HOME`/`RUSTUP_HOME` so sudo's root user finds
-//! the same toolchain: dropping it commonly makes `cargo` resolve to
-//! nothing under sudo's default `PATH`.) Non-root runs of the ordinary
-//! `cargo test` suite pass this file cleanly with three skip lines.
+//! Non-root runs of the ordinary `cargo test` suite pass this file
+//! cleanly with three skip lines.
 //!
 //! ## Why real netns + veth, not mocked interfaces
 //!
@@ -89,7 +91,28 @@ fn preconditions_met(test_name: &str) -> bool {
         eprintln!("{test_name}: `ip` (iproute2) not on PATH — skipping");
         return false;
     }
-    true
+    // euid 0 does not guarantee namespace privileges (a restricted-root
+    // container can lack CAP_NET_ADMIN / CAP_SYS_ADMIN) — probe the real
+    // operation rather than trusting the uid, so such environments get
+    // the documented visible skip instead of a panic (PR #13 review).
+    let probe = format!("rcprobe-{}", std::process::id());
+    let created = Command::new("ip")
+        .args(["netns", "add", &probe])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if created {
+        let _ = Command::new("ip")
+            .args(["netns", "delete", &probe])
+            .output();
+        true
+    } else {
+        eprintln!(
+            "{test_name}: root but `ip netns add` failed (restricted container, \
+             missing CAP_NET_ADMIN?) — skipping"
+        );
+        false
+    }
 }
 
 fn run_ok(cmd: &mut Command) -> Output {
@@ -349,8 +372,16 @@ fn netns_interface_down_up_triggers_reannounce() {
                 }
             });
 
-            // Signal the main thread that setup is complete and it is
-            // safe to flap the interface now.
+            // Let the spawned watcher actually reach its netlink
+            // subscription before declaring ready: tokio::spawn only
+            // QUEUES the task, and a flap that lands before IfWatcher::new
+            // subscribes is silently unobservable (PR #13 review). There
+            // is no ready-handshake in the production API (production
+            // starts the watcher at daemon boot, ages before any change),
+            // so a settle window stands in: subscription is one
+            // synchronous netlink socket setup, sub-millisecond in
+            // practice — 300ms is orders of magnitude of margin.
+            tokio::time::sleep(Duration::from_millis(300)).await;
             ready_tx.send(()).expect("send ready signal");
 
             // Bounded wait for the re-announce. DEBOUNCE_WINDOW (750ms)
@@ -435,6 +466,10 @@ fn netns_address_change_triggers_reannounce() {
                 }
             });
 
+            // Same settle-before-ready as the flap test above (PR #13
+            // review): let the watcher reach its netlink subscription
+            // before the main thread mutates addresses.
+            tokio::time::sleep(Duration::from_millis(300)).await;
             ready_tx.send(()).expect("send ready signal");
 
             let result = tokio::time::timeout(Duration::from_secs(15), listener.listen()).await;
@@ -515,20 +550,25 @@ fn netns_mdns_down_fallback_observes_two_backoff_intervals() {
                         }
                     },
                     schedule_shutdown,
-                    Duration::from_millis(300),
-                    Duration::from_millis(300),
+                    // DISTINCT initial/max so the doubling leg is
+                    // exercised end-to-end, not just in the paused-time
+                    // unit tests: expected real gaps ~200ms, ~400ms,
+                    // ~800ms(cap) (PR #13 review — with initial == max a
+                    // regression stuck at the initial interval forever
+                    // still passed this test).
+                    Duration::from_millis(200),
+                    Duration::from_millis(800),
                     Duration::from_millis(100),
                 )
                 .await;
             });
 
-            // Observe three broadcasts: the immediate one, then two
-            // more spaced ~300ms apart (initial == max here, so no
-            // doubling to account for — this scenario tests CADENCE,
-            // piece 3's own unit tests already cover doubling/capping
-            // in isolation under paused time).
+            // Observe four broadcasts: the immediate one, then three
+            // more on the doubling schedule (~200ms, ~400ms, ~800ms-cap
+            // gaps) — real-socket confirmation that the backoff actually
+            // GROWS, complementing the paused-time unit tests.
             let mut timestamps = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..4 {
                 tokio::time::timeout(Duration::from_secs(5), listener.listen())
                     .await
                     .expect("each scheduled broadcast must arrive within 5s")
@@ -541,15 +581,25 @@ fn netns_mdns_down_fallback_observes_two_backoff_intervals() {
     });
 
     let timestamps = worker.join().expect("netns worker thread panicked");
-    assert_eq!(timestamps.len(), 3);
+    assert_eq!(timestamps.len(), 4);
     let gap1 = timestamps[1] - timestamps[0];
     let gap2 = timestamps[2] - timestamps[1];
-    // Real wall-clock cadence, so allow scheduling slack either side of
-    // the 300ms interval rather than asserting exact equality.
-    for (i, gap) in [gap1, gap2].into_iter().enumerate() {
-        assert!(
-            gap >= Duration::from_millis(200) && gap <= Duration::from_secs(2),
-            "backoff interval #{i} was {gap:?}, expected roughly 300ms"
-        );
-    }
+    let gap3 = timestamps[3] - timestamps[2];
+    // Real wall-clock cadence: assert the SHAPE (each gap meaningfully
+    // larger than the last, i.e. the schedule grows) with generous slack
+    // bands rather than exact values — timer coalescing and scheduler
+    // noise on a live kernel make exact-equality flaky, but a regression
+    // stuck at the initial interval cannot produce growing gaps.
+    assert!(
+        gap1 >= Duration::from_millis(120) && gap1 <= Duration::from_millis(600),
+        "first backoff gap was {gap1:?}, expected ~200ms"
+    );
+    assert!(
+        gap2 > gap1 && gap2 >= Duration::from_millis(280),
+        "second gap ({gap2:?}) must grow past the first ({gap1:?}) — doubling"
+    );
+    assert!(
+        gap3 > gap2 && gap3 >= Duration::from_millis(560) && gap3 <= Duration::from_secs(3),
+        "third gap ({gap3:?}) must grow to the ~800ms cap (was {gap2:?} before)"
+    );
 }

@@ -50,7 +50,7 @@ Investigated whether `MdnsDiscoveryService::reannounce` (piece 2) is even necess
 
 ## Netns suite — how to run
 
-```
+```bash
 TOOLBIN=$(dirname "$(rustup which rustc)") && sudo env PATH="$TOOLBIN:$PATH" HOME="$HOME" CARGO_HOME="$HOME/.cargo" "$TOOLBIN/cargo" test --test netns_discovery --locked
 # (bare `sudo -E cargo` hits the rustup shim with no root default toolchain on this host)
 ```
