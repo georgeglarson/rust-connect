@@ -208,20 +208,40 @@ impl ProcessRingBackend {
         }
     }
 
+    /// The player priority table (Task 1.6 Backend D "verify + pin", vk
+    /// #1010): pw-play and paplay take the file bare; ffplay/aplay need
+    /// flags to stay non-interactive and quiet. Order is pw-play > paplay >
+    /// ffplay > aplay — PipeWire/PulseAudio native tools first, then the
+    /// generic media player, then the bare-ALSA fallback.
+    const PLAYER_CANDIDATES: &'static [(&'static str, &'static [&'static str])] = &[
+        ("pw-play", &[]),
+        ("paplay", &[]),
+        ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet"]),
+        ("aplay", &["-q"]),
+    ];
+
+    /// First available candidate, in `PLAYER_CANDIDATES` priority order.
+    /// Pure — takes each candidate's PATH-availability as input — so the
+    /// priority order is unit-testable without depending on which players
+    /// happen to be installed on the test host, and without touching the
+    /// real PATH at all.
+    fn choose_player(available: [bool; 4]) -> Option<(&'static str, &'static [&'static str])> {
+        Self::PLAYER_CANDIDATES
+            .iter()
+            .zip(available)
+            .find(|(_, avail)| *avail)
+            .map(|((bin, args), _)| (*bin, *args))
+    }
+
     /// (binary, args prefix) for the first player found on PATH.
     fn player() -> Option<(&'static str, Vec<&'static str>)> {
-        // pw-play and paplay take the file bare; ffplay/aplay need flags to
-        // stay non-interactive and quiet.
-        const CANDIDATES: &[(&str, &[&str])] = &[
-            ("pw-play", &[]),
-            ("paplay", &[]),
-            ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet"]),
-            ("aplay", &["-q"]),
+        let available = [
+            which_exists("pw-play"),
+            which_exists("paplay"),
+            which_exists("ffplay"),
+            which_exists("aplay"),
         ];
-        CANDIDATES
-            .iter()
-            .find(|(bin, _)| which_exists(bin))
-            .map(|(bin, args)| (*bin, args.to_vec()))
+        Self::choose_player(available).map(|(bin, args)| (bin, args.to_vec()))
     }
 
     /// Some(was_muted) when pactl is usable — the state to restore after.
@@ -452,6 +472,127 @@ mod tests {
         );
         plugin.handle_packet("device1", packet).await.unwrap();
         assert!(wait_until(|| backend.completed.load(Ordering::SeqCst) == 1).await);
+    }
+
+    // -----------------------------------------------------------------
+    // Player selection order (Task 1.6 Backend D "verify + pin", vk
+    // #1010): pure, no PATH dependency.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_choose_player_first_available_wins() {
+        // Exact priority order pinned against the module doc: pw-play >
+        // paplay > ffplay > aplay.
+        assert_eq!(
+            ProcessRingBackend::choose_player([true, true, true, true]),
+            Some(("pw-play", &[][..]))
+        );
+        assert_eq!(
+            ProcessRingBackend::choose_player([false, true, true, true]),
+            Some(("paplay", &[][..]))
+        );
+        assert_eq!(
+            ProcessRingBackend::choose_player([false, false, true, true]),
+            Some((
+                "ffplay",
+                &["-nodisp", "-autoexit", "-loglevel", "quiet"][..]
+            ))
+        );
+        assert_eq!(
+            ProcessRingBackend::choose_player([false, false, false, true]),
+            Some(("aplay", &["-q"][..]))
+        );
+    }
+
+    #[test]
+    fn test_choose_player_none_available_is_none() {
+        // The no-player-available degraded path: `player()` returns None,
+        // `ring()` returns false without spawning anything, and
+        // handle_packet's caller treats that as a logged, non-fatal
+        // failure (see test_no_player_and_crashed_player_release_the_latch
+        // below — from handle_packet's perspective the two cases are the
+        // same event).
+        assert_eq!(
+            ProcessRingBackend::choose_player([false, false, false, false]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_choose_player_only_middle_candidate_available() {
+        // Guards against an off-by-one in the zip/find: aplay-only and
+        // ffplay-only are covered above; this pins paplay being picked
+        // when it is the ONLY one present, not merely the first.
+        assert_eq!(
+            ProcessRingBackend::choose_player([false, true, false, false]),
+            Some(("paplay", &[][..]))
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Latch release on ring failure (Task 1.6 Backend D): a player that
+    // crashes, exits non-zero, or was never found all collapse to the
+    // SAME event above ProcessRingBackend — `ring()` returning `false` —
+    // so a mock returning `false` exercises the identical code path
+    // (RingGuard's unconditional Drop) a real crashed/killed player would.
+    // -----------------------------------------------------------------
+
+    /// Returns immediately with `false` — simulates any of "no player on
+    /// PATH", "player exited non-zero", "player crashed/was killed
+    /// mid-playback", or "spawn failed": ProcessRingBackend::ring()
+    /// normalizes all four into `false` without ever panicking (see
+    /// ring()'s match arms above), so this mock is a faithful stand-in
+    /// for all of them at the layer handle_packet actually depends on.
+    struct FailingMock {
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl RingBackend for FailingMock {
+        async fn ring(&self) -> bool {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_player_and_crashed_player_release_the_latch() {
+        // The single-flight latch releases via RingGuard's Drop
+        // (handle_packet, spawned task) regardless of ring()'s return
+        // value. If this DID stick, a real player crash would leave the
+        // daemon permanently unable to ring again — read the code: Drop
+        // runs unconditionally when the spawned task's async block ends,
+        // success or failure, so it does not stick. Pinned here so a
+        // future refactor that moves the guard inside a conditional
+        // breaks this test loudly.
+        let backend = Arc::new(FailingMock {
+            attempts: AtomicUsize::new(0),
+        });
+        let plugin = FindThisDevicePlugin::new().with_backend(backend.clone());
+
+        // First request: handle_packet must still return Ok (never
+        // fatal), and the failure must be non-panicking.
+        let result = plugin.handle_packet("device1", request_packet()).await;
+        assert!(
+            result.is_ok(),
+            "a failed ring must not error the packet handler"
+        );
+        assert!(wait_until(|| backend.attempts.load(Ordering::SeqCst) == 1).await);
+        assert!(
+            wait_until(|| !plugin.is_ringing()).await,
+            "latch must release after a failed ring, not just a successful one"
+        );
+
+        // Second request after the failure: must actually attempt to
+        // ring again, proving the latch never stuck.
+        plugin
+            .handle_packet("device1", request_packet())
+            .await
+            .unwrap();
+        assert!(
+            wait_until(|| backend.attempts.load(Ordering::SeqCst) == 2).await,
+            "a request after a failed ring must ring again, not stay latched"
+        );
     }
 
     #[tokio::test]

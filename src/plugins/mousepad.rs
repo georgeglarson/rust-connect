@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use evdev::AttributeSet;
-use evdev::{EventType, InputEvent, KeyCode, RelativeAxisCode};
+use evdev::{AbsoluteAxisCode, EventType, InputEvent, KeyCode, RelativeAxisCode};
 use tracing::{debug, info, warn};
 
 use crate::protocol::types::Packet;
@@ -44,8 +44,12 @@ pub struct MousepadRequest {
     pub dy: Option<f64>,
     /// Absolute pointer position. Only kdeconnect-kde's
     /// shareinputdevicesremote plugin ever produces these
-    /// (plugins/shareinputdevicesremote/shareinputdevicesremoteplugin.cpp:74).
-    /// See the `mousepad_absolute_unsupported` path in `handle_packet`.
+    /// (plugins/shareinputdevicesremote/shareinputdevicesremoteplugin.cpp:74),
+    /// and it hands the packet to its local mousepad plugin in-process
+    /// rather than transmitting it — no wire producer exercises this path.
+    /// See `absolute_position` for the decision and `scale_abs_coord` for
+    /// how the values are mapped onto our synthetic absolute-pointer
+    /// device.
     #[serde(default)]
     pub x: Option<f64>,
     #[serde(default)]
@@ -521,28 +525,115 @@ fn plan_actions(req: &MousepadRequest) -> Vec<InputAction> {
     }
 }
 
-/// True when a packet's only actionable content is absolute positioning.
+/// Fixed logical coordinate range advertised on the absolute-pointer uinput
+/// device (`AbsoluteInputDevice`).
 ///
-/// GAP, deliberate: absolute pointer positioning is not implemented.
-/// kdeconnect-kde warps the cursor to (x, y) here
-/// (x11remoteinput.cpp:194-197, waylandremoteinput.cpp:523-524), which
-/// needs ABS_X/ABS_Y registered on the uinput device. Ours carries
-/// relative axes only, and mixing ABS onto it risks the device
-/// classification that makes its relative motion work at all — see the
-/// comment in src/plugins/presenter.rs about the missing `mouseN` handler.
+/// libinput maps a device's declared ABS_X/ABS_Y min/max linearly across
+/// the receiving screen's real pixels — the same mechanism
+/// `src/plugins/digitizer.rs` already relies on, there with a
+/// phone-declared width/height as the range because the digitizer wire
+/// protocol negotiates one first (`kdeconnect.digitizer.session`).
+/// Mousepad has no such negotiation and, per `absolute_position`'s doc, no
+/// live wire producer to observe, so a fixed constant is the only
+/// available choice. 65535 matches the convention used by QEMU's
+/// usb-tablet device, VNC, and RDP absolute pointers (16-bit range,
+/// "0..65535 == 0%..100% of the target screen").
+const ABS_RANGE_MAX: i32 = 65535;
+
+/// Maps a wire coordinate onto the fixed `ABS_RANGE_MAX` logical range.
 ///
-/// Nothing sends these over the wire: kdeconnect-android never sets x/y,
-/// and kdeconnect-kde's only producer hands the packet to its local
-/// mousepad plugin in-process rather than transmitting it
-/// (plugins/shareinputdevicesremote/shareinputdevicesremoteplugin.cpp:74-75).
-/// So we log and drop. See ROADMAP.md, "Later" — absolute pointer
-/// positioning.
+/// DIVERGENCE, documented: upstream's x/y are the *sender's* real screen
+/// pixel coordinates (kdeconnect-kde XWarpPointer takes them verbatim —
+/// x11remoteinput.cpp:196-197 — and `pointerMotionAbsolute` forwards them
+/// unchanged to libei/the portal — waylandremoteinput.cpp:394-401,
+/// 523-524). That is only meaningful when sender and receiver share a
+/// screen, which is true for upstream's sole in-process producer
+/// (shareinputdevicesremote) and never true for a real network peer. We
+/// have no screen-geometry query in this codebase to scale against even if
+/// a peer did send real pixels, so incoming coordinates are rounded and
+/// clamped directly into `[0, ABS_RANGE_MAX]` with no separate
+/// normalization step. A peer that sends coordinates already within that
+/// range lands correctly; no real display exceeds 65535px in either
+/// dimension, so clamping there costs nothing in practice.
+fn scale_abs_coord(v: f64) -> i32 {
+    v.round().clamp(0.0, ABS_RANGE_MAX as f64) as i32
+}
+
+/// Absolute pointer coordinates for a packet, when that is ALL the packet
+/// carries — mirrors upstream's branch order: the absolute arm is reached
+/// only after the click/key chain and only when dx/dy are zero or absent
+/// (x11remoteinput.cpp:191-197, waylandremoteinput.cpp:521-524).
+fn absolute_position(req: &MousepadRequest) -> Option<(i32, i32)> {
+    if (req.x.is_some() || req.y.is_some()) && plan_actions(req).is_empty() {
+        Some((
+            scale_abs_coord(req.x.unwrap_or(0.0)),
+            scale_abs_coord(req.y.unwrap_or(0.0)),
+        ))
+    } else {
+        None
+    }
+}
+
+/// A second, single-purpose uinput device for absolute pointer positioning.
 ///
-/// Matches upstream's branch order: the absolute arm is reached only after
-/// the click/key chain and only when dx/dy are zero or absent
-/// (x11remoteinput.cpp:191-197).
-fn is_dropped_absolute(req: &MousepadRequest) -> bool {
-    (req.x.is_some() || req.y.is_some()) && plan_actions(req).is_empty()
+/// Kept separate from `InputDevice` rather than adding ABS axes onto the
+/// same virtual device: mixing REL and ABS axes on one uinput device makes
+/// kernel/libinput device classification unreliable and version-dependent.
+/// `InputDevice` already carries one hard-won classification lesson of its
+/// own kind — a device with no EV_KEY buttons at all gets no `mouseN`
+/// handler, only a bare `eventN` one, and its motion is silently dropped
+/// (see `src/plugins/presenter.rs`'s `InputDevice::new`, "no mouseN
+/// handler"). A second device sidesteps the ambiguity rather than risking
+/// a second, harder-to-diagnose variant of the same failure mode.
+///
+/// Created lazily, on the first absolute packet a device sends: most
+/// sessions never send one (see `absolute_position`'s doc), so most
+/// daemon runs never need a second virtual input device to exist at all.
+struct AbsoluteInputDevice {
+    device: evdev::uinput::VirtualDevice,
+}
+
+impl AbsoluteInputDevice {
+    fn new() -> Option<Self> {
+        let device = evdev::uinput::VirtualDevice::builder()
+            .ok()?
+            .name("rust-connect-mousepad-absolute")
+            // No click is ever emitted from this device — clicks stay on
+            // the primary REL device above — but at least one EV_KEY is
+            // required for the kernel to attach a mouseN handler (same
+            // finding as InputDevice::new above and presenter.rs).
+            .with_keys(
+                &[KeyCode::BTN_LEFT]
+                    .into_iter()
+                    .collect::<AttributeSet<KeyCode>>(),
+            )
+            .ok()?
+            .with_absolute_axis(&evdev::UinputAbsSetup::new(
+                AbsoluteAxisCode::ABS_X,
+                evdev::AbsInfo::new(0, 0, ABS_RANGE_MAX, 0, 0, 0),
+            ))
+            .ok()?
+            .with_absolute_axis(&evdev::UinputAbsSetup::new(
+                AbsoluteAxisCode::ABS_Y,
+                evdev::AbsInfo::new(0, 0, ABS_RANGE_MAX, 0, 0, 0),
+            ))
+            .ok()?
+            .build()
+            .ok()?;
+
+        Some(Self { device })
+    }
+
+    fn move_to(&mut self, x: i32, y: i32) {
+        let events = [
+            InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, x),
+            InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_Y.0, y),
+            InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0),
+        ];
+        if let Err(e) = self.device.emit(&events) {
+            warn!(error = %e, event = "mousepad_abs_emit_failed", "Failed to emit absolute pointer event");
+        }
+    }
 }
 
 /// Key injection with modifiers held around it.
@@ -578,6 +669,24 @@ fn key_actions(req: &MousepadRequest, has_key: bool, special: i32) -> Vec<InputA
 pub struct MousepadPlugin {
     events_received: AtomicUsize,
     input_device: Mutex<Option<InputDevice>>,
+    /// Lazily created on the first absolute-positioning packet — see
+    /// `AbsoluteInputDevice`'s doc.
+    abs_input_device: Mutex<Option<AbsoluteInputDevice>>,
+    /// Whether the lazy `abs_input_device` creation has been tried.
+    /// `None` in the cell alone can't distinguish "never tried" from
+    /// "tried and failed", and without the distinction a host with no
+    /// usable `/dev/uinput` re-opens the device and re-warns on EVERY
+    /// absolute packet a peer streams (PR #11 review). One attempt per
+    /// plugin instance, matching `input_device`'s decided-once semantics.
+    abs_device_attempted: std::sync::atomic::AtomicBool,
+    /// Whether this instance may open real uinput devices at all.
+    /// `new_without_input()` sets this false: unlike `input_device` (which
+    /// is decided once at construction and never retried), the absolute
+    /// device is created lazily on first use, so without this flag a
+    /// fixture packet routed through `new_without_input()` would still
+    /// reach for `/dev/uinput` the first time it carried x/y — defeating
+    /// the whole point of that constructor.
+    uinput_enabled: bool,
 }
 
 impl Default for MousepadPlugin {
@@ -604,6 +713,9 @@ impl MousepadPlugin {
         Self {
             events_received: AtomicUsize::new(0),
             input_device: Mutex::new(input_device),
+            abs_input_device: Mutex::new(None),
+            abs_device_attempted: std::sync::atomic::AtomicBool::new(false),
+            uinput_enabled: true,
         }
     }
 
@@ -614,11 +726,64 @@ impl MousepadPlugin {
         Self {
             events_received: AtomicUsize::new(0),
             input_device: Mutex::new(None),
+            abs_input_device: Mutex::new(None),
+            abs_device_attempted: std::sync::atomic::AtomicBool::new(false),
+            uinput_enabled: false,
         }
     }
 
     pub fn events_received(&self) -> usize {
         self.events_received.load(Ordering::SeqCst)
+    }
+
+    /// Injects an absolute pointer position, creating the second uinput
+    /// device on first use. A creation failure is an environment gap —
+    /// logged and dropped, exactly like the primary `InputDevice`'s own
+    /// unavailable-uinput path in `new()` — not a code gap.
+    fn inject_absolute(&self, device_id: &str, x: i32, y: i32) {
+        if !self.uinput_enabled {
+            return;
+        }
+        let Ok(mut guard) = self.abs_input_device.lock() else {
+            return;
+        };
+        if guard.is_none()
+            && !self
+                .abs_device_attempted
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            *guard = AbsoluteInputDevice::new();
+            if guard.is_some() {
+                info!(
+                    device_id = %device_id,
+                    event = "mousepad_abs_uinput_ready",
+                    "Absolute-pointer uinput device created"
+                );
+            } else {
+                warn!(
+                    device_id = %device_id,
+                    event = "mousepad_abs_uinput_unavailable",
+                    "Could not create the absolute-pointer uinput device; \
+                     packet dropped. Ensure /dev/uinput is accessible \
+                     (add user to 'input' group or run as root)."
+                );
+            }
+        }
+        if let Some(ref mut dev) = *guard {
+            dev.move_to(x, y);
+            // debug!, not info!: continuous motion arrives many times a
+            // second, and the relative path's per-move log
+            // (mousepad_input) is debug-level too. The info-level
+            // lifecycle events (mousepad_abs_uinput_ready/_unavailable)
+            // carry the observability.
+            debug!(
+                device_id = %device_id,
+                x = x,
+                y = y,
+                event = "mousepad_absolute_injected",
+                "Injected absolute pointer position"
+            );
+        }
     }
 }
 
@@ -683,14 +848,8 @@ impl Plugin for MousepadPlugin {
 
         let actions = plan_actions(&req);
 
-        if is_dropped_absolute(&req) {
-            warn!(
-                device_id = %device_id,
-                x = ?req.x,
-                y = ?req.y,
-                event = "mousepad_absolute_unsupported",
-                "Absolute pointer positioning is not supported; packet dropped"
-            );
+        if let Some((x, y)) = absolute_position(&req) {
+            self.inject_absolute(device_id, x, y);
         }
 
         debug!(
@@ -1205,29 +1364,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_absolute_position_packet_is_dropped_not_treated_as_movement() {
-        // The only producer of x/y in a mousepad packet anywhere upstream
-        // is kdeconnect-kde's shareinputdevicesremote plugin
-        // (shareinputdevicesremoteplugin.cpp:74), and it delivers that
-        // packet in-process (:75), never over the wire. kdeconnect-android
-        // never sends x/y at all. We have no absolute axes on the uinput
-        // device, so such a packet must inject NOTHING — and must
-        // certainly not be mistaken for relative movement.
+    async fn test_absolute_position_packet_reaches_the_backend() {
+        // Was test_absolute_position_packet_is_dropped_not_treated_as_movement
+        // (vk #1010, Task 1.6, Backend A): absolute positioning is now
+        // implemented, so a packet carrying only x/y must produce a
+        // position rather than being dropped or mistaken for relative
+        // movement. The only upstream producer of x/y is
+        // kdeconnect-kde's shareinputdevicesremote plugin
+        // (shareinputdevicesremoteplugin.cpp:74), delivered in-process
+        // (:75), never over the wire — kdeconnect-android never sends x/y
+        // at all — but the wire shape is well-defined regardless.
         let req = request_from(serde_json::json!({ "x": 1920.0, "y": 12.0 }));
-        assert!(plan_actions(&req).is_empty());
-        assert!(is_dropped_absolute(&req));
+        assert!(
+            plan_actions(&req).is_empty(),
+            "an x/y-only packet must not also plan a relative Move"
+        );
+        assert_eq!(absolute_position(&req), Some((1920, 12)));
     }
 
     #[tokio::test]
-    async fn test_relative_movement_is_not_flagged_as_dropped_absolute() {
+    async fn test_relative_movement_does_not_produce_absolute_position() {
         // Upstream reaches its absolute branch only when dx/dy are zero or
-        // absent (x11remoteinput.cpp:192-197). A normal movement packet
-        // must not be reported as a dropped absolute one.
+        // absent (x11remoteinput.cpp:192-197). A normal movement or click
+        // packet must not report an absolute position.
         let req = request_from(serde_json::json!({ "dx": 10.5, "dy": -3.2 }));
-        assert!(!is_dropped_absolute(&req));
+        assert_eq!(absolute_position(&req), None);
 
         let click = request_from(serde_json::json!({ "singleclick": true }));
-        assert!(!is_dropped_absolute(&click));
+        assert_eq!(absolute_position(&click), None);
+    }
+
+    #[tokio::test]
+    async fn test_absolute_position_ignores_zero_relative_delta() {
+        // dx: 0.0 / dy: 0.0 present-but-zero must not block the absolute
+        // arm: upstream's guard is `if (dx || dy)` (C++ truthiness — zero
+        // is falsy), not "has the field at all"
+        // (x11remoteinput.cpp:191-197). plan_actions already treats an
+        // explicit zero delta as no relative motion (see
+        // test_plan_scroll_maps_to_wheel_not_movement's sibling coverage
+        // of the dx/dy==0 arm), so the same packet's x/y must still reach
+        // absolute_position.
+        let req = request_from(serde_json::json!({ "dx": 0.0, "dy": 0.0, "x": 500.0, "y": 250.0 }));
+        assert!(plan_actions(&req).is_empty());
+        assert_eq!(absolute_position(&req), Some((500, 250)));
+    }
+
+    #[tokio::test]
+    async fn test_scale_abs_coord_rounds_and_clamps() {
+        // Pins the fixed-range scaling documented on scale_abs_coord:
+        // round-to-nearest, then clamp into [0, ABS_RANGE_MAX].
+        assert_eq!(scale_abs_coord(0.0), 0);
+        assert_eq!(scale_abs_coord(1920.0), 1920);
+        assert_eq!(scale_abs_coord(1920.4), 1920);
+        assert_eq!(scale_abs_coord(1920.5), 1921); // round-half-away-from-zero
+        assert_eq!(scale_abs_coord(-5.0), 0, "negative coordinates clamp to 0");
+        assert_eq!(
+            scale_abs_coord(f64::from(ABS_RANGE_MAX) + 100.0),
+            ABS_RANGE_MAX,
+            "coordinates beyond the fixed range clamp to ABS_RANGE_MAX"
+        );
+        assert_eq!(scale_abs_coord(f64::MAX), ABS_RANGE_MAX);
+        assert_eq!(scale_abs_coord(f64::MIN), 0);
+        assert_eq!(
+            scale_abs_coord(f64::NAN),
+            0,
+            "NaN must not panic or escape the clamp"
+        );
     }
 
     #[tokio::test]

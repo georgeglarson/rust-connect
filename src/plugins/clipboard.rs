@@ -39,6 +39,28 @@
 //! backoff after unexpected exits (compositor restart, wl-paste crash);
 //! clean shutdown (plugin dropped) does not restart.
 //!
+//! X11 backend (Task 1.6 Backend C, vk #1010): `xclip` preferred, `xsel`
+//! fallback (both probed with `binary_in_path`, same as wl-copy/wl-paste
+//! above). DIVERGENCE, documented: upstream (kdeconnect-kde, GSConnect) is
+//! event-driven via QClipboard::dataChanged() / GtkClipboard "owner-change",
+//! native toolkit signals with no CLI equivalent on X11 the way `wl-paste
+//! --watch` gives Wayland one. This backend uses `clipnotify`
+//! (github.com/cdown/clipnotify) when present — a one-shot "block until the
+//! next XFixes SelectionNotify, then exit" program, looped the same way the
+//! classic `while clipnotify; do ...; done` shell idiom does, so it stays
+//! genuinely event-driven and needs no dedup (mirrors wl-paste --watch's own
+//! shape: one push per real change). Without `clipnotify` — the common case,
+//! since it is a niche tool most systems do not ship — it falls back to
+//! polling `xclip -o -selection clipboard` (or the xsel equivalent) on a
+//! fixed interval with content-checksum dedup, since a poll loop re-reads
+//! unconditionally every tick and would otherwise repush the same unchanged
+//! content forever. Backend PICK order at plugin init
+//! (`enable_session_backend`): `WAYLAND_DISPLAY` set → Wayland; else
+//! `DISPLAY` set → X11; neither → degraded, same as today. `WAYLAND_DISPLAY`
+//! is checked first because XWayland means `DISPLAY` is very often ALSO set
+//! under a native Wayland session — checking it first is what keeps a
+//! Wayland session from being picked as X11 by accident.
+//!
 //! Capability honesty: incoming and outgoing both advertise
 //! `kdeconnect.clipboard` + `kdeconnect.clipboard.connect`, matching upstream
 //! (kdeconnect-kde kdeconnect_clipboard.json X-KdeConnect-SupportedPacketType
@@ -67,8 +89,8 @@ use crate::utils::errors::{Error, Result};
 use super::plugin::Plugin;
 
 /// Session clipboard abstraction so unit tests don't need a live Wayland
-/// session. A second backend (e.g. X11 via xsel) is a new impl of this trait
-/// plus one branch in the production wiring.
+/// session. `X11Clipboard` below is the second impl (xclip preferred, xsel
+/// fallback — Task 1.6 Backend C).
 pub trait ClipboardBackend: Send + Sync {
     /// Backend name for logs ("wayland").
     fn name(&self) -> &str;
@@ -81,6 +103,31 @@ pub trait ClipboardBackend: Send + Sync {
     /// implementations should supervise post-start exits internally (the
     /// Wayland backend restarts with capped backoff).
     fn spawn_watcher(&self, tx: UnboundedSender<String>) -> Result<()>;
+}
+
+/// Which desktop session type `enable_session_backend` should try, decided
+/// from env var PRESENCE only — never binary availability, which is each
+/// backend's own `detect()`'s job. Pure so the WAYLAND_DISPLAY-before-
+/// DISPLAY priority order (module doc: XWayland means DISPLAY is often ALSO
+/// set under a native Wayland session) is unit-testable without touching
+/// the process environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayServer {
+    Wayland,
+    X11,
+    None,
+}
+
+impl DisplayServer {
+    fn from_env_presence(wayland_display_set: bool, display_set: bool) -> Self {
+        if wayland_display_set {
+            DisplayServer::Wayland
+        } else if display_set {
+            DisplayServer::X11
+        } else {
+            DisplayServer::None
+        }
+    }
 }
 
 /// Wayland backend via wl-clipboard (`wl-copy` / `wl-paste`). Needs
@@ -171,6 +218,139 @@ impl ClipboardBackend for WaylandClipboard {
     }
 }
 
+/// Which command line `X11Clipboard` uses. xclip is preferred (the trait
+/// doc's stated intent names xsel, but xclip is chosen here because its
+/// exit-code contract is simpler to act on: non-zero unambiguously means
+/// "no selection owner", where xsel exits 0 with empty output for that same
+/// case — see `read_clipboard_once`'s unified "no content" check below,
+/// which folds both shapes into one branch anyway).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum X11Tool {
+    Xclip,
+    Xsel,
+}
+
+impl X11Tool {
+    fn binary_name(self) -> &'static str {
+        match self {
+            X11Tool::Xclip => "xclip",
+            X11Tool::Xsel => "xsel",
+        }
+    }
+
+    /// Args for a CLIPBOARD-selection write, stdin piped as the content.
+    fn write_args(self) -> &'static [&'static str] {
+        match self {
+            X11Tool::Xclip => &["-i", "-selection", "clipboard"],
+            X11Tool::Xsel => &["--clipboard", "--input"],
+        }
+    }
+
+    /// Args for a CLIPBOARD-selection read.
+    fn read_args(self) -> &'static [&'static str] {
+        match self {
+            X11Tool::Xclip => &["-o", "-selection", "clipboard"],
+            X11Tool::Xsel => &["--clipboard", "--output"],
+        }
+    }
+
+    /// Picks xclip when available, else xsel, else no X11 backend at all.
+    /// Pure so the preference order is testable without touching PATH.
+    fn choose(xclip_available: bool, xsel_available: bool) -> Option<Self> {
+        if xclip_available {
+            Some(X11Tool::Xclip)
+        } else if xsel_available {
+            Some(X11Tool::Xsel)
+        } else {
+            None
+        }
+    }
+}
+
+/// X11 backend via `xclip` (preferred) or `xsel` (fallback). Needs DISPLAY
+/// in the process environment — see the module doc's backend-pick-order
+/// paragraph for why `WAYLAND_DISPLAY` is checked ahead of this at the
+/// call site (`ClipboardPlugin::enable_session_backend`).
+pub struct X11Clipboard {
+    tool: X11Tool,
+}
+
+impl X11Clipboard {
+    /// Detect a usable X11 clipboard: DISPLAY present, and xclip or xsel on
+    /// PATH. Returns None (degrade) otherwise.
+    pub fn detect() -> Option<Self> {
+        std::env::var_os("DISPLAY")?;
+        let tool = X11Tool::choose(binary_in_path("xclip"), binary_in_path("xsel"))?;
+        Some(Self { tool })
+    }
+}
+
+/// Synchronous xclip/xsel write; invoked via spawn_blocking, mirroring
+/// `wl_write`. Both tools read the selection from stdin and fork to serve
+/// it once stdin closes, so `wait()` returns promptly (live-verified for
+/// both in this session, same as the comment on `wl_write` already
+/// documents for wl-copy).
+fn x11_write(tool: X11Tool, content: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(tool.binary_name())
+        .args(tool.write_args())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| Error::io(format!("failed to spawn {}: {e}", tool.binary_name()), None))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(content.as_bytes()).map_err(|e| {
+            Error::io(
+                format!("failed to write to {}: {e}", tool.binary_name()),
+                None,
+            )
+        })?;
+    }
+    let status = child.wait().map_err(|e| {
+        Error::io(
+            format!("failed to wait on {}: {e}", tool.binary_name()),
+            None,
+        )
+    })?;
+    if !status.success() {
+        return Err(Error::io(
+            format!("{} exited with {status}", tool.binary_name()),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+impl ClipboardBackend for X11Clipboard {
+    fn name(&self) -> &str {
+        match self.tool {
+            X11Tool::Xclip => "x11-xclip",
+            X11Tool::Xsel => "x11-xsel",
+        }
+    }
+
+    fn set(&self, content: &str) -> Result<()> {
+        x11_write(self.tool, content)
+    }
+
+    fn spawn_watcher(&self, tx: UnboundedSender<String>) -> Result<()> {
+        let tool = self.tool;
+        if binary_in_path("clipnotify") {
+            tokio::spawn(supervise_watcher(tx, move |tx| {
+                run_x11_clipnotify_watcher(tool, tx)
+            }));
+        } else {
+            tokio::spawn(supervise_watcher(tx, move |tx| {
+                run_x11_poll_watcher(tool, tx)
+            }));
+        }
+        Ok(())
+    }
+}
+
 /// Why one watcher run ended. `Shutdown` (the plugin's receiver is gone) is
 /// the only clean exit and must NOT restart; everything else is supervised.
 enum WatcherExit {
@@ -256,6 +436,125 @@ async fn read_clipboard_once() -> Result<Option<String>> {
             })
         }
     }
+}
+
+/// A single X11 read (xclip/xsel) with the same hard-timeout shape as
+/// `read_clipboard_once`. Unifies both tools' "nothing to report" cases into
+/// one branch: xclip exits non-zero with no CLIPBOARD owner
+/// ("Error: There is no owner for the CLIPBOARD selection", live-verified
+/// this session), xsel instead exits 0 with empty stdout for the same
+/// case — either shape, or a genuinely empty clipboard, means `Ok(None)`.
+async fn read_x11_clipboard_once(tool: X11Tool) -> Result<Option<String>> {
+    use tokio::process::Command;
+
+    let read = Command::new(tool.binary_name())
+        .args(tool.read_args())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(CLIPBOARD_READ_TIMEOUT, read).await {
+        Err(_) => Err(Error::io(
+            format!(
+                "{} read timed out after {}s",
+                tool.binary_name(),
+                CLIPBOARD_READ_TIMEOUT.as_secs()
+            ),
+            None,
+        )),
+        Ok(Err(e)) => Err(Error::io(
+            format!("failed to spawn {}: {e}", tool.binary_name()),
+            None,
+        )),
+        Ok(Ok(out)) if !out.status.success() => Ok(None),
+        Ok(Ok(out)) => {
+            let content = String::from_utf8_lossy(&out.stdout).into_owned();
+            Ok(if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            })
+        }
+    }
+}
+
+/// Event-driven watcher via `clipnotify`: each invocation blocks until ONE
+/// clipboard-selection change, then exits — looped like the classic
+/// `while clipnotify; do ...; done` shell idiom. No content-checksum dedup
+/// needed here (unlike the poll fallback below): a real XFixes event only
+/// fires on an actual change, matching `run_watcher`'s own one-push-per-
+/// change shape for Wayland.
+async fn run_x11_clipnotify_watcher(tool: X11Tool, tx: UnboundedSender<String>) -> WatcherExit {
+    use tokio::process::Command;
+
+    loop {
+        let mut child = match Command::new("clipnotify")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => return WatcherExit::Failed(format!("failed to spawn clipnotify: {e}")),
+        };
+        match child.wait().await {
+            Ok(status) if status.success() => {}
+            Ok(status) => return WatcherExit::Failed(format!("clipnotify exited with {status}")),
+            Err(e) => return WatcherExit::Failed(format!("clipnotify wait failed: {e}")),
+        }
+        match read_x11_clipboard_once(tool).await {
+            Ok(Some(content)) => {
+                if tx.send(content).is_err() {
+                    return WatcherExit::Shutdown;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, event = "clipboard_read_failed", "X11 clipboard read failed");
+            }
+        }
+    }
+}
+
+/// X11 has no CLI watch primitive the way `wl-paste --watch` gives Wayland
+/// one; without `clipnotify` this polls on a fixed interval instead.
+const X11_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Poll-based watcher (clipnotify unavailable — the common case). Re-reads
+/// unconditionally every tick, so content-checksum dedup is load-bearing
+/// here specifically: without it, unchanged clipboard content would be
+/// repushed once per tick forever, unlike the event-driven paths above.
+async fn run_x11_poll_watcher(tool: X11Tool, tx: UnboundedSender<String>) -> WatcherExit {
+    let mut last_hash: Option<u64> = None;
+    loop {
+        tokio::time::sleep(X11_POLL_INTERVAL).await;
+        match read_x11_clipboard_once(tool).await {
+            Ok(Some(content)) => {
+                let hash = content_hash(&content);
+                if last_hash != Some(hash) {
+                    last_hash = Some(hash);
+                    if tx.send(content).is_err() {
+                        return WatcherExit::Shutdown;
+                    }
+                }
+            }
+            // A cleared/ownerless selection resets the dedup so the next
+            // real content always pushes, even if it happens to match
+            // whatever was last pushed before the clear.
+            Ok(None) => last_hash = None,
+            Err(e) => {
+                warn!(error = %e, event = "clipboard_read_failed", "X11 clipboard poll read failed");
+            }
+        }
+    }
+}
+
+fn content_hash(content: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
 }
 
 const CLIPBOARD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -458,20 +757,34 @@ impl ClipboardPlugin {
     /// live session. Degrades with a log event, mousepad-style, when no
     /// backend is available.
     pub fn enable_session_backend(&self) {
-        match WaylandClipboard::detect() {
+        let display_server = DisplayServer::from_env_presence(
+            std::env::var_os("WAYLAND_DISPLAY").is_some(),
+            std::env::var_os("DISPLAY").is_some(),
+        );
+        let backend: Option<Arc<dyn ClipboardBackend>> = match display_server {
+            DisplayServer::Wayland => {
+                WaylandClipboard::detect().map(|b| Arc::new(b) as Arc<dyn ClipboardBackend>)
+            }
+            DisplayServer::X11 => {
+                X11Clipboard::detect().map(|b| Arc::new(b) as Arc<dyn ClipboardBackend>)
+            }
+            DisplayServer::None => None,
+        };
+        match backend {
             Some(backend) => {
                 info!(
                     event = "clipboard_backend_ready",
                     backend = backend.name(),
                     "Session clipboard backend enabled"
                 );
-                self.set_backend(Arc::new(backend));
+                self.set_backend(backend);
             }
             None => {
                 warn!(
                     event = "clipboard_backend_unavailable",
-                    "No usable session clipboard (need WAYLAND_DISPLAY + XDG_RUNTIME_DIR and \
-                     wl-copy/wl-paste on PATH). Clipboard sync degraded to store-and-event only."
+                    display_server = ?display_server,
+                    "No usable session clipboard (need WAYLAND_DISPLAY + wl-copy/wl-paste, \
+                     or DISPLAY + xclip/xsel). Clipboard sync degraded to store-and-event only."
                 );
             }
         }
@@ -822,6 +1135,86 @@ mod tests {
             "kdeconnect.clipboard".to_string(),
             serde_json::json!({ "content": content }),
         )
+    }
+
+    // -----------------------------------------------------------------
+    // X11 backend selection (Task 1.6 Backend C, vk #1010) — pure
+    // decision logic, no live X server needed.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_display_server_priority_prefers_wayland() {
+        // WAYLAND_DISPLAY set → Wayland, REGARDLESS of DISPLAY — XWayland
+        // means DISPLAY is very often also set under a native Wayland
+        // session (module doc), so checking WAYLAND_DISPLAY first is what
+        // keeps that session from being picked as X11 by accident.
+        assert_eq!(
+            DisplayServer::from_env_presence(true, true),
+            DisplayServer::Wayland
+        );
+        assert_eq!(
+            DisplayServer::from_env_presence(true, false),
+            DisplayServer::Wayland
+        );
+    }
+
+    #[test]
+    fn test_display_server_priority_falls_back_to_x11() {
+        assert_eq!(
+            DisplayServer::from_env_presence(false, true),
+            DisplayServer::X11
+        );
+    }
+
+    #[test]
+    fn test_display_server_priority_neither_is_none() {
+        assert_eq!(
+            DisplayServer::from_env_presence(false, false),
+            DisplayServer::None
+        );
+    }
+
+    #[test]
+    fn test_x11_tool_choose_prefers_xclip() {
+        assert_eq!(X11Tool::choose(true, true), Some(X11Tool::Xclip));
+        assert_eq!(X11Tool::choose(true, false), Some(X11Tool::Xclip));
+    }
+
+    #[test]
+    fn test_x11_tool_choose_falls_back_to_xsel() {
+        assert_eq!(X11Tool::choose(false, true), Some(X11Tool::Xsel));
+    }
+
+    #[test]
+    fn test_x11_tool_choose_neither_is_none() {
+        assert_eq!(X11Tool::choose(false, false), None);
+    }
+
+    #[test]
+    fn test_x11_tool_command_shapes_are_pinned() {
+        // Regression guard on the exact wire-level command shape
+        // (live-verified against real xclip/xsel in this session).
+        assert_eq!(
+            X11Tool::Xclip.write_args(),
+            &["-i", "-selection", "clipboard"]
+        );
+        assert_eq!(
+            X11Tool::Xclip.read_args(),
+            &["-o", "-selection", "clipboard"]
+        );
+        assert_eq!(X11Tool::Xsel.write_args(), &["--clipboard", "--input"]);
+        assert_eq!(X11Tool::Xsel.read_args(), &["--clipboard", "--output"]);
+        assert_eq!(X11Tool::Xclip.binary_name(), "xclip");
+        assert_eq!(X11Tool::Xsel.binary_name(), "xsel");
+    }
+
+    #[test]
+    fn test_content_hash_distinguishes_content_matches_identical() {
+        // Sanity pin for the poll watcher's dedup key: same content, same
+        // hash; different content, (almost certainly) different hash.
+        assert_eq!(content_hash("hello"), content_hash("hello"));
+        assert_ne!(content_hash("hello"), content_hash("world"));
+        assert_ne!(content_hash(""), content_hash("hello"));
     }
 
     #[tokio::test]
