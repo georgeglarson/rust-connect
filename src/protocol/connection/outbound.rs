@@ -482,18 +482,22 @@ mod tests {
         let capture_port = capture.local_addr().expect("local_addr").port();
 
         let identity = test_identity();
-        send_reverse_connection_fallback(&identity, Ipv4Addr::LOCALHOST.into(), capture_port)
-            .await;
+        send_reverse_connection_fallback(&identity, Ipv4Addr::LOCALHOST.into(), capture_port).await;
 
         let mut buf = vec![0u8; 65536];
-        let (len, _addr) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), capture.recv_from(&mut buf))
-                .await
-                .expect("the fallback datagram must arrive")
-                .expect("recv_from");
+        let (len, _addr) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            capture.recv_from(&mut buf),
+        )
+        .await
+        .expect("the fallback datagram must arrive")
+        .expect("recv_from");
 
         let packet = PacketSerializer::deserialize(&buf[..len]).expect("must deserialize");
-        assert!(packet.is_identity(), "fallback must send an identity packet");
+        assert!(
+            packet.is_identity(),
+            "fallback must send an identity packet"
+        );
         let received = Identity::from_packet(packet).expect("must be a valid identity");
         assert_eq!(received.device_id, identity.device_id);
         let tcp_port = received.tcp_port.expect("tcpPort must be present");
@@ -545,24 +549,34 @@ mod tests {
         let result = cm
             .connect_to_device_with_fallback_port(&our_identity, dead_addr, None, capture_port)
             .await;
-        assert!(result.is_err(), "a refused dial must still surface as an error");
+        assert!(
+            result.is_err(),
+            "a refused dial must still surface as an error"
+        );
 
         let mut buf = vec![0u8; 65536];
-        let (len, _addr) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), capture.recv_from(&mut buf))
-                .await
-                .expect("the fallback datagram must arrive after the dial failure")
-                .expect("recv_from");
+        let (len, _addr) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            capture.recv_from(&mut buf),
+        )
+        .await
+        .expect("the fallback datagram must arrive after the dial failure")
+        .expect("recv_from");
         let received =
             Identity::from_packet(PacketSerializer::deserialize(&buf[..len]).expect("deserialize"))
                 .expect("valid identity");
         assert_eq!(received.device_id, "dial-fail-senderaaaaaaaaaaaaaaaaaa");
 
         // Exactly once — no retry loop.
-        let second =
-            tokio::time::timeout(std::time::Duration::from_millis(200), capture.recv_from(&mut buf))
-                .await;
-        assert!(second.is_err(), "the fallback must fire at most once per failed dial");
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            capture.recv_from(&mut buf),
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "the fallback must fire at most once per failed dial"
+        );
     }
 
     /// Gap 5 behavioral test 2: the plaintext-identity-write failure leg
@@ -647,7 +661,8 @@ mod tests {
 
         let err = result.expect_err("a write against a reset peer must still surface as an error");
         assert!(
-            err.to_string().contains("Failed to send plaintext identity"),
+            err.to_string()
+                .contains("Failed to send plaintext identity"),
             "must fail specifically in the write-failure branch (leg 2), not leg 1 or TLS: {err}"
         );
     }
@@ -698,9 +713,11 @@ mod tests {
         assert!(result.is_ok(), "the dial must succeed: {result:?}");
 
         let mut buf = vec![0u8; 65536];
-        let second =
-            tokio::time::timeout(std::time::Duration::from_millis(300), capture.recv_from(&mut buf))
-                .await;
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            capture.recv_from(&mut buf),
+        )
+        .await;
         assert!(
             second.is_err(),
             "a successful connect must never send a reverse-connection fallback"

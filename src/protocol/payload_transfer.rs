@@ -444,8 +444,7 @@ impl PayloadTransfer {
                 return Err(error);
             }
         };
-        let bytes =
-            Self::receive_into_streaming(tls_stream, file, max_bytes, &destination).await?;
+        let bytes = Self::receive_into_streaming(tls_stream, file, max_bytes, &destination).await?;
         Ok((bytes, destination))
     }
 
@@ -1068,7 +1067,10 @@ mod tls_tests {
     /// Gap 7 (parity-checklist.md § Payload transfers, vk #998 Task 2.3):
     /// the streaming receive path — no declared size, read to clean EOF,
     /// bounded by `max_bytes`.
-    async fn roundtrip_streaming(content: &[u8], max_bytes: u64) -> (Result<u64>, Vec<u8>, PathBuf) {
+    async fn roundtrip_streaming(
+        content: &[u8],
+        max_bytes: u64,
+    ) -> (Result<u64>, Vec<u8>, PathBuf) {
         let (cm_a, cm_b, t_a, t_b) = paired_pair();
 
         let src = t_a.path().join("src.bin");
@@ -1096,8 +1098,7 @@ mod tls_tests {
     #[tokio::test]
     async fn test_streaming_receive_clean_eof_lands_complete_byte_identical() {
         let content: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
-        let (result, got, _dest) =
-            roundtrip_streaming(&content, /* max_bytes */ 1024 * 1024).await;
+        let (result, got, _dest) = roundtrip_streaming(&content, /* max_bytes */ 1024 * 1024).await;
         assert_eq!(
             result.expect("streaming receive must succeed on clean EOF"),
             content.len() as u64

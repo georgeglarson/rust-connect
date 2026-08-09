@@ -597,8 +597,7 @@ mod tests {
         assert!(!is_message_too_large(&std::io::Error::from_raw_os_error(
             111 // ECONNREFUSED
         )));
-        assert!(!is_message_too_large(&std::io::Error::new(
-            std::io::ErrorKind::Other,
+        assert!(!is_message_too_large(&std::io::Error::other(
             "generic error with no errno"
         )));
     }
@@ -621,7 +620,10 @@ mod tests {
         let mut caps = Vec::new();
         let mut identity = create_test_identity("Oversized Broadcaster");
         loop {
-            caps.push(format!("kdeconnect.synthetic.capability.number.{}", caps.len()));
+            caps.push(format!(
+                "kdeconnect.synthetic.capability.number.{}",
+                caps.len()
+            ));
             let candidate = Identity::new(
                 identity.device_id.clone(),
                 identity.device_name.clone(),
@@ -652,9 +654,7 @@ mod tests {
         let capture = UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("Value expected to be present");
-        service.broadcast_addr = capture
-            .local_addr()
-            .expect("Value expected to be present");
+        service.broadcast_addr = capture.local_addr().expect("Value expected to be present");
 
         service
             .broadcast()
@@ -662,10 +662,11 @@ mod tests {
             .expect("broadcast must retry and succeed, not surface the oversized send's error");
 
         let mut buf = vec![0u8; RECV_BUFFER_SIZE];
-        let (len, _addr) = tokio::time::timeout(Duration::from_secs(2), capture.recv_from(&mut buf))
-            .await
-            .expect("the retried, smaller datagram must arrive")
-            .expect("recv_from must succeed");
+        let (len, _addr) =
+            tokio::time::timeout(Duration::from_secs(2), capture.recv_from(&mut buf))
+                .await
+                .expect("the retried, smaller datagram must arrive")
+                .expect("recv_from must succeed");
 
         let received = crate::protocol::packet::PacketSerializer::deserialize(&buf[..len])
             .expect("retried datagram must deserialize");
@@ -685,8 +686,8 @@ mod tests {
         // socket, so a regression that fires the retry twice (or the
         // original oversized identity somehow shrinking enough to also
         // go out) would show up here as a second arrival.
-        let second = tokio::time::timeout(Duration::from_millis(200), capture.recv_from(&mut buf))
-            .await;
+        let second =
+            tokio::time::timeout(Duration::from_millis(200), capture.recv_from(&mut buf)).await;
         assert!(
             second.is_err(),
             "exactly one datagram must land — the oversized send must never actually go out"
@@ -706,29 +707,27 @@ mod tests {
             .await
             .expect("Value expected to be present");
         let mut service = service;
-        service.broadcast_addr = capture
-            .local_addr()
-            .expect("Value expected to be present");
+        service.broadcast_addr = capture.local_addr().expect("Value expected to be present");
 
         service.broadcast().await.expect("broadcast must succeed");
 
         let mut buf = vec![0u8; RECV_BUFFER_SIZE];
-        let (len, _addr) = tokio::time::timeout(Duration::from_secs(2), capture.recv_from(&mut buf))
-            .await
-            .expect("the datagram must arrive")
-            .expect("recv_from must succeed");
+        let (len, _addr) =
+            tokio::time::timeout(Duration::from_secs(2), capture.recv_from(&mut buf))
+                .await
+                .expect("the datagram must arrive")
+                .expect("recv_from must succeed");
         let received = crate::protocol::packet::PacketSerializer::deserialize(&buf[..len])
             .expect("must deserialize");
-        let received_identity =
-            Identity::from_packet(received).expect("must be a valid identity");
+        let received_identity = Identity::from_packet(received).expect("must be a valid identity");
         assert_eq!(
             received_identity.incoming_capabilities,
             vec!["kdeconnect.ping".to_string()],
             "an un-oversized identity's capabilities must arrive intact"
         );
 
-        let second = tokio::time::timeout(Duration::from_millis(200), capture.recv_from(&mut buf))
-            .await;
+        let second =
+            tokio::time::timeout(Duration::from_millis(200), capture.recv_from(&mut buf)).await;
         assert!(second.is_err(), "exactly one datagram, no spurious retry");
     }
 

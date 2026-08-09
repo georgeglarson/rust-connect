@@ -707,7 +707,10 @@ mod tests {
     #[test]
     fn test_payload_size_stream_round_trips_back_to_negative_one() {
         // KDE peers re-read what we relay: -1 in, -1 out.
-        let packet = Packet::new("kdeconnect.share.request".to_string(), serde_json::json!({}));
+        let packet = Packet::new(
+            "kdeconnect.share.request".to_string(),
+            serde_json::json!({}),
+        );
         let mut packet = packet;
         packet.payload_size = Some(PayloadSize::Stream);
         let json = serde_json::to_string(&packet).expect("serialize");

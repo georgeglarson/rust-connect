@@ -2141,17 +2141,22 @@ async fn setup_gated_pair() -> (
         .expect("Value expected to be present");
     let addr = listener.local_addr().expect("Value expected to be present");
 
-    let client_cm =
-        Arc::new(ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present"));
-    let server_cm =
-        Arc::new(ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present"));
+    let client_cm = Arc::new(
+        ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present"),
+    );
+    let server_cm = Arc::new(
+        ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present"),
+    );
     server_cm.set_device_identity("gate-server-aaaaaaaaaaaaaaaaaaaa", "Server");
 
     let peer_device_id = "gate-peer-device-aaaaaaaaaaaaaaaa".to_string();
     let accept_cm = server_cm.clone();
     let accept_id = peer_device_id.clone();
     let accept = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("Value expected to be present");
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("Value expected to be present");
         accept_cm
             .accept_test(accept_id, stream)
             .await
@@ -2179,7 +2184,10 @@ async fn test_send_packet_refuses_unsupported_capability() {
         )
         .await;
 
-    let packet = Packet::new("kdeconnect.mousepad.request".to_string(), serde_json::json!({}));
+    let packet = Packet::new(
+        "kdeconnect.mousepad.request".to_string(),
+        serde_json::json!({}),
+    );
     let err = client_cm
         .send_packet(&peer_id, &packet)
         .await
@@ -2278,7 +2286,10 @@ async fn test_send_packet_allows_when_peer_capabilities_unknown() {
     let (client_cm, server_cm, peer_id, _t) = setup_gated_pair().await;
     // Deliberately never call record_peer_capabilities.
 
-    let packet = Packet::new("kdeconnect.mousepad.request".to_string(), serde_json::json!({}));
+    let packet = Packet::new(
+        "kdeconnect.mousepad.request".to_string(),
+        serde_json::json!({}),
+    );
     client_cm
         .send_packet(&peer_id, &packet)
         .await
@@ -2306,7 +2317,10 @@ async fn test_capability_update_re_allows_previously_refused_type() {
         )
         .await;
 
-    let packet = Packet::new("kdeconnect.mousepad.request".to_string(), serde_json::json!({}));
+    let packet = Packet::new(
+        "kdeconnect.mousepad.request".to_string(),
+        serde_json::json!({}),
+    );
     client_cm
         .send_packet(&peer_id, &packet)
         .await
@@ -2384,7 +2398,9 @@ async fn test_capability_gating_wired_from_real_identity_exchange() {
     cert_manager.init().expect("Value expected to be present");
     let peer_temp = tempfile::TempDir::new().expect("Value expected to be present");
     let cert_manager_peer = Arc::new(CertificateManager::new(peer_temp.path().to_path_buf()));
-    cert_manager_peer.init().expect("Value expected to be present");
+    cert_manager_peer
+        .init()
+        .expect("Value expected to be present");
 
     let our_id = "wiring-our-device-aaaaaaaaaaaaaaaa";
     let remote_id = "wiring-remote-device-aaaaaaaaaaaa";
@@ -2409,7 +2425,10 @@ async fn test_capability_gating_wired_from_real_identity_exchange() {
     let addr = listener.local_addr().expect("Value expected to be present");
 
     let remote_handle = tokio::spawn(async move {
-        let (tcp_stream, _) = listener.accept().await.expect("Value expected to be present");
+        let (tcp_stream, _) = listener
+            .accept()
+            .await
+            .expect("Value expected to be present");
         let mut buf_reader = tokio::io::BufReader::new(tcp_stream);
         use tokio::io::AsyncBufReadExt;
         let mut line = Vec::new();
@@ -2439,11 +2458,13 @@ async fn test_capability_gating_wired_from_real_identity_exchange() {
             .read_until(b'\n', &mut our_identity_line)
             .await
             .expect("Value expected to be present");
-        let our_encrypted_identity =
-            PacketSerializer::deserialize(&our_identity_line).expect("Value expected to be present");
+        let our_encrypted_identity = PacketSerializer::deserialize(&our_identity_line)
+            .expect("Value expected to be present");
         assert!(our_encrypted_identity.is_identity());
 
-        let resp = remote_identity.to_packet().expect("Value expected to be present");
+        let resp = remote_identity
+            .to_packet()
+            .expect("Value expected to be present");
         let resp_bytes = PacketSerializer::serialize(&resp).expect("Value expected to be present");
         use tokio::io::AsyncWriteExt;
         tls_reader
@@ -2451,7 +2472,11 @@ async fn test_capability_gating_wired_from_real_identity_exchange() {
             .write_all(&resp_bytes)
             .await
             .expect("Value expected to be present");
-        tls_reader.get_mut().flush().await.expect("Value expected to be present");
+        tls_reader
+            .get_mut()
+            .flush()
+            .await
+            .expect("Value expected to be present");
 
         // Read (and discard) whatever the sends below actually put on the
         // wire — only kdeconnect.ping should ever arrive.
@@ -2470,7 +2495,10 @@ async fn test_capability_gating_wired_from_real_identity_exchange() {
     assert_eq!(device_id, remote_id);
 
     // Refused: the real identity exchange above never advertised this.
-    let unsupported = Packet::new("kdeconnect.mousepad.request".to_string(), serde_json::json!({}));
+    let unsupported = Packet::new(
+        "kdeconnect.mousepad.request".to_string(),
+        serde_json::json!({}),
+    );
     cm.send_packet(&device_id, &unsupported)
         .await
         .expect_err("production wiring must gate on the exchanged identity's capabilities");
