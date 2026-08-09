@@ -1793,16 +1793,16 @@ environment_matrix:
   # Keyed by feature. Each value lists the per-backend status.
   - feature: clipboard-write
     rust_impl: true
-    clipboard-x11: UNVERIFIED
+    clipboard-x11: PASS
     clipboard-wayland: UNVERIFIED
     uinput: NOT-APPLICABLE
     audio: NOT-APPLICABLE
     session_dbus: PASS
     notification_server: NOT-APPLICABLE
     status: UNVERIFIED
-    cite:
-    reason: "wayland portal design depends on compositor; Task 1.6 X11 backend pending"
-    owner: "Task 1.6"
+    cite: "Task 1.6 Backend C, vk #1010: tests/clipboard_x11.rs live-verifies X11Clipboard (xclip) against a real Xvfb X server in both directions — backend write read back via an independent xclip call, and an independent xclip write picked up by the backend's watcher (poll fallback here; no clipnotify on this host, see src/plugins/clipboard.rs module doc for the clipnotify-vs-poll divergence from upstream's QClipboard/GtkClipboard signals)"
+    reason: "Task 1.6 Backend C closed the X11 gap: xclip-preferred/xsel-fallback backend (ClipboardBackend impl), clipnotify when present else content-checksum-deduped polling. clipboard-x11 promoted to PASS on the Xvfb-backed evidence above. clipboard-wayland stays UNVERIFIED — no live Wayland session exercised this session; status stays UNVERIFIED pending that (D3 rollup: every status cell must be PASS/NOT-APPLICABLE)."
+    owner: "Task 1.6 integrator (live Wayland session)"
 
   - feature: mousepad-absolute
     rust_impl: true
