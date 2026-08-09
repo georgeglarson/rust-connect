@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use tokio::sync::{mpsc::UnboundedSender, RwLock};
@@ -93,7 +94,14 @@ pub(crate) trait MediaPlayer2Player {
 /// zbus session-bus backend. `connect()` is the fallible step (no session
 /// bus → plugin degrades); everything after that logs and keeps going.
 pub struct ZbusMprisBackend {
-    conn: zbus::Connection,
+    /// The live session connection. `zbus::Connection` is internally
+    /// `Arc`-based and `Clone`, so every method takes a cheap snapshot
+    /// under a short read lock (`current_conn`) rather than holding the
+    /// lock across an await on a proxy call. `watch_supervisor` installs a
+    /// fresh connection here on recovery (install-on-recovery contract,
+    /// see its doc comment) so both the next watch iteration and every
+    /// control method rebind to the live bus.
+    conn: Arc<RwLock<zbus::Connection>>,
     /// Display name → bus service name; the watcher task keeps it current.
     services: Arc<RwLock<HashMap<String, String>>>,
     /// Bus service name → its signal-listener task. Aborted on remove /
@@ -115,10 +123,17 @@ impl ZbusMprisBackend {
             .await
             .map_err(|e| internal(format!("cannot connect to session D-Bus: {e}")))?;
         Ok(Self {
-            conn,
+            conn: Arc::new(RwLock::new(conn)),
             services: Arc::new(RwLock::new(HashMap::new())),
             listeners: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Snapshot the current live connection. Cloning `zbus::Connection` is
+    /// cheap; the read lock is held only long enough to clone, never
+    /// across an await on a proxy call.
+    async fn current_conn(&self) -> zbus::Connection {
+        self.conn.read().await.clone()
     }
 
     async fn service_for(&self, display_name: &str) -> Result<String> {
@@ -132,7 +147,8 @@ impl ZbusMprisBackend {
 
     async fn player_proxy(&self, display_name: &str) -> Result<MediaPlayer2PlayerProxy<'_>> {
         let service = self.service_for(display_name).await?;
-        MediaPlayer2PlayerProxy::new(&self.conn, service.clone())
+        let conn = self.current_conn().await;
+        MediaPlayer2PlayerProxy::new(&conn, service.clone())
             .await
             .map_err(|e| internal(format!("cannot build MPRIS proxy for {service}: {e}")))
     }
@@ -547,7 +563,8 @@ impl MprisBackend for ZbusMprisBackend {
 
     async fn player_state(&self, display_name: &str) -> Option<LocalPlayerState> {
         let service = self.service_for(display_name).await.ok()?;
-        let proxy = MediaPlayer2PlayerProxy::new(&self.conn, service.as_str())
+        let conn = self.current_conn().await;
+        let proxy = MediaPlayer2PlayerProxy::new(&conn, service.as_str())
             .await
             .ok()?;
         Some(read_state(&proxy, &service, display_name).await)
@@ -640,7 +657,8 @@ impl MprisBackend for ZbusMprisBackend {
         // request so the phone can't ask for a stale URL, refuse non-file://
         // schemes, and let the plugin apply the daemon-side size cap.
         let service = self.service_for(display_name).await.ok()?;
-        let proxy = MediaPlayer2PlayerProxy::new(&self.conn, service.as_str())
+        let conn = self.current_conn().await;
+        let proxy = MediaPlayer2PlayerProxy::new(&conn, service.as_str())
             .await
             .ok()?;
         let metadata = proxy.metadata().await.unwrap_or_default();
@@ -686,25 +704,34 @@ impl MprisBackend for ZbusMprisBackend {
 /// when the watch stream ends — the supervisor then clears the
 /// listener tasks and emits `BackendLost` so the plugin's cache drops
 /// every stale entry before the next recovery cycle re-enumerates.
+///
+/// Install-on-recovery contract: `conn` is the SAME `Arc<RwLock<..>>` the
+/// owning `ZbusMprisBackend` holds in `self.conn`. On a successful
+/// re-acquire this installs the new connection into that shared cell
+/// (`*conn.write().await = new_conn`) rather than dropping it, so both the
+/// next `watch_loop` iteration (which snapshots at the top of the loop)
+/// and every control method (`transport`, `set_volume`, ...) rebind to the
+/// live bus. Dropping the new connection here (the old band-aid) left
+/// every control method permanently bound to the dead initial connection.
 async fn watch_supervisor(
-    conn: zbus::Connection,
+    conn: Arc<RwLock<zbus::Connection>>,
     services: Arc<RwLock<HashMap<String, String>>>,
     listeners: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
     tx: UnboundedSender<MprisBackendEvent>,
 ) {
     let mut backoff_ms: u64 = 500;
     let backoff_max_ms: u64 = 30_000;
+    // Below this, a "successful" reconnect isn't actually healthy — the
+    // hot-loop guard below treats it the same as a failed reconnect.
+    const HEALTHY_RUN_THRESHOLD: Duration = Duration::from_secs(5);
     loop {
         // The current connection may be dead; the loop will fail fast
         // when the stream is broken. After the loop ends, drop the
         // listeners and tell the plugin to clear its cache.
-        watch_loop(
-            conn.clone(),
-            services.clone(),
-            listeners.clone(),
-            tx.clone(),
-        )
-        .await;
+        let snapshot = conn.read().await.clone();
+        let started = Instant::now();
+        watch_loop(snapshot, services.clone(), listeners.clone(), tx.clone()).await;
+        let ran_for = started.elapsed();
 
         // Listen-stream ended (or errored). Tear down any in-flight
         // per-player listeners — their bus names may be dead too.
@@ -733,19 +760,29 @@ async fn watch_supervisor(
                     event = "mpris_backend_recovered",
                     "Reconnected to session bus; re-enumerating MPRIS players"
                 );
-                // Wrap the new connection in the same Arc the backend keeps
-                // a reference to, so the methods (transport, etc.) pick up
-                // the recovered connection.
-                // SAFETY: the ZbusMprisBackend holds the same Arc in
-                // self.conn (Cloned via zbus::Connection::clone). We can't
-                // reach into that from here, so the recovery is BAND-AID:
-                // the OWNING ZbusMprisBackend's connection is the *initial*
-                // one, which may be dead. The methods (transport, etc.)
-                // will fail until the daemon is restarted. The recovery
-                // here is for the watch loop ONLY — the brief restricts
-                // ourselves to "re-subscribe, re-enumerate, no panic".
-                drop(new_conn);
-                backoff_ms = 500; // reset on a successful re-acquire
+                *conn.write().await = new_conn;
+
+                // Hot-loop guard: a reconnect can succeed while the
+                // connection it hands back is itself unusable (or some
+                // other watch_loop precondition keeps failing), in which
+                // case the just-installed connection fails fast on the
+                // very next iteration too. Only treat this cycle as
+                // healthy — and reset the backoff — if watch_loop actually
+                // ran for a while; otherwise keep backing off
+                // exponentially so a bad reconnect can't spin a busy loop
+                // of connect/drop as fast as the bus answers.
+                if ran_for >= HEALTHY_RUN_THRESHOLD {
+                    backoff_ms = 500;
+                } else {
+                    warn!(
+                        ran_for_ms = ran_for.as_millis() as u64,
+                        backoff_ms = backoff_ms,
+                        event = "mpris_watch_hot_loop_guard",
+                        "watch_loop exited quickly after a successful reconnect; backing off instead of resetting"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(backoff_max_ms);
+                }
             }
             Err(e) => {
                 warn!(
@@ -754,7 +791,7 @@ async fn watch_supervisor(
                     event = "mpris_backend_reconnect_failed",
                     "Could not re-acquire session bus; backing off"
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 backoff_ms = (backoff_ms * 2).min(backoff_max_ms);
             }
         }
