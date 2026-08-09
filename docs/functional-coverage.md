@@ -208,9 +208,9 @@ feature_ledger:
     live_device: NOT-APPLICABLE
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/findthisdevice/ring_request.json (kdeconnect-kde plugins/findthisdevice/findthisdeviceplugin.cpp:25; the desktop-side mirror of findmyphoneplugin.cpp:17-21 — empty body, body unused)"
-    reason: "Slice 0B follow-up: fixture_provenance now PASS via the upstream-derived ring_request fixture (mirrors the findmyphone plugin; the wire shape is the same empty-body Packet::new(..., {})). Remaining cells owned by Sprint 1 / Task 1.6 verification."
-    owner: "Task 1.6"
+    cite: "tests/fixtures/upstream-wire/findthisdevice/ring_request.json (kdeconnect-kde plugins/findthisdevice/findthisdeviceplugin.cpp:25; the desktop-side mirror of findmyphoneplugin.cpp:17-21 — empty body, body unused); Task 1.6 Backend D (verify + pin, vk #1010): ProcessRingBackend::choose_player pins the exact pw-play>paplay>ffplay>aplay priority order + per-player args and the no-player-available None case as pure unit tests (no PATH dependency); the single-flight latch's release-on-failure path is verified (RingGuard's Drop is unconditional — a mock ring() returning false, which is what a real player crash/non-zero-exit/spawn-failure/missing-binary all normalize to above ProcessRingBackend, proves a second request rings again rather than staying stuck)"
+    reason: "Slice 0B follow-up: fixture_provenance now PASS via the upstream-derived ring_request fixture (mirrors the findmyphone plugin; the wire shape is the same empty-body Packet::new(..., {})). Task 1.6 Backend D automated what the plan calls for (player selection order, no-player-available degraded path, latch release on abnormal player exit) — no bug was found in the latch (verified, not assumed: temporarily removing RingGuard's construction made 3 of the new/existing tests fail as predicted, confirming they are real guards, then the removal was reverted). Live playback through a real audio device (pw-play/paplay/ffplay/aplay against an actual PipeWire/PulseAudio session) is deliberately NOT exercised by these tests — it would audibly ring the alarm on whatever host runs the suite — and stays a live-only, integrator-owned check, same as before. Remaining cells (desktop_effect, api_surface, lifecycle, hostile_input, environment) still need that live check."
+    owner: "Task 1.6 integrator (live audio-backend restart test)"
 
   - feature: lock
     rust_impl: true
