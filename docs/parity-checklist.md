@@ -27,8 +27,8 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 
 | Behavior | kde | android | rust status | rust ref |
 |---|---|---|---|---|
-| Broadcast cadence | No periodic timer; on start, network change, rename, custom-device change (`core/backends/lan/lanlinkprovider.cpp:149,192`, `core/daemon.cpp:282,296`) | On start + network change, min gap 200 ms (V `LanLinkProvider.java:567,573-577`) | **DIVERGENT** — periodic broadcast forever, 60 s default (deliberate pre-mDNS; revisit after mDNS live-validation, see `service_manager.rs` TODO) | `src/config/settings.rs:13`, `src/protocol/discovery.rs:235` |
-| Immediate re-broadcast on network change | Yes (`lanlinkprovider.cpp:180-194`) | Yes (V `LanLinkProvider.java:572-584`) | **UNIMPLEMENTED** — no network-change hook | — |
+| Broadcast cadence | No periodic timer; on start, network change, rename, custom-device change (`core/backends/lan/lanlinkprovider.cpp:149,192`, `core/daemon.cpp:282,296`) | On start + network change, min gap 200 ms (V `LanLinkProvider.java:567,573-577`) | **CONFORMANT\*** — on start + on debounced network change, matching both references; plus a documented DIVERGENCE (Task 2.2, vk #994): a bounded backoff broadcast (5s initial, doubling, capped 5min) while mDNS is down AND no device is connected, since — unlike upstream's avahi assumption — mDNS can be genuinely absent here. A healthy host never broadcasts outside start/network-change | `src/services/service_manager.rs` (`start_discovery`), `src/services/broadcast_fallback.rs` |
+| Immediate re-broadcast on network change | Yes (`lanlinkprovider.cpp:180-194`) | Yes (V `LanLinkProvider.java:572-584`) | **CONFORMANT** — a netlink-backed watcher (interface/address changes, resume-from-suspend) debounces into one event that broadcasts once + re-announces mDNS | `src/services/network_watcher.rs`, `src/services/discovery_coordinator.rs` |
 | Broadcast destination | 255.255.255.255 per-interface (source-bound) + custom devices (`lanlinkprovider.cpp:207-248`) | 255.255.255.255 (trusted nets only) + custom devices (V `LanLinkProvider.java:474-481`) | **CONFORMANT\*** — 255.255.255.255 only, single socket; no per-interface binding, no custom-device list (manual connect via API instead) | `src/protocol/discovery.rs:97` |
 | Ports: UDP 1716, TCP first-free 1716-1764 | `lanlinkprovider.h:67-69`, `lanlinkprovider.cpp:139-147` | V `LanLinkProvider.java:64-65,454-470` | **CONFORMANT** | `src/protocol/types.rs:15-23`, `src/protocol/listener.rs` `bind_port` |
 | Oversized identity fallback (re-send with emptied capabilities) | On `DatagramTooLargeError` (`lanlinkprovider.cpp:259-269`) | Absent | **UNIMPLEMENTED** (kde-only behavior) | — |
@@ -122,14 +122,16 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 > skip-and-continue), 4 (blank lines skipped), 5 (lenient `id`) — all four
 > rows above now read CONFORMANT. The list below is renumbered to only the
 > still-open gaps (the audit's 3 and 6-13).
+>
+> Also fixed since (2026-08-09, Task 2.2, vk #994): the former User-visible
+> gap 1 (broadcast-forever cadence) and Cosmetic gap 5 (no network-change
+> re-broadcast trigger) — see the Discovery table's "Broadcast cadence" and
+> "Immediate re-broadcast on network change" rows above, both now
+> CONFORMANT. Renumbered again below to only the still-open gaps.
 
 ### User-visible breakage
 
-1. **Broadcast-forever cadence.** Both references broadcast only on start /
-   network change (kde `lanlinkprovider.cpp:149,192`; android V
-   `LanLinkProvider.java:567,572-584`); rust-connect broadcasts every 60 s
-   forever (`src/config/settings.rs:13`). Deliberate pre-mDNS; the follow-up
-   is already noted in `service_manager.rs` pending live mDNS validation.
+(No open User-visible gaps remain — the former gap 1 closed 2026-08-09.)
 
 ### Robustness
 
@@ -137,14 +139,13 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 
 ### Cosmetic / interop edge
 
-5. No network-change re-broadcast trigger (both refs have one).
-6. No reverse-connection fallback when a dial fails (kde-only,
+5. No reverse-connection fallback when a dial fails (kde-only,
    `lanlinkprovider.cpp:343-354`).
-7. No oversized-identity emptied-caps fallback (kde-only,
+6. No oversized-identity emptied-caps fallback (kde-only,
    `lanlinkprovider.cpp:259-269`).
-8. `payloadSize = -1` endless-stream sentinel unsupported (kde-only,
+7. `payloadSize = -1` endless-stream sentinel unsupported (kde-only,
    `core/networkpacket.h:85`); rust uses `Option<u64>`.
-9. No send-side capability gating (kde-only, `core/device.cpp:360-363`).
+8. No send-side capability gating (kde-only, `core/device.cpp:360-363`).
 
 ---
 
