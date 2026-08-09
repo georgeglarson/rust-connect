@@ -4,7 +4,9 @@ Audit date: 2026-08-04. Revised 2026-08-04: gaps 1/2/4/5 fixed 2026-08-04
 (gap-1/2/4/5 rows updated to CONFORMANT). Revised 2026-08-09 (Task 2.1,
 vk #997): Robustness gap 2 (payload accept timeout) fixed, row updated to
 CONFORMANT*; gap 3 (capability overwrite on empty-cap identity) fixed,
-row updated to CONFORMANT. Sources:
+row updated to CONFORMANT; gap 4 (UDP receive buffer) fixed, row updated
+to CONFORMANT* — see that row's note on what SO_RCVBUF actually protects
+against. Sources:
 
 - **kde** = kdeconnect-kde, local clone `~/repos/kdeconnect-kde` (paths relative to it).
 - **android** = kdeconnect-android. `docs/reference/LanLinkProvider.java` and
@@ -30,7 +32,7 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 | Broadcast destination | 255.255.255.255 per-interface (source-bound) + custom devices (`lanlinkprovider.cpp:207-248`) | 255.255.255.255 (trusted nets only) + custom devices (V `LanLinkProvider.java:474-481`) | **CONFORMANT\*** — 255.255.255.255 only, single socket; no per-interface binding, no custom-device list (manual connect via API instead) | `src/protocol/discovery.rs:97` |
 | Ports: UDP 1716, TCP first-free 1716-1764 | `lanlinkprovider.h:67-69`, `lanlinkprovider.cpp:139-147` | V `LanLinkProvider.java:64-65,454-470` | **CONFORMANT** | `src/protocol/types.rs:15-23`, `src/protocol/listener.rs` `bind_port` |
 | Oversized identity fallback (re-send with emptied capabilities) | On `DatagramTooLargeError` (`lanlinkprovider.cpp:259-269`) | Absent | **UNIMPLEMENTED** (kde-only behavior) | — |
-| UDP receive buffer | (Qt datagram) | 512 KiB (V `LanLinkProvider.java:69`) | **DIVERGENT** — 64 KiB; a >64 KiB identity is truncated and dropped | `src/protocol/discovery.rs:136` |
+| UDP receive buffer | (Qt datagram) | 512 KiB (V `LanLinkProvider.java:69`) | **CONFORMANT\*** — SO_RCVBUF explicitly raised to 512 KiB matching android's target (Task 2.1, vk #997). Finding: the original "truncated and dropped" framing doesn't hold for real IPv4 traffic — a single UDP datagram is capped at 65507 bytes by IPv4 itself (verified empirically: `sendto()` past that fails with `EMSGSIZE`), which the OLD 65536-byte read buffer already covered. What SO_RCVBUF actually protects against is receive-QUEUE drops under a burst of near-simultaneous datagrams, not single-datagram truncation — see plans/task-2.1-report.md gap 4 | `src/protocol/discovery.rs` (`RECV_BUFFER_SIZE`, `DiscoveryService::new`) |
 | Receiver dials sender's TCP port on UDP identity (any device, not paired-only) | `lanlinkprovider.cpp:331-339` | V `LanLinkProvider.java:236-252` | **CONFORMANT** | `src/services/service_manager.rs:149` |
 | Received identity tcpPort outside 1716-1764 dropped | `lanlinkprovider.cpp:316-320` | V `LanLinkProvider.java:236-243` | **CONFORMANT** | `src/protocol/discovery.rs:177-182` |
 | Reverse-connection fallback (dial fails → send UDP identity back) | `lanlinkprovider.cpp:343-354,395-399` | Absent | **UNIMPLEMENTED** (kde-only) | — |
@@ -131,9 +133,7 @@ The Gaps section at the end lists only DIVERGENT / UNIMPLEMENTED rows, ranked.
 
 ### Robustness
 
-4. **UDP receive buffer 64 KiB** vs android's 512 KiB
-   (`src/protocol/discovery.rs:136`). An identity with a very large
-   capability list would be truncated and dropped.
+(All Robustness gaps 2/3/4 resolved as of 2026-08-09, Task 2.1.)
 
 ### Cosmetic / interop edge
 

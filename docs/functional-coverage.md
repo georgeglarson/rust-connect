@@ -525,17 +525,17 @@ feature_ledger:
     rust_impl: true
     upstream: kdeconnect-android
     upstream_ref: "LanLinkProvider.java:69"
-    desktop_effect: FAIL
-    api_surface: FAIL
-    lifecycle: FAIL
+    desktop_effect: UNVERIFIED
+    api_surface: UNVERIFIED
+    lifecycle: UNVERIFIED
     hostile_input: PASS
     fixture_provenance: UNVERIFIED
     live_device: UNVERIFIED
     environment: UNVERIFIED
-    status: INTENTIONAL-DIVERGENCE
-    cite: "docs/parity-checklist.md Gaps #4"
-    reason: "64 KiB instead of android 512 KiB; oversized identity truncates and drops. Need vk-backed decision."
-    owner: "Sprint 2 / Task 2.1"
+    status: UNVERIFIED
+    cite: "Task 2.1 (vk #997): src/protocol/discovery.rs RECV_BUFFER_SIZE (524288, matching LanLinkProvider.java:69) is now set explicitly as SO_RCVBUF via socket2's set_recv_buffer_size, and used as the userspace read-buffer size in listen(). test_recv_buffer_size_matches_android_target reads SO_RCVBUF back via socket2::SockRef (deterministic, getsockopt-based) and pins it >= 524288; captured red pre-fix (got 212992, the OS default net.core.rmem_default). test_receives_largest_possible_udp_identity_with_huge_capability_list sends the largest datagram IPv4 UDP can carry (65507 bytes, the hard IPv4 ceiling — verified empirically this session that anything past it fails sendto() with EMSGSIZE) end-to-end through the real DiscoveryService::new construction path and confirms it parses/registers correctly."
+    reason: "Fixed 2026-08-09 (Task 2.1) — no longer an intentional divergence. IMPORTANT FINDING recorded here and in parity-checklist.md: the original diagnosis (\"oversized identity truncates and drops\" due to the 64 KiB read buffer) does not hold for real IPv4 traffic — a single UDP datagram is capped at 65507 bytes by IPv4 itself, which the OLD 65536-byte (64 KiB) buffer already covered with room to spare. What SO_RCVBUF (now explicitly set, previously left at the OS default) actually protects against is receive-QUEUE depth under a burst of near-simultaneous datagrams, matching android's real intent more precisely than the checklist's original framing. desktop_effect/api_surface/lifecycle/live_device/environment stay UNVERIFIED pending a live multi-device burst soak (the plan's own validation note; integrator's job)."
+    owner: "Sprint 2 / Task 2.1 (live burst soak = integrator)"
 
   - feature: payload-accept-timeout
     rust_impl: true
@@ -1991,7 +1991,6 @@ ledger row that resolves it:
 | Gap | Source row | Tracker |
 |---|---|---|
 | Broadcast-forever cadence | feature_ledger discovery-broadcast-cadence | Task 2.2 |
-| UDP receive buffer 64 KiB | feature_ledger udp-receive-buffer | Task 2.1 |
 | Network-change re-broadcast trigger | feature_ledger discovery-network-change-rebroadcast | Task 2.2 |
 
 Any new intentional divergence added to the ledger must carry a `reason`
