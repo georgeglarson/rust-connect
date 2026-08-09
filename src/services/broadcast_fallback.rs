@@ -66,7 +66,17 @@ pub const ELIGIBILITY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// broadcast immediately, then wait `current_interval` before the next
 /// broadcast, doubling `current_interval` (capped at `max_interval`)
 /// each cycle. Returns when `shutdown` is cancelled.
-pub(crate) async fn run_fallback_schedule<EFut, E, BFut, B>(
+///
+/// `pub` (not `pub(crate)`): `run_broadcast_fallback` below calls this
+/// unconditionally in every build, AND the netns integration suite
+/// (`tests/netns_discovery.rs`, Task 2.2 piece 4) — a separate crate —
+/// calls it directly with short injected intervals to observe the
+/// fallback's real backoff cadence over a live socket in a few real
+/// seconds, rather than the multi-minute production intervals. No
+/// `cfg(test)` gate: unlike `protocol::connection`'s test-only seams
+/// (e.g. `ConnectionManager::recv_packet`), this function is load-
+/// bearing production code, not a test-only alternate path.
+pub async fn run_fallback_schedule<EFut, E, BFut, B>(
     mut eligible: E,
     mut broadcast: B,
     shutdown: CancellationToken,
