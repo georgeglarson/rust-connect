@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc bad8236f865eab522ce7b9519babcc016fbafca4a5db80f9e3c59a9fd1b74e4c # shrinks to pt = "kdeconnect..", body = Array [Number(-2.2616791606519502e-165)], id = 0, payload_size = None
+cc 66855c94a33dc656afa25c6f60de1a85d84b8599473445d586d2c9c0d47af413 # shrinks to pt = "kdeconnect.a", body = Null, id = 0, payload_size = Some(Known(9223372036854775808))

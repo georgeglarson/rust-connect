@@ -290,12 +290,35 @@ impl<'de> Deserialize<'de> for PayloadSize {
         D: serde::Deserializer<'de>,
     {
         use serde::de::Error;
-        let n = i64::deserialize(deserializer)?;
-        match n {
-            -1 => Ok(Self::Stream),
-            n if n >= 0 => Ok(Self::Known(n as u64)),
+        // Route through i64 FIRST (as the property test caught): a `Known`
+        // value near u64::MAX is a legal payload size but doesn't fit in
+        // i64, so it must fall through to the u64 parse below rather than
+        // erroring — this is exactly the class of bug
+        // `deserialize_lenient_i64` (this file, `id`) exists to avoid by
+        // going through `serde_json::Value` instead of a single fixed
+        // numeric type.
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    if i == -1 {
+                        return Ok(Self::Stream);
+                    }
+                    if i >= 0 {
+                        return Ok(Self::Known(i as u64));
+                    }
+                    return Err(Error::custom(format!(
+                        "payloadSize must be a non-negative integer or -1 (endless stream), got {i}"
+                    )));
+                }
+                if let Some(u) = n.as_u64() {
+                    return Ok(Self::Known(u));
+                }
+                Err(Error::custom(format!(
+                    "payloadSize must be an integer, got {n}"
+                )))
+            }
             other => Err(Error::custom(format!(
-                "payloadSize must be a non-negative integer or -1 (endless stream), got {other}"
+                "payloadSize must be a number, got {other}"
             ))),
         }
     }
@@ -703,6 +726,23 @@ mod tests {
         assert!(
             result.is_err(),
             "payloadSize values other than -1 must be rejected, not silently accepted"
+        );
+    }
+
+    // Regression: the property test (tests/property_tests.rs) caught this
+    // dead — a Known value above i64::MAX (still a perfectly legal u64
+    // payload size) failed to round-trip because the first deserialize
+    // implementation routed every value through i64 first. Fixed by
+    // parsing via serde_json::Value and falling back to as_u64().
+    #[test]
+    fn test_payload_size_known_value_above_i64_max_round_trips() {
+        let packet = Packet::new("kdeconnect.ping".to_string(), serde_json::json!({}))
+            .with_payload_size(9_223_372_036_854_775_808u64); // i64::MAX + 1
+        let json = serde_json::to_string(&packet).expect("serialize");
+        let round_tripped: Packet = serde_json::from_str(&json).expect("must deserialize");
+        assert_eq!(
+            round_tripped.payload_size,
+            Some(PayloadSize::Known(9_223_372_036_854_775_808u64))
         );
     }
 
