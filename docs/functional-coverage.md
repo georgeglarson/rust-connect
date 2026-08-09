@@ -1800,7 +1800,7 @@ environment_matrix:
     session_dbus: PASS
     notification_server: NOT-APPLICABLE
     status: UNVERIFIED
-    cite: "Task 1.6 Backend C, vk #1010: tests/clipboard_x11.rs live-verifies X11Clipboard (xclip) against a real Xvfb X server in both directions — backend write read back via an independent xclip call, and an independent xclip write picked up by the backend's watcher (poll fallback here; no clipnotify on this host, see src/plugins/clipboard.rs module doc for the clipnotify-vs-poll divergence from upstream's QClipboard/GtkClipboard signals)"
+    cite: "Task 1.6 Backend C, vk #1010: tests/clipboard_x11.rs live-verifies X11Clipboard (xclip) against a real Xvfb X server in both directions — backend write is read back via an independent xclip call, and an independent xclip write is picked up by the backend's watcher (poll fallback here; no clipnotify on this host, see src/plugins/clipboard.rs module doc for the clipnotify-vs-poll divergence from upstream's QClipboard/GtkClipboard signals)"
     reason: "Task 1.6 Backend C closed the X11 gap: xclip-preferred/xsel-fallback backend (ClipboardBackend impl), clipnotify when present else content-checksum-deduped polling. clipboard-x11 promoted to PASS on the Xvfb-backed evidence above. clipboard-wayland stays UNVERIFIED — no live Wayland session exercised this session; status stays UNVERIFIED pending that (D3 rollup: every status cell must be PASS/NOT-APPLICABLE)."
     owner: "Task 1.6 integrator (live Wayland session)"
 

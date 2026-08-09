@@ -758,7 +758,12 @@ impl MousepadPlugin {
         }
         if let Some(ref mut dev) = *guard {
             dev.move_to(x, y);
-            info!(
+            // debug!, not info!: continuous motion arrives many times a
+            // second, and the relative path's per-move log
+            // (mousepad_input) is debug-level too. The info-level
+            // lifecycle events (mousepad_abs_uinput_ready/_unavailable)
+            // carry the observability.
+            debug!(
                 device_id = %device_id,
                 x = x,
                 y = y,
