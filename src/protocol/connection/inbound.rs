@@ -169,6 +169,13 @@ impl ConnectionManager {
             "TLS handshake completed (rustls client, Android was TLS server)"
         );
 
+        self.record_peer_capabilities(
+            &device_id,
+            &remote_identity.incoming_capabilities,
+            &remote_identity.outgoing_capabilities,
+        )
+        .await;
+
         let (read_half, write_half) = tokio::io::split(tls_stream);
 
         // Duplicate-inbound policy lives here, after the handshake, because

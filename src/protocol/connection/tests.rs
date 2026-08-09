@@ -2113,3 +2113,373 @@ async fn test_blank_lines_are_skipped() {
         .expect("blank lines must be skipped, not kill the link");
     assert_eq!(got.packet_type, "kdeconnect.ping");
 }
+
+// Gap D (parity-checklist.md § Lifecycle, vk #998 Task 2.3): send-side
+// capability gating. `record_peer_capabilities` is `pub(crate)`, reachable
+// directly from this module (a descendant of `connection`), so these tests
+// drive the gate's logic directly rather than through a full identity
+// exchange — `test_capability_gating_wired_from_real_identity_exchange`
+// below covers that the PRODUCTION wiring (accept_incoming /
+// connect_to_device) actually populates the map from a real identity.
+
+/// A raw connected pair (no identity exchange — `client_cm.connect` /
+/// `server_cm.accept_test`), for driving `send_packet`'s gate directly via
+/// `record_peer_capabilities` without needing a full TLS + identity dance.
+async fn setup_gated_pair() -> (
+    Arc<ConnectionManager>,
+    Arc<ConnectionManager>,
+    String,
+    tempfile::TempDir,
+) {
+    init_crypto();
+    let temp_dir = tempfile::TempDir::new().expect("Value expected to be present");
+    let cert_manager = Arc::new(CertificateManager::new(temp_dir.path().to_path_buf()));
+    cert_manager.init().expect("Value expected to be present");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Value expected to be present");
+    let addr = listener.local_addr().expect("Value expected to be present");
+
+    let client_cm =
+        Arc::new(ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present"));
+    let server_cm =
+        Arc::new(ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present"));
+    server_cm.set_device_identity("gate-server-aaaaaaaaaaaaaaaaaaaa", "Server");
+
+    let peer_device_id = "gate-peer-device-aaaaaaaaaaaaaaaa".to_string();
+    let accept_cm = server_cm.clone();
+    let accept_id = peer_device_id.clone();
+    let accept = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("Value expected to be present");
+        accept_cm
+            .accept_test(accept_id, stream)
+            .await
+            .expect("Value expected to be present")
+    });
+
+    client_cm
+        .connect(&peer_device_id, addr)
+        .await
+        .expect("Value expected to be present");
+    accept.await.expect("Value expected to be present");
+
+    (client_cm, server_cm, peer_device_id, temp_dir)
+}
+
+#[tokio::test]
+async fn test_send_packet_refuses_unsupported_capability() {
+    let (client_cm, _server_cm, peer_id, _t) = setup_gated_pair().await;
+
+    client_cm
+        .record_peer_capabilities(
+            &peer_id,
+            &["kdeconnect.ping".to_string()],
+            &["kdeconnect.ping".to_string()],
+        )
+        .await;
+
+    let packet = Packet::new("kdeconnect.mousepad.request".to_string(), serde_json::json!({}));
+    let err = client_cm
+        .send_packet(&peer_id, &packet)
+        .await
+        .expect_err("a type the peer never advertised must be refused");
+    assert_eq!(err.code().http_status(), 400, "must reach the API as a 4xx");
+    match err {
+        crate::utils::errors::Error::CapabilityNotSupported {
+            device_id,
+            packet_type,
+        } => {
+            assert_eq!(device_id, peer_id);
+            assert_eq!(packet_type, "kdeconnect.mousepad.request");
+        }
+        other => panic!("expected CapabilityNotSupported, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_send_packet_allows_advertised_capability() {
+    let (client_cm, server_cm, peer_id, _t) = setup_gated_pair().await;
+
+    client_cm
+        .record_peer_capabilities(
+            &peer_id,
+            &["kdeconnect.ping".to_string()],
+            &["kdeconnect.ping".to_string()],
+        )
+        .await;
+
+    let packet = Packet::ping();
+    client_cm
+        .send_packet(&peer_id, &packet)
+        .await
+        .expect("an advertised type must send");
+
+    let received = server_cm
+        .recv_packet(&peer_id)
+        .await
+        .expect("Value expected to be present");
+    assert_eq!(received.packet_type, "kdeconnect.ping");
+}
+
+#[tokio::test]
+async fn test_send_packet_exempts_identity_and_pair() {
+    let (client_cm, server_cm, peer_id, _t) = setup_gated_pair().await;
+
+    // The peer's advertised caps carry NEITHER identity NOR pair — real
+    // peers never advertise those as plugin capabilities either, since
+    // they're protocol packets, not plugin packets.
+    client_cm
+        .record_peer_capabilities(
+            &peer_id,
+            &["kdeconnect.ping".to_string()],
+            &["kdeconnect.ping".to_string()],
+        )
+        .await;
+
+    let identity = Identity::new(
+        "us-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        "Us".to_string(),
+        crate::device::types::DeviceType::Desktop,
+        vec![],
+        vec![],
+    );
+    client_cm
+        .send_packet(&peer_id, &identity.to_packet().expect("to_packet"))
+        .await
+        .expect("kdeconnect.identity must be exempt from gating");
+    client_cm
+        .send_packet(&peer_id, &Packet::pair_request())
+        .await
+        .expect("kdeconnect.pair must be exempt from gating");
+
+    // Drain both off the wire so the test doesn't depend on socket buffer
+    // capacity happening to be large enough to swallow two small packets.
+    let first = server_cm
+        .recv_packet(&peer_id)
+        .await
+        .expect("Value expected to be present");
+    let second = server_cm
+        .recv_packet(&peer_id)
+        .await
+        .expect("Value expected to be present");
+    assert!(first.is_identity() || second.is_identity());
+    assert!(first.is_pair() || second.is_pair());
+}
+
+/// The empty-caps-device ordering case named in the brief: a device we've
+/// never exchanged capabilities with (no map entry at all) must NOT have
+/// plugin sends silently start failing — unknown caps means "don't gate",
+/// not "gate everything". Upstream gates unconditionally because its caps
+/// always arrive with identity; ordering here isn't guaranteed the same
+/// way (see record_peer_capabilities's doc).
+#[tokio::test]
+async fn test_send_packet_allows_when_peer_capabilities_unknown() {
+    let (client_cm, server_cm, peer_id, _t) = setup_gated_pair().await;
+    // Deliberately never call record_peer_capabilities.
+
+    let packet = Packet::new("kdeconnect.mousepad.request".to_string(), serde_json::json!({}));
+    client_cm
+        .send_packet(&peer_id, &packet)
+        .await
+        .expect("a device with no known capabilities must not be gated");
+
+    let received = server_cm
+        .recv_packet(&peer_id)
+        .await
+        .expect("Value expected to be present");
+    assert_eq!(received.packet_type, "kdeconnect.mousepad.request");
+}
+
+/// A capability update (e.g. a fresh identity re-announcing a newly
+/// installed plugin) must re-allow a previously-refused type — the gate
+/// reads the CURRENT map, not a value cached from the first refusal.
+#[tokio::test]
+async fn test_capability_update_re_allows_previously_refused_type() {
+    let (client_cm, server_cm, peer_id, _t) = setup_gated_pair().await;
+
+    client_cm
+        .record_peer_capabilities(
+            &peer_id,
+            &["kdeconnect.ping".to_string()],
+            &["kdeconnect.ping".to_string()],
+        )
+        .await;
+
+    let packet = Packet::new("kdeconnect.mousepad.request".to_string(), serde_json::json!({}));
+    client_cm
+        .send_packet(&peer_id, &packet)
+        .await
+        .expect_err("must be refused before the capability update");
+
+    client_cm
+        .record_peer_capabilities(
+            &peer_id,
+            &[
+                "kdeconnect.ping".to_string(),
+                "kdeconnect.mousepad.request".to_string(),
+            ],
+            &["kdeconnect.ping".to_string()],
+        )
+        .await;
+
+    client_cm
+        .send_packet(&peer_id, &packet)
+        .await
+        .expect("must be allowed after the capability update");
+
+    let received = server_cm
+        .recv_packet(&peer_id)
+        .await
+        .expect("Value expected to be present");
+    assert_eq!(received.packet_type, "kdeconnect.mousepad.request");
+}
+
+/// A subsequent empty-caps identity (legitimate or hostile) must NOT wipe
+/// capabilities already learned — same non-empty-both guard as
+/// `Device::apply_capability_update`.
+#[tokio::test]
+async fn test_record_peer_capabilities_empty_update_does_not_erase_known_caps() {
+    let (client_cm, server_cm, peer_id, _t) = setup_gated_pair().await;
+
+    client_cm
+        .record_peer_capabilities(
+            &peer_id,
+            &["kdeconnect.ping".to_string()],
+            &["kdeconnect.ping".to_string()],
+        )
+        .await;
+    // A hostile or legitimately-empty follow-up identity must be a no-op.
+    client_cm.record_peer_capabilities(&peer_id, &[], &[]).await;
+
+    let packet = Packet::ping();
+    client_cm
+        .send_packet(&peer_id, &packet)
+        .await
+        .expect("previously-known capabilities must survive an empty update");
+
+    let received = server_cm
+        .recv_packet(&peer_id)
+        .await
+        .expect("Value expected to be present");
+    assert_eq!(received.packet_type, "kdeconnect.ping");
+}
+
+/// Proves the PRODUCTION wiring, not just the gate's logic: a real
+/// `connect_to_device` identity exchange populates `peer_capabilities`
+/// from the remote identity's advertised `incomingCapabilities`, and
+/// `send_packet` gates on it immediately afterward with no test-only
+/// setup step.
+#[tokio::test]
+async fn test_capability_gating_wired_from_real_identity_exchange() {
+    // TWO separate certificate managers, one per party. `tls_connect` /
+    // `tls_accept` present the manager's fixed-path OWN cert (own.crt /
+    // own.key) as the party's identity — sharing ONE manager between both
+    // sides of a real handshake would make the remote peer's TLS client
+    // cert carry OUR own CN instead of its own, since `connect_to_device`
+    // already calls `ensure_own_certificate(our_id, ...)` on whatever
+    // manager it holds.
+    let our_temp = tempfile::TempDir::new().expect("Value expected to be present");
+    let cert_manager = Arc::new(CertificateManager::new(our_temp.path().to_path_buf()));
+    cert_manager.init().expect("Value expected to be present");
+    let peer_temp = tempfile::TempDir::new().expect("Value expected to be present");
+    let cert_manager_peer = Arc::new(CertificateManager::new(peer_temp.path().to_path_buf()));
+    cert_manager_peer.init().expect("Value expected to be present");
+
+    let our_id = "wiring-our-device-aaaaaaaaaaaaaaaa";
+    let remote_id = "wiring-remote-device-aaaaaaaaaaaa";
+
+    let cm = ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present");
+    cm.set_device_identity(our_id, "Our Device");
+    let our_identity = cm.get_identity().expect("Value expected to be present");
+
+    // The remote peer advertises ONLY kdeconnect.ping as an incoming
+    // capability — it never asked for kdeconnect.mousepad.request.
+    let remote_identity = Identity::new(
+        remote_id.to_string(),
+        "Remote Device".to_string(),
+        crate::device::types::DeviceType::Phone,
+        vec!["kdeconnect.ping".to_string()],
+        vec!["kdeconnect.ping".to_string()],
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Value expected to be present");
+    let addr = listener.local_addr().expect("Value expected to be present");
+
+    let remote_handle = tokio::spawn(async move {
+        let (tcp_stream, _) = listener.accept().await.expect("Value expected to be present");
+        let mut buf_reader = tokio::io::BufReader::new(tcp_stream);
+        use tokio::io::AsyncBufReadExt;
+        let mut line = Vec::new();
+        buf_reader
+            .read_until(b'\n', &mut line)
+            .await
+            .expect("Value expected to be present");
+        let _ = PacketSerializer::deserialize(&line).expect("Value expected to be present");
+
+        // `connect_to_device` (outbound.rs) dials expecting the PEER to
+        // drive TLS as the client and plays TLS SERVER itself (reversed-
+        // role convention: whoever initiated TCP is the TLS server). This
+        // test's remote peer is on the other end of that dial, so it
+        // takes the TLS CLIENT role via `tls_connect`.
+        let (tls_stream, _peer_cert) =
+            super::tls::tls_connect(cert_manager_peer, remote_id, buf_reader.into_inner())
+                .await
+                .expect("Value expected to be present");
+
+        // connect_to_device writes ITS OWN encrypted identity onto the
+        // stream immediately after the handshake, before reading ours —
+        // that must be drained first or it's what the later read below
+        // sees instead of the ping.
+        let mut tls_reader = tokio::io::BufReader::new(tls_stream);
+        let mut our_identity_line = Vec::new();
+        tls_reader
+            .read_until(b'\n', &mut our_identity_line)
+            .await
+            .expect("Value expected to be present");
+        let our_encrypted_identity =
+            PacketSerializer::deserialize(&our_identity_line).expect("Value expected to be present");
+        assert!(our_encrypted_identity.is_identity());
+
+        let resp = remote_identity.to_packet().expect("Value expected to be present");
+        let resp_bytes = PacketSerializer::serialize(&resp).expect("Value expected to be present");
+        use tokio::io::AsyncWriteExt;
+        tls_reader
+            .get_mut()
+            .write_all(&resp_bytes)
+            .await
+            .expect("Value expected to be present");
+        tls_reader.get_mut().flush().await.expect("Value expected to be present");
+
+        // Read (and discard) whatever the sends below actually put on the
+        // wire — only kdeconnect.ping should ever arrive.
+        let mut received_line = Vec::new();
+        tls_reader
+            .read_until(b'\n', &mut received_line)
+            .await
+            .expect("Value expected to be present");
+        PacketSerializer::deserialize(&received_line).expect("Value expected to be present")
+    });
+
+    let (device_id, _remote_identity, _generation) = cm
+        .connect_to_device(&our_identity, addr, None)
+        .await
+        .expect("Value expected to be present");
+    assert_eq!(device_id, remote_id);
+
+    // Refused: the real identity exchange above never advertised this.
+    let unsupported = Packet::new("kdeconnect.mousepad.request".to_string(), serde_json::json!({}));
+    cm.send_packet(&device_id, &unsupported)
+        .await
+        .expect_err("production wiring must gate on the exchanged identity's capabilities");
+
+    // Allowed: it was advertised.
+    cm.send_packet(&device_id, &Packet::ping())
+        .await
+        .expect("kdeconnect.ping was advertised by the real identity exchange");
+
+    let received = remote_handle.await.expect("Value expected to be present");
+    assert_eq!(received.packet_type, "kdeconnect.ping");
+}

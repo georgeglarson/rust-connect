@@ -261,6 +261,13 @@ impl ConnectionManager {
             )));
         }
 
+        self.record_peer_capabilities(
+            &device_id,
+            &remote_identity.incoming_capabilities,
+            &remote_identity.outgoing_capabilities,
+        )
+        .await;
+
         let generation = {
             let mut gens = self.generations.write().await;
             let gen = gens.get(&device_id).unwrap_or(&0) + 1;

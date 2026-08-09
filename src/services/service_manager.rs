@@ -56,6 +56,12 @@ pub async fn start_services(
 
     let mut identity = identity;
     identity.tcp_port = Some(actual_port);
+    // Task 2.3 gap A plumbing: ConnectionManager::get_identity() needs the
+    // REAL bound port (not the DEFAULT_TCP_PORT constant) so the reverse-
+    // connection fallback's UDP identity carries a tcpPort Android will
+    // actually accept when 1716 was taken and we bound elsewhere in
+    // 1716-1764.
+    state.connection_manager.set_tcp_port(actual_port);
 
     let discovery = start_discovery(&state, identity.clone(), shutdown.clone()).await?;
     let tcp = start_tcp_listener(&state, tcp_listener, identity.clone(), shutdown.clone());
