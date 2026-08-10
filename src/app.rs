@@ -44,11 +44,6 @@ impl AppState {
         let cert_manager = Arc::new(CertificateManager::new(settings.cert_dir.clone()));
         cert_manager.init()?;
 
-        let devices_path = settings.data_dir.join("devices.json");
-        let registry = Arc::new(DeviceRegistry::with_persistence(devices_path));
-        let broadcaster = Arc::new(EventBroadcaster::new(256, "device"));
-        let lifecycle = Arc::new(LifecycleManager::new(registry.clone(), broadcaster.clone()));
-
         let pairing_path = settings.data_dir.join("paired.json");
         // No with_timeout override: the requester/accepter timeouts stay at
         // the Android-conformant 30s/25s defaults (PairingHandler.kt:151/88).
@@ -60,6 +55,18 @@ impl AppState {
         // and the unpaired phone correctly rejected with pair=false.
         let pairing_handler =
             Arc::new(PairingHandler::new(cert_manager.clone()).with_persistence(pairing_path));
+
+        // Built before the registry so its shared paired-ids handle
+        // (finding L2-1, Sprint 2 security audit) can be wired in at
+        // construction: the registry needs to tell truly-paired devices
+        // from pre-auth ones that merely reached Connected.
+        let devices_path = settings.data_dir.join("devices.json");
+        let registry = Arc::new(
+            DeviceRegistry::with_persistence(devices_path)
+                .with_paired_source(pairing_handler.paired_handle()),
+        );
+        let broadcaster = Arc::new(EventBroadcaster::new(256, "device"));
+        let lifecycle = Arc::new(LifecycleManager::new(registry.clone(), broadcaster.clone()));
 
         let connection_manager = Arc::new(ConnectionManager::new(cert_manager.clone())?);
         let packet_router = Arc::new(PacketRouter::new());

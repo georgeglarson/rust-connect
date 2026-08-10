@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use tokio::sync::RwLock;
 use tracing::{debug, info};
@@ -25,9 +25,34 @@ use crate::utils::errors::{Error, Result};
 /// handset is the observed shape.
 const STALE_DEVICE_TTL_DAYS: i64 = 30;
 
+/// Cap on unpaired, pre-auth device records held in memory. Mirrors
+/// `MAX_TRANSFER_DEVICES` (share.rs:176) for the identical
+/// peer-id-keyed-map reason: `lifecycle::ensure_and_transition`
+/// unconditionally `add()`s a registry record for ANY device id that
+/// completes TCP+TLS+identity, with zero pairing required (TOFU accepts any
+/// first-contact cert) — a flood of fresh random ids grew this map and
+/// `devices.json` without bound (finding L2-1, Sprint 2 security audit).
+/// Truly-paired devices are never counted against this cap and never
+/// evicted; see `is_truly_paired`.
+const MAX_UNPAIRED_DEVICES: usize = 64;
+
+/// The shape of `PairingHandler`'s `paired` map, shared by `Arc` — see
+/// `PairingHandler::paired_handle` and the `paired_ids` field below.
+type PairedIds = Arc<RwLock<HashMap<DeviceId, DateTime<Utc>>>>;
+
 pub struct DeviceRegistry {
     devices: Arc<RwLock<HashMap<DeviceId, Device>>>,
     persist_path: Option<PathBuf>,
+    /// Shared view of the REAL paired set — the same `Arc` `PairingHandler`
+    /// holds internally (`PairingHandler::paired_handle`), not a copy of its
+    /// contents. Wired in production by `app.rs` via `with_paired_source`.
+    ///
+    /// `None` when nothing wired one (older test setups): the unpaired cap
+    /// still applies, but `is_truly_paired` degrades to `Device::is_paired()`
+    /// (state-based — "reached Connected once," not "completed SAS pairing",
+    /// see that method's doc) as a fallback. Documented, accepted
+    /// degradation: production always wires the handle.
+    paired_ids: Option<PairedIds>,
 }
 
 impl Default for DeviceRegistry {
@@ -41,6 +66,7 @@ impl DeviceRegistry {
         Self {
             devices: Arc::new(RwLock::new(HashMap::new())),
             persist_path: None,
+            paired_ids: None,
         }
     }
 
@@ -48,6 +74,78 @@ impl DeviceRegistry {
         Self {
             devices: Arc::new(RwLock::new(HashMap::new())),
             persist_path: Some(persist_path),
+            paired_ids: None,
+        }
+    }
+
+    /// Wire the shared view of true pairing (see `paired_ids` field doc).
+    /// Consumed at construction, before wrapping in `Arc` — the production
+    /// call site is `app.rs`, chained onto `with_persistence`.
+    pub fn with_paired_source(mut self, paired_ids: PairedIds) -> Self {
+        self.paired_ids = Some(paired_ids);
+        self
+    }
+
+    /// Whether `device` has completed REAL SAS pairing, not merely reached
+    /// `Connected` once (see `Device::is_paired`'s doc for that distinction
+    /// — the L2-1 naming collision). Falls back to `Device::is_paired()`
+    /// only when no `paired_ids` handle is wired.
+    async fn is_truly_paired(&self, device: &Device) -> bool {
+        match &self.paired_ids {
+            Some(paired) => paired.read().await.contains_key(&device.id),
+            None => device.is_paired(),
+        }
+    }
+
+    /// Enforce `MAX_UNPAIRED_DEVICES` before a NEW record is inserted
+    /// (`add()` / the insert branch of `upsert_device()`). Caller must
+    /// already hold the write lock on `devices` and `incoming` must not yet
+    /// be present in it.
+    ///
+    /// If `incoming` is itself truly paired, it never counts against the cap
+    /// and nothing is evicted for it. Otherwise, if the current unpaired
+    /// count is already at the cap, the oldest unpaired record by
+    /// `last_seen` is evicted to make room — evict-oldest, not reject: a
+    /// reject lets an attacker who fills the cap first lock out a
+    /// legitimate new device, whereas LRU eviction keeps the newest
+    /// activity and can never displace a truly-paired device (they are
+    /// never eviction candidates).
+    async fn enforce_unpaired_cap(
+        &self,
+        devices: &mut HashMap<DeviceId, Device>,
+        incoming: &Device,
+    ) {
+        if self.is_truly_paired(incoming).await {
+            return;
+        }
+
+        let mut oldest_unpaired: Option<(DeviceId, DateTime<Utc>)> = None;
+        let mut unpaired_count = 0usize;
+        for d in devices.values() {
+            if self.is_truly_paired(d).await {
+                continue;
+            }
+            unpaired_count += 1;
+            if oldest_unpaired
+                .as_ref()
+                .is_none_or(|(_, last_seen)| d.last_seen < *last_seen)
+            {
+                oldest_unpaired = Some((d.id.clone(), d.last_seen));
+            }
+        }
+
+        if unpaired_count < MAX_UNPAIRED_DEVICES {
+            return;
+        }
+
+        if let Some((oldest_id, _)) = oldest_unpaired {
+            if let Some(evicted) = devices.remove(&oldest_id) {
+                info!(
+                    device_id = %evicted.id,
+                    event = "device_evicted_unpaired_cap",
+                    "Evicted oldest unpaired device record to enforce MAX_UNPAIRED_DEVICES"
+                );
+            }
         }
     }
 
@@ -84,6 +182,7 @@ impl DeviceRegistry {
                 // the device on every discovery packet.
                 existing.update_last_seen();
             } else {
+                self.enforce_unpaired_cap(&mut devices, &device).await;
                 info!(device_id = %device.id, event = "device_upserted", "Adding new device via upsert");
                 devices.insert(device.id.clone(), device);
             }
@@ -102,6 +201,7 @@ impl DeviceRegistry {
             if devices.contains_key(&device.id) {
                 return Err(Error::DeviceAlreadyExists(device.id));
             }
+            self.enforce_unpaired_cap(&mut devices, &device).await;
             info!(device_id = %device.id, event = "device_added", "Adding device to registry");
             devices.insert(device.id.clone(), device);
             self.persist_path.is_some()
@@ -178,8 +278,17 @@ impl DeviceRegistry {
         };
 
         let devices = self.devices.read().await;
-        let paired_only: std::collections::HashMap<&DeviceId, &Device> =
-            devices.iter().filter(|(_, d)| d.is_paired()).collect();
+        // Gate on TRUE pairing, not `Device::is_paired()` — that method
+        // returns true for `Connected`/`Disconnected` too, meaning "reached
+        // Connected once," not "completed SAS pairing" (types.rs:253-258).
+        // Filtering on it persisted zero-pairing records to devices.json
+        // (finding L2-1, Sprint 2 security audit).
+        let mut paired_only: std::collections::HashMap<&DeviceId, &Device> = HashMap::new();
+        for (id, device) in devices.iter() {
+            if self.is_truly_paired(device).await {
+                paired_only.insert(id, device);
+            }
+        }
         let json = serde_json::to_string_pretty(&paired_only)?;
         drop(devices);
 
@@ -835,6 +944,231 @@ mod device_record_accuracy_tests {
         assert_eq!(
             got.discovered_at, discovered_at,
             "first-seen time is history"
+        );
+        Ok(())
+    }
+}
+
+/// L2-1 (High, Sprint 2 security audit): unbounded pre-auth device-registry
+/// growth. `lifecycle::ensure_and_transition` (lifecycle.rs:120)
+/// unconditionally `registry.add()`s any unknown device id that completes
+/// TCP+TLS+identity — TOFU accepts any first-contact cert, so a LAN peer
+/// reaches a persistable record with ZERO pairing. `save_to_disk` filtered
+/// on `Device::is_paired()`, which returns true for `Connected` — a naming
+/// collision meaning "reached Connected once," not "completed SAS pairing"
+/// (types.rs:253-258). Result: a flood of fresh random device ids grows the
+/// in-memory map and `devices.json` without bound, pre-auth.
+#[cfg(test)]
+mod unpaired_cap_tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+    use crate::device::types::{Device, DeviceType};
+
+    fn unpaired_device(id: &str) -> Device {
+        // Discovered is the state `Device::new` produces and the state a
+        // device is in at the moment `registry.add()`/`upsert_device()` is
+        // called on the real insertion path (lifecycle.rs:110-120) —
+        // transition to Connected happens strictly AFTER the insert, via
+        // `update()`, which this fix does not touch.
+        Device::new(
+            id.to_string(),
+            format!("Device {}", id),
+            DeviceType::Phone,
+            8,
+        )
+    }
+
+    /// Test 1 (the repro): flood 200 distinct unpaired device ids through
+    /// `add()`. Must FAIL on the unbounded code (count == 200, all 200
+    /// persisted) and PASS after the fix (count <= MAX_UNPAIRED_DEVICES,
+    /// zero of them in devices.json).
+    #[tokio::test]
+    async fn test_flood_of_unpaired_devices_is_capped_and_not_persisted() -> anyhow::Result<()> {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = temp.path().join("devices.json");
+        let registry = DeviceRegistry::with_persistence(path.clone());
+
+        for i in 0..200 {
+            registry
+                .add(unpaired_device(&format!("flood-{i}")))
+                .await
+                .expect("add device");
+        }
+
+        assert!(
+            registry.count().await <= MAX_UNPAIRED_DEVICES,
+            "in-memory registry must stay bounded at MAX_UNPAIRED_DEVICES under an unpaired flood, got {}",
+            registry.count().await
+        );
+
+        let on_disk = tokio::fs::read_to_string(&path).await?;
+        let on_disk: std::collections::HashMap<DeviceId, Device> = serde_json::from_str(&on_disk)?;
+        assert!(
+            on_disk.is_empty(),
+            "devices.json must hold ZERO unpaired records, got {}",
+            on_disk.len()
+        );
+        Ok(())
+    }
+
+    /// Test 2: a device that completes REAL SAS pairing (present in the
+    /// shared `paired_ids` handle — the same Arc `PairingHandler.paired`
+    /// holds) must survive a flood of unpaired devices: never evicted, still
+    /// present in the registry, still persisted to devices.json.
+    #[tokio::test]
+    async fn test_truly_paired_device_survives_unpaired_flood() -> anyhow::Result<()> {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = temp.path().join("devices.json");
+
+        let paired_ids: Arc<RwLock<HashMap<DeviceId, chrono::DateTime<Utc>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        paired_ids
+            .write()
+            .await
+            .insert("real-paired-device".to_string(), Utc::now());
+
+        let registry =
+            DeviceRegistry::with_persistence(path.clone()).with_paired_source(paired_ids.clone());
+
+        registry
+            .add(unpaired_device("real-paired-device"))
+            .await
+            .expect("add paired device");
+
+        for i in 0..200 {
+            registry
+                .add(unpaired_device(&format!("flood-{i}")))
+                .await
+                .expect("add device");
+        }
+
+        assert!(
+            registry.contains(&"real-paired-device".to_string()).await,
+            "a truly-paired device must never be evicted by the unpaired-cap flood"
+        );
+        assert_eq!(
+            registry.count().await,
+            MAX_UNPAIRED_DEVICES + 1,
+            "the cap bounds the unpaired flood; the paired device is never a candidate for it"
+        );
+
+        let on_disk = tokio::fs::read_to_string(&path).await?;
+        let on_disk: std::collections::HashMap<DeviceId, Device> = serde_json::from_str(&on_disk)?;
+        assert!(
+            on_disk.contains_key("real-paired-device"),
+            "the truly-paired device must be persisted to devices.json"
+        );
+        assert_eq!(
+            on_disk.len(),
+            1,
+            "only the truly-paired device may be persisted, no unpaired flood records"
+        );
+        Ok(())
+    }
+
+    /// Test 3: LRU eviction order. Fill the cap, add one more unpaired
+    /// device; the oldest-by-`last_seen` unpaired record is the one dropped
+    /// — evict-oldest, not reject, so an attacker who fills the cap first
+    /// cannot lock out a legitimate new device.
+    #[tokio::test]
+    async fn test_eviction_drops_oldest_unpaired_by_last_seen() -> anyhow::Result<()> {
+        let registry = DeviceRegistry::new();
+
+        for i in 0..MAX_UNPAIRED_DEVICES {
+            let mut device = unpaired_device(&format!("cap-{i}"));
+            // Spread last_seen deterministically so ordering never races on
+            // wall-clock resolution: cap-0 is the oldest, cap-63 the newest.
+            device.last_seen =
+                Utc::now() - chrono::Duration::seconds((MAX_UNPAIRED_DEVICES - i) as i64);
+            registry.add(device).await.expect("add device");
+        }
+        assert_eq!(registry.count().await, MAX_UNPAIRED_DEVICES);
+
+        registry
+            .add(unpaired_device("newcomer"))
+            .await
+            .expect("add newcomer");
+
+        assert_eq!(
+            registry.count().await,
+            MAX_UNPAIRED_DEVICES,
+            "count stays at the cap: one evicted, one inserted"
+        );
+        assert!(
+            !registry.contains(&"cap-0".to_string()).await,
+            "the oldest-by-last_seen unpaired record must be the one evicted"
+        );
+        for i in 1..MAX_UNPAIRED_DEVICES {
+            assert!(
+                registry.contains(&format!("cap-{i}")).await,
+                "cap-{i} is newer than cap-0 and must survive"
+            );
+        }
+        assert!(registry.contains(&"newcomer".to_string()).await);
+        Ok(())
+    }
+
+    /// Test 4: the persistence gate. An unpaired `Connected` device (reached
+    /// Connected with zero SAS pairing — exactly the L2-1 shape) is NOT
+    /// written to devices.json; a truly-paired one IS. This is the
+    /// `is_paired()` vs `is_truly_paired()` distinction from types.rs:253-258.
+    #[tokio::test]
+    async fn test_persistence_gate_uses_true_pairing_not_connected_state() -> anyhow::Result<()> {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = temp.path().join("devices.json");
+
+        let paired_ids: Arc<RwLock<HashMap<DeviceId, chrono::DateTime<Utc>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let registry =
+            DeviceRegistry::with_persistence(path.clone()).with_paired_source(paired_ids.clone());
+
+        let mut connected_unpaired = unpaired_device("connected-not-paired");
+        connected_unpaired.state = DeviceState::Connected;
+        registry.add(connected_unpaired).await?;
+
+        let mut truly_paired = unpaired_device("truly-paired");
+        truly_paired.state = DeviceState::Connected;
+        registry.add(truly_paired).await?;
+        paired_ids
+            .write()
+            .await
+            .insert("truly-paired".to_string(), Utc::now());
+        registry.save_to_disk().await?;
+
+        let on_disk = tokio::fs::read_to_string(&path).await?;
+        let on_disk: std::collections::HashMap<DeviceId, Device> = serde_json::from_str(&on_disk)?;
+        assert!(
+            !on_disk.contains_key("connected-not-paired"),
+            "reaching Connected with zero SAS pairing must not persist (the L2-1 bug shape)"
+        );
+        assert!(
+            on_disk.contains_key("truly-paired"),
+            "a device present in the shared paired_ids handle must persist"
+        );
+        Ok(())
+    }
+
+    /// Test 5: fallback. With no `paired_ids` handle wired (`None` — the
+    /// state older test setups are in), the unpaired cap still bounds
+    /// growth on both insert paths (`add()` and `upsert_device()`). The
+    /// persistence filter degrades to `Device::is_paired()` in this mode
+    /// (documented, accepted: production always wires the handle in
+    /// app.rs) — this test covers the cap, not the persistence gate.
+    #[tokio::test]
+    async fn test_cap_bounds_growth_with_no_paired_handle_wired() -> anyhow::Result<()> {
+        let registry = DeviceRegistry::new();
+
+        for i in 0..200 {
+            registry
+                .upsert_device(unpaired_device(&format!("flood-{i}")))
+                .await
+                .expect("upsert device");
+        }
+
+        assert!(
+            registry.count().await <= MAX_UNPAIRED_DEVICES,
+            "the cap must bound growth even with no paired_ids handle wired, got {}",
+            registry.count().await
         );
         Ok(())
     }
