@@ -155,6 +155,19 @@ impl PairingHandler {
         self.own_device_id.read().await.as_ref() == Some(device_id)
     }
 
+    /// Clone of the shared `paired` handle — the SAME `Arc`, not a copy of
+    /// its contents. `DeviceRegistry` holds this (wired via
+    /// `DeviceRegistry::with_paired_source` in app.rs) so it can tell
+    /// truly-paired devices (completed SAS pairing, present in this map)
+    /// apart from records that merely reached `Connected`
+    /// (`Device::is_paired`'s weaker, state-based signal) — finding L2-1,
+    /// Sprint 2 security audit. Sharing the inner `Arc` here — never
+    /// `Arc<PairingHandler>` itself — keeps the registry from holding a
+    /// back-reference to this handler, so there is no reference cycle.
+    pub fn paired_handle(&self) -> Arc<RwLock<HashMap<DeviceId, DateTime<Utc>>>> {
+        self.paired.clone()
+    }
+
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
