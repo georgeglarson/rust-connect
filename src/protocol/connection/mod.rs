@@ -73,8 +73,11 @@ pub(crate) const MAX_PACKET_SIZE: usize = 524_288;
 pub(crate) const MAX_STEADY_PACKET_SIZE: usize = 32 * 1024 * 1024;
 /// Android allows a minimum of 1 second between connections to the same
 /// device (LanLinkProvider.java:71,
-/// MILLIS_DELAY_BETWEEN_CONNECTIONS_TO_SAME_DEVICE).
-pub(crate) const CONNECTION_RATE_LIMIT: Duration = Duration::from_millis(1000);
+/// MILLIS_DELAY_BETWEEN_CONNECTIONS_TO_SAME_DEVICE). `pub` (not
+/// `pub(crate)`) so the fault suite (Task 2.4, vk #990) can pace its
+/// redial scenarios off the real value instead of guessing a sleep
+/// duration that silently drifts from it.
+pub const CONNECTION_RATE_LIMIT: Duration = Duration::from_millis(1000);
 
 /// Read one `\n`-delimited packet line, enforcing `max_len` DURING the read
 /// rather than after it: as soon as the accumulated bytes would exceed the
@@ -727,6 +730,19 @@ impl ConnectionManager {
         let connected = self.connected_device_ids().await;
         let mut generations = self.generations.write().await;
         generations.retain(|device_id, _| connected.contains(device_id));
+    }
+
+    /// Test-only observability: number of registered cancel tokens. The
+    /// `cancel_tokens` map itself is `pub(crate)` (no production caller needs
+    /// its size), but the fault suite's resource-count assertions (Task 2.4,
+    /// vk #990 — no token/map growth across a duplicate-dial storm or a
+    /// stale-loop replacement) need to observe it from an external
+    /// integration test. Mirrors the existing test/debug-only pattern
+    /// (`recv_packet`, `register_cancel_token`) rather than widening the
+    /// field's own visibility.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn cancel_token_count(&self) -> usize {
+        self.cancel_tokens.read().await.len()
     }
 }
 

@@ -6,6 +6,21 @@ use socket2::SockRef;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
+/// TCP_KEEPIDLE (Linux): seconds of idle time before the first keepalive
+/// probe. Named so callers deriving a bounded "dead link must surface
+/// within N seconds" deadline (the fault suite, `tests/fault_suite.rs`)
+/// reference the actual production value instead of re-hardcoding it — a
+/// future tuning change here must widen/narrow those deadlines with it,
+/// never silently invalidate them.
+pub const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+/// TCP_KEEPINTVL (Linux): seconds between probes once idle.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// TCP_KEEPCNT (Linux): probes sent before the kernel gives up on the peer.
+pub const KEEPALIVE_RETRIES: u32 = 3;
+/// TCP_USER_TIMEOUT (Linux): bounds how long unacknowledged data may sit
+/// before the kernel fails the socket outright (kdeconnectd BUG 476747).
+pub const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Configures TCP keepalive on a stream.
 /// On Linux: 30s idle, 10s interval, 3 retries.
 /// On other platforms: OS defaults.
@@ -16,11 +31,11 @@ pub fn configure_keepalive(stream: &TcpStream) {
     {
         let _ = sock_ref.set_tcp_keepalive(
             &socket2::TcpKeepalive::new()
-                .with_time(Duration::from_secs(30))
-                .with_interval(Duration::from_secs(10))
-                .with_retries(3),
+                .with_time(KEEPALIVE_IDLE)
+                .with_interval(KEEPALIVE_INTERVAL)
+                .with_retries(KEEPALIVE_RETRIES),
         );
-        let _ = sock_ref.set_tcp_user_timeout(Some(Duration::from_secs(30)));
+        let _ = sock_ref.set_tcp_user_timeout(Some(TCP_USER_TIMEOUT));
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -61,28 +76,28 @@ mod tests {
                 sock_ref
                     .tcp_keepalive_time()
                     .expect("Value expected to be present"),
-                Duration::from_secs(30),
+                KEEPALIVE_IDLE,
                 "TCP_KEEPIDLE must be 30s (kdeconnectd BUG 476747)"
             );
             assert_eq!(
                 sock_ref
                     .tcp_keepalive_interval()
                     .expect("Value expected to be present"),
-                Duration::from_secs(10),
+                KEEPALIVE_INTERVAL,
                 "TCP_KEEPINTVL must be 10s"
             );
             assert_eq!(
                 sock_ref
                     .tcp_keepalive_retries()
                     .expect("Value expected to be present"),
-                3,
+                KEEPALIVE_RETRIES,
                 "TCP_KEEPCNT must be 3"
             );
             assert_eq!(
                 sock_ref
                     .tcp_user_timeout()
                     .expect("Value expected to be present"),
-                Some(Duration::from_secs(30)),
+                Some(TCP_USER_TIMEOUT),
                 "TCP_USER_TIMEOUT must bound unacknowledged keepalive probes"
             );
         }
