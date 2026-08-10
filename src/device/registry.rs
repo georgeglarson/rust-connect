@@ -115,30 +115,46 @@ impl DeviceRegistry {
         devices: &mut HashMap<DeviceId, Device>,
         incoming: &Device,
     ) {
-        if self.is_truly_paired(incoming).await {
+        // Snapshot the shared paired set ONCE (or its absence) instead of an
+        // async read per device — the scan below is then pure sync. The
+        // `None` fallback keeps the state-based `Device::is_paired()` signal
+        // (documented degradation; production always wires the handle).
+        let paired_snapshot: Option<std::collections::HashSet<DeviceId>> = match &self.paired_ids {
+            Some(paired) => Some(paired.read().await.keys().cloned().collect()),
+            None => None,
+        };
+        let is_paired = |d: &Device| match &paired_snapshot {
+            Some(ids) => ids.contains(&d.id),
+            None => d.is_paired(),
+        };
+
+        if is_paired(incoming) {
             return;
         }
 
-        let mut oldest_unpaired: Option<(DeviceId, DateTime<Utc>)> = None;
-        let mut unpaired_count = 0usize;
-        for d in devices.values() {
-            if self.is_truly_paired(d).await {
-                continue;
-            }
-            unpaired_count += 1;
-            if oldest_unpaired
-                .as_ref()
-                .is_none_or(|(_, last_seen)| d.last_seen < *last_seen)
-            {
-                oldest_unpaired = Some((d.id.clone(), d.last_seen));
-            }
-        }
+        // Every currently-unpaired record, oldest first. We must drain down
+        // to the cap, not evict a single record: a mass unpair (many devices
+        // leaving the shared paired map at once) flips their registry records
+        // to unpaired all at once, pushing the count well over the cap. A
+        // one-per-insert eviction would then pin the registry at that
+        // elevated count forever (evict 1, add 1 = net zero), never
+        // converging — the invariant is "at most MAX_UNPAIRED_DEVICES
+        // unpaired records after an unpaired insert", and only a drain
+        // restores it. (PR #15 review: coderabbit MAJOR.)
+        let mut unpaired: Vec<(DeviceId, DateTime<Utc>)> = devices
+            .values()
+            .filter(|d| !is_paired(d))
+            .map(|d| (d.id.clone(), d.last_seen))
+            .collect();
 
-        if unpaired_count < MAX_UNPAIRED_DEVICES {
+        // Leave room for the incoming insert: drain to cap-1 so the caller's
+        // insert lands exactly at the cap.
+        if unpaired.len() < MAX_UNPAIRED_DEVICES {
             return;
         }
-
-        if let Some((oldest_id, _)) = oldest_unpaired {
+        unpaired.sort_by_key(|(_, last_seen)| *last_seen);
+        let evict_count = unpaired.len() - MAX_UNPAIRED_DEVICES + 1;
+        for (oldest_id, _) in unpaired.into_iter().take(evict_count) {
             if let Some(evicted) = devices.remove(&oldest_id) {
                 info!(
                     device_id = %evicted.id,
@@ -1105,6 +1121,49 @@ mod unpaired_cap_tests {
             );
         }
         assert!(registry.contains(&"newcomer".to_string()).await);
+        Ok(())
+    }
+
+    /// PR #15 review (coderabbit MAJOR): a mass unpair pushes the unpaired
+    /// count well over the cap all at once. Eviction must DRAIN back to the
+    /// cap on the next unpaired insert, not evict a single record (which
+    /// would pin the registry at the elevated count forever). Red before the
+    /// drain-loop fix: the count stayed at cap+N.
+    #[tokio::test]
+    async fn test_mass_unpair_then_insert_drains_back_to_cap() -> anyhow::Result<()> {
+        let paired_ids: Arc<RwLock<HashMap<DeviceId, chrono::DateTime<Utc>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let registry = DeviceRegistry::new().with_paired_source(paired_ids.clone());
+
+        // 100 genuinely-paired devices: present in the shared paired map, so
+        // they are exempt from the cap and all persist in the registry.
+        for i in 0..100 {
+            let mut d = unpaired_device(&format!("paired-{i}"));
+            d.last_seen = Utc::now() - chrono::Duration::seconds((100 - i) as i64);
+            paired_ids.write().await.insert(d.id.clone(), Utc::now());
+            registry.add(d).await.expect("add paired device");
+        }
+        assert_eq!(registry.count().await, 100, "100 paired records, no cap");
+
+        // Mass unpair: all 100 leave the shared paired map at once. Their
+        // registry records are now unpaired, count 100 > cap 64.
+        paired_ids.write().await.clear();
+
+        // A single unpaired insert must drain the excess down to exactly the
+        // cap, not merely evict one.
+        registry
+            .add(unpaired_device("newcomer"))
+            .await
+            .expect("add newcomer");
+        assert_eq!(
+            registry.count().await,
+            MAX_UNPAIRED_DEVICES,
+            "the insert must drain the post-unpair excess back to the cap"
+        );
+        assert!(
+            registry.contains(&"newcomer".to_string()).await,
+            "the newcomer (newest) survives the drain"
+        );
         Ok(())
     }
 

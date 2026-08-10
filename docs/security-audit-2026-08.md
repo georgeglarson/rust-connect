@@ -6,10 +6,11 @@ API auth/CORS/secrets, CVE/dependency) audited the daemon against
 was verified against code (file:line) and, for the one High finding,
 reproduced red-before-green before fixing.
 
-**Bottom line:** one High finding (L2-1, fixed this cycle). Everything else is
-Low or config-gated. Dependency tree carries zero runtime-reachable
-vulnerabilities. Every historical KDE Connect CVE is closed in this
-reimplementation.
+**Bottom line:** one High finding (L2-1, fixed this cycle). Of the rest, one is
+Medium (F1, a TLS-layer-vs-application-layer invariant divergence that is not a
+bypass) and the remainder are Low or config-gated. Dependency tree carries zero
+runtime-reachable vulnerabilities. Every historical KDE Connect CVE is closed in
+this reimplementation.
 
 Method caveat: the CVE lane's `/tmp/kdeconnect-kde` reference was a shallow
 single-commit clone, so upstream git-log archaeology was not possible; KDE's
@@ -32,10 +33,19 @@ reachable pre-auth."
 **Fix:** durability now follows real pairing. The registry holds a shared clone
 of `PairingHandler`'s paired-ids handle; `save_to_disk` filters on true pairing,
 not the state predicate; unpaired records are bounded by `MAX_UNPAIRED_DEVICES`
-with LRU-by-`last_seen` eviction that never drops a truly-paired device.
-Reproduced red-before-green (see the fix branch's tests). This also subsumes
-CVE-2020-26164 item 1f (spoofed-UDP-broadcast device-record accumulation),
-which the CVE lane punted here.
+with LRU-by-`last_seen` eviction that never drops a truly-paired device; a mass
+unpair that pushes the unpaired count over the cap is drained back on the next
+insert (not evicted one-at-a-time). Reproduced red-before-green in
+`src/device/registry.rs` unit tests
+(`test_flood_of_unpaired_devices_is_capped_and_not_persisted`,
+`test_truly_paired_device_survives_unpaired_flood`,
+`test_eviction_drops_oldest_unpaired_by_last_seen`,
+`test_persistence_gate_uses_true_pairing_not_connected_state`,
+`test_cap_bounds_growth_with_no_paired_handle_wired`,
+`test_mass_unpair_then_insert_drains_back_to_cap`), each confirmed failing
+against pre-fix code before the fix landed. This also subsumes CVE-2020-26164
+item 1f (spoofed-UDP-broadcast device-record accumulation), which the CVE lane
+punted here.
 
 ## Ledger — accepted residual risks (Low / config-gated, not fixed this cycle)
 
@@ -73,8 +83,9 @@ the outer router, so the Swagger UI and full OpenAPI schema serve
 unauthenticated (`router.rs:246-249`). No secret in the schema, but it is
 undocumented recon surface if the API is ever rebound off loopback. One-line
 fix (wrap SwaggerUi in the auth layer, or gate it off-loopback). Confidence:
-high. *(Closed alongside L2-1 if the one-liner lands cleanly; otherwise a
-fast-follow.)*
+high. **Disposition: deferred to a fast-follow, not in this PR** — kept out to
+keep the trust-boundary change reviewable in isolation; tracked for the next
+API-hardening pass.
 
 ### API-2 — API key accepted via `?api_key=` query string [Low, class C]
 Necessary for browser `EventSource` (can't set headers) for the SSE stream. The
@@ -96,9 +107,10 @@ read the key file (mode 0600) and the identity keys directly — scoping buys
 nothing against that adversary. The blast-radius argument (one flat token
 controls pairing, SFTP mount, input injection, remote-command, SMS send, and
 the authenticated outbound-dial primitive at `device.rs:429`) becomes real only
-on a LAN rebind, where the threat model already says "generate a fresh key."
-Extend that note to state the key is a single flat capability token. If ever
-scoped, the natural first cut is read-only vs control. Not Sprint-2 budget.
+on a LAN rebind, where the threat model already says "generate a fresh key" —
+and on that rebind the key is a single flat capability token with no
+compartmentalization across those operations. If ever scoped, the natural first
+cut is read-only vs control. Not Sprint-2 budget.
 
 ## Confirmed bounded (independently verified against threat-model claims)
 
