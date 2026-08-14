@@ -740,6 +740,13 @@ async fn test_sftp_tool_availability_matches_backend_probe() {
 
 #[tokio::test]
 async fn test_unpair_device_not_paired() {
+    // Idempotent: a device that was never paired (or was already unpaired
+    // by a peer-initiated pair=false) returns 200 with status="unpaired"
+    // because the desired outcome — the device is unpaired — is already
+    // achieved. M2 finding (vk #991): the test's `kde_unpair` first
+    // roundtrip triggers the rust-side unpair via pair=false; the
+    // harness's own DELETE then arrived, hit DeviceNotPaired, and the
+    // 500 broke the M2 dance. See src/api/handlers/device.rs:unpair_device.
     let (state, _temp, api_key) = create_test_app().await;
     let app = build_router(state);
 
@@ -755,7 +762,7 @@ async fn test_unpair_device_not_paired() {
         .await
         .unwrap();
 
-    assert!(response.status() == StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(response.status() == StatusCode::OK);
 }
 
 #[tokio::test]
