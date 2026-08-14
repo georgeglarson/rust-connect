@@ -53,8 +53,17 @@ plugins:
   - role: findremotedevice
     source_file: src/main/java/org/kde/kdeconnect/plugins/findremotedevice/FindRemoteDevicePlugin.kt
     incoming_packet_types: []
-    outgoing_packet_types: []
-    notes: no packet types declared in supportedPacketTypes/getSupportedPacketTypes nor outgoingPacketTypes/getOutgoingPacketTypes
+    outgoing_packet_types:
+      - kdeconnect.findmyphone.request
+    notes: outgoing rides the cross-file constant FindMyPhonePlugin.PACKET_TYPE_FINDMYPHONE_REQUEST (FindRemoteDevicePlugin.kt:26,32) — the prior "no packet types declared" was a Task 0.1 extractor artifact, corrected 2026-08-14
+  - role: inputdevicesreceiver
+    source_file: src/main/java/org/kde/kdeconnect/plugins/inputdevicesreceiver/InputDevicesReceiver.kt
+    incoming_packet_types:
+      - kdeconnect.mousepad.request
+      - kdeconnect.shareinputdevices.request
+    outgoing_packet_types:
+      - kdeconnect.shareinputdevices
+    notes: new 2026 upstream plugin (target-side barrier tracking); the packet constants are `private const val` in a companion object (InputDevicesReceiver.kt:120-121), which the Task 0.1 extractor missed — entry added 2026-08-14
   - role: mousepad
     source_file: src/main/java/org/kde/kdeconnect/plugins/mousepad/MousePadPlugin.kt
     incoming_packet_types:

@@ -9,7 +9,7 @@
 # note: alignment with rust-connect and kdeconnect-kde is deferred to Sprint 3 (Task 3.1)
 plugins:
   - role: battery
-    source_file: service/plugins/battery.js
+    source_file: src/service/plugins/battery.js
     incoming_packet_types:
       - kdeconnect.battery
       - kdeconnect.battery.request
@@ -17,7 +17,7 @@ plugins:
       - kdeconnect.battery
       - kdeconnect.battery.request
   - role: clipboard
-    source_file: service/plugins/clipboard.js
+    source_file: src/service/plugins/clipboard.js
     incoming_packet_types:
       - kdeconnect.clipboard
       - kdeconnect.clipboard.connect
@@ -25,13 +25,13 @@ plugins:
       - kdeconnect.clipboard
       - kdeconnect.clipboard.connect
   - role: connectivity_report
-    source_file: service/plugins/connectivity_report.js
+    source_file: src/service/plugins/connectivity_report.js
     incoming_packet_types:
       - kdeconnect.connectivity_report
     outgoing_packet_types:
       - kdeconnect.connectivity_report.request
   - role: contacts
-    source_file: service/plugins/contacts.js
+    source_file: src/service/plugins/contacts.js
     incoming_packet_types:
       - kdeconnect.contacts.response_uids_timestamps
       - kdeconnect.contacts.response_vcards
@@ -39,13 +39,13 @@ plugins:
       - kdeconnect.contacts.request_all_uids_timestamps
       - kdeconnect.contacts.request_vcards_by_uid
   - role: findmyphone
-    source_file: service/plugins/findmyphone.js
+    source_file: src/service/plugins/findmyphone.js
     incoming_packet_types:
       - kdeconnect.findmyphone.request
     outgoing_packet_types:
       - kdeconnect.findmyphone.request
   - role: mousepad
-    source_file: service/plugins/mousepad.js
+    source_file: src/service/plugins/mousepad.js
     incoming_packet_types:
       - kdeconnect.mousepad.echo
       - kdeconnect.mousepad.keyboardstate
@@ -55,7 +55,7 @@ plugins:
       - kdeconnect.mousepad.keyboardstate
       - kdeconnect.mousepad.request
   - role: mpris
-    source_file: service/plugins/mpris.js
+    source_file: src/service/plugins/mpris.js
     incoming_packet_types:
       - kdeconnect.mpris
       - kdeconnect.mpris.request
@@ -63,7 +63,7 @@ plugins:
       - kdeconnect.mpris
       - kdeconnect.mpris.request
   - role: notification
-    source_file: service/plugins/notification.js
+    source_file: src/service/plugins/notification.js
     incoming_packet_types:
       - kdeconnect.notification
       - kdeconnect.notification.request
@@ -73,18 +73,18 @@ plugins:
       - kdeconnect.notification.reply
       - kdeconnect.notification.request
   - role: ping
-    source_file: service/plugins/ping.js
+    source_file: src/service/plugins/ping.js
     incoming_packet_types:
       - kdeconnect.ping
     outgoing_packet_types:
       - kdeconnect.ping
   - role: presenter
-    source_file: service/plugins/presenter.js
+    source_file: src/service/plugins/presenter.js
     incoming_packet_types:
       - kdeconnect.presenter
     outgoing_packet_types: []
   - role: runcommand
-    source_file: service/plugins/runcommand.js
+    source_file: src/service/plugins/runcommand.js
     incoming_packet_types:
       - kdeconnect.runcommand
       - kdeconnect.runcommand.request
@@ -92,19 +92,19 @@ plugins:
       - kdeconnect.runcommand
       - kdeconnect.runcommand.request
   - role: sftp
-    source_file: service/plugins/sftp.js
+    source_file: src/service/plugins/sftp.js
     incoming_packet_types:
       - kdeconnect.sftp
     outgoing_packet_types:
       - kdeconnect.sftp.request
   - role: share
-    source_file: service/plugins/share.js
+    source_file: src/service/plugins/share.js
     incoming_packet_types:
       - kdeconnect.share.request
     outgoing_packet_types:
       - kdeconnect.share.request
   - role: sms
-    source_file: service/plugins/sms.js
+    source_file: src/service/plugins/sms.js
     incoming_packet_types:
       - kdeconnect.sms.messages
     outgoing_packet_types:
@@ -112,13 +112,13 @@ plugins:
       - kdeconnect.sms.request_conversation
       - kdeconnect.sms.request_conversations
   - role: systemvolume
-    source_file: service/plugins/systemvolume.js
+    source_file: src/service/plugins/systemvolume.js
     incoming_packet_types:
       - kdeconnect.systemvolume.request
     outgoing_packet_types:
       - kdeconnect.systemvolume
   - role: telephony
-    source_file: service/plugins/telephony.js
+    source_file: src/service/plugins/telephony.js
     incoming_packet_types:
       - kdeconnect.telephony
     outgoing_packet_types:

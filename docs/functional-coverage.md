@@ -129,7 +129,7 @@ feature_ledger:
     environment: UNVERIFIED
     status: UNVERIFIED
     cite: "tests/fixtures/upstream-wire/clipboard/{local_change,connect}.json (kdeconnect-android ClipboardPlugin.kt:77-81,93-97); docs/live-validation.md 2026-08-02 Clipboard desktop<->phone rows. Task 2.5 (merged 2026-08-10) hostile-input evidence: test_handle_clipboard_connect_without_content_ignored + test_handle_clipboard_connect_stale_timestamp_ignored (src/plugins/clipboard.rs:1375,1343) — missing-field + stale-timestamp inputs ignored"
-    reason: "Slice 0B rollup (D3): environment is UNVERIFIED, blocking status=PASS. fixture_provenance promoted via the slice-0b clipboard fixtures. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): a connect packet without content is ignored and a stale timestamp is ignored. The open cell is owned by Task 4.1."
+    reason: "Slice 0B rollup (D3): environment is UNVERIFIED, blocking status=PASS. fixture_provenance promoted via the slice-0b clipboard fixtures. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): a connect packet without content is ignored and a stale timestamp is ignored. The open cell is owned by Task 4.1. Role-internal gap (Task 3.1, 2026-08-14): kde advertises kdeconnect.clipboard.file (in+out, kdeconnect_clipboard.json) — rust declares only clipboard + clipboard.connect (src/plugins/clipboard.rs:932-949); unimplemented."
     owner: "Task 4.1"
 
   - feature: connectivity
@@ -435,7 +435,7 @@ feature_ledger:
     environment: UNVERIFIED
     status: UNVERIFIED
     cite: "tests/fixtures/upstream-wire/share/{text_share_request,url_share_request,share_file_request}.json (SharePlugin.java:268-269,339-341); docs/live-validation.md 2026-08-02 Share desktop<->phone rows + 81 KiB PNG receipt. Task 2.5 (merged 2026-08-10) hostile-input evidence: tests/share_security_tests.rs suite (test_share_path_traversal_blocked:131, test_share_multipart_part_filename_traversal_blocked:171, test_share_symlinked_intermediate_dir_not_followed:341), test_sanitize_filename_path_traversal (src/plugins/share.rs:889), test_transfer_permits_cap_per_device/test_transfer_permits_cap_global (:916,943), test_incoming_text_over_cap_is_refused (:1155), test_allowed_url_scheme_rejects_dangerous_and_malformed (:1235), test_stream_upload_enforces_100mib_cap (src/api/handlers/share.rs:539), fuzz target fuzz/fuzz_targets/share_multipart.rs, security-audit-2026-08.md 'path traversal defeated by basename-flatten + create_new'"
-    reason: "Slice 0B rollup (D3): environment is UNVERIFIED, blocking status=PASS. fixture_provenance promoted via the slice-0b share fixtures. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): path traversal is defeated by basename-flatten + create_new (incl. multipart part filenames and symlinked intermediate dirs), transfer permits are capped per-device and globally, over-cap text is refused, dangerous/malformed URL schemes are rejected, stream uploads enforce the 100 MiB cap, and the multipart parser has a fuzz target. The open cell is owned by Task 4.1."
+    reason: "Slice 0B rollup (D3): environment is UNVERIFIED, blocking status=PASS. fixture_provenance promoted via the slice-0b share fixtures. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): path traversal is defeated by basename-flatten + create_new (incl. multipart part filenames and symlinked intermediate dirs), transfer permits are capped per-device and globally, over-cap text is refused, dangerous/malformed URL schemes are rejected, stream uploads enforce the 100 MiB cap, and the multipart parser has a fuzz target. The open cell is owned by Task 4.1. Role-internal note (Task 3.1, 2026-08-14): kdeconnect.share.request.update is consumed but never sent (src/plugins/share.rs:656-667 — no multi-file batch to report on); kde advertises it outgoing (kdeconnect_share.json)."
     owner: "Task 4.1"
 
   - feature: sms
@@ -451,7 +451,7 @@ feature_ledger:
     environment: UNVERIFIED
     status: UNVERIFIED
     cite: "tests/fixtures/upstream-wire/sms/message_batch.json (kdeconnect-android SMSHelper.kt:911-933 — Message.toJSONObject() emits the {addresses, body, date, type, read, threadID, uID, event, subscriptionID, attachments} shape; the rust SmsMessage struct mirrors those camelCase keys). Task 2.5 (merged 2026-08-10) hostile-input evidence: test_handle_malformed_sms_packet + test_handle_sms_missing_fields (src/plugins/sms.rs:229,240)"
-    reason: "Slice 0B follow-up: fixture_provenance now PASS via the upstream-derived message-batch fixture. The four accept-coverage variants (read-as-int, multiple addresses, event flags, minimal fields) test the plugin's tolerant parser; they keep inline json! because they assert accept behavior, not wire shape. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): malformed packets and missing-field packets are handled. Remaining cells (desktop_effect, api_surface, lifecycle, live_device, environment) owned by Sprint 3 / Task 3.1 alignment."
+    reason: "Slice 0B follow-up: fixture_provenance now PASS via the upstream-derived message-batch fixture. The four accept-coverage variants (read-as-int, multiple addresses, event flags, minimal fields) test the plugin's tolerant parser; they keep inline json! because they assert accept behavior, not wire shape. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): malformed packets and missing-field packets are handled. Remaining cells (desktop_effect, api_surface, lifecycle, live_device, environment) owned by Sprint 3 / Task 3.1 alignment. Role-internal gaps (Task 3.1, 2026-08-14): kde advertises kdeconnect.sms.attachment_file (in), kdeconnect.sms.request_attachment + kdeconnect.sms.request_conversation (out, kdeconnect_sms.json) — rust has none; unimplemented."
     owner: "Task 3.1"
 
   - feature: systemvolume
@@ -744,42 +744,42 @@ feature_ledger:
     fixture_provenance: UNVERIFIED
     live_device: NOT-APPLICABLE
     environment: UNVERIFIED
-    status: UNVERIFIED
+    status: INTENTIONAL-DIVERGENCE
     cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment"
-    owner: "Task 3.1"
+    reason: "deferred: ModemManager WWAN voice backend producing kdeconnect.telephony from a desktop modem (mmtelephonyplugin.cpp:33-124; its own request_mute handling is an upstream TODO stub). Requires WWAN hardware essentially no host has; only consumers are other desktops. Rust `telephony` already consumes the packet type it produces. Documented nice-to-have."
+    owner: "Task 3.1 (classified 2026-08-14)"
 
   - feature: kdeconnect-kde/mpriscontrol
     rust_impl: false
     upstream: kdeconnect-kde
     upstream_ref: "kdeconnect-kde plugins/mpriscontrol/kdeconnect_mpriscontrol.json"
-    desktop_effect: UNVERIFIED
-    api_surface: UNVERIFIED
-    lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    desktop_effect: NOT-APPLICABLE
+    api_surface: NOT-APPLICABLE
+    lifecycle: NOT-APPLICABLE
+    hostile_input: NOT-APPLICABLE
+    fixture_provenance: NOT-APPLICABLE
     live_device: NOT-APPLICABLE
-    environment: UNVERIFIED
-    status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment (rust plugin `mpris` covers KDE split into remote+control)"
-    owner: "Task 3.1"
+    environment: NOT-APPLICABLE
+    status: NOT-APPLICABLE
+    cite: "row satisfied as the rust plugin `mpris`"
+    reason: "covered by rust plugin `mpris` — src/plugins/mpris/mod.rs:1154-1173 advertises in+out kdeconnect.mpris/kdeconnect.mpris.request and dispatch at :1203-1205 handles both roles; rust `mpris` is the union of kde's two split plugins (mpriscontrol = in mpris.request/out mpris, mprisremote = in mpris/out mpris.request)"
+    owner: "Task 3.1 (classified 2026-08-14)"
 
   - feature: kdeconnect-kde/mprisremote
     rust_impl: false
     upstream: kdeconnect-kde
     upstream_ref: "kdeconnect-kde plugins/mprisremote/kdeconnect_mprisremote.json"
-    desktop_effect: UNVERIFIED
-    api_surface: UNVERIFIED
-    lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
+    desktop_effect: NOT-APPLICABLE
+    api_surface: NOT-APPLICABLE
+    lifecycle: NOT-APPLICABLE
+    hostile_input: NOT-APPLICABLE
+    fixture_provenance: NOT-APPLICABLE
     live_device: NOT-APPLICABLE
-    environment: UNVERIFIED
-    status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment (rust plugin `mpris` covers KDE split into remote+control)"
-    owner: "Task 3.1"
+    environment: NOT-APPLICABLE
+    status: NOT-APPLICABLE
+    cite: "row satisfied as the rust plugin `mpris`"
+    reason: "covered by rust plugin `mpris` — src/plugins/mpris/mod.rs:1154-1173 advertises in+out kdeconnect.mpris/kdeconnect.mpris.request and dispatch at :1203-1205 handles both roles; rust `mpris` is the union of kde's two split plugins (mpriscontrol = in mpris.request/out mpris, mprisremote = in mpris/out mpris.request)"
+    owner: "Task 3.1 (classified 2026-08-14)"
 
   - feature: kdeconnect-kde/notifications
     rust_impl: false
@@ -874,8 +874,8 @@ feature_ledger:
     environment: UNVERIFIED
     status: UNVERIFIED
     cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment"
-    owner: "Task 3.1"
+    reason: "PARTIAL coverage: kde's remotecontrol is a D-Bus adaptor PRODUCING kdeconnect.mousepad.request (remotecontrolplugin.cpp:21-33 — moveCursor sends dx/dy). Rust's producer (`remotekeyboard`, out mousepad.request) only emits keyboard fields, never dx/dy/x/y/click/scroll. Implementation task (S): extend the producer REST surface to emit pointer fields (dx/dy, absolute x/y, click/hold/release/scroll) per Android MouseReceiverPlugin.kt:51-65's parse set. No capability-negotiation change needed."
+    owner: "vk #1040"
 
   - feature: kdeconnect-kde/remotekeyboard
     rust_impl: false
@@ -897,17 +897,17 @@ feature_ledger:
     rust_impl: false
     upstream: kdeconnect-kde
     upstream_ref: "kdeconnect-kde plugins/remotesystemvolume/kdeconnect_remotesystemvolume.json"
-    desktop_effect: UNVERIFIED
-    api_surface: UNVERIFIED
-    lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
-    live_device: UNVERIFIED
-    environment: UNVERIFIED
-    status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment (controller side of systemvolume)"
-    owner: "Task 3.1"
+    desktop_effect: NOT-APPLICABLE
+    api_surface: NOT-APPLICABLE
+    lifecycle: NOT-APPLICABLE
+    hostile_input: NOT-APPLICABLE
+    fixture_provenance: NOT-APPLICABLE
+    live_device: NOT-APPLICABLE
+    environment: NOT-APPLICABLE
+    status: NOT-APPLICABLE
+    cite: "row satisfied as the rust plugin `systemvolume` (controller side)"
+    reason: "covered by rust plugin `systemvolume` controller side — always in kdeconnect.systemvolume / out kdeconnect.systemvolume.request (src/plugins/systemvolume/mod.rs:506-530)"
+    owner: "Task 3.1 (classified 2026-08-14)"
 
   - feature: kdeconnect-kde/runcommand
     rust_impl: false
@@ -923,22 +923,6 @@ feature_ledger:
     status: NOT-APPLICABLE
     cite: "row satisfied as the rust plugin `runcommand`"
     reason: "rolled-up to rust plugin `runcommand`"
-    owner: "Task 3.1"
-
-  - feature: kdeconnect-kde/screensaver-inhibit
-    rust_impl: false
-    upstream: kdeconnect-kde
-    upstream_ref: "kdeconnect-kde plugins/screensaver-inhibit/kdeconnect_screensaver_inhibit.json"
-    desktop_effect: NOT-APPLICABLE
-    api_surface: NOT-APPLICABLE
-    lifecycle: NOT-APPLICABLE
-    hostile_input: NOT-APPLICABLE
-    fixture_provenance: NOT-APPLICABLE
-    live_device: NOT-APPLICABLE
-    environment: NOT-APPLICABLE
-    status: NOT-APPLICABLE
-    cite: "row satisfied as the rust plugin `screensaver-inhibit`"
-    reason: "rolled-up to rust plugin `screensaver-inhibit`"
     owner: "Task 3.1"
 
   - feature: kdeconnect-kde/sendnotifications
@@ -1002,8 +986,8 @@ feature_ledger:
     environment: UNVERIFIED
     status: UNVERIFIED
     cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment"
-    owner: "Task 3.1"
+    reason: "producer half. Implementation task (L): capture local input at a configured screen edge via the xdg-desktop-portal InputCapture portal, forward as mousepad.request + shareinputdevices.request, consume the release (shareinputdevicesplugin.cpp:71-138). Deps: InputCapture portal availability outside KWin UNVERIFIED, the M-sized remote role (kdeconnect-kde/shareinputdevicesremote), Task 3.2 kdeconnectd harness. Recommend remote-half first."
+    owner: "vk #1042"
 
   - feature: kdeconnect-kde/shareinputdevicesremote
     rust_impl: false
@@ -1018,8 +1002,8 @@ feature_ledger:
     environment: UNVERIFIED
     status: UNVERIFIED
     cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment"
-    owner: "Task 3.1"
+    reason: "target-side barrier tracking — the SAME role as kdeconnect-android/inputdevicesreceiver on the other upstream. Implementation task (M): consume kdeconnect.shareinputdevices.request (enter: exitEdge/deltax/y), feed absolute mousepad.request into the existing local mousepad receiver, track cursor position, emit kdeconnect.shareinputdevices (releaseDeltax/y) on cursor exit — mirror shareinputdevicesremoteplugin.cpp:31-101 and InputDevicesReceiver.kt:70-118. Depends on the Task 3.2 kdeconnectd harness for end-to-end validation (only kde desktops produce shareinputdevices.request; the 2026 Android inputdevicesreceiver plugin is also a consumer). Without this, a kde peer sharing input into rust-connect gets its cursor trapped."
+    owner: "vk #1041"
 
   - feature: kdeconnect-kde/sms
     rust_impl: false
@@ -1041,17 +1025,17 @@ feature_ledger:
     rust_impl: false
     upstream: kdeconnect-kde
     upstream_ref: "kdeconnect-kde plugins/systemvolume/kdeconnect_systemvolume.json"
-    desktop_effect: UNVERIFIED
-    api_surface: UNVERIFIED
-    lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
-    live_device: UNVERIFIED
-    environment: UNVERIFIED
-    status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 1 / Task 1.1 audio backend pending"
-    owner: "Task 1.1"
+    desktop_effect: NOT-APPLICABLE
+    api_surface: NOT-APPLICABLE
+    lifecycle: NOT-APPLICABLE
+    hostile_input: NOT-APPLICABLE
+    fixture_provenance: NOT-APPLICABLE
+    live_device: NOT-APPLICABLE
+    environment: NOT-APPLICABLE
+    status: NOT-APPLICABLE
+    cite: "row satisfied as the rust plugin `systemvolume` (provider side)"
+    reason: "covered by rust plugin `systemvolume` provider side — src/plugins/systemvolume/mod.rs:506-530 adds in kdeconnect.systemvolume.request / out kdeconnect.systemvolume when the pactl backend is available; live-validated A15 2026-08-06"
+    owner: "Task 3.1 (classified 2026-08-14)"
 
   - feature: kdeconnect-kde/telephony
     rust_impl: false
@@ -1064,10 +1048,10 @@ feature_ledger:
     fixture_provenance: NOT-APPLICABLE
     live_device: NOT-APPLICABLE
     environment: NOT-APPLICABLE
-    status: NOT-APPLICABLE
-    cite: "row satisfied as the rust plugin `telephony`"
-    reason: "rolled-up to rust plugin `telephony`"
-    owner: "Task 3.1"
+    status: UNVERIFIED
+    cite: "row partially satisfied by the rust plugin `telephony` (kdeconnect.telephony consume side)"
+    reason: "rolled-up to rust plugin `telephony` EXCEPT a missing desktop→phone request_mute leg (mute ringing phone): kde's telephony SENDS kdeconnect.telephony.request_mute (telephonyplugin.cpp:89-90; Android consumes it) and rust never sends or consumes request_mute anywhere (zero hits in src/); small implementation task filed 2026-08-14"
+    owner: "vk #1043"
 
   - feature: kdeconnect-kde/virtualmonitor
     rust_impl: false
@@ -1080,16 +1064,16 @@ feature_ledger:
     fixture_provenance: UNVERIFIED
     live_device: NOT-APPLICABLE
     environment: UNVERIFIED
-    status: UNVERIFIED
+    status: INTENTIONAL-DIVERGENCE
     cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment"
-    owner: "Task 3.1"
+    reason: "deferred: spawns KRDP (krdpserver --virtual-monitor) + RDP credentials (virtualmonitorplugin.cpp:92-261); desktop-to-desktop only (the pinned Android app has NO virtualmonitor plugin), environment-heavy, no Android test path. No capability advertised → nothing dishonest. Documented nice-to-have."
+    owner: "Task 3.1 (classified 2026-08-14)"
 
   # Android-only roles not yet mapped to a Rust plugin.
   - feature: kdeconnect-android/inputdevicesreceiver
     rust_impl: false
     upstream: kdeconnect-android
-    upstream_ref: "kdeconnect-android src/main/java/.../plugins/inputdevicesreceiver/"
+    upstream_ref: "kdeconnect-android src/main/java/.../inputdevicesreceiver/InputDevicesReceiver.kt"
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
@@ -1099,40 +1083,40 @@ feature_ledger:
     environment: UNVERIFIED
     status: UNVERIFIED
     cite:
-    reason: "no Plugin.java/PACKET_TYPE declarations in this android directory; upstream SKU — Sprint 3 / Task 3.1 alignment"
-    owner: "Task 3.1"
+    reason: "target-side barrier tracking — the SAME role as kdeconnect-kde/shareinputdevicesremote on the other upstream. Implementation task (M): consume kdeconnect.shareinputdevices.request (enter: exitEdge/deltax/y), feed absolute mousepad.request into the existing local mousepad receiver, track cursor position, emit kdeconnect.shareinputdevices (releaseDeltax/y) on cursor exit — mirror InputDevicesReceiver.kt:70-118 and shareinputdevicesremoteplugin.cpp:31-101. Depends on the Task 3.2 kdeconnectd harness for end-to-end validation (only kde desktops produce shareinputdevices.request; this 2026 Android plugin is also a consumer). Without this, a kde peer sharing input into rust-connect gets its cursor trapped. (The prior 'no packet types declared' note was an extraction artifact — InputDevicesReceiver.kt:120-121 declares in [mousepad.request, shareinputdevices.request] / out [shareinputdevices] as private companion-object consts; fixture corrected 2026-08-14.)"
+    owner: "vk #1041"
 
   - feature: kdeconnect-android/mousereceiver
     rust_impl: false
     upstream: kdeconnect-android
     upstream_ref: "kdeconnect-android src/main/java/.../MouseReceiverPlugin.kt"
-    desktop_effect: UNVERIFIED
-    api_surface: UNVERIFIED
-    lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
-    live_device: UNVERIFIED
-    environment: UNVERIFIED
-    status: UNVERIFIED
-    cite:
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment (android-only — Rust plugin `mousepad` is the receive side for both)"
-    owner: "Task 3.1"
+    desktop_effect: NOT-APPLICABLE
+    api_surface: NOT-APPLICABLE
+    lifecycle: NOT-APPLICABLE
+    hostile_input: NOT-APPLICABLE
+    fixture_provenance: NOT-APPLICABLE
+    live_device: NOT-APPLICABLE
+    environment: NOT-APPLICABLE
+    status: NOT-APPLICABLE
+    cite: "row satisfied as the rust plugin `mousepad`"
+    reason: "covered by rust plugin `mousepad` — it consumes any peer's kdeconnect.mousepad.request incl. absolute x/y (src/plugins/mousepad.rs); Android's MouseReceiverPlugin.kt:136-138 is the phone-side accessibility-service consumer of the same packet"
+    owner: "Task 3.1 (classified 2026-08-14)"
 
   - feature: kdeconnect-android/findremotedevice
     rust_impl: false
     upstream: kdeconnect-android
     upstream_ref: "kdeconnect-android src/main/java/.../FindRemoteDevicePlugin.kt"
-    desktop_effect: UNVERIFIED
-    api_surface: UNVERIFIED
-    lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
-    fixture_provenance: UNVERIFIED
-    live_device: UNVERIFIED
-    environment: UNVERIFIED
-    status: UNVERIFIED
-    cite:
-    reason: "android-only — findremotedevice's outgoing packet type is FindMyPhonePlugin.PACKET_TYPE_FINDMYPHONE_REQUEST (Rust covers via `findmyphone`)"
-    owner: "Task 3.1"
+    desktop_effect: NOT-APPLICABLE
+    api_surface: NOT-APPLICABLE
+    lifecycle: NOT-APPLICABLE
+    hostile_input: NOT-APPLICABLE
+    fixture_provenance: NOT-APPLICABLE
+    live_device: NOT-APPLICABLE
+    environment: NOT-APPLICABLE
+    status: NOT-APPLICABLE
+    cite: "row satisfied as the rust plugins `findmyphone` + `findthisdevice`"
+    reason: "covered by rust plugin `findmyphone` (producer, out kdeconnect.findmyphone.request) + `findthisdevice` (ring target); upstream FindRemoteDevicePlugin.kt:26,32 — its only wire act is sending the findmyphone request packet"
+    owner: "Task 3.1 (classified 2026-08-14)"
 
   # GSConnect-only roles not mapped to a Rust plugin.
   - feature: gsconnect/connectivity_report
