@@ -107,14 +107,14 @@ feature_ledger:
     desktop_effect: PASS
     api_surface: PASS
     lifecycle: PASS
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: PASS
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/battery/request.json holds the upstream truth (gsconnect battery.js:364-368 `{request: true}`); the rust plugin's empty-body divergence is pinned by test_on_connected_requests_battery and queued in vk #1018 — behaviorally inert, as no implementation reads the field and Android does not implement the request type. docs/live-validation.md 2026-08-02 Battery row (live 90%, charging); docs/parity-checklist.md Discovery/Lifecycle CONFORMANT"
-    reason: "Slice 0B rollup (D3): hostile_input and environment are UNVERIFIED, blocking status=PASS. fixture_provenance promoted to PASS via battery/request.json (upstream truth; replaces the prior identity/basic.json overcite); the remaining two cells are owned by the Sprint 2 hostile-input audit (Task 2.5) and the env matrix expansion (Task 4.1)."
-    owner: "Tasks 2.5 + 4.1"
+    cite: "tests/fixtures/upstream-wire/battery/request.json holds the upstream truth (gsconnect battery.js:364-368 `{request: true}`); the rust plugin's empty-body divergence is pinned by test_on_connected_requests_battery and queued in vk #1018 — behaviorally inert, as no implementation reads the field and Android does not implement the request type. docs/live-validation.md 2026-08-02 Battery row (live 90%, charging); docs/parity-checklist.md Discovery/Lifecycle CONFORMANT. Task 2.5 (merged 2026-08-10) hostile-input evidence: test_handle_malformed_battery_packet (src/plugins/battery.rs:144) — garbage-body packet rejected"
+    reason: "Slice 0B rollup (D3): environment is UNVERIFIED, blocking status=PASS. fixture_provenance promoted to PASS via battery/request.json (upstream truth; replaces the prior identity/basic.json overcite). hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): test_handle_malformed_battery_packet (src/plugins/battery.rs:144) rejects a garbage-body packet. The open cell is owned by Task 4.1."
+    owner: "Task 4.1"
 
   - feature: clipboard
     rust_impl: true
@@ -123,14 +123,14 @@ feature_ledger:
     desktop_effect: PASS
     api_surface: PASS
     lifecycle: PASS
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: PASS
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/clipboard/{local_change,connect}.json (kdeconnect-android ClipboardPlugin.kt:77-81,93-97); docs/live-validation.md 2026-08-02 Clipboard desktop<->phone rows"
-    reason: "Slice 0B rollup (D3): hostile_input and environment are UNVERIFIED, blocking status=PASS. fixture_provenance promoted via the slice-0b clipboard fixtures; remaining cells owned by Sprint 2 hostile-input audit (Task 2.5) and env-matrix expansion (Task 4.1)."
-    owner: "Tasks 2.5 + 4.1"
+    cite: "tests/fixtures/upstream-wire/clipboard/{local_change,connect}.json (kdeconnect-android ClipboardPlugin.kt:77-81,93-97); docs/live-validation.md 2026-08-02 Clipboard desktop<->phone rows. Task 2.5 (merged 2026-08-10) hostile-input evidence: test_handle_clipboard_connect_without_content_ignored + test_handle_clipboard_connect_stale_timestamp_ignored (src/plugins/clipboard.rs:1375,1343) — missing-field + stale-timestamp inputs ignored"
+    reason: "Slice 0B rollup (D3): environment is UNVERIFIED, blocking status=PASS. fixture_provenance promoted via the slice-0b clipboard fixtures. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): a connect packet without content is ignored and a stale timestamp is ignored. The open cell is owned by Task 4.1."
+    owner: "Task 4.1"
 
   - feature: connectivity
     rust_impl: true
@@ -145,8 +145,8 @@ feature_ledger:
     environment: UNVERIFIED
     status: UNVERIFIED
     cite: "tests/fixtures/upstream-wire/connectivity/report.json (kdeconnect-android ConnectivityReportPlugin.kt:51-68 — phone publishes signalStrengths dict keyed by subscriptionID). docs/live-validation.md 2026-08-02 Connectivity row"
-    reason: "Slice 0B follow-up: fixture_provenance promoted to PASS via the upstream-derived signalStrengths fixture. The remaining two cells are owned by the Sprint 2 hostile-input audit (Task 2.5) and the env matrix expansion (Task 4.1)."
-    owner: "Tasks 2.5 + 4.1"
+    reason: "Slice 0B follow-up: fixture_provenance promoted to PASS via the upstream-derived signalStrengths fixture. Task 2.5 (security audit) completed 2026-08-10 without producing row-specific malformed-input evidence for connectivity; no row-specific hostile-input test exists, so hostile_input stays UNVERIFIED — an honest gap to be swept by the Sprint 5 evidence gate. environment stays UNVERIFIED (Task 4.1); both cells block status=PASS."
+    owner: "Task 4.1 (environment); hostile_input gap → vk #1012 sweep"
 
   - feature: contacts
     rust_impl: true
@@ -155,13 +155,13 @@ feature_ledger:
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/contacts/{request_all_uids_timestamps,request_vcards_by_uid,response_uids_timestamps}.json (kdeconnect-kde plugins/contacts/contactsplugin.cpp:169-185; kdeconnect-android ContactsPlugin.kt:110-119)"
-    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived contacts fixtures. Remaining cells owned by Sprint 3 / Task 3.1 alignment."
+    cite: "tests/fixtures/upstream-wire/contacts/{request_all_uids_timestamps,request_vcards_by_uid,response_uids_timestamps}.json (kdeconnect-kde plugins/contacts/contactsplugin.cpp:169-185; kdeconnect-android ContactsPlugin.kt:110-119). Task 2.5 (merged 2026-08-10) hostile-input evidence: test_malformed_responses_are_ignored (src/plugins/contacts.rs:627) + test_contacts_sync_rejects_unconnected_device (tests/api_plugin_endpoints.rs:125)"
+    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived contacts fixtures. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): malformed responses are ignored and sync requests from unconnected devices are rejected. Remaining cells (desktop_effect, api_surface, lifecycle, live_device, environment) owned by Sprint 3 / Task 3.1 alignment."
     owner: "Task 3.1"
 
   - feature: digitizer
@@ -171,13 +171,13 @@ feature_ledger:
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/digitizer/{pen_stroke,rubber_stroke}.json (kdeconnect-android ToolEvent.kt:11-19, DigitizerPlugin.kt:73-79 — tool enum serializes via Kotlin .name = 'Pen'/'Rubber'; digitizer works only on a tablet, this is the Android emulator path)"
-    reason: "Slice 0B follow-up: fixture_provenance now PASS via the two upstream-derived stroke fixtures (the wire-cap test pins the case-sensitive 'Pen'/'Rubber' literals — the lowercase variant is a deliberate negative). Remaining cells owned by Sprint 3 / Task 3.1 alignment."
+    cite: "tests/fixtures/upstream-wire/digitizer/{pen_stroke,rubber_stroke}.json (kdeconnect-android ToolEvent.kt:11-19, DigitizerPlugin.kt:73-79 — tool enum serializes via Kotlin .name = 'Pen'/'Rubber'; digitizer works only on a tablet, this is the Android emulator path). Task 2.5 (merged 2026-08-10) hostile-input evidence: test_coordinates_clamped_to_session_bounds + test_empty_body_produces_no_events (src/plugins/digitizer.rs:407,416)"
+    reason: "Slice 0B follow-up: fixture_provenance now PASS via the two upstream-derived stroke fixtures (the wire-cap test pins the case-sensitive 'Pen'/'Rubber' literals — the lowercase variant is a deliberate negative). hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): coordinates are clamped to session bounds and an empty body produces no events. Remaining cells (desktop_effect, api_surface, lifecycle, live_device, environment) owned by Sprint 3 / Task 3.1 alignment."
     owner: "Task 3.1"
 
   - feature: findmyphone
@@ -187,13 +187,13 @@ feature_ledger:
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/findmyphone/ring_request.json (kdeconnect-kde plugins/findmyphone/findmyphoneplugin.cpp:17-21)"
-    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived ring_request fixture. Remaining cells owned by Sprint 3 / Task 3.1 alignment."
+    cite: "tests/fixtures/upstream-wire/findmyphone/ring_request.json (kdeconnect-kde plugins/findmyphone/findmyphoneplugin.cpp:17-21). Task 2.5 (merged 2026-08-10) hostile-input evidence: test_findmyphone_rejects_unconnected_device + test_findmyphone_rejects_invalid_device_id (tests/api_plugin_endpoints.rs:64,84); the plugin ignores all peer packets (test_handle_packet_noop, src/plugins/findmyphone.rs:119)"
+    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived ring_request fixture. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): requests from unconnected/invalid devices are rejected and all peer packets are ignored. Remaining cells (desktop_effect, api_surface, lifecycle, live_device, environment) owned by Sprint 3 / Task 3.1 alignment."
     owner: "Task 3.1"
 
   - feature: findthisdevice
@@ -203,13 +203,13 @@ feature_ledger:
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: NOT-APPLICABLE
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/findthisdevice/ring_request.json (kdeconnect-kde plugins/findthisdevice/findthisdeviceplugin.cpp:25; the desktop-side mirror of findmyphoneplugin.cpp:17-21 — empty body, body unused); Task 1.6 Backend D (verify + pin, vk #1010): ProcessRingBackend::choose_player pins the exact pw-play>paplay>ffplay>aplay priority order + per-player args and the no-player-available None case as pure unit tests (no PATH dependency); the single-flight latch's release-on-failure path is verified (RingGuard's Drop is unconditional — a mock ring() returning false, which is what a real player crash/non-zero-exit/spawn-failure/missing-binary all normalize to above ProcessRingBackend, proves a second request rings again rather than staying stuck)"
-    reason: "Slice 0B follow-up: fixture_provenance now PASS via the upstream-derived ring_request fixture (mirrors the findmyphone plugin; the wire shape is the same empty-body Packet::new(..., {})). Task 1.6 Backend D automated what the plan calls for (player selection order, no-player-available degraded path, latch release on abnormal player exit) — no bug was found in the latch (verified, not assumed: temporarily removing RingGuard's construction made 3 of the new/existing tests fail as predicted, confirming they are real guards, then the removal was reverted). Live playback through a real audio device (pw-play/paplay/ffplay/aplay against an actual PipeWire/PulseAudio session) is deliberately NOT exercised by these tests — it would audibly ring the alarm on whatever host runs the suite — and stays a live-only, integrator-owned check, same as before. Remaining cells (desktop_effect, api_surface, lifecycle, hostile_input, environment) still need that live check."
+    cite: "tests/fixtures/upstream-wire/findthisdevice/ring_request.json (kdeconnect-kde plugins/findthisdevice/findthisdeviceplugin.cpp:25; the desktop-side mirror of findmyphoneplugin.cpp:17-21 — empty body, body unused); Task 1.6 Backend D (verify + pin, vk #1010): ProcessRingBackend::choose_player pins the exact pw-play>paplay>ffplay>aplay priority order + per-player args and the no-player-available None case as pure unit tests (no PATH dependency); the single-flight latch's release-on-failure path is verified (RingGuard's Drop is unconditional — a mock ring() returning false, which is what a real player crash/non-zero-exit/spawn-failure/missing-binary all normalize to above ProcessRingBackend, proves a second request rings again rather than staying stuck). Task 2.5 (merged 2026-08-10) hostile-input evidence: test_body_contents_ignored + test_single_flight_drops_duplicate_while_ringing (src/plugins/findthisdevice.rs:463,413)"
+    reason: "Slice 0B follow-up: fixture_provenance now PASS via the upstream-derived ring_request fixture (mirrors the findmyphone plugin; the wire shape is the same empty-body Packet::new(..., {})). Task 1.6 Backend D automated what the plan calls for (player selection order, no-player-available degraded path, latch release on abnormal player exit) — no bug was found in the latch (verified, not assumed: temporarily removing RingGuard's construction made 3 of the new/existing tests fail as predicted, confirming they are real guards, then the removal was reverted). Live playback through a real audio device (pw-play/paplay/ffplay/aplay against an actual PipeWire/PulseAudio session) is deliberately NOT exercised by these tests — it would audibly ring the alarm on whatever host runs the suite — and stays a live-only, integrator-owned check, same as before. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): body contents are ignored and the single-flight latch drops a duplicate ring request while ringing. Remaining cells (desktop_effect, api_surface, lifecycle, environment) still need that live check."
     owner: "Task 1.6 integrator (live audio-backend restart test)"
 
   - feature: lock
@@ -219,13 +219,13 @@ feature_ledger:
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: NOT-APPLICABLE
     environment: UNVERIFIED
     status: FAIL
-    cite: "tests/fixtures/upstream-wire/lock/{lock_request,lock_state}.json hold the upstream truth (kdeconnect-kde plugins/lockdevice/lockdeviceplugin.cpp:104,116,122: setLocked/requestLocked/isLocked/lockResult on kdeconnect.lock/.request). The rust plugin reads and emits a `locked` field no upstream uses (src/plugins/lock.rs) — not a deliberate decision; the plugin predates upstream verification. Defect pinned by test_upstream_lock_state_shape_currently_misparsed + test_lock_request_reply_diverges_from_upstream_field. No Android lock implementation exists, so phones are unaffected; the break is desktop-peer-direction."
-    reason: "Wire contract FAIL vs kdeconnect-kde lockdevice (the only lock implementation upstream): field names disagree in both directions, so a kde peer's state parses as false and our replies are unreadable there. Rewriting to the kde contract is vk #1018; live validation rides Task 3.2's kdeconnectd harness. fixture_provenance is PASS: both fixtures are upstream-derived and loaded."
+    cite: "tests/fixtures/upstream-wire/lock/{lock_request,lock_state}.json hold the upstream truth (kdeconnect-kde plugins/lockdevice/lockdeviceplugin.cpp:104,116,122: setLocked/requestLocked/isLocked/lockResult on kdeconnect.lock/.request). The rust plugin reads and emits a `locked` field no upstream uses (src/plugins/lock.rs) — not a deliberate decision; the plugin predates upstream verification. Defect pinned by test_upstream_lock_state_shape_currently_misparsed + test_lock_request_reply_diverges_from_upstream_field. No Android lock implementation exists, so phones are unaffected; the break is desktop-peer-direction. Task 2.5 (merged 2026-08-10) hostile-input evidence: test_handle_lock_missing_locked_field (src/plugins/lock.rs:204)"
+    reason: "Wire contract FAIL vs kdeconnect-kde lockdevice (the only lock implementation upstream): field names disagree in both directions, so a kde peer's state parses as false and our replies are unreadable there. Rewriting to the kde contract is vk #1018; live validation rides Task 3.2's kdeconnectd harness. fixture_provenance is PASS: both fixtures are upstream-derived and loaded. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): a lock packet missing the locked field is handled without a misparse. Status stays FAIL on the wire contract — only the hostile_input cell changed."
     owner: "vk #1018"
 
   - feature: mousepad
@@ -235,13 +235,13 @@ feature_ledger:
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/mousepad/presenter_slide_keys.json (kdeconnect-android PresenterPlugin.kt:53-74 + KeyListenerView.java:36-37,48,53); Task 1.6 Backend A absolute-axes implementation cites kdeconnect-kde x11remoteinput.cpp:191-206 + waylandremoteinput.cpp:394-401,521-524 (see the mousepad-absolute environment-matrix row)"
-    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived presenter_slide_keys fixture. Task 1.6 Backend A closed the absolute-positioning code gap (src/plugins/mousepad.rs AbsoluteInputDevice); remaining cells (desktop_effect, api_surface, lifecycle, hostile_input, live_device, environment) are still UNVERIFIED — they need a real X11/Wayland session and a live phone, not just the kernel-level uinput readback Task 1.6 added (tests/mousepad_uinput_absolute.rs)."
+    cite: "tests/fixtures/upstream-wire/mousepad/presenter_slide_keys.json (kdeconnect-android PresenterPlugin.kt:53-74 + KeyListenerView.java:36-37,48,53); Task 1.6 Backend A absolute-axes implementation cites kdeconnect-kde x11remoteinput.cpp:191-206 + waylandremoteinput.cpp:394-401,521-524 (see the mousepad-absolute environment-matrix row). Task 2.5 (merged 2026-08-10) hostile-input evidence: test_parse_key_code_unknown, test_special_key_code_ignores_unmapped_codes, test_plan_ignores_invented_button_field, test_scale_abs_coord_rounds_and_clamps (src/plugins/mousepad.rs:1129,1038,1202,1413)"
+    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived presenter_slide_keys fixture. Task 1.6 Backend A closed the absolute-positioning code gap (src/plugins/mousepad.rs AbsoluteInputDevice). hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): unknown key codes and unmapped special-key codes are ignored, an invented button field is ignored, and absolute coordinates are rounded + clamped. Remaining cells (desktop_effect, api_surface, lifecycle, live_device, environment) are still UNVERIFIED — they need a real X11/Wayland session and a live phone, not just the kernel-level uinput readback Task 1.6 added (tests/mousepad_uinput_absolute.rs)."
     owner: "Task 1.6"
 
   - feature: mpris
@@ -251,14 +251,14 @@ feature_ledger:
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/mpris/{player_list,props_changed_playback_status,props_changed_metadata,props_changed_volume,seeked,now_playing_answer}.json (kdeconnect-kde plugins/mpriscontrol/mpriscontrolplugin.cpp:116-119,139-146,155-159,186-193,317-358,387-394); Task 1.5 closed the supportAlbumArtPayload divergence (rust now emits true, kdeconnect-kde mpriscontrolplugin.cpp:392) and added honor-via-payload-transfer (mpriscontrolplugin.cpp:217-253 sendAlbumArt; MprisReceiverPlugin.java:254-259) with daemon-side size cap (ALBUM_ART_MAX_BYTES, 32 MiB); race + recovery tests pin the cache invariants (Lane B finding 20 + the 4.0 recovery); unit pins for wire-unit conversions (pos ms, length ms, Seek µs, volume 0-100 int) — see plans/task-1.5-report.md"
-    reason: "Task 1.5 wired the album-art payload transfer (player_list_packet now emits supportAlbumArtPayload:true; handle_album_art_request opens a payload-transfer listener and sends the envelope), added the watch_supervisor with bounded backoff for session-bus recovery (MprisBackendEvent::BackendLost clears the cache), and added race tests for add/remove/add and double-remove. Slice 0B rollup (D3): desktop_effect, api_surface, lifecycle, hostile_input, live_device, environment remain UNVERIFIED — they ride the Sprint 2 hostile-input audit (Task 2.5) and the env-matrix expansion (Task 4.1)."
-    owner: "Tasks 2.5 + 4.1"
+    cite: "tests/fixtures/upstream-wire/mpris/{player_list,props_changed_playback_status,props_changed_metadata,props_changed_volume,seeked,now_playing_answer}.json (kdeconnect-kde plugins/mpriscontrol/mpriscontrolplugin.cpp:116-119,139-146,155-159,186-193,317-358,387-394); Task 1.5 closed the supportAlbumArtPayload divergence (rust now emits true, kdeconnect-kde mpriscontrolplugin.cpp:392) and added honor-via-payload-transfer (mpriscontrolplugin.cpp:217-253 sendAlbumArt; MprisReceiverPlugin.java:254-259) with daemon-side size cap (ALBUM_ART_MAX_BYTES, 32 MiB); race + recovery tests pin the cache invariants (Lane B finding 20 + the 4.0 recovery); unit pins for wire-unit conversions (pos ms, length ms, Seek µs, volume 0-100 int) — see plans/task-1.5-report.md. Task 2.5 (merged 2026-08-10) hostile-input evidence: test_request_unknown_action_dropped, test_request_unknown_player_gets_list_only, test_request_album_art_unknown_player_declined_silently, test_album_art_size_cap_refuses_oversized_art (src/plugins/mpris/mod.rs:1871,1796,2077,2190)"
+    reason: "Task 1.5 wired the album-art payload transfer (player_list_packet now emits supportAlbumArtPayload:true; handle_album_art_request opens a payload-transfer listener and sends the envelope), added the watch_supervisor with bounded backoff for session-bus recovery (MprisBackendEvent::BackendLost clears the cache), and added race tests for add/remove/add and double-remove. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): unknown actions are dropped, unknown players get list-only responses, album-art requests for unknown players are declined silently, and the album-art size cap refuses oversized art. Slice 0B rollup (D3): desktop_effect, api_surface, lifecycle, live_device, environment remain UNVERIFIED — they ride a live MPRIS session validation and the env-matrix expansion (Task 4.1)."
+    owner: "Task 4.1 (environment); live MPRIS session validation (desktop_effect/api_surface/lifecycle/live_device)"
 
   - feature: notification
     rust_impl: true
@@ -267,14 +267,14 @@ feature_ledger:
     desktop_effect: PASS
     api_surface: PASS
     lifecycle: PASS
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: PASS
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/notification/{reply_id_request,request_packet,full_with_icon_actions_reply,action_request,reply_request,cancel}.json (NotificationsPlugin.kt:227-298,351-374,438-454 + kdeconnect-kde notificationsplugin.cpp:29,142-185,218-238); docs/live-validation.md 2026-08-02 Notification desktop->phone and mirror rows"
-    reason: "Slice 1.4 follow-up: Task 1.4 closed the phone->desktop mirror — payload-receive + cache (bounded per-device, 512 KiB cap, MD5-keyed, TLS-pinned, 64-icon LRU eviction, owner=rust-connect), inline actions + reply routing with phone-issued requestReplyId, idempotent sync by Android key (replace, not append), and lenient cancel semantics — all pinned by upstream-derived fixtures. Slice 0B rollup (D3): hostile_input and environment remain UNVERIFIED, blocking status=PASS; api_surface now covers POST /api/v1/devices/{id}/notification/{nid}/action and GET /api/v1/devices/{id}/notification-icons/{hash}. Live_device covers the already-proven S21+A15 path; the new action/icon surface awaits the integrator's live run."
-    owner: "Tasks 2.5 + 4.1"
+    cite: "tests/fixtures/upstream-wire/notification/{reply_id_request,request_packet,full_with_icon_actions_reply,action_request,reply_request,cancel}.json (NotificationsPlugin.kt:227-298,351-374,438-454 + kdeconnect-kde notificationsplugin.cpp:29,142-185,218-238); docs/live-validation.md 2026-08-02 Notification desktop->phone and mirror rows. Task 2.5 (merged 2026-08-10) hostile-input evidence: security-audit-2026-08.md 'notification-icon path strictly validated' (valid_icon_hash/is_regular_icon, src/plugins/notification.rs:224-260) + test_icon_cache_enforces_per_device_cap (:1712) + test_escape_markup (:824) + test_cancel_for_unknown_id_is_accepted (:1445)"
+    reason: "Slice 1.4 follow-up: Task 1.4 closed the phone->desktop mirror — payload-receive + cache (bounded per-device, 512 KiB cap, MD5-keyed, TLS-pinned, 64-icon LRU eviction, owner=rust-connect), inline actions + reply routing with phone-issued requestReplyId, idempotent sync by Android key (replace, not append), and lenient cancel semantics — all pinned by upstream-derived fixtures. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): the notification-icon path is strictly validated (valid_icon_hash/is_regular_icon), the icon cache enforces a per-device cap, markup is escaped, and a cancel for an unknown id is accepted. Slice 0B rollup (D3): environment remains UNVERIFIED, blocking status=PASS; api_surface now covers POST /api/v1/devices/{id}/notification/{nid}/action and GET /api/v1/devices/{id}/notification-icons/{hash}. Live_device covers the already-proven S21+A15 path; the new action/icon surface awaits the integrator's live run."
+    owner: "Task 4.1"
 
 
   - feature: pausemusic
@@ -284,13 +284,13 @@ feature_ledger:
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: NOT-APPLICABLE
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/pausemusic/telephony_talking_cancel_string.json (kdeconnect-android TelephonyPlugin.kt:114-116); Task 1.6 Backend B mute mechanism cites kdeconnect-kde pausemusicplugin.cpp:43-57,85-97 (actionMute default + mute/unmute + unconditional bookkeeping clear)"
-    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived telephony cancel fixture (pausemusic observes telephony events). Task 1.6 Backend B closed the mute-vs-pause policy gap: mute_for/unmute_for mute-and-restore via the systemvolume VolumeBackend (src/plugins/systemvolume/backend.rs), unit-tested (mute on ring, restore on end, no double-restore, independent of pause). Decision: ACTION_MUTE stays hardcoded to upstream's own default (off) — this codebase has no per-plugin config surface to let a user enable it (adding one with no reader would be a Task-1.7-class dead knob); flipping the constant is the entire activation path. Remaining cells (desktop_effect, api_surface, lifecycle, hostile_input, environment) still need a live call + real media player, per the plan's Task 1.6 validation note."
+    cite: "tests/fixtures/upstream-wire/pausemusic/telephony_talking_cancel_string.json (kdeconnect-android TelephonyPlugin.kt:114-116); Task 1.6 Backend B mute mechanism cites kdeconnect-kde pausemusicplugin.cpp:43-57,85-97 (actionMute default + mute/unmute + unconditional bookkeeping clear). Task 2.5 (merged 2026-08-10) hostile-input evidence: test_non_call_events_ignored + test_is_cancel_parsing (src/plugins/pausemusic.rs:728,807) — thin coverage: no missing-field test exists for this plugin"
+    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived telephony cancel fixture (pausemusic observes telephony events). Task 1.6 Backend B closed the mute-vs-pause policy gap: mute_for/unmute_for mute-and-restore via the systemvolume VolumeBackend (src/plugins/systemvolume/backend.rs), unit-tested (mute on ring, restore on end, no double-restore, independent of pause). Decision: ACTION_MUTE stays hardcoded to upstream's own default (off) — this codebase has no per-plugin config surface to let a user enable it (adding one with no reader would be a Task-1.7-class dead knob); flipping the constant is the entire activation path. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): non-call events are ignored and isCancel parsing is pinned — thin coverage (no missing-field test), noted honestly in the cite. Remaining cells (desktop_effect, api_surface, lifecycle, environment) still need a live call + real media player, per the plan's Task 1.6 validation note."
     owner: "Task 1.6"
 
   - feature: ping
@@ -316,13 +316,13 @@ feature_ledger:
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/presenter/{pointer,stop}.json (kdeconnect-android PresenterPlugin.kt:77-82,84-88 — dx/dy floats for relative pointer, stop:true to end the stroke)"
-    reason: "Slice 0B follow-up: fixture_provenance now PASS via the two upstream-derived pointer fixtures. The bogus-legacy-fields test (src/plugins/presenter.rs:282) is a behavioral negative test — kept inline. Remaining cells owned by Sprint 3 / Task 3.1 alignment."
+    cite: "tests/fixtures/upstream-wire/presenter/{pointer,stop}.json (kdeconnect-android PresenterPlugin.kt:77-82,84-88 — dx/dy floats for relative pointer, stop:true to end the stroke). Task 2.5 (merged 2026-08-10) hostile-input evidence: test_bogus_legacy_fields_are_ignored (src/plugins/presenter.rs:295)"
+    reason: "Slice 0B follow-up: fixture_provenance now PASS via the two upstream-derived pointer fixtures. The bogus-legacy-fields test (src/plugins/presenter.rs:282) is a behavioral negative test — kept inline. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10) on that bogus-legacy-fields evidence (bogus legacy fields are ignored). Remaining cells (desktop_effect, api_surface, lifecycle, live_device, environment) owned by Sprint 3 / Task 3.1 alignment."
     owner: "Task 3.1"
 
   - feature: remotecommands
@@ -332,13 +332,13 @@ feature_ledger:
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: NOT-APPLICABLE
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/remotecommands/{command_list,request_command_list}.json (kdeconnect-kde plugins/runcommand/runcommandplugin.cpp:188-195 emits the commandList envelope; plugins/remotecommands/remotecommandsplugin.cpp:35-39 emits `{requestCommandList: true}` on connect; the same wire types are shared with the runcommand plugin)"
-    reason: "Slice 0B follow-up: fixture_provenance now PASS via the two upstream-derived wire fixtures. The five behavioral variants (malformed entry, canAddCommand read, defaults, non-object commandList rejected, disconnect-clears) are kept inline — they test accept-coverage, not wire shape. Remaining cells owned by Sprint 1 / Task 1.2 authorization model."
+    cite: "tests/fixtures/upstream-wire/remotecommands/{command_list,request_command_list}.json (kdeconnect-kde plugins/runcommand/runcommandplugin.cpp:188-195 emits the commandList envelope; plugins/remotecommands/remotecommandsplugin.cpp:35-39 emits `{requestCommandList: true}` on connect; the same wire types are shared with the runcommand plugin). Task 2.5 (merged 2026-08-10) hostile-input evidence: test_malformed_entry_does_not_drop_the_list + test_non_object_command_list_is_dropped (src/plugins/remotecommands.rs:215,271)"
+    reason: "Slice 0B follow-up: fixture_provenance now PASS via the two upstream-derived wire fixtures. The five behavioral variants (malformed entry, canAddCommand read, defaults, non-object commandList rejected, disconnect-clears) are kept inline — they test accept-coverage, not wire shape. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): a malformed entry does not drop the list and a non-object command list is dropped. Remaining cells (desktop_effect, api_surface, lifecycle, environment) owned by Sprint 1 / Task 1.2 authorization model."
     owner: "Task 1.2"
 
   - feature: remotekeyboard
@@ -348,13 +348,13 @@ feature_ledger:
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/remotekeyboard/echo_ack.json (kdeconnect-android RemoteKeyboardPlugin.java:383-395)"
-    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived echo_ack fixture. Remaining cells owned by Sprint 3 / Task 3.1 alignment."
+    cite: "tests/fixtures/upstream-wire/remotekeyboard/echo_ack.json (kdeconnect-android RemoteKeyboardPlugin.java:383-395). Task 2.5 (merged 2026-08-10) hostile-input evidence: test_echo_without_key_is_not_swallowed (src/plugins/remotekeyboard.rs:199)"
+    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived echo_ack fixture. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): an echo without a key is not swallowed. Remaining cells (desktop_effect, api_surface, lifecycle, live_device, environment) owned by Sprint 3 / Task 3.1 alignment."
     owner: "Task 3.1"
 
   - feature: runcommand
@@ -364,13 +364,13 @@ feature_ledger:
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: INTENTIONAL-DIVERGENCE
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: INTENTIONAL-DIVERGENCE
-    cite: "tests/fixtures/upstream-wire/runcommand/{command_list_empty,command_list_populated,request_command_list,request_key}.json (kdeconnect-kde plugins/runcommand/runcommandplugin.cpp:188-195; kdeconnect-android RunCommandPlugin.java:251-262); the rust plugin intentionally advertises canAddCommand=false (upstream emits true at runcommandplugin.cpp:192) because the allowlist is one-way — we push commands to the phone, the phone never pushes them to us."
-    reason: "Slice 0B promotion: four upstream-derived fixtures now load in src/plugins/runcommand.rs. Recording canAddCommand as INTENTIONAL-DIVERGENCE so an integrator decision can resolve it. Remaining cells owned by Sprint 1 / Task 1.2 allowlist + output-stream work."
+    cite: "tests/fixtures/upstream-wire/runcommand/{command_list_empty,command_list_populated,request_command_list,request_key}.json (kdeconnect-kde plugins/runcommand/runcommandplugin.cpp:188-195; kdeconnect-android RunCommandPlugin.java:251-262); the rust plugin intentionally advertises canAddCommand=false (upstream emits true at runcommandplugin.cpp:192) because the allowlist is one-way — we push commands to the phone, the phone never pushes them to us. Task 2.5 (merged 2026-08-10) hostile-input evidence: security-audit-2026-08.md 'runcommand peer input is only a lookup key, never reaches the shell' + test_blocked_by_default_exact_phone_shape, test_command_not_found, test_infinite_output_is_capped_and_killed, test_timeout_kills_whole_process_group, test_executed_history_is_capped (src/plugins/runcommand.rs:590,665,817,758,732)"
+    reason: "Slice 0B promotion: four upstream-derived fixtures now load in src/plugins/runcommand.rs. Recording canAddCommand as INTENTIONAL-DIVERGENCE so an integrator decision can resolve it. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): peer input is only a lookup key and never reaches the shell; unknown commands are blocked by default, output is capped and killed, timeouts kill the whole process group, and the executed history is capped. Remaining cells owned by Sprint 1 / Task 1.2 allowlist + output-stream work."
     owner: "Task 1.2"
 
   - feature: screensaver-inhibit
@@ -386,8 +386,8 @@ feature_ledger:
     environment: UNVERIFIED
     status: UNVERIFIED
     cite: "kdeconnect-kde plugins/screensaver-inhibit/ declares no packet types — the rust plugin's incoming_capabilities() is empty (src/plugins/screensaver_inhibit.rs::Plugin::incoming_capabilities). Behavioral-only; no wire-shape literal transcribable (per main brief D5)"
-    reason: "unclassified — Sprint 3 / Task 3.1 alignment; lifecycle-only plugin, no wire surface to convert"
-    owner: "Task 3.1"
+    reason: "Sprint 3 / Task 3.1 alignment; lifecycle-only plugin, no wire surface to convert. Task 2.5 (security audit) completed 2026-08-10 without producing row-specific malformed-input evidence; no row-specific hostile-input test exists (the plugin declares no incoming packet types, so there is no peer input to fuzz), so hostile_input stays UNVERIFIED — an honest gap to be swept by the Sprint 5 evidence gate. environment is owned by Task 4.1."
+    owner: "Task 3.1 (Sprint 3 alignment); Task 4.1 (environment); hostile_input gap → vk #1012 sweep"
 
   - feature: sendnotifications
     rust_impl: true
@@ -396,14 +396,14 @@ feature_ledger:
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: NOT-APPLICABLE
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/sendnotifications/{outgoing,request_flag,cancel_string}.json (kdeconnect-kde dbusnotificationslistener.cpp:317-329 for the outgoing body; notificationsplugin.cpp:29 for `{request: true}`; notificationsplugin.cpp:142-144 for the cancel-id string and the Android-side counterpart at NotificationsPlugin.kt:528-533)"
-    reason: "Slice 1.4 follow-up: sendnotifications direction was already conformant per the audit and stayed untouched (the brief says only touch if a finding forces it — none did). Behavioral tests for the legacy-bool-cancel and empty-cancel cases stay inline (they test the lenient deserializer, not wire shape). Remaining cells owned by Sprint 2 hostile-input audit (Task 2.5) and env-matrix expansion (Task 4.1)."
-    owner: "Tasks 2.5 + 4.1"
+    cite: "tests/fixtures/upstream-wire/sendnotifications/{outgoing,request_flag,cancel_string}.json (kdeconnect-kde dbusnotificationslistener.cpp:317-329 for the outgoing body; notificationsplugin.cpp:29 for `{request: true}`; notificationsplugin.cpp:142-144 for the cancel-id string and the Android-side counterpart at NotificationsPlugin.kt:528-533). Task 2.5 (merged 2026-08-10) hostile-input evidence: test_legacy_bool_cancel_is_ignored_not_a_parse_error + test_empty_cancel_is_not_an_id (src/plugins/sendnotifications.rs:504,519)"
+    reason: "Slice 1.4 follow-up: sendnotifications direction was already conformant per the audit and stayed untouched (the brief says only touch if a finding forces it — none did). Behavioral tests for the legacy-bool-cancel and empty-cancel cases stay inline (they test the lenient deserializer, not wire shape). hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): a legacy bool cancel is ignored (not a parse error) and an empty cancel is not treated as an id. Remaining cells (desktop_effect, api_surface, lifecycle, environment) owned by the env-matrix expansion (Task 4.1)."
+    owner: "Task 4.1"
 
 
   - feature: sftp
@@ -413,14 +413,14 @@ feature_ledger:
     desktop_effect: PASS
     api_surface: PASS
     lifecycle: PASS
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: PASS
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/sftp/credentials.json (kdeconnect-android SftpPlugin.kt:126-137 — credentials packet body, transcribed in the Slice 0B follow-up). The binary payload stream rides on a separate channel and is not asserted here. Lane-4-lifecycle tests: src/plugins/sftp/mounter.rs (argv/stdin/password redaction), src/plugins/sftp/mod.rs (state machine + Debug redaction + cleanup + startup_sweep + credentials_packet_shape_matches_android), tests/api_integration.rs (sftp mount/unmount/info + tools + unpair-drops-creds + shutdown-drops-creds). Upstream: kdeconnect-kde @ f5ed3ed8 plugins/sftp/mounter.cpp:72,93-95,99-100,103-105,114,204; plugins/sftp/sftpplugin.cpp:88-104,136-163. Live: docs/live-validation.md 2026-08-06 entries 'SFTP desktop browsing lifecycle (Galaxy A15)' (full lifecycle incl. reconnect + disconnect-cleanup) and 'SFTP second-device leg (Galaxy S21 Ultra 5G)' (request/creds-no-password/mount/browse/copy-md5-match/unmount on the second handset, run inside the vk #1020 churn window)."
-    reason: "Slice 0B rollup (D3): hostile_input and environment are UNVERIFIED, blocking status=PASS. fixture_provenance promoted to PASS via the new sftp/credentials.json fixture (replaces the prior UNVERIFIED status — the credentials packet IS JSON-shaped, only the data stream is binary). The remaining two cells are owned by the Sprint 2 hostile-input audit (Task 2.5) and the env matrix expansion (Task 4.1)."
-    owner: "Tasks 2.5 + 4.1"
+    cite: "tests/fixtures/upstream-wire/sftp/credentials.json (kdeconnect-android SftpPlugin.kt:126-137 — credentials packet body, transcribed in the Slice 0B follow-up). The binary payload stream rides on a separate channel and is not asserted here. Lane-4-lifecycle tests: src/plugins/sftp/mounter.rs (argv/stdin/password redaction), src/plugins/sftp/mod.rs (state machine + Debug redaction + cleanup + startup_sweep + credentials_packet_shape_matches_android), tests/api_integration.rs (sftp mount/unmount/info + tools + unpair-drops-creds + shutdown-drops-creds). Upstream: kdeconnect-kde @ f5ed3ed8 plugins/sftp/mounter.cpp:72,93-95,99-100,103-105,114,204; plugins/sftp/sftpplugin.cpp:88-104,136-163. Live: docs/live-validation.md 2026-08-06 entries 'SFTP desktop browsing lifecycle (Galaxy A15)' (full lifecycle incl. reconnect + disconnect-cleanup) and 'SFTP second-device leg (Galaxy S21 Ultra 5G)' (request/creds-no-password/mount/browse/copy-md5-match/unmount on the second handset, run inside the vk #1020 churn window). Task 2.5 (merged 2026-08-10) hostile-input evidence: security-audit-2026-08.md 'SFTP mount points daemon-derived' + 'SFTP password never in any response/log/argv' + sftp_connection_info_debug_redacts_password (src/plugins/sftp/mod.rs:689) + test_sftp_mount_without_credentials_returns_4xx (tests/api_integration.rs:556)"
+    reason: "Slice 0B rollup (D3): environment is UNVERIFIED, blocking status=PASS. fixture_provenance promoted to PASS via the new sftp/credentials.json fixture (replaces the prior UNVERIFIED status — the credentials packet IS JSON-shaped, only the data stream is binary). hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): mount points are daemon-derived, the password never appears in any response/log/argv, Debug redacts it, and a mount without credentials returns 4xx. The open cell is owned by Task 4.1."
+    owner: "Task 4.1"
 
   - feature: share
     rust_impl: true
@@ -429,14 +429,14 @@ feature_ledger:
     desktop_effect: PASS
     api_surface: PASS
     lifecycle: PASS
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: PASS
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/share/{text_share_request,url_share_request,share_file_request}.json (SharePlugin.java:268-269,339-341); docs/live-validation.md 2026-08-02 Share desktop<->phone rows + 81 KiB PNG receipt"
-    reason: "Slice 0B rollup (D3): hostile_input and environment are UNVERIFIED, blocking status=PASS. fixture_provenance promoted via the slice-0b share fixtures; remaining cells owned by Tasks 2.5, 4.1."
-    owner: "Tasks 2.5 + 4.1"
+    cite: "tests/fixtures/upstream-wire/share/{text_share_request,url_share_request,share_file_request}.json (SharePlugin.java:268-269,339-341); docs/live-validation.md 2026-08-02 Share desktop<->phone rows + 81 KiB PNG receipt. Task 2.5 (merged 2026-08-10) hostile-input evidence: tests/share_security_tests.rs suite (test_share_path_traversal_blocked:131, test_share_multipart_part_filename_traversal_blocked:171, test_share_symlinked_intermediate_dir_not_followed:341), test_sanitize_filename_path_traversal (src/plugins/share.rs:889), test_transfer_permits_cap_per_device/test_transfer_permits_cap_global (:916,943), test_incoming_text_over_cap_is_refused (:1155), test_allowed_url_scheme_rejects_dangerous_and_malformed (:1235), test_stream_upload_enforces_100mib_cap (src/api/handlers/share.rs:539), fuzz target fuzz/fuzz_targets/share_multipart.rs, security-audit-2026-08.md 'path traversal defeated by basename-flatten + create_new'"
+    reason: "Slice 0B rollup (D3): environment is UNVERIFIED, blocking status=PASS. fixture_provenance promoted via the slice-0b share fixtures. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): path traversal is defeated by basename-flatten + create_new (incl. multipart part filenames and symlinked intermediate dirs), transfer permits are capped per-device and globally, over-cap text is refused, dangerous/malformed URL schemes are rejected, stream uploads enforce the 100 MiB cap, and the multipart parser has a fuzz target. The open cell is owned by Task 4.1."
+    owner: "Task 4.1"
 
   - feature: sms
     rust_impl: true
@@ -445,13 +445,13 @@ feature_ledger:
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/sms/message_batch.json (kdeconnect-android SMSHelper.kt:911-933 — Message.toJSONObject() emits the {addresses, body, date, type, read, threadID, uID, event, subscriptionID, attachments} shape; the rust SmsMessage struct mirrors those camelCase keys)"
-    reason: "Slice 0B follow-up: fixture_provenance now PASS via the upstream-derived message-batch fixture. The four accept-coverage variants (read-as-int, multiple addresses, event flags, minimal fields) test the plugin's tolerant parser; they keep inline json! because they assert accept behavior, not wire shape. Remaining cells owned by Sprint 3 / Task 3.1 alignment."
+    cite: "tests/fixtures/upstream-wire/sms/message_batch.json (kdeconnect-android SMSHelper.kt:911-933 — Message.toJSONObject() emits the {addresses, body, date, type, read, threadID, uID, event, subscriptionID, attachments} shape; the rust SmsMessage struct mirrors those camelCase keys). Task 2.5 (merged 2026-08-10) hostile-input evidence: test_handle_malformed_sms_packet + test_handle_sms_missing_fields (src/plugins/sms.rs:229,240)"
+    reason: "Slice 0B follow-up: fixture_provenance now PASS via the upstream-derived message-batch fixture. The four accept-coverage variants (read-as-int, multiple addresses, event flags, minimal fields) test the plugin's tolerant parser; they keep inline json! because they assert accept behavior, not wire shape. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): malformed packets and missing-field packets are handled. Remaining cells (desktop_effect, api_surface, lifecycle, live_device, environment) owned by Sprint 3 / Task 3.1 alignment."
     owner: "Task 3.1"
 
   - feature: systemvolume
@@ -461,14 +461,14 @@ feature_ledger:
     desktop_effect: PASS
     api_surface: PASS
     lifecycle: PASS
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: PASS
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/systemvolume/sink_list.json (kdeconnect-kde plugins/systemvolume/pulse.cpp:90-104); docs/live-validation.md 2026-08-06 (A15: sinkList render, phone->desktop volume+mute, REST<->pactl parity, wire deltas); live-captured pactl fixtures; subscribe supervision tests"
-    reason: "Slice 0B promotion: fixture_provenance now PASS via the slice-0b sink_list fixture (was UNVERIFIED). Provider validated live on A15; phone-app delta re-render caveat recorded in the live-validation entry. Remaining: hostile-input audit (Task 2.5) and non-Sway environments (Task 4.1)."
-    owner: "Tasks 2.5 + 4.1"
+    cite: "tests/fixtures/upstream-wire/systemvolume/sink_list.json (kdeconnect-kde plugins/systemvolume/pulse.cpp:90-104); docs/live-validation.md 2026-08-06 (A15: sinkList render, phone->desktop volume+mute, REST<->pactl parity, wire deltas); live-captured pactl fixtures; subscribe supervision tests. Task 2.5 (merged 2026-08-10) hostile-input evidence: test_malformed_sink_entry_skipped, test_update_for_unknown_sink_is_ignored, test_request_unknown_sink_name_does_not_crash (src/plugins/systemvolume/mod.rs:1298,1280,1456)"
+    reason: "Slice 0B promotion: fixture_provenance now PASS via the slice-0b sink_list fixture (was UNVERIFIED). Provider validated live on A15; phone-app delta re-render caveat recorded in the live-validation entry. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): malformed sink entries are skipped, updates for unknown sinks are ignored, and a request for an unknown sink name does not crash. Remaining: non-Sway environments (Task 4.1)."
+    owner: "Task 4.1"
 
   - feature: telephony
     rust_impl: true
@@ -477,13 +477,13 @@ feature_ledger:
     desktop_effect: UNVERIFIED
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
-    hostile_input: UNVERIFIED
+    hostile_input: PASS
     fixture_provenance: PASS
     live_device: UNVERIFIED
     environment: UNVERIFIED
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/telephony/ringing.json (kdeconnect-android TelephonyPlugin.kt:78,95,99,105)"
-    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived ringing fixture. Remaining cells owned by Sprint 3 / Task 3.1 alignment."
+    cite: "tests/fixtures/upstream-wire/telephony/ringing.json (kdeconnect-android TelephonyPlugin.kt:78,95,99,105). Task 2.5 (merged 2026-08-10) hostile-input evidence: test_invented_number_field_captures_nothing (src/plugins/telephony.rs:207)"
+    reason: "Slice 0B promotion: fixture_provenance now PASS via the upstream-derived ringing fixture. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): an invented number field captures nothing. Remaining cells (desktop_effect, api_surface, lifecycle, live_device, environment) owned by Sprint 3 / Task 3.1 alignment."
     owner: "Task 3.1"
 
   # Behavioral parity rows — sourced from docs/parity-checklist.md.
@@ -509,17 +509,17 @@ feature_ledger:
     rust_impl: true
     upstream: kdeconnect-kde
     upstream_ref: "lanlinkprovider.cpp:180-194 / LanLinkProvider.java:572-584"
-    desktop_effect: FAIL
-    api_surface: FAIL
-    lifecycle: FAIL
+    desktop_effect: PASS
+    api_surface: NOT-APPLICABLE
+    lifecycle: PASS
     hostile_input: PASS
-    fixture_provenance: UNVERIFIED
-    live_device: UNVERIFIED
+    fixture_provenance: PASS
+    live_device: PASS
     environment: UNVERIFIED
-    status: FAIL
-    cite: "docs/parity-checklist.md Gaps #5"
-    reason: "no network-change hook"
-    owner: "Sprint 2 / Task 2.2"
+    status: UNVERIFIED
+    cite: "Task 2.2 (merged 5a04b0e, plans/task-2.2-report.md): src/services/network_watcher.rs — debounced netlink watcher driving mDNS reannounce + eligibility-gated broadcast fallback; debounce tests inline in src/services/network_watcher.rs (test_debounce_single_event_fires_after_window, test_debounce_coalesces_a_burst_into_one_event, test_debounce_separate_bursts_produce_separate_events, test_debounce_ends_when_raw_source_closes, test_debounce_window_is_nonzero) plus the root-only netns suite (tests/netns_discovery.rs). Upstream oracle: kdeconnect-kde lanlinkprovider.cpp:180-194. fixture_provenance PASS under the D5 behavioral-only allowance (ping row precedent): the rebroadcast emits the standard identity packet (the tests/fixtures/upstream-wire/identity/basic.json shape) — there are no wire-shape tests to convert. Live 2026-08-09, integrator run with the S21 peer + laptop: Wi-Fi roam → reconnect attempt-1 in 1.5s; airplane-mode 30s → clean reconnect via event-driven rediscovery; laptop Wi-Fi toggle → watcher fired both legs, reannounce, phone back in ~4s."
+    reason: "Task 2.2 shipped the network-change hook (src/services/network_watcher.rs) and the integrator live-validated the roam / airplane-mode / Wi-Fi-toggle legs on 2026-08-09 against the S21 peer. api_surface is NOT-APPLICABLE — internal discovery behavior, no REST surface. Remaining open legs: the suspend / mDNS-death soak legs (vk #994 passive soak — this laptop is s2idle-only; the 4s test sleep was under the watchdog's 5s slack) and the environment matrix (Task 4.1), which is why status stays UNVERIFIED."
+    owner: "vk #994 (passive soak) + Task 4.1 (environment)"
 
   - feature: udp-receive-buffer
     rust_impl: true

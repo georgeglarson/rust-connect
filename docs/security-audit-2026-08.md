@@ -83,9 +83,9 @@ the outer router, so the Swagger UI and full OpenAPI schema serve
 unauthenticated (`router.rs:246-249`). No secret in the schema, but it is
 undocumented recon surface if the API is ever rebound off loopback. One-line
 fix (wrap SwaggerUi in the auth layer, or gate it off-loopback). Confidence:
-high. **Disposition: deferred to a fast-follow, not in this PR** — kept out to
-keep the trust-boundary change reviewable in isolation; tracked for the next
-API-hardening pass.
+high. **Disposition: FIXED 2026-08-14** — SwaggerUi now merges into
+`api_router` inside the auth layer; pinned by
+`test_swagger_ui_and_openapi_require_auth` (401 keyless, serves with key).
 
 ### API-2 — API key accepted via `?api_key=` query string [Low, class C]
 Necessary for browser `EventSource` (can't set headers) for the SSE stream. The

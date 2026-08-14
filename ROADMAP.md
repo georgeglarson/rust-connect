@@ -58,10 +58,14 @@ peer, upstream-derived fixture, or applicable environment proves the behavior.
 
 ## Next
 
-- Sprint 0 of the functional-completeness plan: exhaustive inventory,
-  evidence ledger, test-provenance classification, and independent audits.
-- Then close advertised features that currently lack their promised desktop
-  effect before spending effort on optional parity or packaging breadth.
+- Sprint 3 of the functional-completeness plan: audit and implement the
+  remaining upstream feature union (remotecontrol, shareinputdevices,
+  virtualmonitor), and build the kdeconnectd independent-peer interop
+  harness that announcement claims require.
+- Then Sprint 4 (device/desktop/soak matrices) and Sprint 5 (evidence
+  closure as a release gate). Sprints 0–2 are complete: the ledger exists
+  and is lint-enforced, advertised features have their desktop effects,
+  and the protocol/security fault cases are closed.
 
 ## Later
 

@@ -143,6 +143,44 @@ async fn test_api_key_auth_rejects_no_key() {
 }
 
 #[tokio::test]
+async fn test_swagger_ui_and_openapi_require_auth() {
+    // security-audit-2026-08 API-1: /docs and /api-docs/openapi.json sit
+    // inside the auth layer — unauthenticated requests get 401, not the
+    // schema.
+    let (state, _temp, api_key) = create_test_app().await;
+
+    for uri in ["/docs", "/api-docs/openapi.json"] {
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{uri} must reject keyless requests"
+        );
+
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{uri} must serve authenticated requests"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_api_key_auth_accepts_valid_key() {
     let (state, _temp) = create_test_app_with_keys(vec!["secret-key".to_string()]).await;
     let app = build_router(state);

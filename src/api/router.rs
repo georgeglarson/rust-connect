@@ -238,6 +238,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(handlers::get_notification_icon),
         )
         .route("/api/v1/events", get(crate::api::sse::sse_events))
+        // Swagger UI + OpenAPI schema merge INSIDE the auth layer: the
+        // schema is recon surface and must not serve unauthenticated
+        // (security-audit-2026-08 API-1).
+        .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::api::middleware::auth_middleware,
@@ -246,7 +250,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
         .route("/api/v1/health", get(handlers::health))
         .merge(api_router)
-        .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .layer(cors)
         .layer(middleware::from_fn(
             crate::api::middleware::security_headers,
