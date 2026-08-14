@@ -122,6 +122,12 @@ log "Phase 0: paired (kde=$KDE_ID rust=$RUST_ID)"
 # once, kept alive for the whole smoke. Captured offset is per-phase.
 start_notify_monitor
 
+# Spin up the tiny org.freedesktop.Notifications stub on the kde private
+# bus. Phase 5 needs it (KDE's KNotification calls Notify via the standard
+# path and fails without a server); Phase 4 doesn't strictly need it
+# (BecomeMonitor catches messages pre-dispatch) but it doesn't hurt.
+start_notif_server || log "  notif_server.py did not start cleanly; Phase 5 may be a wall"
+
 # ---------------------------------------------------------------- phase 1
 # ping both directions. The cheapest possible flow.
 log "=== Phase 1: ping both directions ==="
@@ -149,10 +155,10 @@ else
     # kde→rust: kdeconnect-cli -d <id> --ping (M1 precedent, M3 brief).
     # Oracle: rust daemon log captured the packet receipt (event: "ping"
     # per src/plugins/ping.rs:41-45).
-    env "${KDE_ENV[@]}" kdeconnect-cli -d "$RUST_ID" --ping --return-names >/dev/null 2>&1 \
+    env "${KDE_ENV[@]}" kdeconnect-cli -d "$RUST_ID" --ping >/dev/null 2>&1 \
         || log "  kdeconnect-cli --ping returned non-zero (non-fatal)"
     if wait_for 10 "rust log to show ping_received" \
-        bash -c "sed 's/\x1b\[[0-9;]*m//g' '$RUST_LOG' | grep -qE 'event: \"ping\"'"; then
+        bash -c "sed 's/\x1b\[[0-9;]*m//g' '$RUST_LOG' | grep -qE 'event: \"ping(_received)?\"'"; then
         PING_KDE_OK=0
     fi
 fi
@@ -165,7 +171,11 @@ check "kde→rust ping: rust log shows event: \"ping\"" \
 log "=== Phase 2: share kde→rust ==="
 SHARE_OK=1
 SHARE_STAGE="$KDE_HOME/home/Downloads/m3-staged-content.txt"
-SHARE_EXPECT="$WORK/rust-home/Downloads/m3-staged-content.txt"
+# The rust plugin writes under dirs::download_dir() OR
+# /tmp/rust-connect-downloads (the documented fallback when dirs returns
+# None — the rust harness HOME has no $HOME/Downloads so dirs returns
+# None). The rust log shows the actual path used; we check the fallback.
+SHARE_EXPECT="/tmp/rust-connect-downloads/m3-staged-content.txt"
 mkdir -p "$(dirname "$SHARE_STAGE")" "$(dirname "$SHARE_EXPECT")"
 # Known content: 64 bytes deterministic + size + name so we can assert
 # both content equality AND that the file isn't a default placeholder.
@@ -188,10 +198,14 @@ else
     wait_for 30 "share file to land at $SHARE_EXPECT" \
         bash -c "[[ -s '$SHARE_EXPECT' ]]"
     if [[ -s "$SHARE_EXPECT" ]]; then
-        if [[ "$(cat "$SHARE_EXPECT")" == "$SHARE_CONTENT" ]]; then
+        # Bytewise compare against the staged content. The smoke runs as
+        # root via sudo, so the artifact files are root-owned and readable.
+        STAGED_HASH=$(sha256sum "$SHARE_STAGE" 2>/dev/null | awk '{print $1}')
+        DOWNLOAD_HASH=$(sha256sum "$SHARE_EXPECT" 2>/dev/null | awk '{print $1}')
+        if [[ -n "$STAGED_HASH" && "$STAGED_HASH" == "$DOWNLOAD_HASH" ]]; then
             SHARE_OK=0
         else
-            log "  share file present but content mismatch (got $(wc -c <"$SHARE_EXPECT") bytes)"
+            log "  share file present but content mismatch (sha256: staged=$STAGED_HASH downloaded=$DOWNLOAD_HASH)"
         fi
     else
         log "  share file did not materialize"
@@ -286,6 +300,17 @@ NOTIFY_SUMMARY="m3-notify-summary"
 if [[ "$SAB_SKIP_NOTIFY_SEND" == "1" ]]; then
     log "SABOTAGE=skip-notify-send: NOT issuing Notify on kde bus"
 else
+    # The kdeconnectd's SendNotificationsPlugin is `EnabledByDefault: false`
+    # (kdeconnect_sendnotifications.json). Without enabling it on the
+    # device there is no BecomeMonitor on the bus, and Notify calls reach
+    # the bus unmonitored. Enable via D-Bus setPluginEnabled (calls
+    # reloadPlugins() in core/device.cpp:459) so the listener comes up
+    # before we fire the test notification. The device object is at
+    # /modules/kdeconnect/devices/<peer-id-as-seen-by-kde> — RUST_ID is
+    # that peer id (KDE_ID is the kde daemon's own id, not a device path).
+    if ! kde_enable_plugin "$RUST_ID" "kdeconnect_sendnotifications"; then
+        log "  kde_enable_plugin returned non-zero (non-fatal)"
+    fi
     # Issue Notify on the kde private bus. The signature per the spec
     # is (app, replaces_id, icon, summary, body, actions, hints, timeout).
     kde_notify_send "m3-harness" "dialog-information" "$NOTIFY_SUMMARY" "$NOTIFY_BODY" \
@@ -294,8 +319,10 @@ else
     # Wait for the rust side to receive + store. The notify→packet→bus
     # round trip is fast (sub-second) but the BecomeMonitor capture +
     # store can take a moment.
+    # Inline (NOT bash -c) because rc_api is a lib.sh function — bash -c
+    # starts a fresh shell that can't see shell functions from the caller.
     if wait_for 15 "rust /api/v1/notifications to contain summary $NOTIFY_SUMMARY" \
-        bash -c "rc_api /api/v1/notifications 2>/dev/null | grep -qF '$NOTIFY_SUMMARY'"; then
+        rc_api_grep "/api/v1/notifications" "$NOTIFY_SUMMARY"; then
         NOTIFY_KDE_TO_RUST_OK=0
     fi
 fi
@@ -318,8 +345,12 @@ else
     # Capture monitor offset BEFORE the trigger (M2 lesson — round trip
     # completes in <10ms; capturing AFTER misses the signal).
     NOTIF_OFFSET=$(notify_log_offset)
+    # The rust handler at api/handlers/plugins/notification.rs:71 deserializes
+    # SendNotificationRequest which expects {title, text, appName?}. `text`
+    # is required; `body` is rejected by serde. App defaults to "Agent"
+    # when omitted.
     rc_api_post_body "/api/v1/devices/$KDE_ID/notification" \
-        "{\"appName\":\"m3-harness\",\"title\":\"$NOTIF_SUMMARY\",\"body\":\"$NOTIF_BODY\"}" \
+        "{\"appName\":\"m3-harness\",\"title\":\"$NOTIF_SUMMARY\",\"text\":\"$NOTIF_BODY\"}" \
         >/dev/null 2>&1 \
         || log "  /api/v1/devices/{id}/notification returned non-zero (non-fatal)"
     # Wait for the Notify call to land in the monitor log. The kde side

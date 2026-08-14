@@ -45,6 +45,7 @@
 #
 # M3-only helpers (per-plugin flow surfaces; cited inline):
 #   kde_share_urls / kde_share_url / kde_share_text
+#   kde_trigger_command / kde_enable_plugin / kde_notify_send
 #   kdeclip_get_text / kdeclip_set_text / kde_clipboard_send
 #   kde_trigger_command
 #   kde_notify_send
@@ -148,12 +149,12 @@ sweep_work_procs() {
 }
 
 cleanup() {
-    for pid in "$KD_PID" "$RC_PID" "$MON_PID" "$TCPDUMP_PID" "$DBUS_PID" "$XVFB_PID" "${NOTIFY_MON_PID:-}"; do
+    for pid in "$KD_PID" "$RC_PID" "$MON_PID" "$TCPDUMP_PID" "$DBUS_PID" "$XVFB_PID" "${NOTIFY_MON_PID:-}" "${NOTIF_SERVER_PID:-}"; do
         [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
     done
     sweep_work_procs TERM
     sleep 1
-    for pid in "$KD_PID" "$RC_PID" "$MON_PID" "$TCPDUMP_PID" "$DBUS_PID" "$XVFB_PID" "${NOTIFY_MON_PID:-}"; do
+    for pid in "$KD_PID" "$RC_PID" "$MON_PID" "$TCPDUMP_PID" "$DBUS_PID" "$XVFB_PID" "${NOTIFY_MON_PID:-}" "${NOTIF_SERVER_PID:-}"; do
         [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null
     done
     sweep_work_procs KILL
@@ -319,6 +320,14 @@ rc_api_post() {
     local path="$1"
     ip netns exec "$NS_B" curl -sf -X POST -H "X-API-Key: $API_KEY" \
         "http://127.0.0.1:9090$path" 2>/dev/null
+}
+
+# rc_api + grep in one helper so wait_for callers don't need bash -c
+# (which can't see lib.sh functions because it starts a fresh shell).
+# Returns 0 if the substring appears in the GET response body.
+rc_api_grep() {
+    local path="$1" needle="$2"
+    rc_api "$path" 2>/dev/null | grep -qF "$needle"
 }
 
 FAILURES=()
@@ -864,6 +873,23 @@ kde_trigger_command() {
         "'$key'" 2>&1
 }
 
+# Enable a plugin on a kde device. The kdeconnectd per-device config
+# (core/device.cpp:448-460) holds `<pluginName>Enabled=true|false`; the
+# D-Bus method writes it and calls reloadPlugins(). Plugins that ship
+# with `EnabledByDefault: false` — e.g. kdeconnect_sendnotifications
+# (kdeconnect_sendnotifications.json:line) — MUST be enabled this way
+# before any phase that depends on their listener is meaningful.
+# Without this, the BecomeMonitor on org.freedesktop.Notifications.Notify
+# never registers and kde Notify calls reach the bus unmonitored.
+kde_enable_plugin() {
+    local device_id="$1"; shift
+    local plugin_name="$1"
+    env "${KDE_ENV[@]}" gdbus call --session --dest org.kde.kdeconnect \
+        --object-path "/modules/kdeconnect/devices/$device_id" \
+        --method org.kde.kdeconnect.device.setPluginEnabled \
+        "'$plugin_name'" true 2>&1
+}
+
 # Send a desktop notification on the kde private session bus. This is
 # the driver for the kde→rust sendnotifications phase: the kdeconnectd's
 # BecomeMonitor listener on org.freedesktop.Notifications.Notify picks
@@ -896,7 +922,15 @@ pactl_set_sink_volume() {
 # observes the kde side posting the notification it received from rust.
 NOTIFY_MONITOR_LOG="$WORK/notify-monitor.log"
 start_notify_monitor() {
-    env "${KDE_ENV[@]}" gdbus monitor --session --dest org.freedesktop.Notifications \
+    # NOTE: gdbus monitor only catches SIGNALS from the destination object,
+    # not method calls addressed to it. Phase 5 (rust→kde notifications)
+    # needs to observe Notify() method calls, so we use dbus-monitor with a
+    # type=method_call filter on the Notifications interface. The kde
+    # sendnotifications plugin's BecomeMonitor also sees these (it's
+    # pre-dispatch), which is why kdeconnectd's log shows "Got notification
+    # from KDE Connect" while gdbus monitor captured nothing.
+    env "${KDE_ENV[@]}" dbus-monitor --session \
+        "type='method_call',interface='org.freedesktop.Notifications',member='Notify'" \
         >"$NOTIFY_MONITOR_LOG" 2>&1 &
     NOTIFY_MON_PID=$!
     disown $! 2>/dev/null || true
@@ -909,6 +943,44 @@ stop_notify_monitor() {
     sleep 1
     [[ -n "${NOTIFY_MON_PID:-}" ]] && kill -9 "$NOTIFY_MON_PID" 2>/dev/null
     NOTIFY_MON_PID=""
+}
+
+# Spin up the tiny org.freedesktop.Notifications stub on the kde private
+# session bus. Required for Phase 5 (rust→kde notifications) because
+# KNotification calls Notify through the KDE framework's standard path
+# — which fails on a bus with no notification server. Without this, the
+# monitor captures nothing (kf.notifications: Failed to notify ... in
+# the kdeconnectd log). Phase 4 (kde→rust sendnotifications) does NOT
+# need it — BecomeMonitor sees messages before destination dispatch.
+# Starts once, kept alive for the smoke lifetime; cleanup() in lib.sh
+# kills it.
+NOTIF_SERVER_PID=""
+start_notif_server() {
+    [[ -n "$NOTIF_SERVER_PID" ]] && kill -0 "$NOTIF_SERVER_PID" 2>/dev/null && return 0
+    python3 "$(dirname "${BASH_SOURCE[0]}")/lib/notif_server.py" "$DBUS_ADDR" \
+        >"$WORK/notif-server.log" 2>&1 &
+    NOTIF_SERVER_PID=$!
+    disown $! 2>/dev/null || true
+    # Give it a moment to claim the name before any phase issues a
+    # Notify. name_has_owner is the right check.
+    for _ in $(seq 1 20); do
+        if env "${KDE_ENV[@]}" gdbus call --session --dest org.freedesktop.DBus \
+            --object-path / --method org.freedesktop.DBus.NameHasOwner \
+            "org.freedesktop.Notifications" 2>/dev/null | grep -q true; then
+            log "notif_server.py started (pid $NOTIF_SERVER_PID) — org.freedesktop.Notifications claimed"
+            return 0
+        fi
+        sleep 0.1
+    done
+    log "WARN: notif_server.py failed to claim org.freedesktop.Notifications within 2s"
+    return 1
+}
+
+stop_notif_server() {
+    [[ -n "${NOTIF_SERVER_PID:-}" ]] && kill "$NOTIF_SERVER_PID" 2>/dev/null
+    sleep 0.5
+    [[ -n "${NOTIF_SERVER_PID:-}" ]] && kill -9 "$NOTIF_SERVER_PID" 2>/dev/null
+    NOTIF_SERVER_PID=""
 }
 
 # Capture log offset BEFORE the trigger, so subsequent greps land only on
