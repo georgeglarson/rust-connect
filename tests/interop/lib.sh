@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # tests/interop/lib.sh — shared infrastructure for the kdeconnectd <-> rust-connect
-# interop smokes (M1: identity exchange, M2: scripted pairing + reconnect).
+# interop smokes (M1: identity exchange, M2: scripted pairing + reconnect,
+# M3: per-plugin flows).
 #
 # SOURCED, not executed. The milestone smoke (m1_smoke.sh / m2_smoke.sh) must
 # set the following before sourcing:
@@ -41,6 +42,16 @@
 #   kde_trusted_devices_path            — filesystem path to the INI
 #   kde_force_on_network_change
 #   start_kde, start_rust
+#
+# M3-only helpers (per-plugin flow surfaces; cited inline):
+#   kde_share_urls / kde_share_url / kde_share_text
+#   kdeclip_get_text / kdeclip_set_text / kde_clipboard_send
+#   kde_trigger_command
+#   kde_notify_send
+#   pactl_set_sink_volume
+#   start_notify_monitor / stop_notify_monitor / notify_log_offset
+#   rc_api_post_body / rc_api_post_body_raw (M3 JSON-bodied POST helpers)
+#   RC_DBUS_SESSION_BUS (override for start_rust; empty = bogus no-such-bus)
 #
 # Sets an EXIT trap that kills every leftover child, sweeps /proc for any
 # process whose environ or cmdline references $WORK, deletes the namespaces
@@ -137,12 +148,12 @@ sweep_work_procs() {
 }
 
 cleanup() {
-    for pid in "$KD_PID" "$RC_PID" "$MON_PID" "$TCPDUMP_PID" "$DBUS_PID" "$XVFB_PID"; do
+    for pid in "$KD_PID" "$RC_PID" "$MON_PID" "$TCPDUMP_PID" "$DBUS_PID" "$XVFB_PID" "${NOTIFY_MON_PID:-}"; do
         [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
     done
     sweep_work_procs TERM
     sleep 1
-    for pid in "$KD_PID" "$RC_PID" "$MON_PID" "$TCPDUMP_PID" "$DBUS_PID" "$XVFB_PID"; do
+    for pid in "$KD_PID" "$RC_PID" "$MON_PID" "$TCPDUMP_PID" "$DBUS_PID" "$XVFB_PID" "${NOTIFY_MON_PID:-}"; do
         [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null
     done
     sweep_work_procs KILL
@@ -577,12 +588,16 @@ api_keys = ["$API_KEY"]
 idle_timeout_secs = 0
 ui_enabled = false
 EOF
-    # DBUS_SESSION_BUS_ADDRESS is explicit for this child too: a bogus
-    # path, so the daemon's D-Bus session backends (mpris, notifications,
-    # …) degrade instantly instead of touching any real bus.
+    # DBUS_SESSION_BUS_ADDRESS is explicit for this child: a bogus path by
+    # default so the daemon's D-Bus session backends (mpris, notifications,
+    # …) degrade instantly instead of touching any real bus. M3 overrides
+    # via RC_DBUS_SESSION_BUS (e.g. to point at $DBUS_ADDR — the kde private
+    # bus — so plugins that read the session bus can find it).
+    local dbus_addr="unix:path=$WORK/rust-home/no-such-bus"
+    [[ -n "${RC_DBUS_SESSION_BUS:-}" ]] && dbus_addr="$RC_DBUS_SESSION_BUS"
     ip netns exec "$NS_B" env \
         "HOME=$WORK/rust-home" \
-        "DBUS_SESSION_BUS_ADDRESS=unix:path=$WORK/rust-home/no-such-bus" \
+        "DBUS_SESSION_BUS_ADDRESS=$dbus_addr" \
         "DISPLAY=" \
         "$RC_BIN" --config "$WORK/rust.toml" \
         >"$RUST_LOG" 2>&1 &
@@ -656,9 +671,11 @@ restart_kde() {
 # data dir. Readiness oracle is the REST API responding.
 restart_rust() {
     stop_rust
+    local dbus_addr="unix:path=$WORK/rust-home/no-such-bus"
+    [[ -n "${RC_DBUS_SESSION_BUS:-}" ]] && dbus_addr="$RC_DBUS_SESSION_BUS"
     ip netns exec "$NS_B" env \
         "HOME=$WORK/rust-home" \
-        "DBUS_SESSION_BUS_ADDRESS=unix:path=$WORK/rust-home/no-such-bus" \
+        "DBUS_SESSION_BUS_ADDRESS=$dbus_addr" \
         "DISPLAY=" \
         "$RC_BIN" --config "$WORK/rust.toml" \
         >"$RUST_LOG" 2>&1 &
@@ -726,6 +743,203 @@ finish_milestone() {
     fi
     fail "${label}: FAIL — ${#FAILURES[@]} assertion(s) failed: ${FAILURES[*]}"
     return 1
+}
+
+# ---------------------------------------------------------------- M3 surfaces
+# Per-plugin flow helpers for M3 (vk #991, M3 of 4). All assume a paired
+# topology; none of these call kdeconnectd's setup. M3-specific saboteages
+# (skip-share-send, skip-clipboard-rx, etc.) are interpreted by m3_smoke.sh
+# itself; the generic skip-rust / skip-kde saboteages are honored by
+# start_kde/start_rust.
+#
+# All citations upstream point to /tmp/kdeconnect-kde (pinned at dcd6ded4)
+# and to rust-connect's plugin + handler code. Each helper has its citations
+# next to the call shape.
+#
+# Surfaces mapped here (paths, interfaces, method names):
+#   share.shareUrls(QStringList)   — org.kde.kdeconnect.device.share
+#                                    /modules/kdeconnect/devices/<id>/share
+#                                    (shareplugin.cpp:276-281,290-293)
+#   share.shareUrl(QString)        — same path (shareplugin.cpp:251-274)
+#   share.shareText(QString)       — same path (shareplugin.cpp:283-288)
+#   clipboard.sendClipboard()      — org.kde.kdeconnect.device.clipboard
+#                                    /modules/kdeconnect/devices/<id>/clipboard
+#                                    (clipboardplugin.h:65-66)
+#   remotecommands.triggerCommand(QString) — org.kde.kdeconnect.device.remotecommands
+#                                    /modules/kdeconnect/devices/<id>/remotecommands
+#                                    (remotecommandsplugin.cpp:54-58)
+#   remotesystemvolume.sendVolume(QString, int) — same iface (volumes.h:35)
+#   remotesystemvolume.volumeChanged(QString, int) — SIGNAL (volumes.h:40)
+
+# Allow start_rust to use a real session bus for the plugins that need one
+# (sendnotifications, mpris, clipboard). Default empty → bogus no-such-bus
+# path. M3 sets this to $DBUS_ADDR so the rust daemon speaks the kde private
+# session bus for plugins that read it. The kde side has BecomeMonitor match
+# rules on org.freedesktop.Notifications.Notify and the rust side has its
+# own (src/plugins/sendnotifications.rs) — multiple monitors on the same
+# bus are fine, and the echo-prevention hint (x-kdeconnect-source-device)
+# is already wired both ways.
+RC_DBUS_SESSION_BUS="${RC_DBUS_SESSION_BUS:-}"
+
+# kde→rust share: invokes share.shareUrls on the kde device path with a
+# single-element QStringList. The kdeconnectd side builds a
+# kdeconnect.share.request packet (shareplugin.cpp:251-274) with payload =
+# the file bytes. Receiver is rust-connect's SharePlugin, which writes
+# the file under dirs::download_dir() — i.e. $RUST_HOME/Downloads by
+# default (src/plugins/share.rs).
+kde_share_urls() {
+    local device_id="$1"; shift
+    local url="$1"
+    env "${KDE_ENV[@]}" gdbus call --session --dest org.kde.kdeconnect \
+        --object-path "/modules/kdeconnect/devices/$device_id/share" \
+        --method org.kde.kdeconnect.device.share.shareUrls \
+        "['$url']" 2>&1
+}
+
+# kde→rust share via the single-URL variant (shareplugin.cpp:251). Useful
+# when the harness wants one share.shareUrl call rather than the list form.
+kde_share_url() {
+    local device_id="$1"; shift
+    local url="$1"
+    env "${KDE_ENV[@]}" gdbus call --session --dest org.kde.kdeconnect \
+        --object-path "/modules/kdeconnect/devices/$device_id/share" \
+        --method org.kde.kdeconnect.device.share.shareUrl \
+        "'$url'" 2>&1
+}
+
+# kde→rust share text (shareplugin.cpp:283). Used to test the no-payload
+# text branch — the kde side posts a KNotification and writes to
+# KSystemClipboard; the rust side receives a kdeconnect.share.request with
+# {text: ...}. Both share the same packet type; the text branch is a
+# distinct assertion.
+kde_share_text() {
+    local device_id="$1"; shift
+    local text="$1"
+    env "${KDE_ENV[@]}" gdbus call --session --dest org.kde.kdeconnect \
+        --object-path "/modules/kdeconnect/devices/$device_id/share" \
+        --method org.kde.kdeconnect.device.share.shareText \
+        "'$text'" 2>&1
+}
+
+# Read the kde Xvfb's X11 clipboard. KSystemClipboard is what kdeconnectd's
+# clipboard plugin writes to on the receive side, so xclip -o inside the
+# kde per-instance env is the independent oracle for a rust→kde clipboard
+# flow. Returns the raw text (no trailing newline). Times out hard so a
+# hung X server can't stall the smoke.
+kdeclip_get_text() {
+    env "${KDE_ENV[@]}" timeout 5 xclip -o -selection clipboard 2>/dev/null
+}
+
+# Write text to the kde Xvfb's X11 clipboard. Used by the kde→rust phase
+# to set the source, then sleep long enough for kdeconnectd's clipboard
+# watcher to fire on the selection change. Per M3 brief: "if the rust
+# side has no X integration, that direction may be a recorded wall."
+kdeclip_set_text() {
+    local text="$1"
+    env "${KDE_ENV[@]}" timeout 5 bash -c "printf '%s' \"\$1\" | xclip -selection clipboard" _ "$text"
+}
+
+# Send the kdeconnect.clipboard packet via kde's clipboard plugin
+# (clipboardplugin.h:65). The plugin reads its own KSystemClipboard and
+# sends the packet — so this is a no-payload "request push" trigger that
+# surfaces whatever is currently on the KDE clipboard.
+kde_clipboard_send() {
+    local device_id="$1"
+    env "${KDE_ENV[@]}" gdbus call --session --dest org.kde.kdeconnect \
+        --object-path "/modules/kdeconnect/devices/$device_id/clipboard" \
+        --method org.kde.kdeconnect.device.clipboard.sendClipboard \
+        2>&1
+}
+
+# Trigger a configured kdeconnect.runcommand on the paired rust device.
+# This is the kde→rust direction; the actual command runs on the rust
+# side. Per vk #1007 the rust production allowlist is empty, so this
+# is recorded as a wall with policy text — see m3_smoke.sh Phase 8.
+kde_trigger_command() {
+    local device_id="$1"; shift
+    local key="$1"
+    env "${KDE_ENV[@]}" gdbus call --session --dest org.kde.kdeconnect \
+        --object-path "/modules/kdeconnect/devices/$device_id/remotecommands" \
+        --method org.kde.kdeconnect.device.remotecommands.triggerCommand \
+        "'$key'" 2>&1
+}
+
+# Send a desktop notification on the kde private session bus. This is
+# the driver for the kde→rust sendnotifications phase: the kdeconnectd's
+# BecomeMonitor listener on org.freedesktop.Notifications.Notify picks
+# up the call, filters x-kdeconnect-source-device (none here), builds
+# a kdeconnect.notification packet (dbusnotificationslistener.cpp:317-329),
+# and forwards to the paired rust device. Signature per the spec
+# (susssasa{sv}i) = (app, replaces_id, icon, summary, body, actions,
+# hints, timeout).
+kde_notify_send() {
+    local app="$1" icon="$2" summary="$3" body="$4"
+    env "${KDE_ENV[@]}" gdbus call --session --dest org.freedesktop.Notifications \
+        --object-path /org/freedesktop/Notifications \
+        --method org.freedesktop.Notifications.Notify \
+        "'$app'" 0 "'$icon'" "'$summary'" "'$body'" "[]" "{}" 5000 2>&1
+}
+
+# Drive a PulseAudio sink volume change via pactl. Requires pactl on the
+# host + a running PA/pipewire-pulse socket the harness can reach. M3's
+# remotesystemvolume-out spike needs this; the cheap-batch phase records
+# the wall if pactl is unavailable inside the netns.
+pactl_set_sink_volume() {
+    local sink="$1" volume="$2"
+    pactl set-sink-volume "$sink" "$volume" 2>&1
+}
+
+# Start a dedicated gdbus monitor targeting org.freedesktop.Notifications
+# (NOT the default org.kde.kdeconnect monitor from line 254, which is
+# kdeconnect-only). Captures the Notify call shape and the app/summary/
+# body/hints so the rust→kde notifications phase has an oracle that
+# observes the kde side posting the notification it received from rust.
+NOTIFY_MONITOR_LOG="$WORK/notify-monitor.log"
+start_notify_monitor() {
+    env "${KDE_ENV[@]}" gdbus monitor --session --dest org.freedesktop.Notifications \
+        >"$NOTIFY_MONITOR_LOG" 2>&1 &
+    NOTIFY_MON_PID=$!
+    disown $! 2>/dev/null || true
+    log "notify monitor started (pid $NOTIFY_MON_PID) at $NOTIFY_MONITOR_LOG"
+}
+
+# Stop the notify monitor and reap.
+stop_notify_monitor() {
+    [[ -n "${NOTIFY_MON_PID:-}" ]] && kill "$NOTIFY_MON_PID" 2>/dev/null
+    sleep 1
+    [[ -n "${NOTIFY_MON_PID:-}" ]] && kill -9 "$NOTIFY_MON_PID" 2>/dev/null
+    NOTIFY_MON_PID=""
+}
+
+# Capture log offset BEFORE the trigger, so subsequent greps land only on
+# new lines. Same lesson as M2's PHASE2_LOG_OFFSET — the trigger→oracle
+# round trip completes in <10ms, and capturing AFTER the trigger misses
+# the signal entirely.
+notify_log_offset() {
+    wc -l < "$NOTIFY_MONITOR_LOG" 2>/dev/null || echo 0
+}
+
+# REST GET on the rust side, body-bearing POST helper. Same shape as
+# rc_api/rc_api_post (lib.sh:312-318) but with body support for the M3
+# phases whose handlers want JSON (clipboard.set, notification.send, mpris).
+# M3 handlers route through these — not through the existing rc_api_* —
+# because rc_api_post hardcodes an empty body.
+rc_api_post_body() {
+    local path="$1" body="${2:-}"
+    ip netns exec "$NS_B" curl -sf -X POST -H "X-API-Key: $API_KEY" \
+        -H "Content-Type: application/json" \
+        -d "$body" \
+        "http://127.0.0.1:9090$path" 2>/dev/null
+}
+
+# Same as rc_api_post_body but tolerates non-2xx (no -f). Useful for
+# red-proofs where we expect a 4xx/5xx response and want the body.
+rc_api_post_body_raw() {
+    local path="$1" body="${2:-}"
+    ip netns exec "$NS_B" curl -s -X POST -H "X-API-Key: $API_KEY" \
+        -H "Content-Type: application/json" \
+        -d "$body" \
+        "http://127.0.0.1:9090$path" 2>/dev/null
 }
 
 # We intentionally do NOT return a non-zero status from sourcing; the
