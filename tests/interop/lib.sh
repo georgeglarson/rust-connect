@@ -385,6 +385,36 @@ kde_request_pairing() {
     local device_id="$1"
     kde_dbus_device "$device_id" org.kde.kdeconnect.device.requestPairing
 }
+
+# Wait for the kde device object to be FULLY present at
+# /modules/kdeconnect/devices/<id> AND surface a real pair state (not the
+# empty `()` that gdbus returns when the object is mid-destruction).
+#
+# Why this exists: after the rust side's "Same-cert redial" (closes the
+# first TLS link and adopts a fresh one within a second), kdeconnectd
+# destroys the device object on the old link and re-creates it on the
+# new one. The window between deviceRemoved and deviceAdded is short
+# (tens of ms) but non-zero — and during it, kde_request_pairing's
+# gdbus call races the destroy and fails ("requestPairing call failed"
+# because the object path returns nothing callable). Polling on
+# pairStateAsInt alone is NOT enough: when the object is gone, it
+# returns the empty `()` string, which is distinct from `0` (NotPaired).
+# We wait for a NUMERIC state, not the empty pre-add state.
+kde_device_ready_for_pairing() {
+    local device_id="$1"
+    local ps
+    ps=$(kde_pair_state_as_int "$device_id")
+    # Numeric state means the device object exists and pairStateAsInt
+    # resolved. Empty (`()`) means the object is gone — the same-cert
+    # redial cycle, or any other in-flight destroy.
+    [[ "$ps" =~ ^[0-9]+$ ]]
+}
+kde_not_paired_for_pairing() {
+    local device_id="$1"
+    local ps
+    ps=$(kde_pair_state_as_int "$device_id")
+    [[ "$ps" == "0" ]]
+}
 kde_accept_pairing() {
     local device_id="$1"
     kde_dbus_device "$device_id" org.kde.kdeconnect.device.acceptPairing
@@ -407,6 +437,21 @@ rust_unpair() {
         "http://127.0.0.1:9090/api/v1/devices/$device_id/unpair" 2>/dev/null
 }
 
+# Send a ping packet to a device via REST. Used by Phase 3 to provoke
+# the rust side to actually use (and surface) a dead TCP socket left
+# dangling by a veth flap. The kernel only reports ECONNRESET on a
+# write to a dead socket when something WRITES — an idle connection
+# stays "alive" in user-space until the next user-level I/O. So flap
+# alone won't surface the disconnect; a ping after the flap will.
+rust_ping() {
+    local device_id="$1"
+    ip netns exec "$NS_B" curl -s -X POST -H "X-API-Key: $API_KEY" \
+        -H "Content-Type: application/json" \
+        -d "{\"device_id\":\"$device_id\"}" \
+        "http://127.0.0.1:9090/api/v1/ping" >/dev/null 2>&1
+    return 0
+}
+
 # Polling helpers: return 0 when the corresponding side is Paired.
 kde_is_paired() {
     [[ "$(kde_pair_state_as_int "$1")" == "3" ]]
@@ -425,14 +470,25 @@ wait_for_paired_both() {
 }
 
 # Wait for the kde side to be NotPaired (state 0) — for the unpair dance
-# between phases.
+# between phases. Treats the device-object-gone case as unpaired: when a
+# Paired device is unpaired while unreachable, kdeconnectd's Device
+# destructor drops the D-Bus object (device.cpp:113-118 +
+# Daemon::removeDevice — once isReachable=false && !isPaired(), the
+# device is removed from the in-memory map). The object path
+# /modules/kdeconnect/devices/<id> then returns from gdbus as `()` —
+# empty. That is the same observable state as NotPaired for our test.
 kde_is_unpaired() {
-    [[ "$(kde_pair_state_as_int "$1")" == "0" ]]
+    local ps
+    ps=$(kde_pair_state_as_int "$1")
+    [[ -z "$ps" || "$ps" == "0" ]]
 }
 rust_is_unpaired() {
     local ps
     ps=$(rust_pair_state "$1")
-    [[ "$ps" == "unpaired" ]]
+    # The rust API surfaces PairState::NotPaired as the underscore form
+    # (src/protocol/pairing/mod.rs:as_api_str) — the human form "unpaired"
+    # is not what the wire emits. Compare against the wire form.
+    [[ "$ps" == "not_paired" ]]
 }
 
 # Wait for the rust side to surface an incoming pair request. The handler
