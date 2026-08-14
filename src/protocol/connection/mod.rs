@@ -502,7 +502,12 @@ impl ConnectionManager {
 
             match read_result {
                 Err(_) => {
-                    warn!(
+                    // Routine idle tick (30s read timeout drives the loop's
+                    // liveness check), NOT an anomaly: two connected phones
+                    // produce ~4 of these per minute, forever. debug!, not
+                    // warn! — at WARN this was 20k journal lines in 4 days
+                    // and drowned real disconnect signals.
+                    debug!(
                         device_id = %device_id,
                         event = "packet_recv_timeout",
                         "Timed out receiving packet"
