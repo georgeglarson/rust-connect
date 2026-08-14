@@ -60,6 +60,39 @@ async fn run_connection_setup(
         .ensure_and_transition(connected_id, remote_identity, DeviceState::Connected)
         .await;
 
+    // If a pair request is queued (INITIATE call from the API that landed
+    // while the link was down — handlers/device.rs:245-258 silently drops
+    // the packet when not connected), send it now that we have a live
+    // socket. Without this the queued request sits in PairingHandler.outgoing
+    // until timeout, the peer never sees a pair_request packet, and the
+    // D-Bus pairStateChanged(2,) signal never fires (M2 finding, vk #991).
+    if !state.pairing_handler.is_paired(connected_id).await {
+        if let Some(timestamp) = state
+            .pairing_handler
+            .pending_outgoing_timestamp(connected_id)
+            .await
+        {
+            let pkt = crate::protocol::types::Packet::pair_request_with_timestamp(timestamp);
+            match state
+                .connection_manager
+                .send_packet(connected_id, &pkt)
+                .await
+            {
+                Ok(()) => info!(
+                    device_id = %connected_id,
+                    event = "pair_request_sent_on_connect",
+                    "Sent queued pair_request on link re-establish"
+                ),
+                Err(e) => warn!(
+                    device_id = %connected_id,
+                    error = %e,
+                    event = "pair_request_send_failed_on_connect",
+                    "Failed to send queued pair_request on link re-establish"
+                ),
+            }
+        }
+    }
+
     if state.pairing_handler.is_paired(connected_id).await {
         let state_clone = state.clone();
         let device_id_clone = connected_id.clone();
