@@ -123,6 +123,25 @@ fn sanitize_device_name(name: &str) -> String {
         .collect()
 }
 
+/// kdeconnect-kde rewrites every received identity's `deviceId` through
+/// `DBusHelper::filterNonExportableCharacters` (`[^A-Za-z0-9_]` -> `_`;
+/// networkpacket.cpp:82-87 @ dcd6ded4) and echoes the REWRITTEN id back as
+/// `targetDeviceId` when it dials us (lanlinkprovider.cpp:371). Our
+/// canonical device ids are dashed UUIDs (`Identity::generate_device_id`),
+/// so a string-exact compare against a kdeconnectd echo can never match —
+/// observed live by the Task 3.2 M1 harness (2026-08-14): every
+/// kdeconnectd-initiated TCP connection was rejected pre-TLS with
+/// "connection request for a device that isn't us". Compare under the same
+/// normalization kde applies instead.
+pub fn device_id_matches_kde_normalized(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect()
+    }
+    norm(a) == norm(b)
+}
+
 impl Identity {
     pub fn new(
         device_id: DeviceId,
@@ -552,6 +571,21 @@ mod tests {
         let recovered = Identity::from_packet(packet).expect("Value expected to be present");
         assert_eq!(recovered.device_id, identity.device_id);
         assert_eq!(recovered.device_name, identity.device_name);
+    }
+
+    #[test]
+    fn test_device_id_matches_kde_normalized() {
+        // The live M1 case: our dashed UUID vs kdeconnectd's underscored echo.
+        assert!(device_id_matches_kde_normalized(
+            "f667cf94-8ea4-4437-8cb7-65891ff1855c",
+            "f667cf94_8ea4_4437_8cb7_65891ff1855c"
+        ));
+        // Identical ids still match; genuinely different ids still don't.
+        assert!(device_id_matches_kde_normalized("abc", "abc"));
+        assert!(!device_id_matches_kde_normalized(
+            "f667cf94-8ea4-4437-8cb7-65891ff1855c",
+            "f667cf94_8ea4_4437_8cb7_65891ff1855d"
+        ));
     }
 
     #[test]

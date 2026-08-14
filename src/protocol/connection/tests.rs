@@ -1149,6 +1149,87 @@ async fn test_accept_incoming_rejects_target_device_id_not_us() {
     peer.await.expect("Value expected to be present");
 }
 
+/// Task 3.2 M1 live-harness finding (2026-08-14): kdeconnect-kde rewrites
+/// our dashed-UUID deviceId to underscores (networkpacket.cpp:82-87 @
+/// dcd6ded4) before echoing it as targetDeviceId (lanlinkprovider.cpp:371).
+/// A string-exact target check rejects EVERY kdeconnectd-initiated
+/// connection pre-TLS. The underscore-normalized echo of OUR id must pass.
+#[tokio::test]
+async fn test_accept_incoming_accepts_kde_normalized_target_device_id() {
+    init_crypto();
+    let (cm, _t) = setup();
+    // INBOUND_OUR_ID ("server-self-aaaa...") already contains dashes; the
+    // kde-echoed form replaces every non-[A-Za-z0-9_] char with '_'.
+    let kde_echoed: String = INBOUND_OUR_ID
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    assert_ne!(kde_echoed, INBOUND_OUR_ID, "test requires a dashed own id");
+    cm.set_device_identity(INBOUND_OUR_ID, "Us");
+    let cm = Arc::new(cm);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Value expected to be present");
+    let addr = listener.local_addr().expect("Value expected to be present");
+
+    let mut identity = Identity::new(
+        INBOUND_PEER_ID.to_string(),
+        "Peer".to_string(),
+        crate::device::DeviceType::Phone,
+        vec![],
+        vec![],
+    );
+    identity.target_device_id = Some(kde_echoed);
+
+    // Bespoke peer (not spawn_plaintext_identity_peer, which asserts the
+    // link is dropped): send the identity, then read — the server passing
+    // the target check proceeds to the TLS handshake as CLIENT, so the
+    // peer must observe handshake bytes.
+    let peer = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("Value expected to be present");
+        let bytes = crate::protocol::packet::PacketSerializer::serialize(
+            &identity
+                .to_tcp_packet()
+                .expect("Value expected to be present"),
+        )
+        .expect("Value expected to be present");
+        tcp.write_all(&bytes)
+            .await
+            .expect("Value expected to be present");
+        let mut buf = [0u8; 64];
+        tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read(&mut buf))
+            .await
+            .expect("the server must proceed to the TLS handshake, not drop us")
+            .expect("Value expected to be present")
+    });
+
+    let (stream, _) = listener
+        .accept()
+        .await
+        .expect("Value expected to be present");
+    // The target check must PASS; the connection then fails later (the
+    // peer can't complete TLS) with any error EXCEPT the "isn't us"
+    // rejection.
+    let err = cm
+        .accept_incoming(stream)
+        .await
+        .expect_err("a plaintext-only peer still cannot complete TLS");
+    assert!(
+        !err.to_string().contains("isn't us"),
+        "kde-normalized targetDeviceId must not be rejected: {err}"
+    );
+
+    let handshake_bytes = peer.await.expect("Value expected to be present");
+    assert!(
+        handshake_bytes > 0,
+        "passing the target check must be followed by a TLS ClientHello"
+    );
+}
+
 #[tokio::test]
 async fn test_accept_incoming_rejects_target_protocol_version_not_ours() {
     init_crypto();

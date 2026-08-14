@@ -107,8 +107,11 @@ impl ConnectionManager {
         // Android tcpPacketReceived (LanLinkProvider.java:169-178): an
         // identity addressed to a different targetDeviceId or
         // targetProtocolVersion is not meant for us — drop the connection.
+        // The compare is kde-normalization-tolerant: kdeconnect-kde rewrites
+        // our dashed UUID to underscores before echoing it as targetDeviceId
+        // (see device_id_matches_kde_normalized in protocol::types).
         if let Some(ref target) = remote_identity.target_device_id {
-            if *target != our_id {
+            if !crate::protocol::types::device_id_matches_kde_normalized(target, &our_id) {
                 return Err(Error::ConnectionError(format!(
                     "Received a connection request for a device that isn't us: {}",
                     target
