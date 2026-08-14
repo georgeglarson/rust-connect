@@ -687,11 +687,13 @@ impl PairingHandler {
     /// drops the packet (api/handlers/device.rs:245-258 only sends when
     /// `is_connected`), and the peer never sees the request.
     pub async fn pending_outgoing_timestamp(&self, device_id: &DeviceId) -> Option<i64> {
-        self.outgoing
-            .read()
-            .await
-            .get(device_id)
-            .and_then(|r| if r.is_expired() { None } else { Some(r.pair_timestamp) })
+        self.outgoing.read().await.get(device_id).and_then(|r| {
+            if r.is_expired() {
+                None
+            } else {
+                Some(r.pair_timestamp)
+            }
+        })
     }
 
     pub async fn has_incoming_request(&self, device_id: &DeviceId) -> bool {
