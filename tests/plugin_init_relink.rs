@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use rust_connect::app::AppState;
 use rust_connect::config::settings::AppSettings;
 use rust_connect::device::{Device, DeviceType};
@@ -22,8 +23,22 @@ async fn test_state() -> (Arc<AppState>, tempfile::TempDir) {
     (state, temp_dir)
 }
 
+/// Mark `device_id` as paired without going through the SAS dance —
+/// these tests only exercise the wait/bound semantics around a missing
+/// link, not the pairing handshake itself.
+async fn mark_paired(state: &AppState, device_id: &str) {
+    state
+        .pairing_handler
+        .paired_handle()
+        .write()
+        .await
+        .insert(device_id.to_string(), Utc::now());
+}
+
 /// With no live link, the send must WAIT for one (bounded) instead of
 /// firing once and giving up — that instant give-up is the bug.
+/// The device MUST be paired; send_plugin_init_packets short-circuits
+/// on unpaired devices (M2 fix: avoid the kdeconnectd unpair storm).
 #[tokio::test]
 async fn test_init_send_waits_for_a_link_instead_of_firing_blind() {
     let (state, _temp) = test_state().await;
@@ -36,6 +51,7 @@ async fn test_init_send_waits_for_a_link_instead_of_firing_blind() {
         8,
     );
     state.registry.add(device).await.unwrap();
+    mark_paired(&state, &device_id).await;
 
     let started = Instant::now();
     state.send_plugin_init_packets(&device_id).await;
@@ -53,7 +69,7 @@ async fn test_init_send_waits_for_a_link_instead_of_firing_blind() {
 }
 
 /// The bound must hold even when called repeatedly, so a reconnect storm
-/// cannot pile up unbounded waiters.
+/// cannot pile up unbounded waiters. Same paired precondition as above.
 #[tokio::test]
 async fn test_init_send_stays_bounded_across_repeated_calls() {
     let (state, _temp) = test_state().await;
@@ -66,6 +82,7 @@ async fn test_init_send_stays_bounded_across_repeated_calls() {
         8,
     );
     state.registry.add(device).await.unwrap();
+    mark_paired(&state, &device_id).await;
 
     let started = Instant::now();
     for _ in 0..3 {
