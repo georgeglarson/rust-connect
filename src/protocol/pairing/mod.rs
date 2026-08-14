@@ -680,6 +680,22 @@ impl PairingHandler {
                 .is_some_and(|r| !r.is_expired())
     }
 
+    /// If there's a non-expired outgoing pair request for `device_id`,
+    /// return its pair-packet timestamp. Used by the connection orchestrator
+    /// to re-send the pair_request packet on link re-establish — without
+    /// this, an INITIATE pairing that lands while the link is down silently
+    /// drops the packet (api/handlers/device.rs:245-258 only sends when
+    /// `is_connected`), and the peer never sees the request.
+    pub async fn pending_outgoing_timestamp(&self, device_id: &DeviceId) -> Option<i64> {
+        self.outgoing.read().await.get(device_id).and_then(|r| {
+            if r.is_expired() {
+                None
+            } else {
+                Some(r.pair_timestamp)
+            }
+        })
+    }
+
     pub async fn has_incoming_request(&self, device_id: &DeviceId) -> bool {
         self.incoming
             .read()

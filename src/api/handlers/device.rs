@@ -293,11 +293,20 @@ pub async fn unpair_device(
     // out so a fresh pairing starts clean.
     state.plugins.sftp.cleanup_device(&device_id).await;
 
-    state
-        .pairing_handler
-        .unpair(&device_id)
-        .await
-        .map_err(api_err)?;
+    // Idempotent: a peer-initiated `pair=false` may already have cleared
+    // our local pair state by the time the harness's DELETE arrives — the
+    // desired outcome (the device is unpaired) is already achieved, so
+    // 200 is the honest response rather than 500. M2 surface (vk #991):
+    // the test calls `kde_unpair` first; the rust side's pair_rejected_
+    // unpair code path drops state before the harness's own DELETE
+    // roundtrips, and the previous 500 broke the M2 dance.
+    if state.pairing_handler.is_paired(&device_id).await {
+        state
+            .pairing_handler
+            .unpair(&device_id)
+            .await
+            .map_err(api_err)?;
+    }
 
     Ok(Json(ApiResponse::ok(PairResponse {
         device_id,
