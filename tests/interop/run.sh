@@ -5,6 +5,7 @@
 #   tests/interop/run.sh                # build (as the invoking user) + run M1 as root
 #   tests/interop/run.sh m1             # default — identity exchange
 #   tests/interop/run.sh m2             # scripted pairing + reconnect
+#   tests/interop/run.sh m3             # per-plugin flows (M3 of 4)
 #   sudo tests/interop/run.sh m2        # already root
 #   RC_M2_SABOTAGE=skip-kde-accept tests/interop/run.sh m2
 #
@@ -31,8 +32,9 @@ MILESTONE="${1:-m1}"
 case "$MILESTONE" in
     m1) SABOTAGE_ENV="RC_M1_SABOTAGE" ; BIN_ENV="RC_M1_BIN" ;;
     m2) SABOTAGE_ENV="RC_M2_SABOTAGE" ; BIN_ENV="RC_M2_BIN" ;;
+    m3) SABOTAGE_ENV="RC_M3_SABOTAGE" ; BIN_ENV="RC_M3_BIN" ;;
     *)
-        echo "[run.sh] FAIL: unknown milestone: $MILESTONE (allowed: m1 | m2)" >&2
+        echo "[run.sh] FAIL: unknown milestone: $MILESTONE (allowed: m1 | m2 | m3)" >&2
         exit 1
         ;;
 esac
