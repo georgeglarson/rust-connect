@@ -162,6 +162,26 @@ impl AppState {
         const LINK_WAIT: Duration = Duration::from_secs(2);
         const POLL: Duration = Duration::from_millis(250);
 
+        // Skip the whole pass if the device is no longer paired. The
+        // re-establish path runs whenever a TCP connection becomes
+        // available — including the post-unpair reconnect, where the
+        // peer came back up but our pair state is gone. Sending plugin
+        // init packets to an unpaired device re-triggers the kdeconnectd
+        // Device::privateReceivedPacket unpair loop (device.cpp:391-394)
+        // — every non-pair packet from an unpaired device re-emits
+        // unpaired() and disk-writes the trust file. M2 finding
+        // (vk #991): the M2 test's inter-phase unpair saw a 12+ cycle
+        // init-packet / unpair / unpair storm that wedged the kde
+        // PairingHandler queue.
+        if !self.pairing_handler.is_paired(device_id).await {
+            tracing::debug!(
+                device_id = %device_id,
+                event = "init_packets_skipped_unpaired",
+                "Skipping plugin init packets: device is not paired"
+            );
+            return;
+        }
+
         for attempt in 1..=ATTEMPTS {
             // Wait for a live link before spending the pass. A replacement in
             // flight resolves within a poll or two; a genuinely absent link
