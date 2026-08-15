@@ -54,3 +54,6 @@ dist/
 
 # Working plans / scratch design docs
 plans/
+
+# Source-built KDE reference cache (M4 pinned-source lane, vk #991)
+tests/interop/.kde/
