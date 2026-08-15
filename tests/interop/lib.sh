@@ -79,8 +79,37 @@ die()  { fail "$*"; exit 1; }
 for tool in ip Xvfb dbus-daemon gdbus tcpdump curl unshare mount; do
     command -v "$tool" >/dev/null || die "required tool not on PATH: $tool"
 done
-KDECONNECTD=/usr/bin/kdeconnectd
-[[ -x "$KDECONNECTD" ]] || die "$KDECONNECTD not installed"
+# ---------------------------------------------------------------- kde ref
+# RC_KDECONNECTD overrides the default /usr/bin/kdeconnectd to the
+# source-built reference at tests/interop/.kde/install/bin/kdeconnectd
+# (built from kdeconnect-kde tag v26.04.3, see tests/interop/.kde/SOURCE_MANIFEST.toml).
+# Empty / unset = distro binary, the historical default.
+# KDE_NEVRA / KDE_SOURCE_TAG / KDE_SOURCE_SHA are ALWAYS defined for the
+# finish_milestone() summary line; source lane supersedes NEVRA.
+KDE_NEVRA=""
+KDE_SOURCE_TAG=""
+KDE_SOURCE_SHA=""
+if [[ -n "${RC_KDECONNECTD:-}" ]]; then
+    KDECONNECTD="$RC_KDECONNECTD"
+    [[ -x "$KDECONNECTD" ]] || die "RC_KDECONNECTD=$KDECONNECTD but not executable"
+    # Source manifest must exist alongside the binary — it's the only
+    # evidence the binary was actually built from the claimed tag. Missing
+    # manifest = refuse to run rather than silently fall back.
+    KDE_CACHE_DIR="$(dirname "$(dirname "$(readlink -f "$KDECONNECTD")")")"
+    if [[ -f "$KDE_CACHE_DIR/../SOURCE_MANIFEST.toml" ]]; then
+        KDE_SOURCE_TAG=$(grep '^source_tag' "$KDE_CACHE_DIR/../SOURCE_MANIFEST.toml" | head -1 | cut -d'"' -f2)
+        KDE_SOURCE_SHA=$(grep '^source_commit' "$KDE_CACHE_DIR/../SOURCE_MANIFEST.toml" | head -1 | cut -d'"' -f2)
+        KDE_NEVRA="source-build $KDE_SOURCE_TAG @ $KDE_SOURCE_SHA"
+        log "KDE reference (pinned SOURCE build): tag=$KDE_SOURCE_TAG commit=$KDE_SOURCE_SHA binary=$KDECONNECTD"
+    else
+        die "RC_KDECONNECTD=$KDECONNECTD but no SOURCE_MANIFEST.toml found at $KDE_CACHE_DIR/../"
+    fi
+else
+    KDECONNECTD=/usr/bin/kdeconnectd
+    [[ -x "$KDECONNECTD" ]] || die "$KDECONNECTD not installed"
+    KDE_NEVRA=$(rpm -q kdeconnectd kde-connect-libs kde-connect 2>/dev/null | tr '\n' ' ')
+    log "KDE reference (pinned binary NEVRA, not source SHA): $KDE_NEVRA"
+fi
 
 # A pre-existing kdeconnectd is REPORTED, never killed (executor
 # discipline) — per-instance bus/XDG isolation keeps this run correct
@@ -88,11 +117,6 @@ KDECONNECTD=/usr/bin/kdeconnectd
 if pgrep -x kdeconnectd >/dev/null 2>&1; then
     log "NOTE: pre-existing kdeconnectd on the host (pids: $(pgrep -x kdeconnectd | tr '\n' ' ')) — left untouched"
 fi
-
-# Honesty note (brief): this is a pinned BINARY version, not a pinned
-# source SHA — Fedora can push 26.08.x; the pinned-source lane is M4.
-KDE_NEVRA=$(rpm -q kdeconnectd kde-connect-libs kde-connect 2>/dev/null | tr '\n' ' ')
-log "KDE reference (pinned binary NEVRA, not source SHA): $KDE_NEVRA"
 
 # ---------------------------------------------------------------- naming
 PID=$$
@@ -149,12 +173,12 @@ sweep_work_procs() {
 }
 
 cleanup() {
-    for pid in "$KD_PID" "$RC_PID" "$MON_PID" "$TCPDUMP_PID" "$DBUS_PID" "$XVFB_PID" "${NOTIFY_MON_PID:-}" "${NOTIF_SERVER_PID:-}"; do
+    for pid in "$KD_PID" "$RC_PID" "$MON_PID" "$TCPDUMP_PID" "$DBUS_PID" "$XVFB_PID" "${RUST_XVFB_PID:-}" "${MPRIS_FAKE_PID:-}" "${NOTIFY_MON_PID:-}" "${NOTIF_SERVER_PID:-}"; do
         [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
     done
     sweep_work_procs TERM
     sleep 1
-    for pid in "$KD_PID" "$RC_PID" "$MON_PID" "$TCPDUMP_PID" "$DBUS_PID" "$XVFB_PID" "${NOTIFY_MON_PID:-}" "${NOTIF_SERVER_PID:-}"; do
+    for pid in "$KD_PID" "$RC_PID" "$MON_PID" "$TCPDUMP_PID" "$DBUS_PID" "$XVFB_PID" "${RUST_XVFB_PID:-}" "${MPRIS_FAKE_PID:-}" "${NOTIFY_MON_PID:-}" "${NOTIF_SERVER_PID:-}"; do
         [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null
     done
     sweep_work_procs KILL
@@ -212,6 +236,74 @@ XVFB_PID=$!
 disown $! 2>/dev/null || true   # keep SIGKILL job-control noise out of the transcript
 for _ in $(seq 1 50); do [[ -S "/tmp/.X11-unix/X$DISPLAY_NUM" ]] && break; sleep 0.1; done
 [[ -S "/tmp/.X11-unix/X$DISPLAY_NUM" ]] || die "Xvfb socket never appeared (see $WORK/xvfb.log)"
+
+# ---------------------------------------------------------------- mpris fake
+# Plant a zbus MPRIS fake-player helper on the kde private session bus.
+# Modeled on tests/mpris_bus_recovery.rs:23-80 (FakeRoot + FakePlayer).
+# Used by M3 Phase 6 when RC_MPRIS_FAKE is set; otherwise the phase is a wall.
+# Requires cargo build --example mpris_fake_player (run.sh builds every
+# example target via `cargo build --examples --locked` below).
+RC_MPRIS_FAKE="${RC_MPRIS_FAKE:-}"
+MPRIS_FAKE_PID=""
+MPRIS_FAKE_BIN="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}/target/debug/examples/mpris_fake_player"
+start_mpris_fake() {
+    [[ -n "$RC_MPRIS_FAKE" ]] || return 0
+    [[ -x "$MPRIS_FAKE_BIN" ]] || die "RC_MPRIS_FAKE set but $MPRIS_FAKE_BIN not built"
+    [[ -n "$MPRIS_FAKE_PID" ]] && kill -0 "$MPRIS_FAKE_PID" 2>/dev/null && return 0
+    local dbus_addr="$DBUS_ADDR"
+    [[ -n "${RC_DBUS_SESSION_BUS:-}" ]] && dbus_addr="$RC_DBUS_SESSION_BUS"
+    env "${KDE_ENV[@]}" \
+        "DBUS_SESSION_BUS_ADDRESS=$dbus_addr" \
+        "MPRIS_FAKE_TITLE=m3-fake-title" \
+        "MPRIS_FAKE_ARTIST=m3-fake-artist" \
+        "MPRIS_FAKE_ALBUM=m3-fake-album" \
+        "$MPRIS_FAKE_BIN" "m3fake" \
+        >"$WORK/mpris-fake.log" 2>&1 &
+    MPRIS_FAKE_PID=$!
+    disown $! 2>/dev/null || true
+    # Verify the player name got claimed on the bus.
+    for _ in $(seq 1 50); do
+        if env "${KDE_ENV[@]}" gdbus call --session --dest org.freedesktop.DBus \
+            --object-path / --method org.freedesktop.DBus.NameHasOwner \
+            "org.mpris.MediaPlayer2.m3fake" 2>/dev/null | grep -q true; then
+            log "mpris fake-player up: org.mpris.MediaPlayer2.m3fake (pid $MPRIS_FAKE_PID)"
+            return 0
+        fi
+        sleep 0.1
+    done
+    die "mpris fake-player did not claim org.mpris.MediaPlayer2.m3fake within 5s (see $WORK/mpris-fake.log)"
+}
+stop_mpris_fake() {
+    [[ -n "$MPRIS_FAKE_PID" ]] && kill "$MPRIS_FAKE_PID" 2>/dev/null
+    sleep 0.5
+    [[ -n "$MPRIS_FAKE_PID" ]] && kill -9 "$MPRIS_FAKE_PID" 2>/dev/null
+    MPRIS_FAKE_PID=""
+}
+
+# ---------------------------------------------------------------- rust Xvfb
+# A second Xvfb INSIDE ns B so the rust daemon has a session clipboard
+# backend (X11) and can read what the kde side pushes. Set by M4 Phase 3
+# (kde→rust clipboard); other phases leave RC_RUST_DISPLAY empty and the
+# rust daemon starts with DISPLAY=" (the historical default — degrades to
+# 'no clipboard sink'). RC_RUST_DISPLAY_NUM picks the display number so
+# the socket never collides with the kde-side Xvfb or with another run.
+RUST_DISPLAY_NUM=""
+RC_RUST_DISPLAY="${RC_RUST_DISPLAY:-}"
+if [[ -n "$RC_RUST_DISPLAY" ]]; then
+    RUST_DISPLAY_NUM="${RC_RUST_DISPLAY_NUM:-$((200 + PID % 400))}"
+    RUST_DISPLAY=":$RUST_DISPLAY_NUM"
+    ip netns exec "$NS_B" Xvfb "$RUST_DISPLAY" -screen 0 1024x768x24 \
+        >"$WORK/rust-xvfb.log" 2>&1 &
+    RUST_XVFB_PID=$!
+    disown $! 2>/dev/null || true
+    for _ in $(seq 1 50); do
+        [[ -S "/tmp/.X11-unix/X$RUST_DISPLAY_NUM" ]] && break
+        sleep 0.1
+    done
+    [[ -S "/tmp/.X11-unix/X$RUST_DISPLAY_NUM" ]] \
+        || die "rust Xvfb socket never appeared (see $WORK/rust-xvfb.log)"
+    log "rust-side Xvfb up on $RUST_DISPLAY (pid $RUST_XVFB_PID)"
+fi
 
 # Private session bus at an explicit filesystem path (pattern:
 # tests/mpris_bus_recovery.rs — private bus, but path-addressed so it is
@@ -604,15 +696,20 @@ EOF
     # bus — so plugins that read the session bus can find it).
     local dbus_addr="unix:path=$WORK/rust-home/no-such-bus"
     [[ -n "${RC_DBUS_SESSION_BUS:-}" ]] && dbus_addr="$RC_DBUS_SESSION_BUS"
+    # M4: when a rust-side Xvfb was started (RC_RUST_DISPLAY non-empty),
+    # expose it so the clipboard plugin uses xclip/xsel instead of degrading
+    # to 'no clipboard sink'. Otherwise leave DISPLAY empty.
+    local rust_display=""
+    [[ -n "${RC_RUST_DISPLAY:-}" && -n "${RUST_DISPLAY:-}" ]] && rust_display="$RUST_DISPLAY"
     ip netns exec "$NS_B" env \
         "HOME=$WORK/rust-home" \
         "DBUS_SESSION_BUS_ADDRESS=$dbus_addr" \
-        "DISPLAY=" \
+        "DISPLAY=$rust_display" \
         "$RC_BIN" --config "$WORK/rust.toml" \
         >"$RUST_LOG" 2>&1 &
     RC_PID=$!
     disown $! 2>/dev/null || true   # keep SIGKILL job-control noise out of the transcript
-    log "rust-connect started (pid $RC_PID) in $NS_B"
+    log "rust-connect started (pid $RC_PID) in $NS_B (DISPLAY=${rust_display:-<empty>})"
 
     wait_for 30 "rust REST API on 127.0.0.1:9090 (inside $NS_B)" \
         bash -c "ip netns exec \"$NS_B\" curl -sf -H 'X-API-Key: $API_KEY' http://127.0.0.1:9090/api/v1/devices >/dev/null 2>&1" \
@@ -682,10 +779,12 @@ restart_rust() {
     stop_rust
     local dbus_addr="unix:path=$WORK/rust-home/no-such-bus"
     [[ -n "${RC_DBUS_SESSION_BUS:-}" ]] && dbus_addr="$RC_DBUS_SESSION_BUS"
+    local rust_display=""
+    [[ -n "${RC_RUST_DISPLAY:-}" && -n "${RUST_DISPLAY:-}" ]] && rust_display="$RUST_DISPLAY"
     ip netns exec "$NS_B" env \
         "HOME=$WORK/rust-home" \
         "DBUS_SESSION_BUS_ADDRESS=$dbus_addr" \
-        "DISPLAY=" \
+        "DISPLAY=$rust_display" \
         "$RC_BIN" --config "$WORK/rust.toml" \
         >"$RUST_LOG" 2>&1 &
     RC_PID=$!
