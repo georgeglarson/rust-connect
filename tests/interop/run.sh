@@ -6,6 +6,10 @@
 #   tests/interop/run.sh m1             # default — identity exchange
 #   tests/interop/run.sh m2             # scripted pairing + reconnect
 #   tests/interop/run.sh m3             # per-plugin flows (M3 of 4)
+#   tests/interop/run.sh m4             # M3 + the M4 unlock knobs (source-built
+#                                       # KDE reference + rust-side Xvfb +
+#                                       # mpris fake-player helper)
+#   tests/interop/run.sh all            # serial M1 → M2 → M3 → M4
 #   sudo tests/interop/run.sh m2        # already root
 #   RC_M2_SABOTAGE=skip-kde-accept tests/interop/run.sh m2
 #
@@ -17,7 +21,7 @@
 # The build happens as the INVOKING user so target/ stays user-owned and
 # the root side never touches the rustup shim (the failure mode documented
 # in tests/netns_discovery.rs:14-21). The harness itself runs as root via
-# `sudo -n` and lives in /m1_smoke.sh or m2_smoke.sh next to this file.
+# `sudo -n` and lives in /mN_smoke.sh next to this file.
 #
 # Sabotage knobs are env-prefixed per milestone (RC_M1_SABOTAGE,
 # RC_M2_SABOTAGE) and are honored for red-before-green proof runs only;
@@ -33,8 +37,32 @@ case "$MILESTONE" in
     m1) SABOTAGE_ENV="RC_M1_SABOTAGE" ; BIN_ENV="RC_M1_BIN" ;;
     m2) SABOTAGE_ENV="RC_M2_SABOTAGE" ; BIN_ENV="RC_M2_BIN" ;;
     m3) SABOTAGE_ENV="RC_M3_SABOTAGE" ; BIN_ENV="RC_M3_BIN" ;;
+    m4) SABOTAGE_ENV="RC_M4_SABOTAGE" ; BIN_ENV="RC_M4_BIN" ;;
+    all)
+        # One-command runner: serial M1 → M2 → M3 → M4. Each is its own
+        # PASS/FAIL gate; we always attempt every milestone so a single
+        # failure doesn't blind subsequent lanes, then exit non-zero if
+        # any of them failed. The ZERO-LEAK invariant gates every
+        # milestone independently inside lib.sh.
+        echo "[run.sh] all: serial M1 → M2 → M3 → M4 (each is its own PASS/FAIL gate)"
+        any_fail=0
+        for ms in m1 m2 m3 m4; do
+            echo "[run.sh] === running $ms ==="
+            if ! "${0}" "$ms"; then
+                echo "[run.sh] === $ms FAILED ===" >&2
+                any_fail=1
+            else
+                echo "[run.sh] === $ms OK ==="
+            fi
+        done
+        if [[ "$any_fail" -ne 0 ]]; then
+            echo "[run.sh] all: at least one milestone failed" >&2
+            exit 1
+        fi
+        exit 0
+        ;;
     *)
-        echo "[run.sh] FAIL: unknown milestone: $MILESTONE (allowed: m1 | m2 | m3)" >&2
+        echo "[run.sh] FAIL: unknown milestone: $MILESTONE (allowed: m1 | m2 | m3 | m4 | all)" >&2
         exit 1
         ;;
 esac
@@ -53,6 +81,11 @@ fi
 
 echo "[run.sh] building rust-connect (cargo build --locked) as $(id -un)…"
 cargo build --locked
+# Examples (mpris_fake_player) are referenced by the harness when
+# RC_MPRIS_FAKE is set. Build them all up-front so the smoke doesn't need
+# to know which ones it needs; `cargo build --examples --locked` is
+# incremental against target/ so this is cheap on cache hits.
+cargo build --examples --locked
 
 RC_BIN="$REPO_ROOT/target/debug/rust-connect"
 [[ -x "$RC_BIN" ]] || { echo "[run.sh] FAIL: expected binary missing: $RC_BIN" >&2; exit 1; }
@@ -63,4 +96,7 @@ SMOKE="$REPO_ROOT/tests/interop/${MILESTONE}_smoke.sh"
 exec "${SUDO[@]}" env \
     "$BIN_ENV=$RC_BIN" \
     "$SABOTAGE_ENV=$SABOTAGE_VAL" \
+    "RC_KDECONNECTD=${RC_KDECONNECTD:-}" \
+    "RC_RUST_DISPLAY=${RC_RUST_DISPLAY:-}" \
+    "RC_MPRIS_FAKE=${RC_MPRIS_FAKE:-}" \
     bash "$SMOKE"
