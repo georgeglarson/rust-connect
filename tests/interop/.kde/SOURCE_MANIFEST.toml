@@ -1,0 +1,14 @@
+# Pinned-source KDE reference build (M4 of Task 3.2, vk #991)
+# Built against kdeconnect-kde tag v26.04.3
+[kde]
+source_repo = "https://invent.kde.org/network/kdeconnect-kde.git"
+source_tag = "v26.04.3"
+source_commit = "c687cf116e5c04354b130ff8cbe3e8900c583a5e"
+build_host = "laptop"
+build_date_utc = "2026-08-14T23:48:55Z"
+cmake_minimum = "3.16"
+build_type = "Release"
+build_jobs = 32
+builddep_packages_count = 89
+build_artifact = "tests/interop/.kde/install/bin/kdeconnectd"
+selection = "via RC_KDECONNECTD env var; empty/unset = distro /usr/bin/kdeconnectd"

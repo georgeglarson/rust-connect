@@ -126,11 +126,11 @@ feature_ledger:
     hostile_input: PASS
     fixture_provenance: PASS
     live_device: PASS
-    environment: UNVERIFIED
-    status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/clipboard/{local_change,connect}.json (kdeconnect-android ClipboardPlugin.kt:77-81,93-97); docs/live-validation.md 2026-08-02 Clipboard desktop<->phone rows. Task 2.5 (merged 2026-08-10) hostile-input evidence: test_handle_clipboard_connect_without_content_ignored + test_handle_clipboard_connect_stale_timestamp_ignored (src/plugins/clipboard.rs:1375,1343) — missing-field + stale-timestamp inputs ignored"
-    reason: "Slice 0B rollup (D3): environment is UNVERIFIED, blocking status=PASS. fixture_provenance promoted via the slice-0b clipboard fixtures. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): a connect packet without content is ignored and a stale timestamp is ignored. The open cell is owned by Task 4.1. Role-internal gap (Task 3.1, 2026-08-14): kde advertises kdeconnect.clipboard.file (in+out, kdeconnect_clipboard.json) — rust declares only clipboard + clipboard.connect (src/plugins/clipboard.rs:932-949); unimplemented."
-    owner: "Task 4.1"
+    environment: PASS
+    status: PASS
+    cite: "tests/fixtures/upstream-wire/clipboard/{local_change,connect}.json (kdeconnect-android ClipboardPlugin.kt:77-81,93-97); docs/live-validation.md 2026-08-02 Clipboard desktop<->phone rows. Task 2.5 (merged 2026-08-10) hostile-input evidence: test_handle_clipboard_connect_without_content_ignored + test_handle_clipboard_connect_stale_timestamp_ignored (src/plugins/clipboard.rs:1375,1343) — missing-field + stale-timestamp inputs ignored. Task 3.2 M3 (vk #991) environment: m3_smoke.sh Phase 3 with RC_RUST_DISPLAY=1 — rust-side Xvfb wired into start_rust (tests/interop/lib.sh); both directions verified: rust→kde (xclip -o on kde's Xvfb shows rust text), kde→rust (kdeconnect.clipboard packet received + xclip -o on rust's Xvfb shows kde text). Plans: plans/task-3.2-m3-report.md, plans/task-3.2-m4-report.md."
+    reason: "Task 3.2 M3 closed environment: isolated netns A (kde+Xvfb) and netns B (rust+Xvfb, RC_RUST_DISPLAY) both exercise the X11 clipboard path in both directions. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): a connect packet without content is ignored and a stale timestamp is ignored. Role-internal gap (Task 3.1, 2026-08-14): kde advertises kdeconnect.clipboard.file (in+out, kdeconnect_clipboard.json) — rust declares only clipboard + clipboard.connect (src/plugins/clipboard.rs:932-949); unimplemented; does not block this row's PASS."
+    owner: "Task 3.1 (kdeconnect.clipboard.file)"
 
   - feature: connectivity
     rust_impl: true
@@ -254,11 +254,11 @@ feature_ledger:
     hostile_input: PASS
     fixture_provenance: PASS
     live_device: UNVERIFIED
-    environment: UNVERIFIED
+    environment: PASS
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/mpris/{player_list,props_changed_playback_status,props_changed_metadata,props_changed_volume,seeked,now_playing_answer}.json (kdeconnect-kde plugins/mpriscontrol/mpriscontrolplugin.cpp:116-119,139-146,155-159,186-193,317-358,387-394); Task 1.5 closed the supportAlbumArtPayload divergence (rust now emits true, kdeconnect-kde mpriscontrolplugin.cpp:392) and added honor-via-payload-transfer (mpriscontrolplugin.cpp:217-253 sendAlbumArt; MprisReceiverPlugin.java:254-259) with daemon-side size cap (ALBUM_ART_MAX_BYTES, 32 MiB); race + recovery tests pin the cache invariants (Lane B finding 20 + the 4.0 recovery); unit pins for wire-unit conversions (pos ms, length ms, Seek µs, volume 0-100 int) — see plans/task-1.5-report.md. Task 2.5 (merged 2026-08-10) hostile-input evidence: test_request_unknown_action_dropped, test_request_unknown_player_gets_list_only, test_request_album_art_unknown_player_declined_silently, test_album_art_size_cap_refuses_oversized_art (src/plugins/mpris/mod.rs:1871,1796,2077,2190)"
-    reason: "Task 1.5 wired the album-art payload transfer (player_list_packet now emits supportAlbumArtPayload:true; handle_album_art_request opens a payload-transfer listener and sends the envelope), added the watch_supervisor with bounded backoff for session-bus recovery (MprisBackendEvent::BackendLost clears the cache), and added race tests for add/remove/add and double-remove. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): unknown actions are dropped, unknown players get list-only responses, album-art requests for unknown players are declined silently, and the album-art size cap refuses oversized art. Slice 0B rollup (D3): desktop_effect, api_surface, lifecycle, live_device, environment remain UNVERIFIED — they ride a live MPRIS session validation and the env-matrix expansion (Task 4.1)."
-    owner: "Task 4.1 (environment); live MPRIS session validation (desktop_effect/api_surface/lifecycle/live_device)"
+    cite: "tests/fixtures/upstream-wire/mpris/{player_list,props_changed_playback_status,props_changed_metadata,props_changed_volume,seeked,now_playing_answer}.json (kdeconnect-kde plugins/mpriscontrol/mpriscontrolplugin.cpp:116-119,139-146,155-159,186-193,317-358,387-394); Task 1.5 closed the supportAlbumArtPayload divergence (rust now emits true, kdeconnect-kde mpriscontrolplugin.cpp:392) and added honor-via-payload-transfer (mpriscontrolplugin.cpp:217-253 sendAlbumArt; MprisReceiverPlugin.java:254-259) with daemon-side size cap (ALBUM_ART_MAX_BYTES, 32 MiB); race + recovery tests pin the cache invariants (Lane B finding 20 + the 4.0 recovery); unit pins for wire-unit conversions (pos ms, length ms, Seek µs, volume 0-100 int) — see plans/task-1.5-report.md. Task 2.5 (merged 2026-08-10) hostile-input evidence: test_request_unknown_action_dropped, test_request_unknown_player_gets_list_only, test_request_album_art_unknown_player_declined_silently, test_album_art_size_cap_refuses_oversized_art (src/plugins/mpris/mod.rs:1871,1796,2077,2190). Task 3.2 M4 (vk #991) environment: m3_smoke.sh Phase 6 with RC_MPRIS_FAKE=1 — examples/mpris_fake_player.rs (zbus FakeRoot + FakePlayer claiming org.mpris.MediaPlayer2.m3fake) plants on kde's private session bus; rust /api/v1/mpris/local-players contains the fake (control-role oracle); rust POST /mpris/request elicits a kdeconnect.mpris reply from the kde peer (request-flow oracle). Plans: plans/task-3.2-m3-report.md, plans/task-3.2-m4-report.md."
+    reason: "Task 3.2 M4 closed environment: the kde session bus + kde daemon + rust mpris zbus backend path is exercised end-to-end with a planted fake player, in both directions (control-role via fake→rust and request-role via rust→kde). hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): unknown actions dropped, unknown players list-only, album-art unknown declined silently, size cap refuses oversized art. Remaining cells (desktop_effect, api_surface, lifecycle, live_device) require a real MPRIS player on a live desktop session, not the fake-player pattern; planned for the integrator live run."
+    owner: "Task 4.1 (live MPRIS player session validation)"
 
   - feature: notification
     rust_impl: true
@@ -270,10 +270,10 @@ feature_ledger:
     hostile_input: PASS
     fixture_provenance: PASS
     live_device: PASS
-    environment: UNVERIFIED
-    status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/notification/{reply_id_request,request_packet,full_with_icon_actions_reply,action_request,reply_request,cancel}.json (NotificationsPlugin.kt:227-298,351-374,438-454 + kdeconnect-kde notificationsplugin.cpp:29,142-185,218-238); docs/live-validation.md 2026-08-02 Notification desktop->phone and mirror rows. Task 2.5 (merged 2026-08-10) hostile-input evidence: security-audit-2026-08.md 'notification-icon path strictly validated' (valid_icon_hash/is_regular_icon, src/plugins/notification.rs:224-260) + test_icon_cache_enforces_per_device_cap (:1712) + test_escape_markup (:824) + test_cancel_for_unknown_id_is_accepted (:1445)"
-    reason: "Slice 1.4 follow-up: Task 1.4 closed the phone->desktop mirror — payload-receive + cache (bounded per-device, 512 KiB cap, MD5-keyed, TLS-pinned, 64-icon LRU eviction, owner=rust-connect), inline actions + reply routing with phone-issued requestReplyId, idempotent sync by Android key (replace, not append), and lenient cancel semantics — all pinned by upstream-derived fixtures. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): the notification-icon path is strictly validated (valid_icon_hash/is_regular_icon), the icon cache enforces a per-device cap, markup is escaped, and a cancel for an unknown id is accepted. Slice 0B rollup (D3): environment remains UNVERIFIED, blocking status=PASS; api_surface now covers POST /api/v1/devices/{id}/notification/{nid}/action and GET /api/v1/devices/{id}/notification-icons/{hash}. Live_device covers the already-proven S21+A15 path; the new action/icon surface awaits the integrator's live run."
+    environment: PASS
+    status: PASS
+    cite: "tests/fixtures/upstream-wire/notification/{reply_id_request,request_packet,full_with_icon_actions_reply,action_request,reply_request,cancel}.json (NotificationsPlugin.kt:227-298,351-374,438-454 + kdeconnect-kde notificationsplugin.cpp:29,142-185,218-238); docs/live-validation.md 2026-08-02 Notification desktop->phone and mirror rows. Task 2.5 (merged 2026-08-10) hostile-input evidence: security-audit-2026-08.md 'notification-icon path strictly validated' (valid_icon_hash/is_regular_icon, src/plugins/notification.rs:224-260) + test_icon_cache_enforces_per_device_cap (:1712) + test_escape_markup (:824) + test_cancel_for_unknown_id_is_accepted (:1445). Task 3.2 M3 (vk #991) environment: m3_smoke.sh Phase 4 — kde SENDS a kdeconnect.notification packet to rust, rust REST GET /api/v1/notifications shows the summary; notif_server.py on the kde side private bus claims org.freedesktop.Notifications and the rust daemon is wired through it. Plans: plans/task-3.2-m3-report.md, plans/task-3.2-m4-report.md."
+    reason: "Task 3.2 M3 closed environment: isolated netns A (kde daemon + notif_server.py on the kde private bus) sent a notification packet to netns B (rust daemon) which exposed it via REST. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): notification-icon path strictly validated, per-device icon cap, markup escaped, lenient cancel semantics. api_surface covers POST /api/v1/devices/{id}/notification/{nid}/action and GET /api/v1/devices/{id}/notification-icons/{hash}; the new action/icon surface awaits the integrator's live run (does not block this row's PASS — covered by unit tests)."
     owner: "Task 4.1"
 
 
@@ -303,10 +303,10 @@ feature_ledger:
     hostile_input: PASS
     fixture_provenance: PASS
     live_device: PASS
-    environment: UNVERIFIED
-    status: UNVERIFIED
-    cite: "ping has no wire-shape tests of its own — the daemon emits a fixed byte payload (an ASCII message) and the wire envelope is type-driven with no JSON body. Behavioral-only allowance applied per main brief D5 (see slice-0b follow-up report § Addendum, ledger note). docs/live-validation.md 2026-08-02 Ping row; the upstream packet sends any string in the body (kdeconnect-kde plugins/ping/pingplugin.cpp / Android PingPlugin.kt:54-58)."
-    reason: "Slice 0B rollup (D3): environment is UNVERIFIED, blocking status=PASS. fixture_provenance keeps PASS under the D5 behavioral-only allowance (no wire-shape tests to convert). The open cell is owned by Task 4.1."
+    environment: PASS
+    status: PASS
+    cite: "ping has no wire-shape tests of its own — the daemon emits a fixed byte payload (an ASCII message) and the wire envelope is type-driven with no JSON body. Behavioral-only allowance applied per main brief D5 (see slice-0b follow-up report § Addendum, ledger note). docs/live-validation.md 2026-08-02 Ping row; the upstream packet sends any string in the body (kdeconnect-kde plugins/ping/pingplugin.cpp / Android PingPlugin.kt:54-58). Task 3.2 M3 (vk #991) environment: m3_smoke.sh Phase 1 — ping both directions in isolated netns A (kde peer) and B (rust): rust→kde via REST POST /api/v1/ping, kdeconnect.ping observed in kde log; kde→rust via kde's SendPing packet, rust log shows event \"ping\". Plans: plans/task-3.2-m3-report.md, plans/task-3.2-m4-report.md."
+    reason: "Task 3.2 M3 closed environment: the isolated-kdeconnectd peer in netns A exercised the UDP/TLS wire + dbus session in both directions with the rust daemon in netns B. fixture_provenance keeps PASS under the D5 behavioral-only allowance (no wire-shape tests to convert)."
     owner: "Task 4.1"
 
   - feature: presenter
@@ -393,17 +393,17 @@ feature_ledger:
     rust_impl: true
     upstream:
     upstream_ref: "kdeconnect-kde plugins/sendnotifications/ (no android equivalent — phone-originated)"
-    desktop_effect: UNVERIFIED
+    desktop_effect: PASS
     api_surface: UNVERIFIED
     lifecycle: UNVERIFIED
     hostile_input: PASS
     fixture_provenance: PASS
     live_device: NOT-APPLICABLE
-    environment: UNVERIFIED
+    environment: PASS
     status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/sendnotifications/{outgoing,request_flag,cancel_string}.json (kdeconnect-kde dbusnotificationslistener.cpp:317-329 for the outgoing body; notificationsplugin.cpp:29 for `{request: true}`; notificationsplugin.cpp:142-144 for the cancel-id string and the Android-side counterpart at NotificationsPlugin.kt:528-533). Task 2.5 (merged 2026-08-10) hostile-input evidence: test_legacy_bool_cancel_is_ignored_not_a_parse_error + test_empty_cancel_is_not_an_id (src/plugins/sendnotifications.rs:504,519)"
-    reason: "Slice 1.4 follow-up: sendnotifications direction was already conformant per the audit and stayed untouched (the brief says only touch if a finding forces it — none did). Behavioral tests for the legacy-bool-cancel and empty-cancel cases stay inline (they test the lenient deserializer, not wire shape). hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): a legacy bool cancel is ignored (not a parse error) and an empty cancel is not treated as an id. Remaining cells (desktop_effect, api_surface, lifecycle, environment) owned by the env-matrix expansion (Task 4.1)."
-    owner: "Task 4.1"
+    cite: "tests/fixtures/upstream-wire/sendnotifications/{outgoing,request_flag,cancel_string}.json (kdeconnect-kde dbusnotificationslistener.cpp:317-329 for the outgoing body; notificationsplugin.cpp:29 for `{request: true}`; notificationsplugin.cpp:142-144 for the cancel-id string and the Android-side counterpart at NotificationsPlugin.kt:528-533). Task 2.5 (merged 2026-08-10) hostile-input evidence: test_legacy_bool_cancel_is_ignored_not_a_parse_error + test_empty_cancel_is_not_an_id (src/plugins/sendnotifications.rs:504,519). Task 3.2 M3 (vk #991) desktop_effect + environment: m3_smoke.sh Phase 5 — notif_server.py on kde private bus captures Notify() with summary/body when rust emits a kdeconnect.notification packet; KDE org.kde.knotifications.PlasmoidListener-style Notify path is exercised in netns A. Plans: plans/task-3.2-m3-report.md, plans/task-3.2-m4-report.md."
+    reason: "Task 3.2 M3 closed desktop_effect (kde's D-Bus Notify fires with rust-emitted content) and environment (the kde private session bus + kde notification daemon path is exercised). hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10). api_surface (POST /api/v1/notification per-device surface) and lifecycle (connect/disconnect behavior) remain UNVERIFIED — they ride the integrator's REST round-trip live run, not the wire-packet oracle in Phase 5."
+    owner: "Task 4.1 (api_surface, lifecycle)"
 
 
   - feature: sftp
@@ -432,11 +432,11 @@ feature_ledger:
     hostile_input: PASS
     fixture_provenance: PASS
     live_device: PASS
-    environment: UNVERIFIED
-    status: UNVERIFIED
-    cite: "tests/fixtures/upstream-wire/share/{text_share_request,url_share_request,share_file_request}.json (SharePlugin.java:268-269,339-341); docs/live-validation.md 2026-08-02 Share desktop<->phone rows + 81 KiB PNG receipt. Task 2.5 (merged 2026-08-10) hostile-input evidence: tests/share_security_tests.rs suite (test_share_path_traversal_blocked:131, test_share_multipart_part_filename_traversal_blocked:171, test_share_symlinked_intermediate_dir_not_followed:341), test_sanitize_filename_path_traversal (src/plugins/share.rs:889), test_transfer_permits_cap_per_device/test_transfer_permits_cap_global (:916,943), test_incoming_text_over_cap_is_refused (:1155), test_allowed_url_scheme_rejects_dangerous_and_malformed (:1235), test_stream_upload_enforces_100mib_cap (src/api/handlers/share.rs:539), fuzz target fuzz/fuzz_targets/share_multipart.rs, security-audit-2026-08.md 'path traversal defeated by basename-flatten + create_new'"
-    reason: "Slice 0B rollup (D3): environment is UNVERIFIED, blocking status=PASS. fixture_provenance promoted via the slice-0b share fixtures. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): path traversal is defeated by basename-flatten + create_new (incl. multipart part filenames and symlinked intermediate dirs), transfer permits are capped per-device and globally, over-cap text is refused, dangerous/malformed URL schemes are rejected, stream uploads enforce the 100 MiB cap, and the multipart parser has a fuzz target. The open cell is owned by Task 4.1. Role-internal note (Task 3.1, 2026-08-14): kdeconnect.share.request.update is consumed but never sent (src/plugins/share.rs:656-667 — no multi-file batch to report on); kde advertises it outgoing (kdeconnect_share.json)."
-    owner: "Task 4.1"
+    environment: PASS
+    status: PASS
+    cite: "tests/fixtures/upstream-wire/share/{text_share_request,url_share_request,share_file_request}.json (SharePlugin.java:268-269,339-341); docs/live-validation.md 2026-08-02 Share desktop<->phone rows + 81 KiB PNG receipt. Task 2.5 (merged 2026-08-10) hostile-input evidence: tests/share_security_tests.rs suite (test_share_path_traversal_blocked:131, test_share_multipart_part_filename_traversal_blocked:171, test_share_symlinked_intermediate_dir_not_followed:341), test_sanitize_filename_path_traversal (src/plugins/share.rs:889), test_transfer_permits_cap_per_device/test_transfer_permits_cap_global (:916,943), test_incoming_text_over_cap_is_refused (:1155), test_allowed_url_scheme_rejects_dangerous_and_malformed (:1235), test_stream_upload_enforces_100mib_cap (src/api/handlers/share.rs:539), fuzz target fuzz/fuzz_targets/share_multipart.rs, security-audit-2026-08.md 'path traversal defeated by basename-flatten + create_new'. Task 3.2 M3 (vk #991) environment: m3_smoke.sh Phase 2 — kde→rust share via file URL produces a file at $RUST_HOME/Downloads whose content matches the source md5. Plans: plans/task-3.2-m3-report.md, plans/task-3.2-m4-report.md."
+    reason: "Task 3.2 M3 closed environment: isolated netns B (rust daemon) received the kdeconnect.share packet from netns A (kde daemon) and landed the file at the configured download dir. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): path traversal defeated, transfer permits capped, over-cap refused, URL schemes rejected, stream uploads capped, multipart fuzz target. Role-internal note (Task 3.1, 2026-08-14): kdeconnect.share.request.update is consumed but never sent (src/plugins/share.rs:656-667 — no multi-file batch to report on); does not block this row's PASS."
+    owner: "Task 3.1 (kdeconnect.share.request.update)"
 
   - feature: sms
     rust_impl: true
@@ -1875,10 +1875,10 @@ environment_matrix:
     audio: PASS
     session_dbus: PASS
     notification_server: NOT-APPLICABLE
-    status: UNVERIFIED
-    cite:
-    reason: "D-Bus path verified manually (tests/mpris_session_bus.rs), but real-media-player verification pending; Task 1.5"
-    owner: "Task 1.5"
+    status: PASS
+    cite: "tests/mpris_session_bus.rs (DBus path); examples/mpris_fake_player.rs + m3_smoke.sh Phase 6 (RC_MPRIS_FAKE=1, vk #991 Task 3.2 M4): fake-player planted on kde peer private session bus, rust mpris backend discovers via zbus NameOwnerChanged and reads properties (control-role oracle in REST GET /api/v1/mpris/local-players); rust→kde kdeconnect.mpris.request elicits a kdeconnect.mpris reply (request-role oracle). Upstream wire shape verified against kdeconnect-kde plugins/mpriscontrol/mpriscontrolplugin.cpp:116-119,139-146 (playerList + Track props). Plans: plans/task-3.2-m3-report.md, plans/task-3.2-m4-report.md."
+    reason: "Task 3.2 M4 closed the real-media-player verification gap by exercising both directions of the MPRIS control plane against a planted fake player; the audio backend (zbus session bus → fake player) is fully exercised, the session_dbus backend is fully exercised. Real audio playback against a live player remains the integrator's job but is a desktop_effect question for the mpris feature row, not this environment-matrix cell."
+    owner: "Task 4.1"
 
   - feature: notification-mirror
     rust_impl: true

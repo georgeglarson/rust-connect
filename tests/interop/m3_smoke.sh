@@ -17,6 +17,7 @@
 #   6: mpris
 #   7: runcommand both directions
 #   8: remotesystemvolume-out
+#   9: lock + battery wire-contract conformance (vk #1018 — gated)
 # SPIKES (timeboxed ~30 min each, after cheap batch is GREEN):
 #   A: remotekeyboard/mousepad RECEIVE
 #   B: systemvolume RECEIVE
@@ -249,7 +250,10 @@ check "rust→kde clipboard: xclip -o in kde Xvfb shows rust text" \
 # detects the selection change → sends kdeconnect.clipboard → rust
 # receives. But the rust plugin's WaylandClipboard / X11Clipboard
 # needs a working session — the rust harness has DISPLAY= and no
-# WAYLAND_DISPLAY, so the plugin degrades. This is a recorded wall.
+# WAYLAND_DISPLAY, so the plugin degrades. This is a recorded wall
+# UNLESS the harness provides a rust-side Xvfb (RC_RUST_DISPLAY=1),
+# in which case xclip/xsel can read what kde pushed. M4 unlocks this
+# direction; m3 standalone keeps the wall.
 if [[ "$SAB_SKIP_CLIPBOARD_KDE_SEND" == "1" ]]; then
     log "SABOTAGE=skip-clipboard-kde-send: NOT writing to kde X11 clipboard"
 else
@@ -275,14 +279,32 @@ else
     if [[ "$RUST_CLIP_LOG_HIT" == "1" ]]; then
         # Packet arrived on the rust side. Did it get written out? With
         # no session bus + no X/Wayland backend, the answer is no.
-        log "  rust received kdeconnect.clipboard packet but has no session clipboard backend (no DISPLAY, no WAYLAND_DISPLAY)"
-        log "  POLICY (lib.sh:587-590): start_rust sets DISPLAY=; clipboard backend degrades to 'no clipboard sink'"
-        CLIP_KDE_TO_RUST_WALL=1
+        log "  rust received kdeconnect.clipboard packet"
+        if [[ -n "${RC_RUST_DISPLAY:-}" ]]; then
+            # rust Xvfb wired up — oracle via xclip -o inside ns B on the
+            # rust display. The x11 watcher (clipboard.rs poll-fallback or
+            # clipnotify if present) reads the kde-pushed content and the
+            # backend's set_clipboard writes to the X11 selection.
+            wait_for 10 "rust X11 clipboard to show kde text" \
+                bash -c "ip netns exec \"$NS_B\" env \"DISPLAY=$RUST_DISPLAY\" xclip -o -selection clipboard 2>/dev/null | grep -qF '$CLIP_K2R_TEXT'"
+            RUST_XCLIP_OUT=$(ip netns exec "$NS_B" env "DISPLAY=$RUST_DISPLAY" xclip -o -selection clipboard 2>/dev/null || true)
+            if [[ "$RUST_XCLIP_OUT" == *"$CLIP_K2R_TEXT"* ]]; then
+                CLIP_KDE_TO_RUST_OK=0
+                log "  rust X11 clipboard (xclip -o) contains: $RUST_XCLIP_OUT"
+            else
+                log "  rust X11 clipboard xclip -o returned: '${RUST_XCLIP_OUT:-<empty>}' (expected to contain $CLIP_K2R_TEXT)"
+                CLIP_KDE_TO_RUST_WALL=1
+            fi
+        else
+            log "  no rust-side Xvfb (RC_RUST_DISPLAY empty); src/plugins/clipboard.rs degrades to 'no clipboard sink' — wall retained"
+            log "  POLICY: lib.sh start_rust defaults DISPLAY=; set RC_RUST_DISPLAY=1 to unblock"
+            CLIP_KDE_TO_RUST_WALL=1
+        fi
     fi
 fi
 if [[ "$CLIP_KDE_TO_RUST_WALL" == "1" ]]; then
     log "WALL phase 3 (kde→rust clipboard): rust daemon has no DISPLAY and no WAYLAND_DISPLAY; src/plugins/clipboard.rs degrades silently"
-    log "  recorded as wall, not silent skip — M3 brief § clipboard both directions"
+    log "  recorded as wall, not silent skip — M3 brief § clipboard both directions. M4 unblocks this with RC_RUST_DISPLAY=1."
 else
     check "kde→rust clipboard: rust received + rendered kde text" \
         "$CLIP_KDE_TO_RUST_OK" "no signal in $RUST_LOG or /api/v1/clipboard"
@@ -368,18 +390,54 @@ check "rust→kde notifications: notify monitor captured Notify with rust summar
 # ---------------------------------------------------------------- phase 6
 # mpris. Per the brief, plant a zbus fake-player on the kdeconnectd
 # private bus (tests/mpris_bus_recovery.rs:23-80 pattern), drive metadata
-# changes, assert rust REST /api/v1/devices/<id>/mpris reflects the player.
+# changes, assert rust REST /api/v1/mpris/local-players reflects the player.
 #
-# Wall candidates:
-#  - The rust mpris plugin needs a real session bus AND a fake player
-#    registered. The harness points RC_DBUS_SESSION_BUS=$DBUS_ADDR, but
-#    planting the fake player requires building a tiny zbus helper
-#    binary — out of scope for the cheap batch. Recorded as a wall.
+# M4 unblocks this with examples/mpris_fake_player (built via
+# cargo build --examples). Set RC_MPRIS_FAKE=1 to plant it; the
+# default behavior (no fake player) keeps the cheap-batch wall.
 log "=== Phase 6: mpris (zbus fake-player) ==="
-log "WALL phase 6: mpris control-role oracle requires a planted zbus fake"
-log "  player on \$DBUS_SESSION_BUS (tests/mpris_bus_recovery.rs:23-80 pattern)"
-log "  with RC_DBUS_SESSION_BUS=$DBUS_ADDR wired — needs a compiled zbus"
-log "  helper binary not in scope for the cheap batch. See plans/task-3.2-m3-report.md"
+MPRIS_OK=1
+if [[ -n "$RC_MPRIS_FAKE" ]]; then
+    start_mpris_fake
+    # The rust daemon connects to RC_DBUS_SESSION_BUS at startup; player
+    # discovery happens on first NameOwnerChanged after connect. The mpris
+    # zbus backend scans the bus for `org.mpris.MediaPlayer2.*` names; the
+    # fake player is one. Give the discovery loop up to 10s to surface it
+    # via GET /api/v1/mpris/local-players.
+    if wait_for 10 "rust /api/v1/mpris/local-players to include m3fake" \
+        bash -c "ip netns exec \"$NS_B\" curl -sf -H 'X-API-Key: $API_KEY' http://127.0.0.1:9090/api/v1/mpris/local-players 2>/dev/null | grep -q 'm3fake'"; then
+        MPRIS_OK=0
+        RUST_LOCAL=$(ip netns exec "$NS_B" curl -sf -H "X-API-Key: $API_KEY" \
+            "http://127.0.0.1:9090/api/v1/mpris/local-players" 2>/dev/null || true)
+        log "  rust /api/v1/mpris/local-players: $RUST_LOCAL"
+    fi
+    check "mpris control-role: rust sees the planted fake player via session bus" \
+        "$MPRIS_OK" "no m3fake in /api/v1/mpris/local-players"
+    # Reverse direction: rust POSTs /api/v1/devices/<kde>/mpris/request →
+    # kdeconnect.mpris.request packet → kde mprisremote plugin handles it,
+    # sending back a kdeconnect.mpris response with the player list. Oracle
+    # is the rust daemon log showing the reply (the kde mprisremote plugin
+    # itself doesn't log every packet at the default qt category debug
+    # level, so we read the wire confirmation from the rust side which
+    # DOES log every received packet).
+    RUST_REQ_OK=1
+    RUST_REQ_RCVD_OFFSET=$(sed 's/\x1b\[[0-9;]*m//g' "$RUST_LOG" | grep -cE 'packet_type: kdeconnect.mpris\b' || true)
+    rc_api_post_body "/api/v1/devices/$KDE_ID/mpris/request" "{}" >/dev/null 2>&1 \
+        || log "  /mpris/request returned non-zero (non-fatal)"
+    if wait_for 10 "rust log to show kdeconnect.mpris reply (post-requestPlayerList)" \
+        bash -c "[[ \$(sed 's/\x1b\[[0-9;]*m//g' '$RUST_LOG' | grep -cE 'packet_type: kdeconnect.mpris\b') -gt $RUST_REQ_RCVD_OFFSET ]]"; then
+        RUST_REQ_OK=0
+    fi
+    check "mpris request flow: rust→kde kdeconnect.mpris.request elicits kde reply" \
+        "$RUST_REQ_OK" "no kdeconnect.mpris reply in $RUST_LOG after the request"
+    stop_mpris_fake
+else
+    log "WALL phase 6: mpris control-role oracle requires a planted zbus fake"
+    log "  player on \$DBUS_SESSION_BUS (tests/mpris_bus_recovery.rs:23-80 pattern)"
+    log "  with RC_DBUS_SESSION_BUS=$DBUS_ADDR wired — needs a compiled zbus"
+    log "  helper binary not in scope for the cheap batch."
+    log "  M4 unlocks this with RC_MPRIS_FAKE=1 (examples/mpris_fake_player)."
+fi
 
 # ---------------------------------------------------------------- phase 7
 # runcommand both directions. Wall per vk #1007 (rust production
@@ -415,6 +473,66 @@ log "  side so pactl subscribe has an audio daemon to talk to. The"
 log "  cheap batch doesn't bring that up; spike B investigates."
 log "  remotesystemvolumeplugin.h:40 (volumeChanged signal) and"
 log "  systemvolumeplugin-pulse.cpp:69-88 (deltas) are the oracle surfaces."
+
+# --------------------------------------------------------------------- 9
+# Phase 9: lock + battery wire-contract conformance (vk #1018).
+#
+# This phase documents the wire-contract oracle that the harness will
+# use to validate the vk #1018 rewrite (kdeconnect.lock reads/emits
+# `locked` today; the upstream contract is `isLocked` on
+# `kdeconnect.lock` and `setLocked` on `kdeconnect.lock`, with
+# `kdeconnect.lock.request` as the state-query packet whose body is
+# `{}`. Battery: `kdeconnect.battery.request` body is empty today;
+# upstream uses `{request: true}` — pinned by
+# tests/fixtures/upstream-wire/{lock,battery}/).
+#
+# Pre-rewrite this phase is a WALL — the rust plugin parses
+# `body.locked` (src/plugins/lock.rs:65) and emits `body.locked`
+# (src/plugins/lock.rs:95), neither of which any upstream peer uses,
+# so the kde side will silently drop the packet and no `lockUpdate`
+# round-trip is observable.
+#
+# When vk #1018 lands, this phase becomes the validator:
+#
+#   1. rust → kde (setLocked): POST /api/v1/devices/{id}/lock with
+#      {action:"lock"} → kde log shows kdeconnect.lock packet body
+#      `{"setLocked": true}` (NOT kdeconnect.lock.request; NOT
+#      `locked`). Asserted by grep'ing $KDE_LOG for
+#      "kdeconnect.lock" with body containing "setLocked":true.
+#
+#   2. kde → rust (requestLocked → isLocked reply): kick the kde side
+#      to query the rust daemon's last-known lock state (e.g. via
+#      `qdbus org.kde.kdeconnect /modules/kdeconnect
+#      org.kde.kdeconnect.daemon.requestLocked <rustId>`); rust log
+#      shows kdeconnect.lock.request received; rust reply packet is
+#      kdeconnect.lock with body `{"isLocked": <bool>}`; the kde log
+#      captures the reply and updates its UI.
+#
+#   3. battery.request body: rust emits kdeconnect.battery.request on
+#      peer-connect; the kde plugin logs the request and replies
+#      with kdeconnect.battery. Asserted by grep'ing $KDE_LOG for
+#      "kdeconnect.battery.request" body containing `"request":true`.
+#
+#   The desktop_effect — actually locking the phone screen via
+#   loginctl/DPMS — is phone-only and not in harness scope. The
+#   wire-contract oracle is what this lane proves.
+log "=== Phase 9: lock + battery wire contract (vk #1018 — gated) ==="
+if grep -q "kdeconnect.lock.request" src/plugins/lock.rs 2>/dev/null \
+        && grep -q '"locked"' src/plugins/lock.rs 2>/dev/null; then
+    log "WALL phase 9: vk #1018 lock rewrite NOT landed yet — rust"
+    log "  plugin still parses/emits \`locked\` on kdeconnect.lock and"
+    log "  uses kdeconnect.lock.request for setLocked. Wire-contract"
+    log "  oracle (see phase header) is queued for when the rewrite"
+    log "  lands; desktop_effect (actual screen lock) is phone-only."
+    log "  feature ledger \`lock\` row stays FAIL until then."
+else
+    log "phase 9: vk #1018 rewrite appears landed — flip this phase"
+    log "  from WALL to the wire-contract assertions documented above."
+    log "  Not auto-flipped because the rewrite hasn't actually merged"
+    log "  at M4 close — this is a hand-flipped gate."
+    log "WALL phase 9 (defensive): rewrite detection is heuristic;"
+    log "  manual gate remains until Phase 9 assertions are written."
+fi
 
 # ---------------------------------------------------------------- spikes
 # Timeboxed investigations. Each is ~30 min wall and records what it
