@@ -85,6 +85,15 @@ a session D-Bus (`DBUS_SESSION_BUS_ADDRESS`, inherited from the graphical
 session). Without one it degrades to advertising an empty player list, and
 logs the degradation.
 
+The runcommand plugin executes shell commands the phone triggers by name,
+on an allowlist defined on the desktop. Entries live in the config file
+under `[[runcommand.commands]]` and are loaded once at boot — there is
+intentionally no runtime write path, so the allowlist can only change by
+editing the config and restarting the daemon. Without an entry the
+allowlist stays empty and every request is refused (safe-by-default).
+Commands run via `/bin/sh -c` with a 30s timeout and a 64KB output cap,
+matching upstream.
+
 Something not working? See [docs/troubleshooting.md](docs/troubleshooting.md)
 for firewall, pairing, clipboard, remote input, and certificate fixes.
 
@@ -177,6 +186,43 @@ It is a technical interface, not a polished product surface: it exposes
 every device endpoint, every plugin action, and the live event stream, so
 that a failure can be localized to the API rather than guessed at. Disable
 it with `ui_enabled = false` in the config file; it is on by default.
+
+## Configuration
+
+Settings live in `~/.config/rust-connect/config.toml` (TOML; missing
+fields fall back to defaults). The file is loaded once at boot — there
+is no live reload.
+
+### `[runcommand]` — desktop-defined command allowlist
+
+Each `[[runcommand.commands]]` table adds one shell command the
+runcommand plugin will advertise to paired phones and execute when the
+phone sends the matching `key`. The allowlist is **desktop-global**
+(visible to every paired device) and is loaded once at boot; absent
+section means every command request is refused.
+
+```toml
+[[runcommand.commands]]
+key = "suspend"
+name = "Suspend"
+command = "systemctl suspend"
+
+[[runcommand.commands]]
+key = "lock"
+name = "Lock screen"
+command = "loginctl lock-session"
+```
+
+- `key` — the lookup the phone sends back (`{"key": "<key>"}`). Must
+  be unique across the allowlist.
+- `name` — human-readable label shown in the phone's UI.
+- `command` — shell snippet executed via `/bin/sh -c`.
+
+Entries with empty `key`, `name`, or `command` are skipped with a
+warning at boot (a bad row never fails the daemon). Duplicate keys
+keep the first entry and skip the rest with a warning. There is no
+runtime write path — to change the allowlist, edit the file and
+restart the daemon.
 
 ## Security
 
