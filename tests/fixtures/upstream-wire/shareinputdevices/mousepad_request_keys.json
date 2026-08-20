@@ -1,0 +1,7 @@
+[
+  { "key": "a", "specialKey": 0, "shift": false, "ctrl": false, "alt": false, "super": false },
+  { "key": "A", "specialKey": 0, "shift": true,  "ctrl": false, "alt": false, "super": false },
+  { "key": "",   "specialKey": 12, "shift": false, "ctrl": false, "alt": false, "super": false },
+  { "key": "",   "specialKey": 24, "shift": false, "ctrl": false, "alt": true,  "super": false },
+  { "key": "c", "specialKey": 0, "shift": false, "ctrl": true,  "alt": false, "super": false }
+]

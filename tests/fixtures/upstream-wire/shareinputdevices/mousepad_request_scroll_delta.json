@@ -1,0 +1,5 @@
+[
+  { "scroll": true, "dx": 0.0, "dy": 1.0 },
+  { "scroll": true, "dx": 0.0, "dy": -1.0 },
+  { "scroll": true, "dx": 1.0, "dy": 0.0 }
+]
