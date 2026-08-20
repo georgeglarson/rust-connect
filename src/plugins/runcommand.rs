@@ -27,11 +27,17 @@
 //! packets synchronously while execution is async, so we cannot stream output
 //! honestly; per project law we don't advertise what we can't honor.
 //!
-//! SECURITY / production posture (per project decision): the allowlist is
-//! EMPTY in production — `allow_command` is a code API exercised by tests
-//! only, and nothing in production wiring calls it. The command list we
-//! broadcast is therefore empty (`{}`), and every `key` request from a phone
-//! is refused. Populating the allowlist is a separate, later decision.
+//! SECURITY / production posture (per project decision, 2026-08-20): the
+//! allowlist is populated from the desktop config file (`AppSettings` ->
+//! `RuncommandConfig`, deserialized from `[[runcommand.commands]]` entries
+//! in `~/.config/rust-connect/config.toml`) and registered into the plugin
+//! at boot via `register_from_config`. There is intentionally NO runtime
+//! write path (no REST, no DBus, no signal handler) — the allowlist can
+//! only change by editing the config and restarting the daemon. This is
+//! the kdeconnect-kde model: commands are defined on the desktop, the
+//! paired phone only triggers them. Without a `[runcommand]` section the
+//! allowlist stays empty and every request is blocked, preserving the
+//! prior safe-by-default posture.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock as StdRwLock};
@@ -40,6 +46,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use crate::config::settings::RuncommandConfig;
 use crate::protocol::types::Packet;
 use crate::utils::errors::Result;
 
@@ -62,8 +69,15 @@ pub struct CommandEntry {
 
 #[derive(Clone)]
 pub struct RuncommandPlugin {
-    /// device_id -> key -> entry. EMPTY in production (see module docs).
+    /// device_id -> key -> entry. The per-device code API
+    /// (`allow_command`) targets this map; in production it stays empty
+    /// because nothing in production wiring calls it.
     allowed_commands: Arc<StdRwLock<HashMap<String, HashMap<String, CommandEntry>>>>,
+    /// key -> entry. Desktop-global allowlist populated from
+    /// `AppSettings.runcommand.commands` at boot via `register_from_config`.
+    /// Both `lookup` and `command_list_json` consult it alongside the
+    /// per-device map.
+    global_commands: Arc<StdRwLock<HashMap<String, CommandEntry>>>,
     executed: Arc<StdRwLock<Vec<ExecutedCommand>>>,
     execution_timeout: Duration,
 }
@@ -89,6 +103,7 @@ impl RuncommandPlugin {
     pub fn new() -> Self {
         Self {
             allowed_commands: Arc::new(StdRwLock::new(HashMap::new())),
+            global_commands: Arc::new(StdRwLock::new(HashMap::new())),
             executed: Arc::new(StdRwLock::new(Vec::new())),
             execution_timeout: EXECUTION_TIMEOUT,
         }
@@ -100,8 +115,9 @@ impl RuncommandPlugin {
     }
 
     /// Code-level API to allowlist a command for a device. NOT called from
-    /// production wiring — the allowlist stays empty outside tests, so the
-    /// advertised command list is empty and all requests are refused.
+    /// production wiring — the per-device map stays empty outside tests.
+    /// The production allowlist lives in `global_commands` and is set
+    /// from the config file via `register_from_config`.
     pub fn allow_command(&self, device_id: &str, key: &str, name: &str, command: &str) {
         if let Ok(mut map) = self.allowed_commands.write() {
             map.entry(device_id.to_string()).or_default().insert(
@@ -111,6 +127,51 @@ impl RuncommandPlugin {
                     command: command.to_string(),
                 },
             );
+        }
+    }
+
+    /// Populate the desktop-global allowlist from `RuncommandConfig`
+    /// (deserialized from `[[runcommand.commands]]` entries in the config
+    /// file). Called once at boot, after `RuncommandPlugin::new()`. No
+    /// runtime write path exists — re-registering is the only way to
+    /// change the allowlist without restarting the daemon.
+    ///
+    /// Validation: entries with empty `key`, `name`, or `command` are
+    /// skipped and `warn!`-ed (daemon boot must not fail on a bad row);
+    /// the first entry for any given key wins, later duplicates of the
+    /// same key are skipped and `warn!`-ed so the advertised JSON object
+    /// never carries duplicate-key entries that phones parse.
+    /// Per-device entries set via `allow_command` are not touched and
+    /// take precedence over global entries with the same key for
+    /// lookup.
+    pub fn register_from_config(&self, cfg: &RuncommandConfig) {
+        if let Ok(mut global) = self.global_commands.write() {
+            for entry in &cfg.commands {
+                if entry.key.is_empty() || entry.name.is_empty() || entry.command.is_empty() {
+                    warn!(
+                        key = %entry.key,
+                        name = %entry.name,
+                        event = "runcommand_config_invalid_entry",
+                        "Skipping runcommand config entry with empty key/name/command"
+                    );
+                    continue;
+                }
+                if global.contains_key(&entry.key) {
+                    warn!(
+                        key = %entry.key,
+                        event = "runcommand_config_duplicate_key",
+                        "Skipping duplicate runcommand config entry; first wins"
+                    );
+                    continue;
+                }
+                global.insert(
+                    entry.key.clone(),
+                    CommandEntry {
+                        name: entry.name.clone(),
+                        command: entry.command.clone(),
+                    },
+                );
+            }
         }
     }
 
@@ -133,27 +194,57 @@ impl RuncommandPlugin {
     }
 
     fn lookup(&self, device_id: &str, key: &str) -> Option<CommandEntry> {
-        let map = self
+        // Per-device entries (set via allow_command, used by tests) take
+        // precedence over desktop-global entries (set via register_from_config).
+        let per_device = self
             .allowed_commands
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        map.get(device_id).and_then(|cmds| cmds.get(key)).cloned()
+        if let Some(entry) = per_device
+            .get(device_id)
+            .and_then(|cmds| cmds.get(key))
+            .cloned()
+        {
+            return Some(entry);
+        }
+        let global = self
+            .global_commands
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        global.get(key).cloned()
     }
 
     /// The `commandList` field value: a JSON-ENCODED STRING of
     /// `{key: {"name": ..., "command": ...}}` (kdeconnect-kde
     /// runcommandplugin.cpp:163-164 sends the config string; Android parses
     /// it as a string, RunCommandPlugin.java:155).
+    ///
+    /// The advertised list is the union of per-device entries for this
+    /// device and the desktop-global entries — honest capability: every
+    /// advertised key is one this plugin will execute when a paired phone
+    /// requests it.
     fn command_list_json(&self, device_id: &str) -> String {
-        let map = self
+        let mut entries: HashMap<String, CommandEntry> = HashMap::new();
+        let per_device = self
             .allowed_commands
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        match map.get(device_id) {
-            Some(entries) if !entries.is_empty() => {
-                serde_json::to_string(entries).unwrap_or_else(|_| "{}".to_string())
+        if let Some(device_entries) = per_device.get(device_id) {
+            for (k, v) in device_entries {
+                entries.insert(k.clone(), v.clone());
             }
-            _ => "{}".to_string(),
+        }
+        let global = self
+            .global_commands
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        for (k, v) in global.iter() {
+            entries.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        if entries.is_empty() {
+            "{}".to_string()
+        } else {
+            serde_json::to_string(&entries).unwrap_or_else(|_| "{}".to_string())
         }
     }
 
@@ -452,6 +543,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
     use super::*;
+    use crate::config::settings::{RuncommandCommand, RuncommandConfig};
 
     fn request_packet(body: serde_json::Value) -> Packet {
         Packet::new("kdeconnect.runcommand.request".to_string(), body)
@@ -832,6 +924,193 @@ mod tests {
         assert_eq!(executed.len(), 1);
         assert!(executed[0].stderr.contains("timed out"));
         assert!(executed[0].stdout.len() <= MAX_OUTPUT_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_register_from_config_advertises_and_executes() {
+        // Config-driven commands are desktop-global: after
+        // register_from_config, the advertisement is non-empty AND the
+        // request for a configured key executes the configured shell
+        // command. Drives the full config -> wire path.
+        let plugin = RuncommandPlugin::new();
+        let cfg = RuncommandConfig {
+            commands: vec![RuncommandCommand {
+                key: "greet".to_string(),
+                name: "Greet".to_string(),
+                command: "echo hello-config".to_string(),
+            }],
+        };
+        plugin.register_from_config(&cfg);
+
+        // Advertisement now reflects exactly what is executable.
+        let packet = plugin.command_list_packet("device1");
+        let list_str = packet.body["commandList"].as_str().unwrap();
+        let list: serde_json::Value = serde_json::from_str(list_str).unwrap();
+        assert_eq!(
+            list,
+            serde_json::json!({
+                "greet": { "name": "Greet", "command": "echo hello-config" }
+            })
+        );
+
+        // Request for the configured key executes through the same path
+        // as the per-device test API.
+        plugin
+            .handle_packet(
+                "device1",
+                request_packet(serde_json::json!({ "key": "greet" })),
+            )
+            .await
+            .unwrap();
+        plugin.wait_for_commands(1, 1000).await;
+        let executed = plugin.executed_commands();
+        assert_eq!(executed.len(), 1);
+        assert_eq!(executed[0].key, "greet");
+        assert_eq!(executed[0].command, "echo hello-config");
+        assert!(executed[0].success);
+        assert_eq!(executed[0].stdout.trim(), "hello-config");
+    }
+
+    #[tokio::test]
+    async fn test_register_from_config_is_desktop_global() {
+        // Config-driven commands apply to every device the daemon pairs
+        // with: device1 and device2 both see the same list and can both
+        // trigger execution by key.
+        let plugin = RuncommandPlugin::new();
+        let cfg = RuncommandConfig {
+            commands: vec![RuncommandCommand {
+                key: "global".to_string(),
+                name: "Global".to_string(),
+                command: "echo from-config".to_string(),
+            }],
+        };
+        plugin.register_from_config(&cfg);
+
+        for device in ["device1", "device2"] {
+            let packet = plugin.command_list_packet(device);
+            let list_str = packet.body["commandList"].as_str().unwrap();
+            let list: serde_json::Value = serde_json::from_str(list_str).unwrap();
+            assert!(
+                list.get("global").is_some(),
+                "device {device} should see the global command list"
+            );
+        }
+
+        plugin
+            .handle_packet(
+                "device2",
+                request_packet(serde_json::json!({ "key": "global" })),
+            )
+            .await
+            .unwrap();
+        plugin.wait_for_commands(1, 1000).await;
+        let executed = plugin.executed_commands();
+        assert_eq!(executed.len(), 1);
+        assert_eq!(executed[0].device_id, "device2");
+        assert_eq!(executed[0].stdout.trim(), "from-config");
+    }
+
+    #[tokio::test]
+    async fn test_register_from_config_skips_malformed_entries() {
+        // Entries with empty key / name / command must be skipped (warned)
+        // and must NOT prevent valid siblings from loading. A bad entry in
+        // the middle of a list still leaves the surrounding valid ones
+        // registered.
+        let plugin = RuncommandPlugin::new();
+        let cfg = RuncommandConfig {
+            commands: vec![
+                RuncommandCommand {
+                    key: "".to_string(),
+                    name: "Empty key".to_string(),
+                    command: "echo nothing".to_string(),
+                },
+                RuncommandCommand {
+                    key: "good".to_string(),
+                    name: "".to_string(),
+                    command: "echo hi".to_string(),
+                },
+                RuncommandCommand {
+                    key: "bad".to_string(),
+                    name: "Bad command".to_string(),
+                    command: "".to_string(),
+                },
+                RuncommandCommand {
+                    key: "ok".to_string(),
+                    name: "OK".to_string(),
+                    command: "echo fine".to_string(),
+                },
+            ],
+        };
+        plugin.register_from_config(&cfg);
+
+        // Only the valid entry survives; the three malformed ones are
+        // skipped.
+        let packet = plugin.command_list_packet("device1");
+        let list_str = packet.body["commandList"].as_str().unwrap();
+        let list: serde_json::Value = serde_json::from_str(list_str).unwrap();
+        assert_eq!(list.as_object().unwrap().len(), 1);
+        assert!(list.get("ok").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_register_from_config_skips_duplicate_keys() {
+        // The first entry with a given key wins; later entries with the
+        // same key are skipped (warned). Prevents the advertisement from
+        // carrying duplicate keys, which would corrupt the JSON object
+        // shape phones parse.
+        let plugin = RuncommandPlugin::new();
+        let cfg = RuncommandConfig {
+            commands: vec![
+                RuncommandCommand {
+                    key: "shared".to_string(),
+                    name: "First".to_string(),
+                    command: "echo first".to_string(),
+                },
+                RuncommandCommand {
+                    key: "shared".to_string(),
+                    name: "Second".to_string(),
+                    command: "echo second".to_string(),
+                },
+                RuncommandCommand {
+                    key: "unique".to_string(),
+                    name: "Unique".to_string(),
+                    command: "echo unique".to_string(),
+                },
+            ],
+        };
+        plugin.register_from_config(&cfg);
+
+        let packet = plugin.command_list_packet("device1");
+        let list_str = packet.body["commandList"].as_str().unwrap();
+        let list: serde_json::Value = serde_json::from_str(list_str).unwrap();
+        assert_eq!(list.as_object().unwrap().len(), 2);
+        assert_eq!(
+            list["shared"],
+            serde_json::json!({ "name": "First", "command": "echo first" })
+        );
+        assert!(list.get("unique").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_register_from_config_empty_config_preserves_blocked_by_default() {
+        // An empty config (or absent section) keeps the production
+        // posture: advertisement is the JSON string "{}", every key
+        // request is refused.
+        let plugin = RuncommandPlugin::new();
+        plugin.register_from_config(&RuncommandConfig::default());
+
+        let packet = plugin.command_list_packet("device1");
+        assert_eq!(packet.body["commandList"], serde_json::json!("{}"));
+
+        plugin
+            .handle_packet(
+                "device1",
+                request_packet(serde_json::json!({ "key": "anything" })),
+            )
+            .await
+            .unwrap();
+        plugin.wait_for_commands(1, 200).await;
+        assert!(plugin.executed_commands().is_empty());
     }
 
     #[tokio::test]
