@@ -322,33 +322,78 @@
                 const res = await fetchAPI('GET', '/devices');
                 const devices = res.data?.devices || [];
                 const listEl = document.getElementById('device-list');
-                
+                listEl.replaceChildren();
+
                 if (devices.length === 0) {
+                    // Static markup only — no peer data, safe to set
+                    // innerHTML; the audit log calls this out explicitly.
                     listEl.innerHTML = '<div style="color:#888; padding:1rem; text-align:center;">No devices paired.</div>';
                     return;
                 }
-                
-                let html = '';
+
                 for (const d of devices) {
-                    const activeClass = d.id === currentDeviceId ? 'active' : '';
-                    const sasLine = (d.pair_state === 'requested_by_peer' && d.verification_key)
-                        ? `<div style="margin:0.5rem 0; color:#ffc800;">Verification key: <code>${escapeHtml(d.verification_key)}</code> — compare with the phone</div>`
-                        : '';
-                    html += `
-                        <div class="device-item ${activeClass}" onclick="selectDevice('${d.id}')">
-                            <h3>${escapeHtml(d.name || d.id)}</h3>
-                            <div class="meta">ID: ${d.id.substring(0,8)}...</div>
-                            <div class="meta" style="margin-top:0.2rem;">
-                                <span class="badge" style="background:transparent; padding:0; color:#888;">${d.device_type}</span>
-                                <span class="badge ${d.state.toLowerCase()}">${d.state}</span>
-                                ${d.pair_state === 'requested_by_peer' ? '<span class="badge pairreq">Pair request</span>' : ''}
-                            </div>
-                            ${sasLine}
-                        </div>
-                    `;
+                    // security-audit-2026-08-20 P1: every field here is
+                    // peer-controlled (device id is set by the phone during
+                    // pairing). The old code interpolated `d.id` into a
+                    // single-quoted inline handler AND into text content
+                    // without escaping, plus `d.state` into a class
+                    // attribute (CSS-class injection). DOM construction
+                    // below keeps every byte outside the HTML parser.
+                    const item = document.createElement('div');
+                    item.className = 'device-item' + (d.id === currentDeviceId ? ' active' : '');
+                    item.addEventListener('click', () => selectDevice(d.id));
+
+                    const h3 = document.createElement('h3');
+                    h3.textContent = d.name || d.id;
+                    item.appendChild(h3);
+
+                    const idMeta = document.createElement('div');
+                    idMeta.className = 'meta';
+                    idMeta.textContent = `ID: ${(d.id || '').substring(0, 8)}...`;
+                    item.appendChild(idMeta);
+
+                    const stateMeta = document.createElement('div');
+                    stateMeta.className = 'meta';
+                    stateMeta.style.marginTop = '0.2rem';
+
+                    const typeBadge = document.createElement('span');
+                    typeBadge.className = 'badge';
+                    typeBadge.style.background = 'transparent';
+                    typeBadge.style.padding = '0';
+                    typeBadge.style.color = '#888';
+                    typeBadge.textContent = d.device_type || '';
+                    stateMeta.appendChild(typeBadge);
+
+                    const stateBadge = document.createElement('span');
+                    stateBadge.className = 'badge ' + (d.state || '').toLowerCase();
+                    stateBadge.textContent = d.state || '';
+                    stateMeta.appendChild(stateBadge);
+
+                    if (d.pair_state === 'requested_by_peer') {
+                        const prBadge = document.createElement('span');
+                        prBadge.className = 'badge pairreq';
+                        prBadge.textContent = 'Pair request';
+                        stateMeta.appendChild(prBadge);
+                    }
+                    item.appendChild(stateMeta);
+
+                    if (d.pair_state === 'requested_by_peer' && d.verification_key) {
+                        const sas = document.createElement('div');
+                        sas.style.margin = '0.5rem 0';
+                        sas.style.color = '#ffc800';
+                        sas.appendChild(document.createTextNode('Verification key: '));
+                        const code = document.createElement('code');
+                        // verification_key is peer-controlled; textContent
+                        // is the safe channel here.
+                        code.textContent = d.verification_key;
+                        sas.appendChild(code);
+                        sas.appendChild(document.createTextNode(' — compare with the phone'));
+                        item.appendChild(sas);
+                    }
+
+                    listEl.appendChild(item);
                 }
-                listEl.innerHTML = html;
-                
+
                 if (currentDeviceId) {
                     const current = devices.find(d => d.id === currentDeviceId);
                     if (current) renderDeviceDetails(current);
@@ -521,73 +566,224 @@
             if (plugin === 'telephony') {
                 const t = data.telephony || data;
                 const calls = t.calls || [];
+                const container = document.getElementById('telephony-state');
+                container.replaceChildren();
                 if (!calls.length) {
-                    document.getElementById('telephony-state').innerHTML = '<div class="empty">No telephony events recorded</div>';
+                    // Static markup — no peer data, safe as innerHTML.
+                    container.innerHTML = '<div class="empty">No telephony events recorded</div>';
                     return;
                 }
                 const eventIcons = { incoming: '📲', ringing: '🔔', talking: '📞', missed: '📵', silent: '🔇', offgoing: '📤' };
+                // `color` is only ever one of these literals (lookup is
+                // keyed off the event field); the inline-style sink is
+                // not a peer-data channel here. Keep `color` for
+                // readability, but the event name itself — which IS
+                // peer-controlled — is rendered via textContent below.
                 const eventColors = { incoming: '#00ff88', ringing: '#ffcc00', talking: '#00d4ff', missed: '#ff4444', silent: '#888', offgoing: '#888' };
-                const html = calls.slice().reverse().map(c => {
+                calls.slice().reverse().forEach(c => {
                     const icon = eventIcons[c.event] || '📱';
                     const color = eventColors[c.event] || '#888';
                     const number = c.number || 'Unknown';
                     const name = c.contactName || c.contact_name || '';
                     const time = c.timestamp ? formatTime(c.timestamp) : '';
-                    return `<div class="log-entry">
-                        <span class="log-time">${time}</span>
-                        <span style="color:${color}; font-weight:bold;">${icon} ${c.event}</span>
-                        ${name ? `<strong>${escapeHtml(name)}</strong> ` : ''}
-                        <span style="color:#888">${escapeHtml(number)}</span>
-                    </div>`;
-                }).join('');
-                document.getElementById('telephony-state').innerHTML = html;
+
+                    const entry = document.createElement('div');
+                    entry.className = 'log-entry';
+
+                    const timeSpan = document.createElement('span');
+                    timeSpan.className = 'log-time';
+                    timeSpan.textContent = time;
+                    entry.appendChild(timeSpan);
+
+                    const evSpan = document.createElement('span');
+                    evSpan.style.color = color;
+                    evSpan.style.fontWeight = 'bold';
+                    evSpan.textContent = `${icon} ${c.event || ''}`;
+                    entry.appendChild(evSpan);
+
+                    if (name) {
+                        const strong = document.createElement('strong');
+                        strong.textContent = name;
+                        entry.appendChild(document.createTextNode(' '));
+                        entry.appendChild(strong);
+                    }
+                    const numberSpan = document.createElement('span');
+                    numberSpan.style.color = '#888';
+                    numberSpan.textContent = number;
+                    entry.appendChild(numberSpan);
+
+                    container.appendChild(entry);
+                });
             }
             if (plugin === 'notifications') {
+                // security-audit-2026-08-20 P1: peer-controlled fields
+                // (appName, title, text) were already routed through
+                // escapeHtml, but `formatTime(...)` ran unescaped into
+                // the template. formatTime() collapses bad inputs to
+                // "Invalid Date" / "" via Date, so the rendered string is
+                // not attacker-chosen in practice — but escape anyway
+                // so the safe path is also the literal one and any
+                // future formatTime change can't quietly reintroduce
+                // XSS through this sink.
                 const notes = data.notifications || [];
                 const cancelled = new Set(notes.filter(n => n.is_cancel).map(n => n.id));
-                const html = notes.filter(n => !n.is_cancel && !cancelled.has(n.id)).map(n => `
-                    <div class="log-entry">
-                        <span class="log-time">[${formatTime(n.timestamp || n.received_at)}]</span>
-                        <strong>${escapeHtml(n.appName || n.app_name || 'Unknown')}</strong><br>
-                        ${escapeHtml(n.title || '')} - <span style="color:#888">${escapeHtml(n.text || n.content || '')}</span>
-                    </div>
-                `).join('');
-                document.getElementById('notifications-list').innerHTML = html || '<div class="empty">No active notifications</div>';
+                const visible = notes.filter(n => !n.is_cancel && !cancelled.has(n.id));
+                const container = document.getElementById('notifications-list');
+                container.replaceChildren();
+                if (!visible.length) {
+                    const empty = document.createElement('div');
+                    empty.className = 'empty';
+                    empty.textContent = 'No active notifications';
+                    container.appendChild(empty);
+                } else {
+                    visible.forEach(n => {
+                        const entry = document.createElement('div');
+                        entry.className = 'log-entry';
+
+                        const timeSpan = document.createElement('span');
+                        timeSpan.className = 'log-time';
+                        timeSpan.textContent = `[${formatTime(n.timestamp || n.received_at)}]`;
+                        entry.appendChild(timeSpan);
+
+                        const app = document.createElement('strong');
+                        app.textContent = n.appName || n.app_name || 'Unknown';
+                        entry.appendChild(app);
+                        entry.appendChild(document.createElement('br'));
+
+                        // Title is peer-controlled; render via
+                        // textContent (which IS escapeHtml in this
+                        // context — no markup interpretation).
+                        const titleText = document.createTextNode((n.title || '') + ' - ');
+                        entry.appendChild(titleText);
+                        const body = document.createElement('span');
+                        body.style.color = '#888';
+                        body.textContent = n.text || n.content || '';
+                        entry.appendChild(body);
+
+                        container.appendChild(entry);
+                    });
+                }
             }
             if (plugin === 'sms') {
+                // security-audit-2026-08-20 P1: `t.thread_id` is peer-
+                // controlled and the old code interpolated it unescaped
+                // into a single-quoted inline handler. Same shape as the
+                // MPRIS bug — DOM construction + addEventListener, no
+                // peer data through the HTML parser.
                 const threads = data.threads || [];
-                const html = threads.map(t => {
-                    const phone = t.addresses?.[0]?.address || 'Unknown';
-                    const name = t.name || phone;
-                    return `<div class="log-entry" onclick="viewSmsThread('${t.thread_id}')" style="cursor:pointer;">
-                        <strong>${escapeHtml(name)}</strong> <span style="color:#888;font-size:0.75rem;">${escapeHtml(phone)}</span> (${t.read_count} msgs)
-                        <br><span style="color:#666">${escapeHtml(t.snippet || '...')}</span>
-                    </div>`;
-                }).join('');
-                document.getElementById('sms-threads').innerHTML = html || '<div class="empty">No threads found</div>';
+                const container = document.getElementById('sms-threads');
+                container.replaceChildren();
+                if (!threads.length) {
+                    const empty = document.createElement('div');
+                    empty.className = 'empty';
+                    empty.textContent = 'No threads found';
+                    container.appendChild(empty);
+                } else {
+                    threads.forEach(t => {
+                        const phone = t.addresses?.[0]?.address || 'Unknown';
+                        const name = t.name || phone;
+                        const row = document.createElement('div');
+                        row.className = 'log-entry';
+                        row.style.cursor = 'pointer';
+                        // Close over the per-row thread id; click handler
+                        // gets the value without it ever touching HTML.
+                        row.addEventListener('click', () => viewSmsThread(t.thread_id));
+
+                        const strong = document.createElement('strong');
+                        strong.textContent = name;
+                        row.appendChild(strong);
+                        row.appendChild(document.createTextNode(' '));
+
+                        const phoneSpan = document.createElement('span');
+                        phoneSpan.style.color = '#888';
+                        phoneSpan.style.fontSize = '0.75rem';
+                        phoneSpan.textContent = phone;
+                        row.appendChild(phoneSpan);
+
+                        // read_count comes from the phone; render via
+                        // textContent so any non-numeric value stays
+                        // unparsed.
+                        row.appendChild(document.createTextNode(` (${t.read_count} msgs)`));
+                        row.appendChild(document.createElement('br'));
+
+                        const snippetSpan = document.createElement('span');
+                        snippetSpan.style.color = '#666';
+                        snippetSpan.textContent = t.snippet || '...';
+                        row.appendChild(snippetSpan);
+
+                        container.appendChild(row);
+                    });
+                }
                 document.getElementById('sms-thread-detail').style.display = 'none';
             }
             if (plugin === 'mpris') {
+                // security-audit-2026-08-20 P1: `p.player` is peer-controlled
+                // (the paired phone's MPRIS player name). The old code
+                // interpolated it unescaped into single-quoted inline
+                // handlers, so a name containing `'` could break out and
+                // run JS in the API origin, stealing the X-API-Key from
+                // localStorage. Build via createElement + addEventListener
+                // and never assemble peer data into HTML strings.
                 const players = data.players || [];
+                const container = document.getElementById('mpris-players');
+                container.replaceChildren();
                 if (!players.length) {
-                    document.getElementById('mpris-players').innerHTML = '<div class="empty">No media playing</div>';
+                    const empty = document.createElement('div');
+                    empty.className = 'empty';
+                    empty.textContent = 'No media playing';
+                    container.appendChild(empty);
                     return;
                 }
-                document.getElementById('mpris-players').innerHTML = players.map(p => `
-                    <div style="border-bottom:1px solid #333; padding-bottom:1rem; margin-bottom:1rem;">
-                        <h4 style="color:#00d4ff; margin-bottom:0.5rem;">${escapeHtml(p.player)}</h4>
-                        <div style="margin-bottom:0.5rem; color:#eee;">
-                            <strong>${escapeHtml(p.title || 'Unknown Title')}</strong><br>
-                            <span style="color:#888">${escapeHtml(p.artist || 'Unknown Artist')}</span>
-                        </div>
-                        <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
-                            <button onclick="mprisAction('${p.player}', 'Previous')" class="secondary" ${!p.canGoPrevious ? 'disabled' : ''}>⏮ Prev</button>
-                            <button onclick="mprisAction('${p.player}', 'PlayPause')" class="${p.isPlaying ? 'playing' : 'secondary'}">${p.isPlaying ? '⏸ Playing' : '▶ Play'}</button>
-                            <button onclick="mprisAction('${p.player}', 'Stop')" class="secondary" ${!p.canPlay ? 'disabled' : ''}>⏹ Stop</button>
-                            <button onclick="mprisAction('${p.player}', 'Next')" class="secondary" ${!p.canGoNext ? 'disabled' : ''}>⏭ Next</button>
-                        </div>
-                    </div>
-                `).join('');
+                players.forEach(p => {
+                    const card = document.createElement('div');
+                    card.style.borderBottom = '1px solid #333';
+                    card.style.paddingBottom = '1rem';
+                    card.style.marginBottom = '1rem';
+
+                    const titleEl = document.createElement('h4');
+                    titleEl.style.color = '#00d4ff';
+                    titleEl.style.marginBottom = '0.5rem';
+                    titleEl.textContent = p.player;
+                    card.appendChild(titleEl);
+
+                    const meta = document.createElement('div');
+                    meta.style.marginBottom = '0.5rem';
+                    meta.style.color = '#eee';
+                    const strongEl = document.createElement('strong');
+                    strongEl.textContent = p.title || 'Unknown Title';
+                    meta.appendChild(strongEl);
+                    meta.appendChild(document.createElement('br'));
+                    const artistEl = document.createElement('span');
+                    artistEl.style.color = '#888';
+                    artistEl.textContent = p.artist || 'Unknown Artist';
+                    meta.appendChild(artistEl);
+                    card.appendChild(meta);
+
+                    const btnRow = document.createElement('div');
+                    btnRow.style.display = 'flex';
+                    btnRow.style.gap = '0.5rem';
+                    btnRow.style.flexWrap = 'wrap';
+
+                    const mkBtn = (label, action, extraClass, disabled) => {
+                        const b = document.createElement('button');
+                        b.className = extraClass || '';
+                        if (disabled) b.disabled = true;
+                        b.textContent = label;
+                        // `player` closes over the per-player string; the
+                        // browser's textContent path keeps the closure
+                        // value out of any HTML parser.
+                        b.addEventListener('click', () => mprisAction(p.player, action));
+                        return b;
+                    };
+
+                    btnRow.appendChild(mkBtn('⏮ Prev', 'Previous', 'secondary', !p.canGoPrevious));
+                    btnRow.appendChild(mkBtn(p.isPlaying ? '⏸ Playing' : '▶ Play', 'PlayPause', p.isPlaying ? 'playing' : 'secondary', false));
+                    btnRow.appendChild(mkBtn('⏹ Stop', 'Stop', 'secondary', !p.canPlay));
+                    btnRow.appendChild(mkBtn('⏭ Next', 'Next', 'secondary', !p.canGoNext));
+
+                    card.appendChild(btnRow);
+                    container.appendChild(card);
+                });
             }
         }
 
@@ -639,19 +835,58 @@
                 const data = await fetchAPI('GET', `/devices/${currentDeviceId}/sms/threads/${threadId}`);
                 const messages = data.messages || [];
                 document.getElementById('sms-thread-title').textContent = `Thread ${threadId} (${messages.length} messages)`;
-                const html = messages.map(m => {
-                    const addr = m.addresses?.[0]?.address || 'Unknown';
-                    const type = m.type === 1 ? 'Sent' : 'Received';
-                    const time = m.date ? formatTime(m.date) : '';
-                    return `<div style="margin-bottom:0.75rem; padding:0.5rem; background:#1a1a2e; border-radius:4px;">
-                        <div style="display:flex; justify-content:space-between; margin-bottom:0.25rem;">
-                            <strong style="color:#00d4ff;">${escapeHtml(addr)}</strong>
-                            <span style="color:#888;font-size:0.75rem;">${type} ${time}</span>
-                        </div>
-                        <div style="color:#eee;">${escapeHtml(m.body || '')}</div>
-                    </div>`;
-                }).join('') || '<div class="empty">No messages in this thread. KDE Connect protocol does not sync SMS message history - only notifications of new incoming/outgoing messages.</div>';
-                document.getElementById('sms-thread-messages').innerHTML = html;
+                // security-audit-2026-08-20 P1: peer fields (addr, body)
+                // were already escapeHtml'd; `${time}` came from
+                // formatTime (peer input → Date → toLocaleTimeString,
+                // which collapses bad inputs to "Invalid Date"/""). Swap
+                // to DOM construction so the safe path is the literal
+                // path and the static fallback markup stays
+                // innerHTML-only.
+                const container = document.getElementById('sms-thread-messages');
+                container.replaceChildren();
+                if (!messages.length) {
+                    const empty = document.createElement('div');
+                    empty.className = 'empty';
+                    empty.textContent = 'No messages in this thread. KDE Connect protocol does not sync SMS message history - only notifications of new incoming/outgoing messages.';
+                    container.appendChild(empty);
+                } else {
+                    messages.forEach(m => {
+                        const addr = m.addresses?.[0]?.address || 'Unknown';
+                        const type = m.type === 1 ? 'Sent' : 'Received';
+                        const time = m.date ? formatTime(m.date) : '';
+
+                        const msg = document.createElement('div');
+                        msg.style.marginBottom = '0.75rem';
+                        msg.style.padding = '0.5rem';
+                        msg.style.background = '#1a1a2e';
+                        msg.style.borderRadius = '4px';
+
+                        const header = document.createElement('div');
+                        header.style.display = 'flex';
+                        header.style.justifyContent = 'space-between';
+                        header.style.marginBottom = '0.25rem';
+
+                        const addrEl = document.createElement('strong');
+                        addrEl.style.color = '#00d4ff';
+                        addrEl.textContent = addr;
+                        header.appendChild(addrEl);
+
+                        const meta = document.createElement('span');
+                        meta.style.color = '#888';
+                        meta.style.fontSize = '0.75rem';
+                        meta.textContent = `${type} ${time}`;
+                        header.appendChild(meta);
+
+                        msg.appendChild(header);
+
+                        const body = document.createElement('div');
+                        body.style.color = '#eee';
+                        body.textContent = m.body || '';
+                        msg.appendChild(body);
+
+                        container.appendChild(msg);
+                    });
+                }
                 document.getElementById('sms-thread-detail').style.display = 'block';
             } catch(e) { alert(e.message); }
         }

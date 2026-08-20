@@ -219,6 +219,96 @@ async fn test_api_key_auth_empty_key_list_rejects() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+// security-audit-2026-08-20 P3: query-string `api_key` is honored on every
+// route today. EventSource cannot set headers, so the SSE route MUST keep
+// accepting the query form; everywhere else the header is mandatory and a
+// leaked query key must NOT authenticate a non-SSE call.
+#[tokio::test]
+async fn test_query_api_key_rejected_on_non_sse_routes() {
+    let (state, _temp) = create_test_app_with_keys(vec!["secret-key".to_string()]).await;
+    let app = build_router(state);
+
+    // No X-API-Key header, only ?api_key= in the query — must NOT 200.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices?api_key=secret-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "?api_key= must not authenticate a non-SSE route; otherwise a key \
+         leaked via Referer or server access logs can pair, share, or lock."
+    );
+
+    // Same query on a different non-SSE route — same rejection.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/clipboard?api_key=secret-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // The X-API-Key header path must still 200 on the same route — the
+    // restriction is on the query form, not on auth overall.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices")
+                .header("X-API-Key", "secret-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+// security-audit-2026-08-20 P3: the SSE route (`/api/v1/events`) must keep
+// honoring `?api_key=` because EventSource cannot set request headers. A
+// regression here would silently break the live UI's event stream.
+#[tokio::test]
+async fn test_query_api_key_accepted_on_sse_route() {
+    let (state, _temp) = create_test_app_with_keys(vec!["secret-key".to_string()]).await;
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/events?api_key=secret-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "SSE route must accept ?api_key=; EventSource cannot set X-API-Key."
+    );
+
+    let content_type = response
+        .headers()
+        .get("Content-Type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(content_type.contains("text/event-stream"));
+}
+
 #[tokio::test]
 async fn test_cors_denied_by_default() {
     // allowed_origins defaults to empty: no cross-origin access is granted.
