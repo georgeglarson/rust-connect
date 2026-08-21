@@ -31,6 +31,7 @@ pub mod screensaver_inhibit;
 pub mod sendnotifications;
 pub mod sftp;
 pub mod share;
+pub mod shareinputdevices;
 pub mod sms;
 pub mod systemvolume;
 pub mod telephony;
