@@ -80,6 +80,10 @@ const KNOWN_FIELDS: &[(&str, &str)] = &[
         "allowed_origins",
         "src/api/router.rs:24 (CORS layer origin allowlist)",
     ),
+    (
+        "runcommand",
+        "src/app.rs:86 (AppState::new_inner — handed to plugins.runcommand.register_from_config, populates the desktop-global allowlist at boot)",
+    ),
 ];
 
 #[test]

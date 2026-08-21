@@ -84,6 +84,15 @@ impl AppState {
             enable_input,
         );
 
+        // Populate the runcommand allowlist from the config file at boot.
+        // There is intentionally no runtime write path (no REST, no DBus,
+        // no signal handler) — the allowlist can only change by editing
+        // the config and restarting the daemon. Empty config keeps the
+        // prior safe-by-default behavior (every request blocked).
+        plugins
+            .runcommand
+            .register_from_config(&settings.runcommand);
+
         Ok(Self {
             settings,
             registry,

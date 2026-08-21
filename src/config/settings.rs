@@ -39,6 +39,40 @@ pub struct AppSettings {
     /// no cross-origin access. "*" allows any origin — dangerous combined
     /// with the API key, since any web page could then call the API.
     pub allowed_origins: Vec<String>,
+    /// Desktop-global commands the runcommand plugin will advertise and
+    /// execute when a paired phone sends the matching key. Empty by
+    /// default — every command request is blocked. Populated from the
+    /// config file at boot (`[[runcommand.commands]]` entries); there is
+    /// intentionally no runtime write path so the allowlist can only be
+    /// changed by editing the config and restarting the daemon.
+    #[serde(default)]
+    pub runcommand: RuncommandConfig,
+}
+
+/// One entry under `[[runcommand.commands]]` in the config file. `key` is
+/// what the phone sends back in `{"key": ...}`; `name` and `command` are
+/// the advertised fields on the wire (matching the schema Android parses
+/// from `commandList`).
+///
+/// Fields default to empty so an incomplete row PARSES and reaches
+/// `register_from_config`'s skip-and-warn validation — without the
+/// defaults, one row missing a field would fail the whole config file
+/// before any validation ran (cubic P2, PR #23).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RuncommandCommand {
+    pub key: String,
+    pub name: String,
+    pub command: String,
+}
+
+/// Section heading for the runcommand allowlist. `commands` is the list of
+/// `[[runcommand.commands]]` table-of-tables entries from the config file.
+/// Absent section deserializes to an empty list (today's behavior).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuncommandConfig {
+    pub commands: Vec<RuncommandCommand>,
 }
 
 impl Default for AppSettings {
@@ -63,6 +97,7 @@ impl Default for AppSettings {
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             ui_enabled: DEFAULT_UI_ENABLED,
             allowed_origins: Vec::new(),
+            runcommand: RuncommandConfig::default(),
         }
     }
 }
@@ -440,6 +475,83 @@ mod tests {
         assert_eq!(settings.device_name, "legacy");
         assert_eq!(settings.tcp_port, DEFAULT_TCP_PORT);
         assert_eq!(settings.udp_port, DEFAULT_UDP_PORT);
+    }
+
+    /// `[runcommand]` section round-trips: parse + serialize preserves the
+    /// commands and defaults to empty when absent. Mirrors the per-field
+    /// round-trip tests above so the new section is held to the same shape bar.
+    #[test]
+    fn test_runcommand_section_round_trip() {
+        let temp = tempfile::TempDir::new().expect("Value expected to be present");
+        let path = temp.path().join("runcommand.toml");
+        let toml = r#"
+device_name = "with-runcommand"
+
+[[runcommand.commands]]
+key = "suspend"
+name = "Suspend"
+command = "systemctl suspend"
+
+[[runcommand.commands]]
+key = "lock"
+name = "Lock screen"
+command = "loginctl lock-session"
+"#;
+        std::fs::write(&path, toml).expect("Value expected to be present");
+
+        let settings = AppSettings::load_from_file(&path).expect("Value expected to be present");
+        assert_eq!(settings.runcommand.commands.len(), 2);
+        assert_eq!(settings.runcommand.commands[0].key, "suspend");
+        assert_eq!(settings.runcommand.commands[0].name, "Suspend");
+        assert_eq!(settings.runcommand.commands[0].command, "systemctl suspend");
+        assert_eq!(settings.runcommand.commands[1].key, "lock");
+        assert_eq!(settings.runcommand.commands[1].name, "Lock screen");
+        assert_eq!(
+            settings.runcommand.commands[1].command,
+            "loginctl lock-session"
+        );
+
+        // Save and re-load; the on-disk form must keep the section intact.
+        settings
+            .save_to_file(&path)
+            .expect("Value expected to be present");
+        let reloaded = AppSettings::load_from_file(&path).expect("Value expected to be present");
+        assert_eq!(reloaded.runcommand.commands.len(), 2);
+        assert_eq!(reloaded.runcommand.commands[0].key, "suspend");
+        assert_eq!(reloaded.runcommand.commands[1].key, "lock");
+    }
+
+    /// Absent `[runcommand]` section deserializes to an empty command list
+    /// (preserves today's behavior: empty advertisement, every request blocked).
+    #[test]
+    fn test_runcommand_section_absent_is_empty() {
+        let temp = tempfile::TempDir::new().expect("Value expected to be present");
+        let path = temp.path().join("no-runcommand.toml");
+        std::fs::write(&path, "device_name = \"minimal\"").expect("Value expected to be present");
+
+        let settings = AppSettings::load_from_file(&path).expect("Value expected to be present");
+        assert!(settings.runcommand.commands.is_empty());
+    }
+
+    /// cubic P2 (PR #23): a row missing a field must PARSE (fields
+    /// default empty) so `register_from_config`'s skip-and-warn sees it —
+    /// before the serde defaults, one incomplete row failed the whole
+    /// config file and no command loaded.
+    #[test]
+    fn test_runcommand_incomplete_row_parses_to_empty_fields() {
+        let temp = tempfile::TempDir::new().expect("Value expected to be present");
+        let path = temp.path().join("incomplete.toml");
+        std::fs::write(
+            &path,
+            "[[runcommand.commands]]\nkey = \"suspend\"\nname = \"Suspend\"\n\n[[runcommand.commands]]\nkey = \"ok\"\nname = \"OK\"\ncommand = \"echo ok\"\n",
+        )
+        .expect("Value expected to be present");
+
+        let settings = AppSettings::load_from_file(&path)
+            .expect("an incomplete row must not fail the whole config file");
+        assert_eq!(settings.runcommand.commands.len(), 2);
+        assert!(settings.runcommand.commands[0].command.is_empty());
+        assert_eq!(settings.runcommand.commands[1].command, "echo ok");
     }
 
     #[test]
