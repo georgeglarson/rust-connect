@@ -545,6 +545,395 @@ fn keyboard_keymap_loads_and_emits_text() {
     });
 }
 
+// ---------- scroll tests ----------
+
+/// Send an EI `ScrollDelta` (smooth path) by reaching into the device's
+/// `ei_scroll` interface proxy, then commit it with a Frame so the
+/// converter flushes the timestamped event out of its pending queue.
+/// Mirrors the `pointer_motion` / `button_event` / `key_event` helpers
+/// above — same `device.frame(0); connection.flush()` close.
+fn scroll_delta(connection: &EisConnection, device: &EisDevice, dx: f32, dy: f32) {
+    let scroll: eis::Scroll = device.interface().expect("device has scroll interface");
+    scroll.scroll(dx, dy);
+    device.frame(0);
+    connection.flush().expect("flush scroll+frame");
+}
+
+/// Send an EI `ScrollDiscrete` (high-res wheel path).
+fn scroll_discrete(connection: &EisConnection, device: &EisDevice, dx: i32, dy: i32) {
+    let scroll: eis::Scroll = device.interface().expect("device has scroll interface");
+    scroll.scroll_discrete(dx, dy);
+    device.frame(0);
+    connection.flush().expect("flush scroll_discrete+frame");
+}
+
+/// Send an EI `ScrollStop` (is_cancel=0). The upstream cpp at
+/// inputcapturesession.cpp:418-419 breaks out of the switch with no
+/// emit; the transport must NOT produce a `WireBody`.
+fn scroll_stop(connection: &EisConnection, device: &EisDevice, x: u32, y: u32) {
+    let scroll: eis::Scroll = device.interface().expect("device has scroll interface");
+    scroll.scroll_stop(x, y, 0);
+    device.frame(0);
+    connection.flush().expect("flush scroll_stop+frame");
+}
+
+/// Send an EI `ScrollCancel` (is_cancel=1). The upstream cpp at
+/// inputcapturesession.cpp:420-421 also breaks with no emit.
+fn scroll_cancel(connection: &EisConnection, device: &EisDevice, x: u32, y: u32) {
+    let scroll: eis::Scroll = device.interface().expect("device has scroll interface");
+    scroll.scroll_stop(x, y, 1);
+    device.frame(0);
+    connection.flush().expect("flush scroll_cancel+frame");
+}
+
+#[test]
+fn scroll_delta_round_trip() {
+    // Oracle: the upstream cpp at inputcapturesession.cpp:412-413 emits
+    // the smooth delta verbatim — `Q_EMIT scrollDelta(dx, dy)`. M1's
+    // `plan_scroll(dx, dy, 0, 0)` returns `{scroll: true, dx, dy}` with
+    // both fields passing through verbatim (mod.rs:233-256; the y-asymmetry
+    // lives in the discrete path only — shareinputdevicesplugin.cpp:100-101
+    // negates y on the discrete side, NOT the smooth side). The transport
+    // exists to route the EI event to the planner.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        let seat = connection.add_seat(
+            Some("test"),
+            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+        );
+        let device = seat.add_device(
+            Some("test-pointer"),
+            DeviceType::Virtual,
+            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            |_device| {},
+        );
+        device.resumed();
+        device.start_emulating(1);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Arm-then-clear the activation gate, same idiom as
+        // `pointer_motion_round_trip`.
+        receiver.handle_activated(1).await;
+
+        scroll_delta(&connection, &device, 3.5, -4.5);
+        let body = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("scroll delta timed out")
+            .expect("wire rx closed");
+        assert_eq!(
+            body.into_json(),
+            serde_json::json!({"scroll": true, "dx": 3.5, "dy": -4.5})
+        );
+
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit");
+    });
+}
+
+#[test]
+fn scroll_discrete_round_trip() {
+    // Oracle: the upstream cpp at inputcapturesession.cpp:415-416 emits
+    // `Q_EMIT scrollDiscrete(discrete_dx, discrete_dy)`. M1's
+    // `plan_scroll_discrete(dx, dy)` returns `{scroll: true, dx:
+    // dx * 15/120, dy: -dy * 15/120}` (mod.rs:267-274) — the upstream
+    // y-negation is the planner's pinned job. The transport exists to
+    // route to it.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        let seat = connection.add_seat(
+            Some("test"),
+            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+        );
+        let device = seat.add_device(
+            Some("test-pointer"),
+            DeviceType::Virtual,
+            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            |_device| {},
+        );
+        device.resumed();
+        device.start_emulating(1);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        receiver.handle_activated(1).await;
+
+        // discrete_dx=0, discrete_dy=1 — the y-negation gives
+        // wire dy = -1 * 15/120 = -0.125; x stays signed normally
+        // (mod.rs:956-965 pins x is NOT negated).
+        scroll_discrete(&connection, &device, 0, 1);
+        let body = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("scroll discrete timed out")
+            .expect("wire rx closed");
+        assert_eq!(
+            body.into_json(),
+            serde_json::json!({"scroll": true, "dx": 0.0, "dy": -0.125})
+        );
+
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit");
+    });
+}
+
+#[test]
+fn scroll_stop_and_cancel_are_noops() {
+    // Oracle: the upstream cpp at inputcapturesession.cpp:418-421 has
+    // `case EI_EVENT_SCROLL_STOP: break; case EI_EVENT_SCROLL_CANCEL:
+    // break;` — both with no emit. The transport's `dispatch`
+    // (ei.rs:523-525) collapses them into a single no-op arm.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        let seat = connection.add_seat(
+            Some("test"),
+            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+        );
+        let device = seat.add_device(
+            Some("test-pointer"),
+            DeviceType::Virtual,
+            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            |_device| {},
+        );
+        device.resumed();
+        device.start_emulating(1);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        receiver.handle_activated(1).await;
+
+        // One real ScrollDelta first — we expect exactly ONE wire body.
+        scroll_delta(&connection, &device, 1.0, 1.0);
+        let body = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("scroll delta timed out")
+            .expect("wire rx closed");
+        assert_eq!(
+            body.into_json(),
+            serde_json::json!({"scroll": true, "dx": 1.0, "dy": 1.0})
+        );
+
+        // Now the no-ops: ScrollStop (is_cancel=0) and ScrollCancel
+        // (is_cancel=1). Neither must produce a wire body.
+        scroll_stop(&connection, &device, 1, 1);
+        scroll_cancel(&connection, &device, 1, 1);
+
+        // Wait a bit to let any spurious body arrive; assert none does.
+        let spurious = timeout(Duration::from_millis(200), wire_rx.recv()).await;
+        assert!(
+            spurious.is_err(),
+            "ScrollStop/ScrollCancel must not produce a wire body"
+        );
+
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit");
+    });
+}
+
+#[test]
+fn gate_queues_scroll_until_activated() {
+    // Oracle: the cpp's `m_currentEisSequence > m_currentActivationId`
+    // dance (inputcapturesession.cpp:362-366) holds scroll events in
+    // `queuedEiEvents` until the D-Bus `Activated` signal arrives.
+    // The transport ports this via `ActivationGate::should_queue()` →
+    // `PendingInput::ScrollDelta` / `PendingInput::ScrollDiscrete`
+    // (ei.rs:505-509, :515-522) and the drain at :620-623.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        let seat = connection.add_seat(
+            Some("test"),
+            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+        );
+        let device = seat.add_device(
+            Some("test-pointer"),
+            DeviceType::Virtual,
+            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            |_device| {},
+        );
+        device.resumed();
+        device.start_emulating(11);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Gate is armed (sequence=11, activation_id=0). Send a
+        // ScrollDelta AND a ScrollDiscrete — both must be queued,
+        // NOT emitted on the wire.
+        scroll_delta(&connection, &device, 2.0, 3.0);
+        scroll_discrete(&connection, &device, 1, 1);
+
+        let premature = timeout(Duration::from_millis(200), wire_rx.recv()).await;
+        assert!(
+            premature.is_err(),
+            "scroll events arrived on the wire while gate was armed"
+        );
+
+        // Activated. The drain emits in arrival order: ScrollDelta
+        // body first (smooth passthrough), then ScrollDiscrete body
+        // (y-negated dy).
+        receiver.handle_activated(11).await;
+
+        let first = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("queued scroll delta replay timed out")
+            .expect("wire rx closed");
+        assert_eq!(
+            first.into_json(),
+            serde_json::json!({"scroll": true, "dx": 2.0, "dy": 3.0})
+        );
+
+        let second = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("queued scroll discrete replay timed out")
+            .expect("wire rx closed");
+        assert_eq!(
+            second.into_json(),
+            serde_json::json!({"scroll": true, "dx": 0.125, "dy": -0.125})
+        );
+
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit");
+    });
+}
+
+// ---------- disconnect tests ----------
+
+#[test]
+fn disconnect_via_explicit_event_signals_and_completes() {
+    // Oracle: the cpp at inputcapturesession.cpp:372-374 logs the
+    // EI disconnect and falls through. The receiver's `dispatch`
+    // (ei.rs:410-417) fires `disconnect_tx.send(true)` on the event.
+    // In production, the portal closes the socket too — the pump
+    // exits on the EOF that follows the Disconnected event.
+    //
+    // **Caveat pinned in FINDINGS.md.** reis's `Connection::disconnected`
+    // (reis request.rs:106) calls `shutdown_read` on the EIS-side
+    // socket, NOT `shutdown_write`. That makes the EIS unable to read
+    // but does NOT cause the Receiver's read end to see EOF — a
+    // half-open scenario the cpp's own `break` (inputcapturesession.cpp:373)
+    // implicitly assumes will not happen (the portal closes the socket
+    // too). To make the pump exit in this test we close the socket
+    // ourselves by ending the eis_drive task — same as production.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, _receiver, _wire_rx, mut disconnect_rx, drive, eis_done_tx) =
+            setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        // 1. Send the explicit Disconnected event from the EIS side.
+        connection.disconnected(reis::ei::connection::DisconnectReason::Disconnected, None);
+
+        // 2. disconnect_rx flips to true once dispatch sees the event
+        //    (ei.rs:417). This is the oracle assertion for the
+        //    Disconnected event itself.
+        let _ = timeout(Duration::from_secs(2), disconnect_rx.changed())
+            .await
+            .expect("disconnect_rx did not flip on Disconnected event");
+        assert!(
+            *disconnect_rx.borrow_and_update(),
+            "disconnect_rx must be true after Disconnected event"
+        );
+
+        // 3. Close the socket to simulate the production follow-up
+        //    (portal closing the socket after sending Disconnected).
+        //    The eis_drive task ends and drops eis::Context, which
+        //    owns the UnixStream.
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+
+        // 4. drive future completes once the pump exits on EOF
+        //    (ei.rs:392).
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit after Disconnected event + socket close");
+    });
+}
+
+#[test]
+fn disconnect_via_eof_signals_and_completes() {
+    // Oracle: ei.rs:392 — when the stream ends (the `while let Some(event)
+    // = stream.next().await` returns None), the pump exits the loop and
+    // calls `let _ = disconnect_tx.send(true);` at the bottom. This is
+    // the EOF-without-explicit-Disconnected path: the EIS side just
+    // closes the socket. We trigger that here by signaling the eis_drive
+    // to drop its converter + eis::Context WITHOUT going through
+    // `connection.disconnected()` first.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, _receiver, _wire_rx, mut disconnect_rx, drive, eis_done_tx) =
+            setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        // Signal the eis_drive task to end and drop the test's
+        // Connection wrapper. The eis_drive's closure drops the
+        // converter and (when the task ends) eis::Context — which
+        // owns the UnixStream. Socket closes; pump sees EOF.
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+
+        // disconnect_rx flips to true once the pump's while-loop
+        // exits on None.
+        let _ = timeout(Duration::from_secs(2), disconnect_rx.changed())
+            .await
+            .expect("disconnect_rx did not flip on EOF");
+        assert!(
+            *disconnect_rx.borrow_and_update(),
+            "disconnect_rx must be true after EOF"
+        );
+
+        // drive future completes.
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit on EOF");
+    });
+}
+
 // ---------- memfd helper ----------
 
 fn memfd_create() -> std::io::Result<std::fs::File> {
