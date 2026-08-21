@@ -111,9 +111,9 @@ tempfile = "3"
 
 # shareinputdevices M3 EI transport. reis is the pure-Rust libei/libeis
 # binding; the lan-mouse upstream uses ashpd+reis for the same portal half
-# we drive from raw zbus (see plans/task-1042-m2-report.md). xkbcommon
-# wraps libxkbcommon for keysym/modifier lookup (the cpp producer at
-# inputcapturesession.cpp:43-89 mirrors this directly).
+# we drive from raw zbus. xkbcommon wraps libxkbcommon for keysym/modifier
+# lookup (the cpp producer at inputcapturesession.cpp:43-89 mirrors this
+# directly).
 reis = { version = "0.7.1", default-features = false, features = ["tokio"] }
 xkbcommon = "0.9"
 # reis re-exports enumflags2::BitFlags; futures-util supplies StreamExt

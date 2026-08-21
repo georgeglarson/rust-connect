@@ -15,7 +15,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libdbus-1-dev
+        # libssl-dev is only needed for dev-dependencies (openssl in test fixtures);
+        # the production binary no longer uses openssl.
+        # libdbus-1-dev is needed for zbus (MPRIS, notifications).
+        # libxkbcommon-dev is linked at build time by the xkbcommon crate
+        # (shareinputdevices M3 keysym/modifier lookup, raw FFI, no pkg-config).
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libdbus-1-dev libxkbcommon-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
