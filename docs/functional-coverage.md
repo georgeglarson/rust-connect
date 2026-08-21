@@ -438,6 +438,22 @@ feature_ledger:
     reason: "Task 3.2 M3 closed environment: isolated netns B (rust daemon) received the kdeconnect.share packet from netns A (kde daemon) and landed the file at the configured download dir. hostile_input promoted to PASS via Task 2.5 (merged 2026-08-10): path traversal defeated, transfer permits capped, over-cap refused, URL schemes rejected, stream uploads capped, multipart fuzz target. Role-internal note (Task 3.1, 2026-08-14): kdeconnect.share.request.update is consumed but never sent (src/plugins/share.rs:656-667 — no multi-file batch to report on); does not block this row's PASS."
     owner: "Task 3.1 (kdeconnect.share.request.update)"
 
+  - feature: shareinputdevices
+    rust_impl: true
+    upstream:
+    upstream_ref: "kdeconnect-kde plugins/shareinputdevices/ / kdeconnect-android InputDevicesReceiver.kt"
+    desktop_effect: UNVERIFIED
+    api_surface: UNVERIFIED
+    lifecycle: UNVERIFIED
+    hostile_input: UNVERIFIED
+    fixture_provenance: PASS
+    live_device: NOT-APPLICABLE
+    environment: UNVERIFIED
+    status: UNVERIFIED
+    cite: "tests/fixtures/upstream-wire/shareinputdevices/ (8 fixtures transcribed from shareinputdevicesplugin.cpp:71-138 + InputDevicesReceiver.kt:60-118, provenance.yaml); M1 wire-shape planners + M2 portal lifecycle (PRs #24/#25, vk #1042). Producer is INERT until the M3 EIS transport attaches: enable_session_backend probes the InputCapture portal and stashes the connection, but no barrier is armed and outgoing kdeconnect.shareinputdevices.request is advertised only after activate_portal_session runs (gated outgoing_capabilities, tests/fixtures/rust-capabilities.yaml records the empty outgoing set)."
+    reason: "M1+M2 landed 2026-08-21 (draft PRs #24/#25): wire shapes, plugin skeleton, portal probe + v1 session lifecycle. Capability honesty: plugin loader-registered but inert until M3 — arming an InputCapture barrier with no event consumer would capture the cursor with nothing forwarding (review panel 0e230438). Remaining cells need M3 (EIS transport) and M4 (interop + live leg on GNOME/KDE Wayland)."
+    owner: "vk #1042"
+
   - feature: sms
     rust_impl: true
     upstream:

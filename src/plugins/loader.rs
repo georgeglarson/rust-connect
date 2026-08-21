@@ -80,7 +80,7 @@ pub fn load_default_plugins(
         runcommand: Arc::new(super::RuncommandPlugin::new()),
         sendnotifications: Arc::new(
             super::SendNotificationsPlugin::new(plugin_events.clone(), pairing_handler)
-                .with_connection_manager(connection_manager),
+                .with_connection_manager(connection_manager.clone()),
         ),
         remotekeyboard: Arc::new(super::RemoteKeyboardPlugin::new(plugin_events.clone())),
         digitizer: Arc::new(super::DigitizerPlugin::new()),
@@ -88,6 +88,13 @@ pub fn load_default_plugins(
         // production entry point (bootstrap.rs create_state).
         screensaver_inhibit: Arc::new(super::ScreensaverInhibitPlugin::new()),
         remotecommands: Arc::new(super::RemoteCommandsPlugin::new(plugin_events.clone())),
+        // Session portal backend is enabled only at the production
+        // entry point (bootstrap.rs create_state), same gate as
+        // clipboard/mpris/screensaver_inhibit/pausemusic/systemvolume.
+        shareinputdevices: Arc::new(
+            super::ShareInputDevicesPlugin::new()
+                .with_connection_manager(connection_manager.clone()),
+        ),
     }
 }
 

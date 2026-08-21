@@ -517,7 +517,7 @@ fixtures:
     source_lines: "71-75"
     extraction_date: "2026-08-20"
     note: "Producer body built on barrier activation; exitEdge is the configured Qt::Edge (default LeftEdge=2), deltax/deltay is the cursor-position minus the activated barrier's p1. Inline envelope (id+type+body) mirrors the receiver-shaped envelopes used elsewhere in this repo."
-    used_by: "src/plugins/shareinputdevices.rs::plan_shareinputdevices_request_default_edge_wire_shape"
+    used_by: "src/plugins/shareinputdevices/mod.rs::plan_shareinputdevices_request_default_edge_wire_shape"
 
   - file: shareinputdevices/shareinputdevices_request_edge_variants.json
     kind: upstream-derived
@@ -527,7 +527,7 @@ fixtures:
     source_lines: "71-75,124-127"
     extraction_date: "2026-08-20"
     note: "Qt::Edge numerics from /usr/include/qt6/QtCore/qnamespace.h: Top=1, Left=2, Right=4, Bottom=8. The Android consumer flips the mapping (TOP_EDGE=8, LEFT_EDGE=4, RIGHT_EDGE=2, BOTTOM_EDGE=1) at InputDevicesReceiver.kt:125-128 — the wire value we send is the Qt-edge integer, NOT the Android-inverted one."
-    used_by: "src/plugins/shareinputdevices.rs::plan_shareinputdevices_request_all_qt_edges"
+    used_by: "src/plugins/shareinputdevices/mod.rs::plan_shareinputdevices_request_all_qt_edges"
 
   - file: shareinputdevices/mousepad_request_motion.json
     kind: upstream-derived
@@ -537,7 +537,7 @@ fixtures:
     source_lines: "76-79"
     extraction_date: "2026-08-20"
     note: "The producer's relative-motion packets reverse the consumer's: dx/dy are signed pixels from the EI receiver. The exact wire body is `{dx, dy}` per the cpp lambda at :76-79."
-    used_by: "src/plugins/shareinputdevices.rs::plan_mousepad_motion_wire_shape"
+    used_by: "src/plugins/shareinputdevices/mod.rs::plan_mousepad_motion_wire_shape"
 
   - file: shareinputdevices/mousepad_request_buttons.json
     kind: upstream-derived
@@ -547,7 +547,7 @@ fixtures:
     source_lines: "80-91"
     extraction_date: "2026-08-20"
     note: "Two upstream quirks captured: (1) BTN_LEFT release goes through as `singlerelease` even though the comment at :82 acknowledges that's 'not entirely correct' — the only desktop peer that can act on a button release is the upstream mousepad consumer, and it treats the field as drag-end. (2) BTN_MIDDLE on BOTH press and release fires `middleclick` — the cpp's :87-89 branch is `if (button == BTN_MIDDLE)` with no press check. Replicated exactly; if a phone-side consumer ever breaks on the duplicate we will know to revisit."
-    used_by: "src/plugins/shareinputdevices.rs::plan_mousepad_buttons_wire_shape"
+    used_by: "src/plugins/shareinputdevices/mod.rs::plan_mousepad_buttons_wire_shape"
 
   - file: shareinputdevices/mousepad_request_scroll_delta.json
     kind: upstream-derived
@@ -557,7 +557,7 @@ fixtures:
     source_lines: "92-97"
     extraction_date: "2026-08-20"
     note: "Smooth scroll delta passes through verbatim: `{scroll: true, dx, dy}` sent as-is from the EI receiver. The 'scrollDirection in kdeconnect is inverted' comment at :94 is upstream-recorded — sign on the wire matches what the portal delivers, not what the consumer expects; Android's MouseReceiverService applies a flip."
-    used_by: "src/plugins/shareinputdevices.rs::plan_mousepad_scroll_delta_passthrough"
+    used_by: "src/plugins/shareinputdevices/mod.rs::plan_mousepad_scroll_delta_passthrough"
 
   - file: shareinputdevices/mousepad_request_scroll_discrete.json
     kind: upstream-derived
@@ -567,7 +567,7 @@ fixtures:
     source_lines: "98-103"
     extraction_date: "2026-08-20"
     note: "Discrete scroll applies `anglePer120Step = 15/120` (0.125) AND negates y (`-y * anglePer120Step`). The y-negation is asymmetric with the delta-passthrough path. Upstream records no rationale; likely a bug. Replicated exactly for wire compat; will validate against the phone in M4b."
-    used_by: "src/plugins/shareinputdevices.rs::plan_mousepad_scroll_discrete_negates_y"
+    used_by: "src/plugins/shareinputdevices/mod.rs::plan_mousepad_scroll_discrete_negates_y"
 
   - file: shareinputdevices/mousepad_request_keys.json
     kind: upstream-derived
@@ -577,7 +577,7 @@ fixtures:
     source_lines: "28-63,104-116"
     extraction_date: "2026-08-20"
     note: "Body shape per the cpp lambda at :104-116: key (text from xkb keysym), specialKey (integer from the Qt::Key->code map at :28-63 — 0 when unmapped), and the four INDEPENDENT modifier booleans shift/ctrl/alt/super. The Android mousepad consumer reads the same shape (KeyListenerView.java:132-163); the specialKey code table is the same 1..32 set our receiver already implements (mousepad.rs:340-380)."
-    used_by: "src/plugins/shareinputdevices.rs::plan_mousepad_keys_wire_shape"
+    used_by: "src/plugins/shareinputdevices/mod.rs::plan_mousepad_keys_wire_shape"
 
   - file: shareinputdevices/shareinputdevices_release.json
     kind: upstream-derived
@@ -587,4 +587,4 @@ fixtures:
     source_lines: "60-68"
     extraction_date: "2026-08-20"
     note: "Release packet the phone sends when the cursor exits the controlled region. Consumer reads it at shareinputdevicesplugin.cpp:129-138: barrier.p1() + releaseDelta becomes the position passed to portal Release. The producer's release seam (M1) is a store/callback; the portal release is M2."
-    used_by: "src/plugins/shareinputdevices.rs::test_handle_release_packet_parses_release_delta"
+    used_by: "src/plugins/shareinputdevices/mod.rs::test_handle_release_packet_parses_release_delta"

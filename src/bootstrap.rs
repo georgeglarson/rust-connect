@@ -169,6 +169,19 @@ pub async fn create_state(settings: AppSettings) -> Result<Arc<AppState>> {
         .with_device_registry(state.registry.clone());
     state.plugins.systemvolume.enable_session_backend().await;
 
+    // Gate for the shareinputdevices producer's InputCapture portal
+    // backend. Degrades with a log event when xdg-desktop-portal is
+    // unreachable / lacks the InputCapture interface / reports
+    // version < 1 / lacks keyboard+pointer capabilities. When the
+    // probe gate fails, is_backend_available() returns false and the
+    // plugin's outgoing capability stays un-advertised to peers —
+    // capability honesty is the contract.
+    state
+        .plugins
+        .shareinputdevices
+        .enable_session_backend()
+        .await;
+
     info!(
         device_name = %state.settings.device_name,
         tcp_port = state.settings.tcp_port,

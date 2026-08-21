@@ -1,11 +1,23 @@
-//! ShareInputDevices plugin — PRODUCER role (M1).
+//! ShareInputDevices plugin — PRODUCER role (M1 + M2 D-Bus half).
 //!
 //! Single Responsibility: Build the wire packets that a desktop
 //! InputCapture session sends to a paired phone — the activation
 //! announcement, the relative motion/button/scroll/key event stream, and
 //! the parse of the release packet the phone sends back. M1 is the
-//! wire-shape layer only: no portal/dbus/ei code lives here. The portal
-//! half is M2; the EI transport is M3.
+//! wire-shape layer; M2 is the D-Bus half (portal probe + v1 session
+//! lifecycle + Release wiring). The EI transport remains M3.
+//!
+//! Module layout:
+//! - `mod.rs` (this file): the `Plugin` impl, the wire-shape planners
+//!   (motion/buttons/scroll/keys/release), the `Edge` enum, and the
+//!   pure activation-announcement builder.
+//! - `barrier.rs`: the pure barrier-math planner (zone set +
+//!   configured edge → one Barrier rectangle). No D-Bus.
+//! - `portal.rs`: the `org.freedesktop.portal.InputCapture` zbus
+//!   binding, the v1 session lifecycle (CreateSession → ConnectToEIS
+//!   → GetZones → SetPointerBarriers → Enable), signal handling,
+//!   Release wiring, and the startup probe that gates
+//!   `is_backend_available()`.
 //!
 //! Wire shapes (upstream-verified):
 //! - **Outgoing `kdeconnect.shareinputdevices.request`**:
@@ -51,15 +63,20 @@
 //! tests only — see `tests_shareinputdevices_plugin_*` and the final
 //! message that records the gating.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 
 use crate::protocol::types::Packet;
 use crate::utils::errors::Result;
 
 use super::plugin::Plugin;
+
+pub mod barrier;
+pub mod portal;
 
 /// Qt::Edge numerics, taken verbatim from the Qt 6 header
 /// /usr/include/qt6/QtCore/qnamespace.h (verified 2026-08-20 against
@@ -297,6 +314,22 @@ pub struct ShareInputDevicesPlugin {
     /// stores it for tests and lets unit tests swap a recording
     /// callback.
     release_callback: Arc<Mutex<Option<ReleaseCallback>>>,
+    /// The live M2 portal session, if the probe gate passed and
+    /// `enable_session_backend` ran. The release callback closes
+    /// over this and calls `release()`. `None` until bootstrap
+    /// succeeds (or for the whole process lifetime when the probe
+    /// fails).
+    portal_session: Arc<Mutex<Option<Arc<portal::PortalSession>>>>,
+    /// The session-bus connection the probe ran on, stashed for
+    /// `activate_portal_session` (M3's entry point) so the EI
+    /// transport attaches on the SAME connection the probe used.
+    portal_conn: Arc<Mutex<Option<zbus::Connection>>>,
+    /// Probe result — `true` after the portal probe gate has
+    /// confirmed the InputCapture interface is present and
+    /// capable. The Plugin trait's `is_backend_available()` reads
+    /// this so capability advertisement is gated by reality, not
+    /// just the existence of a build artefact.
+    backend_available: Arc<AtomicBool>,
 }
 
 impl Default for ShareInputDevicesPlugin {
@@ -312,6 +345,9 @@ impl ShareInputDevicesPlugin {
             connection_manager: None,
             last_release: Arc::new(Mutex::new(None)),
             release_callback: Arc::new(Mutex::new(None)),
+            portal_session: Arc::new(Mutex::new(None)),
+            portal_conn: Arc::new(Mutex::new(None)),
+            backend_available: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -358,6 +394,236 @@ impl ShareInputDevicesPlugin {
     pub fn edge(&self) -> Edge {
         self.edge
     }
+
+    /// Test/inspection seam: whether the M2 portal backend is wired.
+    /// Mirrors clipboard.rs / mpris / screensaver_inhibit pattern —
+    /// `false` until `enable_session_backend()` has run AND the
+    /// portal probe passed.
+    pub fn portal_backend_available(&self) -> bool {
+        self.backend_available.load(Ordering::SeqCst)
+    }
+
+    /// Inject a pre-built `PortalSession` for integration tests.
+    /// Production wiring goes through `enable_session_backend()` —
+    /// which connects to the session bus, probes the portal, and
+    /// starts the session in one shot. The test bypass is needed
+    /// because a fake-portal session is built against a
+    /// test-supplied `Connection`, not the live session bus.
+    #[cfg(test)]
+    pub fn with_portal_session(self, session: Arc<portal::PortalSession>) -> Self {
+        *self
+            .portal_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
+        self.backend_available.store(true, Ordering::SeqCst);
+        // Wire release callback to the injected session.
+        let session_for_cb = session.clone();
+        let cb: ReleaseCallback = Arc::new(move |deltax, deltay| {
+            let s = session_for_cb.clone();
+            tokio::spawn(async move {
+                if let Err(e) = s.release(deltax, deltay).await {
+                    warn!(
+                        error = %e,
+                        event = "shareinputdevices_release_dbus_failed",
+                        "Portal Release() failed"
+                    );
+                }
+            });
+        });
+        *self
+            .release_callback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(cb);
+        self
+    }
+
+    /// Production entry point. Called ONLY from
+    /// `bootstrap.rs::create_state` (mirrors
+    /// screensaver_inhibit.rs::enable_session_backend /
+    /// pausemusic.rs / mpris). The flow:
+    ///
+    /// 1. Connect to the session D-Bus.
+    /// 2. Probe `org.freedesktop.portal.InputCapture` (interface
+    ///    present + `SupportedCapabilities` has keyboard|pointer +
+    ///    `version` >= 1).
+    /// 3. If probe fails, log loudly and leave the plugin inert —
+    ///    `is_backend_available()` returns false, capability
+    ///    advertisement gates off, no session is started.
+    /// 4. If probe passes, stash the connection and STOP. The
+    ///    barrier is NOT armed here (panel 0e230438 / 573c501e):
+    ///    an armed InputCapture barrier with no EI consumer would
+    ///    capture the user's cursor with nothing forwarding the
+    ///    promised mousepad.request stream. Session start waits for
+    ///    the M3 EI transport, which calls
+    ///    `activate_portal_session` once its receiver exists.
+    pub async fn enable_session_backend(&self) {
+        let conn = match zbus::Connection::session().await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    event = "shareinputdevices_session_bus_unavailable",
+                    "Cannot connect to session D-Bus; shareinputdevices plugin stays inert"
+                );
+                return;
+            }
+        };
+
+        if !portal::probe_portal_available(&conn).await {
+            // Probe already logged the reason; just leave backend
+            // unavailable and return. Capability advertisement is
+            // gated by is_backend_available(), which still returns
+            // false because we never set backend_available.
+            return;
+        }
+
+        *self.portal_conn.lock().unwrap_or_else(|e| e.into_inner()) = Some(conn);
+        info!(
+            event = "shareinputdevices_probe_passed_inert",
+            "InputCapture portal available; producer stays INERT until the M3 EI transport attaches (no barrier armed, nothing advertised)"
+        );
+    }
+
+    /// M3's entry point: start the portal session and go live. Called
+    /// once the EI transport is ready to consume the session's event
+    /// stream — never before, because Enable arms the capture
+    /// barrier. Runs the full v1 sequence (CreateSession →
+    /// ConnectToEIS → GetZones → SetPointerBarriers → Enable), wires
+    /// the release callback to `session.release()`, and spawns the
+    /// Activated → wire-packet consumer task that pumps
+    /// `kdeconnect.shareinputdevices.request` packets to peers.
+    pub async fn activate_portal_session(&self) {
+        let conn = self
+            .portal_conn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(conn) = conn else {
+            warn!(
+                event = "shareinputdevices_activate_without_probe",
+                "activate_portal_session called before a successful probe; refusing"
+            );
+            return;
+        };
+
+        // Build a channel for Activated events. The PortalSession
+        // owns the sender; we own the receiver and turn each event
+        // into a kdeconnect.shareinputdevices.request packet.
+        let (activated_tx, mut activated_rx) = mpsc::unbounded_channel::<portal::ActivatedEvent>();
+        let session = match portal::PortalSession::start(conn, self.edge, activated_tx).await {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    event = "shareinputdevices_session_start_failed",
+                    "PortalSession::start failed; shareinputdevices plugin stays inert"
+                );
+                return;
+            }
+        };
+
+        // Wire release callback to session.release(). The callback
+        // is async-required (D-Bus call) so we spawn a tokio task.
+        let session_for_cb = session.clone();
+        let cb: ReleaseCallback = Arc::new(move |deltax, deltay| {
+            let s = session_for_cb.clone();
+            tokio::spawn(async move {
+                if let Err(e) = s.release(deltax, deltay).await {
+                    warn!(
+                        error = %e,
+                        event = "shareinputdevices_release_dbus_failed",
+                        "Portal Release() failed"
+                    );
+                }
+            });
+        });
+        *self
+            .release_callback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(cb);
+
+        *self
+            .portal_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
+        self.backend_available.store(true, Ordering::SeqCst);
+        // The daemon's capability collection ran at boot, before this
+        // activation — push the delta or the advertisement never goes
+        // out (panel b152dcc0).
+        if let Some(cm) = &self.connection_manager {
+            cm.add_capabilities(&[], &["kdeconnect.shareinputdevices.request".to_string()]);
+        }
+        info!(
+            event = "shareinputdevices_backend_enabled",
+            session_handle = session.session_handle().as_str(),
+            edge = ?self.edge,
+            "shareinputdevices session backend wired"
+        );
+
+        // Spawn the Activated → wire-packet consumer. We hold the
+        // receiver here; the plugin's connection_manager may be
+        // wired later (after enable_session_backend returns — see
+        // bootstrap.rs), so this consumer needs to be tolerant of
+        // CM being None at the time it spawns. Easiest: capture an
+        // Option<Arc<CM>>-like accessor that the consumer polls.
+        let cm_accessor: Arc<Mutex<Option<Arc<crate::protocol::ConnectionManager>>>> =
+            Arc::new(Mutex::new(self.connection_manager.clone()));
+        let edge = self.edge;
+        tokio::spawn(async move {
+            while let Some(event) = activated_rx.recv().await {
+                let cm_opt = cm_accessor
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let Some(cm) = cm_opt else {
+                    warn!(
+                        event = "shareinputdevices_activated_no_connection_manager",
+                        "No connection manager wired; Activated event dropped"
+                    );
+                    continue;
+                };
+                let body = plan_shareinputdevices_request(edge, event.deltax, event.deltay);
+                let packet = Packet::new(
+                    "kdeconnect.shareinputdevices.request".to_string(),
+                    serde_json::to_value(&body).unwrap_or_else(|e| {
+                        warn!(
+                            error = %e,
+                            event = "shareinputdevices_request_serialize_failed",
+                            "ShareInputDevicesRequest serialize failed"
+                        );
+                        serde_json::json!({})
+                    }),
+                );
+                // No "broadcast" method on ConnectionManager; iterate
+                // connected device ids and send per peer (mirrors the
+                // pattern at src/plugins/share.rs / 359 — both
+                // fan-out one packet at a time). An Activated with
+                // no peers drops the packet at the broker.
+                let peers = cm.connected_device_ids().await;
+                if peers.is_empty() {
+                    debug!(
+                        event = "shareinputdevices_activated_no_peers",
+                        "Activated: no peers connected; request dropped"
+                    );
+                    continue;
+                }
+                for device_id in peers {
+                    if let Err(e) = cm.send_packet(&device_id, &packet).await {
+                        warn!(
+                            device_id = %device_id,
+                            error = %e,
+                            event = "shareinputdevices_activated_send_failed",
+                            "Send of shareinputdevices.request failed"
+                        );
+                    }
+                }
+            }
+            debug!(
+                event = "shareinputdevices_activated_consumer_exit",
+                "Activated consumer task ended (channel closed)"
+            );
+        });
+    }
 }
 
 #[async_trait::async_trait]
@@ -379,20 +645,29 @@ impl Plugin for ShareInputDevicesPlugin {
     /// src/plugins/remotekeyboard.rs:76-78) and the registry dedups at
     /// src/daemon.rs:102-116, so we add only the shareinputdevices-
     /// request delta here.
+    ///
+    /// Gated on the portal probe (systemvolume/mod.rs:519-530
+    /// pattern): the daemon's capability aggregation
+    /// (src/daemon.rs:102-116) does NOT filter on
+    /// `is_backend_available()`, so the honesty contract lives here —
+    /// on a portal-less desktop (X11, Sway, Hyprland) this returns
+    /// empty and nothing is advertised.
     fn outgoing_capabilities(&self) -> Vec<String> {
-        vec!["kdeconnect.shareinputdevices.request".to_string()]
+        if self.backend_available.load(Ordering::SeqCst) {
+            vec!["kdeconnect.shareinputdevices.request".to_string()]
+        } else {
+            Vec::new()
+        }
     }
 
-    /// **M1 carries no portal presence probe.** Until M2's probe
-    /// exists, the plugin must NOT advertise to the registry:
-    /// capability honesty is a load-bearing project rule. The plugin
-    /// is constructed but not registered in `load_default_plugins`
-    /// (See the gating paragraph in the module doc.) Once the M2
-    /// probe is wired, the override returns `true` only when the
-    /// portal backend is present, mirroring the clipboard/mpris
-    /// pattern (clipboard.rs:36-37 module doc).
+    /// M2 wires the probe gate from `enable_session_backend()` —
+    /// the override returns the live probe state, mirroring
+    /// clipboard / mpris / screensaver_inhibit / pausemusic. The
+    /// plugin IS loader-registered; probe-failure on a portal-less
+    /// desktop keeps the capability un-advertised via the gated
+    /// `outgoing_capabilities()` above.
     fn is_backend_available(&self) -> bool {
-        false
+        self.backend_available.load(Ordering::SeqCst)
     }
 
     async fn handle_packet(&self, device_id: &str, packet: Packet) -> Result<Option<Vec<Packet>>> {
@@ -808,6 +1083,13 @@ mod tests {
             plugin.incoming_capabilities(),
             vec!["kdeconnect.shareinputdevices".to_string()]
         );
+        // Capability honesty: outgoing is gated on the M2 portal
+        // probe. A fresh plugin (probe not run / probe failed)
+        // advertises nothing outgoing...
+        assert!(plugin.outgoing_capabilities().is_empty());
+        // ...and once the backend is available the request delta
+        // appears (systemvolume/mod.rs:519-530 pattern).
+        plugin.backend_available.store(true, Ordering::SeqCst);
         assert_eq!(
             plugin.outgoing_capabilities(),
             vec!["kdeconnect.shareinputdevices.request".to_string()]
