@@ -18,6 +18,10 @@
 //!   → GetZones → SetPointerBarriers → Enable), signal handling,
 //!   Release wiring, and the startup probe that gates
 //!   `is_backend_available()`.
+//! - `ei.rs` (M3): the reis-based receiver that takes ownership of
+//!   the ConnectToEIS fd and pumps EI events into the M1 planners,
+//!   with the activation-id/sequence queue (:362-366, :394-404 of
+//!   inputcapturesession.cpp) ported.
 //!
 //! Wire shapes (upstream-verified):
 //! - **Outgoing `kdeconnect.shareinputdevices.request`**:
@@ -76,6 +80,7 @@ use crate::utils::errors::Result;
 use super::plugin::Plugin;
 
 pub mod barrier;
+pub mod ei;
 pub mod portal;
 
 /// Qt::Edge numerics, taken verbatim from the Qt 6 header
