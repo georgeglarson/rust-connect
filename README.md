@@ -89,7 +89,7 @@ The runcommand plugin executes shell commands the phone triggers by name,
 on an allowlist defined on the desktop. Entries live in the config file
 under `[[runcommand.commands]]` and are loaded once at boot — there is
 intentionally no runtime write path, so the allowlist can only change by
-editing the config and restarting the daemon. Without an entry the
+editing the config and restarting the daemon. Without any entries, the
 allowlist stays empty and every request is refused (safe-by-default).
 Commands run via `/bin/sh -c` with a 30s timeout and a 64KB output cap,
 matching upstream.
@@ -219,9 +219,9 @@ command = "loginctl lock-session"
 - `command` — shell snippet executed via `/bin/sh -c`.
 
 Entries with empty `key`, `name`, or `command` are skipped with a
-warning at boot (a bad row never fails the daemon). Duplicate keys
-keep the first entry and skip the rest with a warning. There is no
-runtime write path — to change the allowlist, edit the file and
+warning at boot (a bad row never fails the daemon). For duplicate keys,
+the first entry is kept and the rest are skipped with a warning. There
+is no runtime write path — to change the allowlist, edit the file and
 restart the daemon.
 
 ## Security

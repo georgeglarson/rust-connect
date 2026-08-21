@@ -42,8 +42,22 @@ fn effective_config_path(
                 EffectiveConfig::Missing(path.to_string())
             }
         }
-        None if default_path.exists() => EffectiveConfig::Default(default_path.to_path_buf()),
-        None => EffectiveConfig::None,
+        None => match default_path.try_exists() {
+            Ok(true) => EffectiveConfig::Default(default_path.to_path_buf()),
+            Ok(false) => EffectiveConfig::None,
+            Err(e) => {
+                // exists() would read a metadata error (e.g. an unreadable
+                // parent) as absence and silently boot with an empty
+                // allowlist — surface it instead (cubic P2, PR #23).
+                warn!(
+                    path = %default_path.display(),
+                    error = %e,
+                    event = "config_default_path_unreadable",
+                    "Cannot stat the default config path; using defaults"
+                );
+                EffectiveConfig::None
+            }
+        },
     }
 }
 

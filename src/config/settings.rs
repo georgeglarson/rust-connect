@@ -53,7 +53,13 @@ pub struct AppSettings {
 /// what the phone sends back in `{"key": ...}`; `name` and `command` are
 /// the advertised fields on the wire (matching the schema Android parses
 /// from `commandList`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// Fields default to empty so an incomplete row PARSES and reaches
+/// `register_from_config`'s skip-and-warn validation — without the
+/// defaults, one row missing a field would fail the whole config file
+/// before any validation ran (cubic P2, PR #23).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct RuncommandCommand {
     pub key: String,
     pub name: String,
@@ -525,6 +531,27 @@ command = "loginctl lock-session"
 
         let settings = AppSettings::load_from_file(&path).expect("Value expected to be present");
         assert!(settings.runcommand.commands.is_empty());
+    }
+
+    /// cubic P2 (PR #23): a row missing a field must PARSE (fields
+    /// default empty) so `register_from_config`'s skip-and-warn sees it —
+    /// before the serde defaults, one incomplete row failed the whole
+    /// config file and no command loaded.
+    #[test]
+    fn test_runcommand_incomplete_row_parses_to_empty_fields() {
+        let temp = tempfile::TempDir::new().expect("Value expected to be present");
+        let path = temp.path().join("incomplete.toml");
+        std::fs::write(
+            &path,
+            "[[runcommand.commands]]\nkey = \"suspend\"\nname = \"Suspend\"\n\n[[runcommand.commands]]\nkey = \"ok\"\nname = \"OK\"\ncommand = \"echo ok\"\n",
+        )
+        .expect("Value expected to be present");
+
+        let settings = AppSettings::load_from_file(&path)
+            .expect("an incomplete row must not fail the whole config file");
+        assert_eq!(settings.runcommand.commands.len(), 2);
+        assert!(settings.runcommand.commands[0].command.is_empty());
+        assert_eq!(settings.runcommand.commands[1].command, "echo ok");
     }
 
     #[test]

@@ -147,34 +147,38 @@ impl RuncommandPlugin {
     /// take precedence over global entries with the same key for
     /// lookup.
     pub fn register_from_config(&self, cfg: &RuncommandConfig) {
-        if let Ok(mut global) = self.global_commands.write() {
-            global.clear();
-            for entry in &cfg.commands {
-                if entry.key.is_empty() || entry.name.is_empty() || entry.command.is_empty() {
-                    warn!(
-                        key = %entry.key,
-                        name = %entry.name,
-                        event = "runcommand_config_invalid_entry",
-                        "Skipping runcommand config entry with empty key/name/command"
-                    );
-                    continue;
-                }
-                if global.contains_key(&entry.key) {
-                    warn!(
-                        key = %entry.key,
-                        event = "runcommand_config_duplicate_key",
-                        "Skipping duplicate runcommand config entry; first wins"
-                    );
-                    continue;
-                }
-                global.insert(
-                    entry.key.clone(),
-                    CommandEntry {
-                        name: entry.name.clone(),
-                        command: entry.command.clone(),
-                    },
+        // Poison-tolerant like lookup/command_list_json: a poisoned lock
+        // must not silently skip registration (sourcery, PR #23).
+        let mut global = self
+            .global_commands
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        global.clear();
+        for entry in &cfg.commands {
+            if entry.key.is_empty() || entry.name.is_empty() || entry.command.is_empty() {
+                warn!(
+                    key = %entry.key,
+                    name = %entry.name,
+                    event = "runcommand_config_invalid_entry",
+                    "Skipping runcommand config entry with empty key/name/command"
                 );
+                continue;
             }
+            if global.contains_key(&entry.key) {
+                warn!(
+                    key = %entry.key,
+                    event = "runcommand_config_duplicate_key",
+                    "Skipping duplicate runcommand config entry; first wins"
+                );
+                continue;
+            }
+            global.insert(
+                entry.key.clone(),
+                CommandEntry {
+                    name: entry.name.clone(),
+                    command: entry.command.clone(),
+                },
+            );
         }
     }
 
