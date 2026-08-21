@@ -10,6 +10,43 @@ use crate::app::AppState;
 use crate::config::settings::AppSettings;
 use crate::utils::{init_logging_from_env, Result};
 
+/// Which config file `load_config` should open, if any. Pure resolution —
+/// separated from `load_config` so the precedence rules are testable
+/// without mutating process-wide XDG env vars (which parallel tests race
+/// on; panel p2 ca718267).
+enum EffectiveConfig {
+    /// Explicit `--config` path that exists.
+    Explicit(std::path::PathBuf),
+    /// No flag; the default config path exists.
+    Default(std::path::PathBuf),
+    /// Explicit `--config` path that does not exist (warns, uses defaults).
+    Missing(String),
+    /// No flag and no default file.
+    None,
+}
+
+/// An explicit `--config` path wins. Without one, the default config path
+/// (`~/.config/rust-connect/config.toml`) is used when it exists — the
+/// shipped systemd unit passes no `--config`, so without this fallback the
+/// documented "edit config.toml and restart" flow configures nothing.
+fn effective_config_path(
+    config_path: Option<&str>,
+    default_path: &std::path::Path,
+) -> EffectiveConfig {
+    match config_path {
+        Some(path) => {
+            let path_buf = std::path::PathBuf::from(path);
+            if path_buf.exists() {
+                EffectiveConfig::Explicit(path_buf)
+            } else {
+                EffectiveConfig::Missing(path.to_string())
+            }
+        }
+        None if default_path.exists() => EffectiveConfig::Default(default_path.to_path_buf()),
+        None => EffectiveConfig::None,
+    }
+}
+
 /// Loads configuration from file or defaults, applies CLI overrides.
 ///
 /// An explicit `--config` path wins. Without one, the default config path
@@ -27,31 +64,23 @@ pub fn load_config(
 ) -> Result<AppSettings> {
     let mut settings = AppSettings::new();
 
-    let default_path = AppSettings::config_path();
-    match config_path {
-        Some(path) => {
-            let path_buf = std::path::PathBuf::from(path);
-            if path_buf.exists() {
-                let mut loaded = AppSettings::load_from_file(&path_buf)?;
-                // A config file without api_keys must not silently disable auth:
-                // give it the same persisted/generated-key treatment as the
-                // default path.
-                loaded.ensure_api_key();
-                settings = loaded;
-            } else {
-                warn!(
-                    path = path,
-                    event = "config_not_found",
-                    "Config file not found, using defaults"
-                );
-            }
-        }
-        None if default_path.exists() => {
-            let mut loaded = AppSettings::load_from_file(&default_path)?;
+    match effective_config_path(config_path, &AppSettings::config_path()) {
+        EffectiveConfig::Explicit(path_buf) | EffectiveConfig::Default(path_buf) => {
+            let mut loaded = AppSettings::load_from_file(&path_buf)?;
+            // A config file without api_keys must not silently disable auth:
+            // give it the same persisted/generated-key treatment as the
+            // default path.
             loaded.ensure_api_key();
             settings = loaded;
         }
-        None => {}
+        EffectiveConfig::Missing(path) => {
+            warn!(
+                path = path.as_str(),
+                event = "config_not_found",
+                "Config file not found, using defaults"
+            );
+        }
+        EffectiveConfig::None => {}
     }
 
     if let Some(p) = port {
@@ -205,65 +234,60 @@ mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
 
-    /// XDG env guard: `dirs::config_dir()`/`dirs::data_dir()` read these at
-    /// call time, so tests point them at a tempdir and restore on drop —
-    /// parallel tests must never see the override or the real home.
-    struct XdgGuard {
-        prev_config: Option<std::ffi::OsString>,
-        prev_data: Option<std::ffi::OsString>,
-    }
-
-    impl XdgGuard {
-        fn new(temp: &std::path::Path) -> Self {
-            let guard = Self {
-                prev_config: std::env::var_os("XDG_CONFIG_HOME"),
-                prev_data: std::env::var_os("XDG_DATA_HOME"),
-            };
-            std::env::set_var("XDG_CONFIG_HOME", temp.join("config"));
-            std::env::set_var("XDG_DATA_HOME", temp.join("data"));
-            guard
-        }
-    }
-
-    impl Drop for XdgGuard {
-        fn drop(&mut self) {
-            match &self.prev_config {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-            match &self.prev_data {
-                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                None => std::env::remove_var("XDG_DATA_HOME"),
-            }
-        }
-    }
-
     /// Panel P1 (review-20260820T235242Z, codex + grok-46): without
     /// `--config`, the default config path was never read, so a documented
-    /// `config.toml` edit configured nothing. One test, three sequential
-    /// scenarios — the XDG env override is process-wide, so parallel tests
-    /// would race on it.
+    /// `config.toml` edit configured nothing. These run against the pure
+    /// resolver — mutating process-wide XDG env vars would race parallel
+    /// tests (panel p2 ca718267).
     #[test]
-    fn test_load_config_default_path_fallback() {
+    fn test_effective_config_path_precedence() {
         let temp = tempfile::TempDir::new().expect("tempdir");
-        let _xdg = XdgGuard::new(temp.path());
-        let cfg_dir = temp.path().join("config").join("rust-connect");
 
-        // (a) No flag, default file present -> the default path is loaded.
-        std::fs::create_dir_all(&cfg_dir).expect("mkdir");
+        // (a) No flag, default file present -> the default path is used.
+        let default_dir = temp.path().join("rust-connect");
+        std::fs::create_dir_all(&default_dir).expect("mkdir");
+        let default_file = default_dir.join("config.toml");
+        std::fs::write(&default_file, "device_name = \"from-default-path\"\n")
+            .expect("write config");
+        match effective_config_path(None, &default_file) {
+            EffectiveConfig::Default(p) => assert_eq!(p, default_file),
+            _ => panic!("expected the default path to be selected"),
+        }
+
+        // (b) An explicit `--config` path wins over the default path.
+        let explicit = temp.path().join("explicit.toml");
+        std::fs::write(&explicit, "device_name = \"explicit-path\"\n").expect("write explicit");
+        match effective_config_path(Some(explicit.to_str().expect("utf8")), &default_file) {
+            EffectiveConfig::Explicit(p) => assert_eq!(p, explicit),
+            _ => panic!("expected the explicit path to win"),
+        }
+
+        // (c) An explicit path that does not exist -> Missing (warns, defaults).
+        match effective_config_path(Some("/nonexistent/config.toml"), &default_file) {
+            EffectiveConfig::Missing(p) => assert_eq!(p, "/nonexistent/config.toml"),
+            _ => panic!("expected Missing for a nonexistent explicit path"),
+        }
+
+        // (d) No flag and no default file -> None.
+        let absent = temp.path().join("absent").join("config.toml");
+        match effective_config_path(None, &absent) {
+            EffectiveConfig::None => {}
+            _ => panic!("expected None when no file exists anywhere"),
+        }
+    }
+
+    /// The resolver feeds `load_config` end to end: an explicit config file
+    /// is actually parsed and applied.
+    #[test]
+    fn test_load_config_applies_explicit_file() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let explicit = temp.path().join("config.toml");
         std::fs::write(
-            cfg_dir.join("config.toml"),
+            &explicit,
             "device_name = \"from-default-path\"\napi_port = 19090\n",
         )
         .expect("write config");
-        let settings = load_config(None, None, None, None, None, false, None)
-            .expect("load_config should succeed");
-        assert_eq!(settings.device_name, "from-default-path");
-        assert_eq!(settings.api_port, 19090);
 
-        // (b) An explicit `--config` path still wins over the default path.
-        let explicit = temp.path().join("explicit.toml");
-        std::fs::write(&explicit, "device_name = \"explicit-path\"\n").expect("write explicit");
         let settings = load_config(
             Some(explicit.to_str().expect("utf8 path")),
             None,
@@ -274,13 +298,8 @@ mod tests {
             None,
         )
         .expect("load_config should succeed");
-        assert_eq!(settings.device_name, "explicit-path");
 
-        // (c) No flag and no default file -> plain defaults, no error.
-        std::fs::remove_file(cfg_dir.join("config.toml")).expect("remove config");
-        let settings = load_config(None, None, None, None, None, false, None)
-            .expect("load_config should succeed");
-        assert_ne!(settings.device_name, "from-default-path");
-        assert_eq!(settings.api_port, 9090);
+        assert_eq!(settings.device_name, "from-default-path");
+        assert_eq!(settings.api_port, 19090);
     }
 }
