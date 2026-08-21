@@ -38,6 +38,16 @@
 //!
 //! The output is sent on an mpsc channel the caller owns; the
 //! receiver is transport-only — wire-shape decisions live in M1.
+//!
+//! **M4 integration cost.** The drive future this module returns is
+//! `!Send` (reis's `EiConvertEventStream` and xkbcommon's
+//! `xkb::State` are both `!Send`). The daemon's main is
+//! `#[tokio::main]` (multithreaded) at `main.rs:10`, so when M4
+//! wires this receiver into the live daemon it cannot use
+//! `tokio::spawn`. It must run the pump on a dedicated thread that
+//! hosts a `current_thread` runtime (or an explicit `LocalSet`) and
+//! forward the resulting `WireBody` mpsc across thread boundaries
+//! to the connection manager.
 
 use std::collections::VecDeque;
 use std::os::unix::io::OwnedFd;
@@ -84,8 +94,7 @@ const MOD_SUPER: &str = "Mod4";
 /// The four booleans the cpp populates from xkbcommon. Mirrors the
 /// `QXkbCommon::modifiers(state, sym)` result at
 /// `inputcapturesession.cpp:434`. Mirrors the `shift`/`ctrl`/`alt`/
-/// `super` fields the M1 `plan_key` planner emits on the wire
-/// (mod.rs:278-294).
+/// `super` fields the M1 `plan_key` planner emits on the wire.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Modifiers {
     pub shift: bool,
@@ -250,12 +259,6 @@ impl WireBody {
 
 /// The EI receiver. Wraps a reis `ei::Context` over the portal's
 /// `ConnectToEIS` fd and pumps events through the M1 planners.
-// `Arc<Self>` is held by callers and shared with the pump task on
-// the same `LocalSet`. The contained `ei::Context` and `xkb::State`
-// are both `!Send + !Sync` (raw-pointer-backed native handles);
-// all access is single-threaded via the LocalSet, so this is safe
-// in practice even though clippy can't prove it.
-#[allow(clippy::arc_with_non_send_sync)]
 pub struct EiReceiver {
     context: ei::Context,
     gate: Arc<Mutex<ActivationGate>>,
@@ -312,13 +315,16 @@ impl EiReceiver {
     }
 
     /// Drive the async handshake and return a drive future for the
-    /// event-pump. The drive future must be spawned by the caller —
-    /// this is a hard requirement: reis's `EiConvertEventStream`
-    /// carries a callback registry that is `!Send`, so any executor
-    /// that requires `Send` futures (tokio's `rt-multi-thread`) will
-    /// reject it. Use `#[tokio::main(flavor = "current_thread")]`,
-    /// `tokio::task::LocalSet`, or a single-threaded runtime that
-    /// permits `!Send` futures.
+    /// event-pump. The drive future is `!Send` (reis's
+    /// `EiConvertEventStream` carries a callback registry that is
+    /// not thread-safe); any executor that requires `Send` futures
+    /// (tokio's `rt-multi-thread`) will reject it. The caller must
+    /// either spawn it on a `tokio::task::LocalSet` via
+    /// `spawn_local`, drive it on a `current_thread` runtime
+    /// (`#[tokio::main(flavor = "current_thread")]`), or `await` it
+    /// inline. **Do not** `tokio::spawn` it on a multithreaded
+    /// runtime — `tokio::spawn` requires `Send`, and the compile
+    /// error is the only signal you get.
     ///
     /// Returns `(wire_rx, disconnect_rx, drive)`:
     ///
@@ -326,9 +332,8 @@ impl EiReceiver {
     ///   takes ownership and pumps events to the connection manager.
     /// - `disconnect_rx` is a `watch` receiver that flips to `true`
     ///   when the EI peer disconnects (or the socket errors out).
-    /// - `drive` is the pump future. Spawn it via
-    ///   `tokio::task::spawn_local` (or `tokio::spawn` on a
-    ///   `current_thread` runtime).
+    /// - `drive` is the pump future. Spawn it on the same `LocalSet`
+    ///   as the test / consumer task.
     ///
     /// The caller can also simply `await` it inline if it wants
     /// pump work and consumer work to share the same task.
@@ -342,6 +347,23 @@ impl EiReceiver {
         ),
         Error,
     > {
+        // Clone the context cheaply (Backend is Arc-backed) so the
+        // pump task can `flush()` it after sending `bind_capabilities`
+        // and any other buffered requests — without us consuming
+        // `self.context` here. Without this clone the bind would
+        // sit in the write buffer indefinitely: reis's
+        // `bind_capabilities` buffers (`reis::event::Connection::bind_capabilities`
+        // at event.rs:901-907) and the only post-handshake flushes
+        // in the crate are the Ping-response path
+        // (event.rs:226-233) and explicit `Context::flush` /
+        // `Connection::flush` calls (ei.rs:120-127, event.rs:88-94,
+        // request.rs:122, handshake.rs:112/192). The receiver's
+        // pump never hits any of those on the bind code path, so
+        // against a real EIS (mutter / KWin) the EIS never sees the
+        // bind — and per the libei contract it never creates the
+        // devices the consumer needs. The fix is one explicit flush
+        // in the SeatAdded arm; the clone keeps the pump self-contained.
+        let context = self.context.clone();
         let (_conn, stream) = self
             .context
             .handshake_tokio(&self.handshake_name, ei::handshake::ContextType::Receiver)
@@ -353,7 +375,15 @@ impl EiReceiver {
         let gate = self.gate.clone();
         let xkb_state = self.xkb_state.clone();
         let bound_caps = self.bound_caps;
-        let drive = Self::pump(bound_caps, gate, xkb_state, stream, wire_tx, disconnect_tx);
+        let drive = Self::pump(
+            context,
+            bound_caps,
+            gate,
+            xkb_state,
+            stream,
+            wire_tx,
+            disconnect_tx,
+        );
         Ok((wire_rx, disconnect_rx, drive))
     }
 
@@ -361,6 +391,7 @@ impl EiReceiver {
     /// (EOF), an error, or the EI peer sends the terminal
     /// `Disconnected` protocol event; on exit, signals disconnect.
     async fn pump(
+        context: ei::Context,
         bound_caps: BitFlags<DeviceCapability>,
         gate: Arc<Mutex<ActivationGate>>,
         xkb_state: Arc<Mutex<Option<xkb::State>>>,
@@ -389,7 +420,8 @@ impl EiReceiver {
                     break;
                 }
                 Ok(ei_event) => {
-                    Self::dispatch(ei_event, &bound_caps, &gate, &xkb_state, &wire_tx).await;
+                    Self::dispatch(&context, ei_event, &bound_caps, &gate, &xkb_state, &wire_tx)
+                        .await;
                 }
                 Err(e) => {
                     warn!(
@@ -414,6 +446,7 @@ impl EiReceiver {
     /// ends the pump on its own (reis does not EOF the stream on
     /// `Disconnected`, see pump's break).
     async fn dispatch(
+        context: &ei::Context,
         event: EiEvent,
         bound_caps: &BitFlags<DeviceCapability>,
         gate: &Arc<Mutex<ActivationGate>>,
@@ -424,6 +457,24 @@ impl EiReceiver {
             EiEvent::SeatAdded(seat) => {
                 // Mirrors inputcapturesession.cpp:375-378.
                 seat.seat.bind_capabilities(*bound_caps);
+                // reis buffers `bind_capabilities` into the EI
+                // context's write buffer; the bytes don't leave the
+                // socket until a flush runs. libei's contract is
+                // that a server creates devices only in response to
+                // a received seat bind, so without this flush the
+                // EIS sits forever, no DeviceAdded arrives, and the
+                // consumer hangs silently. `Context::flush` is
+                // cheap (writes any pending bytes; no-op when the
+                // buffer is empty) and the libei handle is single-
+                // threaded per context, so this is the only place
+                // in the dispatch path that needs it.
+                if let Err(e) = context.flush() {
+                    warn!(
+                        error = %e,
+                        event = "shareinputdevices_ei_bind_flush_failed",
+                        "Failed to flush seat bind; EIS may never create devices"
+                    );
+                }
             }
             EiEvent::SeatRemoved(_) => {
                 // Mirrors inputcapturesession.cpp:380-381 (no-op).
@@ -553,9 +604,27 @@ impl EiReceiver {
                 };
                 let is_press = key.state == reis::ei::keyboard::KeyState::Press;
                 let xkb_keycode = key.key + XKB_KEYCODE_OFFSET;
-                // Mirror inputcapturesession.cpp:430 — always update
-                // the keymap state, but only emit on press
-                // (":431 trigger on press like remotekeyboard").
+                // Faithful port of the cpp's `Xkb::updateKey` →
+                // `xkb_state_update_key` call (inputcapturesession.cpp
+                // :430): always update the keymap state, emit only on
+                // press (`:431` "trigger on press like remotekeyboard").
+                //
+                // **Caveat the cpp shares.** xkbcommon's docs flag
+                // `xkb_state_update_key` and `xkb_state_update_mask` as
+                // NOT to be mixed on the same state — each call
+                // overwrites the modifiers the other had previously
+                // fed in. We mix them anyway because the cpp does:
+                // the cpp's `Xkb` exposes both `updateModifiers` and
+                // `updateKey` on the same `xkb_state`, and the
+                // `handleEiEvent` driver calls `updateModifiers` first
+                // (:423-426) then `updateKey` (:430) on every key
+                // event. So our modifier bookkeeping is consistent
+                // with what the cpp does, and consistent with what
+                // xkbcommon warns against. A future cleanup would
+                // either keep both modes in lock-step or replace
+                // `update_key` with the `mods | keycode` form of
+                // `update_mask`. Same tension in both ports, same
+                // trade-off; not a divergence to fix here.
                 state.update_key(
                     xkb::Keycode::new(xkb_keycode),
                     if is_press {
@@ -647,12 +716,13 @@ impl EiReceiver {
                 PendingInput::Motion(dx, dy) => WireBody::Motion(plan_motion(dx, dy)),
                 PendingInput::Button(b, e) => {
                     // Mirror the live-path Null-body drop
-                    // (ei.rs:486-490 in the dispatch arm): the live
-                    // path's gate-queuing path dropped the BTN_RIGHT
-                    // release before queueing, but since the gate
-                    // refactor queues raw and rebuilds at drain, a
-                    // Null body can appear here. Skip it so the wire
-                    // stays clean.
+                    // (mirrors the Button arm of dispatch's
+                    // `plan_button.is_null()` drop): the live path's
+                    // gate-queuing path dropped the BTN_RIGHT release
+                    // before queueing, but since the gate refactor
+                    // queues raw and rebuilds at drain, a Null body
+                    // can appear here. Skip it so the wire stays
+                    // clean.
                     let body = plan_button(b, e);
                     if body.is_null() {
                         continue;
@@ -710,25 +780,30 @@ fn map_button(button: u32, is_press: bool) -> Option<(Button, ButtonEdge)> {
 /// The xkbcommon crate's `new_from_string` takes a `String`; we read
 /// the keymap bytes out of the fd into one.
 fn build_xkb_state(fd: &OwnedFd, size: u32) -> Result<xkb::State, Error> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::from(fd.try_clone().map_err(|e| Error::Xkb {
+    use std::os::unix::fs::FileExt;
+    // Read at offset 0 without mutating the fd's shared seek
+    // position. An fd that crossed SCM_RIGHTS shares its open file
+    // description with the sender — including the file offset the
+    // compositor left behind. A `seek(0)` on our handle would move
+    // the compositor's offset too (corrupting any later read it
+    // does), and `try_clone` of the OwnedFd only buys us a second
+    // reference to the same offset — not independence of the offset
+    // itself. The `pread`-via-`read_exact_at` below is the
+    // positionless variant: it reads `buf.len()` bytes starting at
+    // `offset` and leaves the file's seek position untouched, so the
+    // compositor's next read still lands where it expected.
+    // `try_clone` here exists only to satisfy `File`'s `From<OwnedFd>`
+    // (the reis API hands us `&OwnedFd`, not an owned one); the
+    // positionless read is what does the actual safety work.
+    let mut buf = vec![0u8; size as usize];
+    let file = std::fs::File::from(fd.try_clone().map_err(|e| Error::Xkb {
         size,
         err: format!("keymap fd try_clone: {e}"),
     })?);
-    // The fd arrives via SCM_RIGHTS; the underlying file's read
-    // offset is not guaranteed to be at 0 after the kernel copy.
-    // Seek explicitly before reading.
-    file.seek(SeekFrom::Start(0)).map_err(|e| Error::Xkb {
+    file.read_exact_at(&mut buf, 0).map_err(|e| Error::Xkb {
         size,
-        err: format!("keymap fd seek: {e}"),
+        err: format!("keymap fd read: {e}"),
     })?;
-    let mut buf = Vec::with_capacity(size as usize);
-    file.take(u64::from(size))
-        .read_to_end(&mut buf)
-        .map_err(|e| Error::Xkb {
-            size,
-            err: format!("keymap fd read: {e}"),
-        })?;
     // The xkbcommon Rust binding wraps `xkb_keymap_new_from_buffer`
     // (explicit length, NOT null-terminated), so any trailing `\0`
     // from a C-string-styled source lands inside the keymap text
@@ -777,17 +852,6 @@ fn build_xkb_state(fd: &OwnedFd, size: u32) -> Result<xkb::State, Error> {
 fn keysym_to_text(keysym: xkb::Keysym) -> String {
     let raw = xkb::keysym_to_utf8(keysym);
     raw.chars().filter(|&c| (c as u32) >= 0x20).collect()
-}
-
-impl EiReceiver {
-    /// Test seam: read-only access to the activation gate (clone of
-    /// the Arc). Tests use this to assert ordering without going
-    /// through the public API.
-    #[cfg(test)]
-    #[must_use]
-    pub fn gate(&self) -> Arc<Mutex<ActivationGate>> {
-        self.gate.clone()
-    }
 }
 
 #[cfg(test)]

@@ -274,8 +274,8 @@ fn key_event(connection: &EisConnection, device: &EisDevice, keycode: u32, is_pr
         EisKeyState::Released
     };
     kb.key(keycode, state);
-    // Keys only need a frame for the press path (the receiver drops
-    // releases — see ei.rs:549-551), but sending a frame unconditionally
+    // Keys only need a frame for the press path (the receiver's
+    // KeyboardKey arm drops releases), but sending a frame unconditionally
     // matches the libei semantics and keeps the helper uniform.
     device.frame(0);
     connection.flush().expect("flush key+frame");
@@ -321,14 +321,20 @@ fn pointer_motion_round_trip() {
         // Add a seat with pointer capability.
         let seat = connection.add_seat(
             Some("test"),
-            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
         );
 
         // Add a virtual pointer device.
         let device = seat.add_device(
             Some("test-pointer"),
             DeviceType::Virtual,
-            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
             |_device| {},
         );
         device.resumed();
@@ -379,12 +385,18 @@ fn button_press_release_round_trip() {
 
         let seat = connection.add_seat(
             Some("test"),
-            DeviceCapability::Button | DeviceCapability::Pointer | DeviceCapability::Scroll,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
         );
         let device = seat.add_device(
             Some("test-pointer"),
             DeviceType::Virtual,
-            DeviceCapability::Button | DeviceCapability::Pointer | DeviceCapability::Scroll,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
             |_device| {},
         );
         device.resumed();
@@ -438,12 +450,18 @@ fn activation_gate_queues_until_activated() {
 
         let seat = connection.add_seat(
             Some("test"),
-            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
         );
         let device = seat.add_device(
             Some("test-pointer"),
             DeviceType::Virtual,
-            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
             |_device| {},
         );
         device.resumed();
@@ -493,12 +511,18 @@ fn events_passthrough_when_not_armed() {
 
         let seat = connection.add_seat(
             Some("test"),
-            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
         );
         let device = seat.add_device(
             Some("test-pointer"),
             DeviceType::Virtual,
-            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
             |_device| {},
         );
         device.resumed();
@@ -539,7 +563,13 @@ fn keyboard_keymap_loads_and_emits_text() {
             setup().await;
         let pump = tokio::task::spawn_local(drive);
 
-        let seat = connection.add_seat(Some("test"), DeviceCapability::Keyboard.into());
+        let seat = connection.add_seat(
+            Some("test"),
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
+        );
         let keymap_text = TEST_KEYMAP.to_string();
         let device = seat.add_device(
             Some("test-kb"),
@@ -635,7 +665,8 @@ fn scroll_delta_round_trip() {
     // Oracle: the upstream cpp at inputcapturesession.cpp:412-413 emits
     // the smooth delta verbatim — `Q_EMIT scrollDelta(dx, dy)`. M1's
     // `plan_scroll(dx, dy, 0, 0)` returns `{scroll: true, dx, dy}` with
-    // both fields passing through verbatim (mod.rs:233-256; the y-asymmetry
+    // both fields passing through verbatim (plan_scroll emits dx/dy
+    // unchanged; the y-asymmetry
     // lives in the discrete path only — shareinputdevicesplugin.cpp:100-101
     // negates y on the discrete side, NOT the smooth side). The transport
     // exists to route the EI event to the planner.
@@ -651,12 +682,18 @@ fn scroll_delta_round_trip() {
 
         let seat = connection.add_seat(
             Some("test"),
-            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
         );
         let device = seat.add_device(
             Some("test-pointer"),
             DeviceType::Virtual,
-            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
             |_device| {},
         );
         device.resumed();
@@ -691,7 +728,8 @@ fn scroll_discrete_round_trip() {
     // Oracle: the upstream cpp at inputcapturesession.cpp:415-416 emits
     // `Q_EMIT scrollDiscrete(discrete_dx, discrete_dy)`. M1's
     // `plan_scroll_discrete(dx, dy)` returns `{scroll: true, dx:
-    // dx * 15/120, dy: -dy * 15/120}` (mod.rs:267-274) — the upstream
+    // dx * 15/120, dy: -dy * 15/120}` (plan_scroll_discrete pins
+    // the y-negation) — the upstream
     // y-negation is the planner's pinned job. The transport exists to
     // route to it.
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -706,12 +744,18 @@ fn scroll_discrete_round_trip() {
 
         let seat = connection.add_seat(
             Some("test"),
-            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
         );
         let device = seat.add_device(
             Some("test-pointer"),
             DeviceType::Virtual,
-            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
             |_device| {},
         );
         device.resumed();
@@ -723,7 +767,8 @@ fn scroll_discrete_round_trip() {
 
         // discrete_dx=0, discrete_dy=1 — the y-negation gives
         // wire dy = -1 * 15/120 = -0.125; x stays signed normally
-        // (mod.rs:956-965 pins x is NOT negated).
+        // (plan_scroll_discrete does NOT negate x — the test
+        // `plan_mousepad_scroll_discrete_does_not_negate_x` pins it).
         scroll_discrete(&connection, &device, 0, 1);
         let body = timeout(Duration::from_secs(2), wire_rx.recv())
             .await
@@ -747,7 +792,8 @@ fn scroll_stop_and_cancel_are_noops() {
     // Oracle: the upstream cpp at inputcapturesession.cpp:418-421 has
     // `case EI_EVENT_SCROLL_STOP: break; case EI_EVENT_SCROLL_CANCEL:
     // break;` — both with no emit. The transport's `dispatch`
-    // (ei.rs:523-525) collapses them into a single no-op arm.
+    // (dispatch's `EiEvent::ScrollStop | EiEvent::ScrollCancel`
+    // arm collapses them into a single no-op).
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -760,12 +806,18 @@ fn scroll_stop_and_cancel_are_noops() {
 
         let seat = connection.add_seat(
             Some("test"),
-            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
         );
         let device = seat.add_device(
             Some("test-pointer"),
             DeviceType::Virtual,
-            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
             |_device| {},
         );
         device.resumed();
@@ -813,7 +865,10 @@ fn gate_queues_scroll_until_activated() {
     // `queuedEiEvents` until the D-Bus `Activated` signal arrives.
     // The transport ports this via `ActivationGate::should_queue()` →
     // `PendingInput::ScrollDelta` / `PendingInput::ScrollDiscrete`
-    // (ei.rs:505-509, :515-522) and the drain at :620-623.
+    // (dispatch's ScrollDelta / ScrollDiscrete arms route through
+    // `ActivationGate::should_queue()` → `PendingInput::ScrollDelta`
+    // / `PendingInput::ScrollDiscrete`, drained by
+    // `handle_activated`).
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -826,12 +881,18 @@ fn gate_queues_scroll_until_activated() {
 
         let seat = connection.add_seat(
             Some("test"),
-            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
         );
         let device = seat.add_device(
             Some("test-pointer"),
             DeviceType::Virtual,
-            DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
             |_device| {},
         );
         device.resumed();
@@ -888,7 +949,8 @@ fn gate_queues_scroll_until_activated() {
 fn disconnect_via_explicit_event_signals_and_completes() {
     // Oracle: the cpp at inputcapturesession.cpp:372-374 logs the
     // EI disconnect and falls through. The receiver's `dispatch`
-    // (ei.rs:410-417) fires `disconnect_tx.send(true)` on the event
+    // (pump's `EiEvent::Disconnected` arm fires
+    // `disconnect_tx.send(true)` on the event
     // AND exits the pump (the M3 fix-lane break — reis does not EOF
     // the stream on `connection.disconnected`, so a Disconnected
     // event alone would otherwise hang the pump until the socket
@@ -979,7 +1041,7 @@ fn disconnect_event_alone_completes_pump_without_socket_close() {
 
 #[test]
 fn disconnect_via_eof_signals_and_completes() {
-    // Oracle: ei.rs:392 — when the stream ends (the `while let Some(event)
+    // Oracle: pump's EOF exit — when the stream ends (the `while let Some(event)
     // = stream.next().await` returns None), the pump exits the loop and
     // calls `let _ = disconnect_tx.send(true);` at the bottom. This is
     // the EOF-without-explicit-Disconnected path: the EIS side just
@@ -1042,7 +1104,13 @@ fn unmapped_keycode_does_not_panic_pump_survives() {
             setup().await;
         let pump = tokio::task::spawn_local(drive);
 
-        let seat = connection.add_seat(Some("test"), DeviceCapability::Keyboard.into());
+        let seat = connection.add_seat(
+            Some("test"),
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
+        );
         let keymap_text = TEST_KEYMAP.to_string();
         let device = seat.add_device(
             Some("test-kb"),
@@ -1126,7 +1194,13 @@ fn latched_shift_modifier_surfaces_as_shift_on_wire() {
             setup().await;
         let pump = tokio::task::spawn_local(drive);
 
-        let seat = connection.add_seat(Some("test"), DeviceCapability::Keyboard.into());
+        let seat = connection.add_seat(
+            Some("test"),
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
+        );
         let keymap_text = TEST_KEYMAP.to_string();
         let device = seat.add_device(
             Some("test-kb"),
@@ -1221,7 +1295,13 @@ fn control_char_keys_emit_empty_text() {
             setup().await;
         let pump = tokio::task::spawn_local(drive);
 
-        let seat = connection.add_seat(Some("test"), DeviceCapability::Keyboard.into());
+        let seat = connection.add_seat(
+            Some("test"),
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
+        );
         let keymap_text = TEST_KEYMAP.to_string();
         let device = seat.add_device(
             Some("test-kb"),
@@ -1294,7 +1374,13 @@ fn ctrl_shortcut_keeps_the_letter_text_on_the_wire() {
             setup().await;
         let pump = tokio::task::spawn_local(drive);
 
-        let seat = connection.add_seat(Some("test"), DeviceCapability::Keyboard.into());
+        let seat = connection.add_seat(
+            Some("test"),
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
+        );
         let keymap_text = TEST_KEYMAP.to_string();
         let device = seat.add_device(
             Some("test-kb"),
@@ -1355,6 +1441,96 @@ fn ctrl_shortcut_keeps_the_letter_text_on_the_wire() {
         let _ = timeout(Duration::from_secs(2), pump)
             .await
             .expect("pump did not exit");
+    });
+}
+
+#[test]
+fn seat_bind_reaches_the_eis_peer_before_devices() {
+    // Red-before-green oracle for fix F (the M3 fix-lane P1): reis's
+    // `seat.bind_capabilities(...)` buffers the request into the EI
+    // context's write buffer; the bytes don't leave the socket until
+    // a `flush()` runs. The receiver's `dispatch` only sends the bind
+    // — it never flushes afterward, so against a real EIS (mutter /
+    // KWin / an emulating portal) the bind never arrives and the EIS
+    // never creates the device, because libei's contract is that
+    // devices are only created in response to a received seat bind.
+    // The result in production would be a silent hang: no
+    // `DeviceAdded`, no input, no error.
+    //
+    // The fake EIS in this suite keeps reading after the handshake
+    // (see `setup`'s doc block) and publishes the first
+    // `EisRequest::Bind` it observes on the oneshot returned as
+    // `bind_rx`. This test asserts that the bind arrives — BEFORE we
+    // call `add_device` on the seat, mirroring the production
+    // ordering. Pre-fix the bind is silently buffered, the fake
+    // never sees it, and `bind_rx` times out. Post-fix the bind
+    // flushes immediately after `bind_capabilities` returns, the
+    // fake observes it on its next read, and `bind_rx` resolves
+    // with the capability set we expect.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, _receiver, _wire_rx, _disconnect, drive, _eis_done_tx, bind_rx) =
+            setup().await;
+        let _pump = tokio::task::spawn_local(drive);
+
+        // The receiver binds the full set the EI transport supports
+        // (Keyboard | Pointer | Button | Scroll, pinned in
+        // `EiReceiver::new`'s `bound_caps`). The fake's
+        // `handle_seat_request` rejects a Bind that asks for
+        // capabilities the seat didn't advertise
+        // (`!advertised_capabilities.contains(capabilities)` →
+        // `RequestError::InvalidCapabilities`), so the seat must
+        // advertise the same set for the bind to be accepted on
+        // the wire. The fake would otherwise `expect` in its drain
+        // loop.
+        let _seat = connection.add_seat(
+            Some("test"),
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
+        );
+        // Flush the eis-side so the `seat` event reaches the receiver.
+        // A production EIS flushes after advertising its seat; reis's
+        // `Connection::add_seat` buffers the `seat` event like every
+        // other write. Without this flush the receiver never sees
+        // `SeatAdded`, never calls `bind_capabilities`, and the test
+        // can't observe the bind at all.
+        connection.flush().expect("flush seat");
+
+        // The bind must reach the EIS peer — and specifically reach
+        // it BEFORE we ever call `add_device`. Production mirrors
+        // this: a real EIS creates devices only after the bind has
+        // been received, so any test that calls `add_device` first
+        // would be testing an ordering the protocol doesn't allow.
+        //
+        // Pre-fix this times out (bind sits in the write buffer
+        // forever); post-fix it resolves within milliseconds.
+        let observed = timeout(Duration::from_secs(2), bind_rx)
+            .await
+            .expect(
+                "seat bind never reached the EIS peer — reis buffers \
+                 bind_capabilities and the receiver does not flush; \
+                 the EIS would never create devices in production",
+            )
+            .expect("bind_rx sender dropped before publishing");
+        assert_eq!(
+            observed,
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
+            "the bound capability set on the wire must match what \
+             EiReceiver::new pins; got {:?}",
+            observed
+        );
+
+        // Hygiene: close the eis drive so the pump exits cleanly.
+        drop(connection);
     });
 }
 
