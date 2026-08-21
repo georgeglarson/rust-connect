@@ -408,9 +408,35 @@ mod tests {
     use super::*;
     use crate::config::settings::AppSettings;
     use crate::protocol::{CertificateManager, ConnectionManager};
+    use std::sync::Arc;
 
     const OUR_ID: &str = "orch-our-device-aaaaaaaaaaaaaaaaaaa";
     const PEER_ID: &str = "orch-peer-device-aaaaaaaaaaaaaaaaaa";
+
+    /// Test helper: build a peer cert DER in a throwaway cert dir so the
+    /// cert-anchor gate (vk #1056) can be staged into a handler that
+    /// would otherwise refuse a cert-less force-accept. The cert's id is
+    /// pad-extended to the cert manager's 32-char minimum.
+    fn make_external_cert_der(peer_id: &str) -> Vec<u8> {
+        const MIN_DEVICE_ID_LEN: usize = 32;
+        let mut valid_id = String::from(peer_id);
+        while valid_id.len() < MIN_DEVICE_ID_LEN {
+            valid_id.push('a');
+        }
+        let cm_for_cert = Arc::new(CertificateManager::new(
+            tempfile::TempDir::new()
+                .expect("Value expected to be present")
+                .path()
+                .to_path_buf(),
+        ));
+        let (cert_pem, _) = cm_for_cert
+            .generate_certificate(&valid_id, "Peer")
+            .expect("Value expected to be present");
+        openssl::x509::X509::from_pem(&cert_pem)
+            .expect("Value expected to be present")
+            .to_der()
+            .expect("Value expected to be present")
+    }
 
     fn test_state() -> (Arc<AppState>, tempfile::TempDir) {
         let temp_dir = tempfile::TempDir::new().expect("Value expected to be present");
@@ -614,6 +640,14 @@ mod tests {
             ))
             .await
             .expect("Value expected to be present");
+        // The cert-anchor gate (vk #1056) refuses a force-accept without
+        // a pending or pinned cert. Stage a synthetic peer cert so the
+        // test exercises the protocol-downgrade path, not the gate.
+        let cert_der = make_external_cert_der(PEER_ID);
+        state
+            .pairing_handler
+            .set_pending_peer_cert(&PEER_ID.to_string(), cert_der)
+            .await;
         state
             .pairing_handler
             .force_accept_pairing(&PEER_ID.to_string())

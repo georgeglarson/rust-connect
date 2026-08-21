@@ -11,16 +11,26 @@ fn setup() -> (PairingHandler, tempfile::TempDir) {
 #[tokio::test]
 async fn test_initiate_pairing() {
     let (handler, _temp) = setup();
-    assert!(!handler.has_pending_request(&"device-1".to_string()).await);
+    assert!(
+        !handler
+            .has_pending_request(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
 
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
-    assert!(handler.has_pending_request(&"device-1".to_string()).await);
+    assert!(
+        handler
+            .has_pending_request(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
     assert_eq!(
-        handler.pair_state(&"device-1".to_string()).await,
+        handler
+            .pair_state(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await,
         PairState::Requested
     );
 }
@@ -29,19 +39,30 @@ async fn test_initiate_pairing() {
 async fn test_accept_pairing() {
     let (handler, _temp) = setup();
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&handler, "device-1aaaaaaaaaaaaaaaaaaaaaaaaa").await;
 
     handler
-        .accept_pairing(&"device-1".to_string())
+        .accept_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
-    assert!(handler.is_paired(&"device-1".to_string()).await);
-    assert!(!handler.has_pending_request(&"device-1".to_string()).await);
+    assert!(
+        handler
+            .is_paired(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
+    assert!(
+        !handler
+            .has_pending_request(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
     assert_eq!(
-        handler.pair_state(&"device-1".to_string()).await,
+        handler
+            .pair_state(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await,
         PairState::Paired
     );
 }
@@ -50,19 +71,29 @@ async fn test_accept_pairing() {
 async fn test_reject_pairing() {
     let (handler, _temp) = setup();
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
     handler
-        .reject_pairing(&"device-1".to_string())
+        .reject_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
-    assert!(!handler.is_paired(&"device-1".to_string()).await);
-    assert!(!handler.has_pending_request(&"device-1".to_string()).await);
+    assert!(
+        !handler
+            .is_paired(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
+    assert!(
+        !handler
+            .has_pending_request(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
     assert_eq!(
-        handler.pair_state(&"device-1".to_string()).await,
+        handler
+            .pair_state(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await,
         PairState::NotPaired
     );
 }
@@ -86,11 +117,13 @@ async fn test_reject_nonexistent_request() {
 async fn test_duplicate_pairing_initiation() {
     let (handler, _temp) = setup();
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
-    let result = handler.initiate_pairing(&"device-1".to_string()).await;
+    let result = handler
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        .await;
     assert!(result.is_ok());
 }
 
@@ -215,11 +248,12 @@ async fn test_set_own_device_id_prunes_self_entry_loaded_from_disk() {
     // restored backup, or a rollback would have written.
     let seeding_handler = PairingHandler::new(cert_manager.clone()).with_persistence(path.clone());
     seeding_handler
-        .initiate_pairing(&"future-self-id-aaaaaaaaaaaaaaaaa".to_string())
+        .initiate_pairing(&"future-self-id-aaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&seeding_handler, "future-self-id-aaaaaaaaaaaaaaaaaaaaa").await;
     seeding_handler
-        .accept_pairing(&"future-self-id-aaaaaaaaaaaaaaaaa".to_string())
+        .accept_pairing(&"future-self-id-aaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
@@ -232,17 +266,17 @@ async fn test_set_own_device_id_prunes_self_entry_loaded_from_disk() {
         .expect("Value expected to be present");
     assert!(
         handler
-            .is_paired(&"future-self-id-aaaaaaaaaaaaaaaaa".to_string())
+            .is_paired(&"future-self-id-aaaaaaaaaaaaaaaaaaaaa".to_string())
             .await
     );
 
     handler
-        .set_own_device_id("future-self-id-aaaaaaaaaaaaaaaaa".to_string())
+        .set_own_device_id("future-self-id-aaaaaaaaaaaaaaaaaaaaa".to_string())
         .await;
 
     assert!(
         !handler
-            .is_paired(&"future-self-id-aaaaaaaaaaaaaaaaa".to_string())
+            .is_paired(&"future-self-id-aaaaaaaaaaaaaaaaaaaaa".to_string())
             .await
     );
 
@@ -253,22 +287,25 @@ async fn test_set_own_device_id_prunes_self_entry_loaded_from_disk() {
     let contents = std::fs::read_to_string(&path).expect("Value expected to be present");
     let parsed: HashMap<String, String> =
         serde_json::from_str(&contents).expect("Value expected to be present");
-    assert!(!parsed.contains_key("future-self-id-aaaaaaaaaaaaaaaaa"));
+    assert!(!parsed.contains_key("future-self-id-aaaaaaaaaaaaaaaaaaaaa"));
 }
 
 #[tokio::test]
 async fn test_pair_already_paired() {
     let (handler, _temp) = setup();
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&handler, "device-1aaaaaaaaaaaaaaaaaaaaaaaaa").await;
     handler
-        .accept_pairing(&"device-1".to_string())
+        .accept_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
-    let result = handler.initiate_pairing(&"device-1".to_string()).await;
+    let result = handler
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        .await;
     assert!(result.is_err());
 }
 
@@ -276,19 +313,24 @@ async fn test_pair_already_paired() {
 async fn test_unpair() {
     let (handler, _temp) = setup();
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&handler, "device-1aaaaaaaaaaaaaaaaaaaaaaaaa").await;
     handler
-        .accept_pairing(&"device-1".to_string())
+        .accept_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
     handler
-        .unpair(&"device-1".to_string())
+        .unpair(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
-    assert!(!handler.is_paired(&"device-1".to_string()).await);
+    assert!(
+        !handler
+            .is_paired(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
 }
 
 #[tokio::test]
@@ -302,30 +344,39 @@ async fn test_unpair_not_paired() {
 async fn test_handle_pair_response_accept() {
     let (handler, _temp) = setup();
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&handler, "device-1aaaaaaaaaaaaaaaaaaaaaaaaa").await;
 
     handler
-        .handle_pair_response(&"device-1".to_string(), true)
+        .handle_pair_response(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string(), true)
         .await
         .expect("Value expected to be present");
-    assert!(handler.is_paired(&"device-1".to_string()).await);
+    assert!(
+        handler
+            .is_paired(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
 }
 
 #[tokio::test]
 async fn test_handle_pair_response_reject() {
     let (handler, _temp) = setup();
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
     handler
-        .handle_pair_response(&"device-1".to_string(), false)
+        .handle_pair_response(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string(), false)
         .await
         .expect("Value expected to be present");
-    assert!(!handler.is_paired(&"device-1".to_string()).await);
+    assert!(
+        !handler
+            .is_paired(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
 }
 
 #[tokio::test]
@@ -334,59 +385,68 @@ async fn test_paired_devices() {
     assert!(handler.paired_devices().await.is_empty());
 
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&handler, "device-1aaaaaaaaaaaaaaaaaaaaaaaaa").await;
     handler
-        .accept_pairing(&"device-1".to_string())
+        .accept_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
     handler
-        .initiate_pairing(&"device-2".to_string())
+        .initiate_pairing(&"device-2aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&handler, "device-2aaaaaaaaaaaaaaaaaaaaaaaaa").await;
     handler
-        .accept_pairing(&"device-2".to_string())
+        .accept_pairing(&"device-2aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
     let mut devices = handler.paired_devices().await;
     devices.sort();
-    assert_eq!(devices, vec!["device-1", "device-2"]);
+    assert_eq!(
+        devices,
+        vec![
+            "device-1aaaaaaaaaaaaaaaaaaaaaaaaa",
+            "device-2aaaaaaaaaaaaaaaaaaaaaaaaa"
+        ]
+    );
 }
 
 #[tokio::test]
 async fn test_pending_devices() {
     let (handler, _temp) = setup();
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
     let pending = handler.pending_devices().await;
-    assert_eq!(pending, vec!["device-1"]);
+    assert_eq!(pending, vec!["device-1aaaaaaaaaaaaaaaaaaaaaaaaa"]);
 }
 
 #[tokio::test]
 async fn test_paired_since() {
     let (handler, _temp) = setup();
     assert!(handler
-        .paired_since(&"device-1".to_string())
+        .paired_since(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .is_none());
 
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&handler, "device-1aaaaaaaaaaaaaaaaaaaaaaaaa").await;
     handler
-        .accept_pairing(&"device-1".to_string())
+        .accept_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
     assert!(handler
-        .paired_since(&"device-1".to_string())
+        .paired_since(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .is_some());
 }
@@ -399,7 +459,7 @@ async fn test_cleanup_expired() {
     let handler = PairingHandler::new(cert_manager).with_timeout(Duration::milliseconds(50));
 
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
@@ -410,40 +470,56 @@ async fn test_cleanup_expired() {
         .await
         .expect("Value expected to be present");
     assert_eq!(removed, 1);
-    assert!(!handler.has_pending_request(&"device-1".to_string()).await);
+    assert!(
+        !handler
+            .has_pending_request(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
 }
 
 #[tokio::test]
 async fn test_repair_after_unpair() {
     let (handler, _temp) = setup();
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        .await
+        .expect("Value expected to be present");
+    stage_test_cert(&handler, "device-1aaaaaaaaaaaaaaaaaaaaaaaaa").await;
+    handler
+        .accept_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
     handler
-        .accept_pairing(&"device-1".to_string())
-        .await
-        .expect("Value expected to be present");
-    handler
-        .unpair(&"device-1".to_string())
+        .unpair(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
     assert_eq!(
-        handler.pair_state(&"device-1".to_string()).await,
+        handler
+            .pair_state(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await,
         PairState::NotPaired
     );
 
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
-    assert!(handler.has_pending_request(&"device-1".to_string()).await);
+    stage_test_cert(&handler, "device-1aaaaaaaaaaaaaaaaaaaaaaaaa").await;
+    assert!(
+        handler
+            .has_pending_request(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
     handler
-        .accept_pairing(&"device-1".to_string())
+        .accept_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
-    assert!(handler.is_paired(&"device-1".to_string()).await);
+    assert!(
+        handler
+            .is_paired(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
 }
 
 #[tokio::test]
@@ -454,14 +530,20 @@ async fn test_accept_expired_request_fails() {
     let handler = PairingHandler::new(cert_manager).with_timeout(Duration::milliseconds(50));
 
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    let result = handler.accept_pairing(&"device-1".to_string()).await;
+    let result = handler
+        .accept_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        .await;
     assert!(result.is_err());
-    assert!(!handler.is_paired(&"device-1".to_string()).await);
+    assert!(
+        !handler
+            .is_paired(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
 }
 
 /// Hostile-peer scenario: the peer's pair accept is delayed to JUST INSIDE
@@ -615,15 +697,22 @@ async fn test_expired_request_drops_staged_cert() {
 
     // A fresh pairing stretch with no re-staged cert (the unit-level
     // equivalent of a peer whose accept arrives without a re-staged cert):
-    // accept must find nothing to persist — the dead stretch's cert is gone.
+    // the dead stretch's cert is gone, so the fresh accept must fail the
+    // cert-anchor gate (vk #1056) and refuse the pairing entirely — both
+    // halves of the invariant (no persisted fingerprint AND no paired
+    // entry) hold for the same reason.
     handler
         .receive_pair_request(&device_id, Some(Utc::now().timestamp()))
         .await
         .expect("Value expected to be present");
-    handler
+    let err = handler
         .accept_pairing(&device_id)
         .await
-        .expect("a fresh, unexpired request must accept");
+        .expect_err("a fresh request with no peer cert must be refused");
+    assert!(
+        matches!(err, Error::PairingRejected(_)),
+        "unexpected error: {err}"
+    );
     assert!(
         !cert_manager.has_peer_fingerprint(&device_id),
         "the timed-out pairing's staged cert must not leak into a later accept"
@@ -669,16 +758,21 @@ async fn test_cleanup_expired_drops_staged_cert() {
         .expect("Value expected to be present");
     assert_eq!(removed, 1, "the expired request must be swept");
 
-    // A fresh pairing stretch with no re-staged cert: accept must find
-    // nothing to persist — the swept stretch's cert is gone.
+    // A fresh pairing stretch with no re-staged cert: the swept cert is
+    // gone, so the fresh accept must fail the cert-anchor gate (vk #1056)
+    // and refuse the pairing entirely.
     handler
         .receive_pair_request(&device_id, Some(Utc::now().timestamp()))
         .await
         .expect("Value expected to be present");
-    handler
+    let err = handler
         .accept_pairing(&device_id)
         .await
-        .expect("a fresh, unexpired request must accept");
+        .expect_err("a fresh request with no peer cert must be refused");
+    assert!(
+        matches!(err, Error::PairingRejected(_)),
+        "unexpected error: {err}"
+    );
     assert!(
         !cert_manager.has_peer_fingerprint(&device_id),
         "a swept pairing's staged cert must not leak into a later accept"
@@ -779,8 +873,11 @@ async fn test_rejected_request_stages_no_cert() {
         "unexpected error: {err}"
     );
 
-    // A pairs and frees the slot; B retries certless (as after a link
-    // reconnect that staged nothing). Accept must find nothing to persist.
+    // A pairs and frees the slot. B retries certless (as after a link
+    // reconnect that staged nothing). The cert-anchor gate (vk #1056)
+    // refuses B's accept; the rejected request's cert has no place to
+    // orphan because nothing accepts.
+    stage_test_cert(&handler, &device_a).await;
     handler
         .accept_pairing(&device_a)
         .await
@@ -789,10 +886,14 @@ async fn test_rejected_request_stages_no_cert() {
         .receive_pair_request(&device_b, Some(Utc::now().timestamp()))
         .await
         .expect("Value expected to be present");
-    handler
+    let err = handler
         .accept_pairing(&device_b)
         .await
-        .expect("B's fresh request must accept");
+        .expect_err("B's certless retry must be refused");
+    assert!(
+        matches!(err, Error::PairingRejected(_)),
+        "unexpected error: {err}"
+    );
     assert!(
         !cert_manager.has_peer_fingerprint(&device_b),
         "a rejected request's cert must not orphan into a later accept"
@@ -843,11 +944,11 @@ async fn test_cleanup_preserves_non_expired() {
     let handler = PairingHandler::new(cert_manager).with_timeout(Duration::seconds(60));
 
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
     handler
-        .initiate_pairing(&"device-2".to_string())
+        .initiate_pairing(&"device-2aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
@@ -856,39 +957,70 @@ async fn test_cleanup_preserves_non_expired() {
         .await
         .expect("Value expected to be present");
     assert_eq!(removed, 0);
-    assert!(handler.has_pending_request(&"device-1".to_string()).await);
-    assert!(handler.has_pending_request(&"device-2".to_string()).await);
+    assert!(
+        handler
+            .has_pending_request(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
+    assert!(
+        handler
+            .has_pending_request(&"device-2aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
 }
 
 #[tokio::test]
 async fn test_multiple_pending_devices() {
     let (handler, _temp) = setup();
     handler
-        .initiate_pairing(&"a".to_string())
+        .initiate_pairing(&"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
     handler
-        .initiate_pairing(&"b".to_string())
+        .initiate_pairing(&"baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
     handler
-        .initiate_pairing(&"c".to_string())
+        .initiate_pairing(&"caaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
     let mut pending = handler.pending_devices().await;
     pending.sort();
-    assert_eq!(pending, vec!["a", "b", "c"]);
+    assert_eq!(
+        pending,
+        vec![
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "caaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ]
+    );
 
+    stage_test_cert(&handler, "baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").await;
     handler
-        .accept_pairing(&"b".to_string())
+        .accept_pairing(&"baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
-    assert!(handler.is_paired(&"b".to_string()).await);
-    assert!(handler.has_pending_request(&"a".to_string()).await);
-    assert!(handler.has_pending_request(&"c".to_string()).await);
-    assert_eq!(handler.paired_devices().await, vec!["b"]);
+    assert!(
+        handler
+            .is_paired(&"baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
+    assert!(
+        handler
+            .has_pending_request(&"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
+    assert!(
+        handler
+            .has_pending_request(&"caaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
+    assert_eq!(
+        handler.paired_devices().await,
+        vec!["baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+    );
 }
 
 #[tokio::test]
@@ -922,15 +1054,15 @@ async fn test_rate_limit_rejects_when_max_pending() {
         .with_timeout(Duration::seconds(60));
 
     handler
-        .initiate_pairing(&"a".to_string())
+        .initiate_pairing(&"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
     handler
-        .initiate_pairing(&"b".to_string())
+        .initiate_pairing(&"baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
     handler
-        .initiate_pairing(&"c".to_string())
+        .initiate_pairing(&"caaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
@@ -954,19 +1086,21 @@ async fn test_save_and_load_paired_devices() {
         .with_timeout(Duration::seconds(60));
 
     handler
-        .initiate_pairing(&"dev-1".to_string())
+        .initiate_pairing(&"dev-1aaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        .await
+        .expect("Value expected to be present");
+    stage_test_cert(&handler, "dev-1aaaaaaaaaaaaaaaaaaaaaaaaaaa").await;
+    handler
+        .accept_pairing(&"dev-1aaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
     handler
-        .accept_pairing(&"dev-1".to_string())
+        .initiate_pairing(&"dev-2aaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&handler, "dev-2aaaaaaaaaaaaaaaaaaaaaaaaaaa").await;
     handler
-        .initiate_pairing(&"dev-2".to_string())
-        .await
-        .expect("Value expected to be present");
-    handler
-        .accept_pairing(&"dev-2".to_string())
+        .accept_pairing(&"dev-2aaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
@@ -975,8 +1109,8 @@ async fn test_save_and_load_paired_devices() {
         std::fs::read_to_string(&path).expect("Serialization of known types cannot fail");
     let parsed: HashMap<String, String> =
         serde_json::from_str(&contents).expect("Value expected to be present");
-    assert!(parsed.contains_key("dev-1"));
-    assert!(parsed.contains_key("dev-2"));
+    assert!(parsed.contains_key("dev-1aaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    assert!(parsed.contains_key("dev-2aaaaaaaaaaaaaaaaaaaaaaaaaaa"));
 
     let handler2 = PairingHandler::new(cert_manager)
         .with_persistence(path)
@@ -986,13 +1120,30 @@ async fn test_save_and_load_paired_devices() {
         .await
         .expect("Value expected to be present");
 
-    assert!(handler2.is_paired(&"dev-1".to_string()).await);
-    assert!(handler2.is_paired(&"dev-2".to_string()).await);
-    assert!(handler2.paired_since(&"dev-1".to_string()).await.is_some());
+    assert!(
+        handler2
+            .is_paired(&"dev-1aaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
+    assert!(
+        handler2
+            .is_paired(&"dev-2aaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
+    assert!(handler2
+        .paired_since(&"dev-1aaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        .await
+        .is_some());
 
     let mut devices = handler2.paired_devices().await;
     devices.sort();
-    assert_eq!(devices, vec!["dev-1", "dev-2"]);
+    assert_eq!(
+        devices,
+        vec![
+            "dev-1aaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "dev-2aaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1025,11 +1176,12 @@ async fn test_save_load_preserves_paired_state() {
         .with_timeout(Duration::seconds(60));
 
     handler1
-        .initiate_pairing(&"phone".to_string())
+        .initiate_pairing(&"phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&handler1, "phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa").await;
     handler1
-        .accept_pairing(&"phone".to_string())
+        .accept_pairing(&"phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
@@ -1042,11 +1194,15 @@ async fn test_save_load_preserves_paired_state() {
         .expect("Value expected to be present");
 
     assert_eq!(
-        handler2.pair_state(&"phone".to_string()).await,
+        handler2
+            .pair_state(&"phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await,
         PairState::Paired
     );
 
-    let result = handler2.initiate_pairing(&"phone".to_string()).await;
+    let result = handler2
+        .initiate_pairing(&"phoneaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        .await;
     assert!(result.is_err());
 }
 
@@ -1152,11 +1308,12 @@ async fn test_no_persistence_path_skips_save() {
 
     let handler = PairingHandler::new(cert_manager);
     handler
-        .initiate_pairing(&"dev".to_string())
+        .initiate_pairing(&"devaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&handler, "devaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").await;
     handler
-        .accept_pairing(&"dev".to_string())
+        .accept_pairing(&"devaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
@@ -1167,13 +1324,22 @@ async fn test_no_persistence_path_skips_save() {
 async fn test_receive_pair_request() {
     let (handler, _temp) = setup();
     handler
-        .receive_pair_request(&"device-1".to_string(), Some(1_700_000_000))
+        .receive_pair_request(
+            &"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            Some(1_700_000_000),
+        )
         .await
         .expect("Value expected to be present");
 
-    assert!(handler.has_incoming_request(&"device-1".to_string()).await);
+    assert!(
+        handler
+            .has_incoming_request(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
     assert_eq!(
-        handler.pair_state(&"device-1".to_string()).await,
+        handler
+            .pair_state(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await,
         PairState::RequestedByPeer
     );
 }
@@ -1182,16 +1348,28 @@ async fn test_receive_pair_request() {
 async fn test_auto_accept_when_both_initiate() {
     let (handler, _temp) = setup();
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&handler, "device-1aaaaaaaaaaaaaaaaaaaaaaaaa").await;
     handler
-        .receive_pair_request(&"device-1".to_string(), Some(1_700_000_000))
+        .receive_pair_request(
+            &"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            Some(1_700_000_000),
+        )
         .await
         .expect("Value expected to be present");
 
-    assert!(handler.is_paired(&"device-1".to_string()).await);
-    assert!(!handler.has_pending_request(&"device-1".to_string()).await);
+    assert!(
+        handler
+            .is_paired(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
+    assert!(
+        !handler
+            .has_pending_request(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
 }
 
 #[tokio::test]
@@ -1201,24 +1379,32 @@ async fn test_receive_pair_request_while_paired() {
     // incoming request — never a silent re-confirm.
     let (handler, _temp) = setup();
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&handler, "device-1aaaaaaaaaaaaaaaaaaaaaaaaa").await;
     handler
-        .accept_pairing(&"device-1".to_string())
+        .accept_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
     let result = handler
-        .receive_pair_request(&"device-1".to_string(), Some(1_700_000_000))
+        .receive_pair_request(
+            &"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            Some(1_700_000_000),
+        )
         .await;
     assert!(result.is_ok());
     assert!(
-        !handler.is_paired(&"device-1".to_string()).await,
+        !handler
+            .is_paired(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await,
         "pair request while paired must unpair (Android semantics)"
     );
     assert!(
-        handler.has_incoming_request(&"device-1".to_string()).await,
+        handler
+            .has_incoming_request(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await,
         "the request must restart as a fresh incoming pairing"
     );
 }
@@ -1227,33 +1413,57 @@ async fn test_receive_pair_request_while_paired() {
 async fn test_incoming_requests() {
     let (handler, _temp) = setup();
     handler
-        .receive_pair_request(&"a".to_string(), Some(1_700_000_000))
+        .receive_pair_request(
+            &"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            Some(1_700_000_000),
+        )
         .await
         .expect("Value expected to be present");
     handler
-        .receive_pair_request(&"b".to_string(), Some(1_700_000_000))
+        .receive_pair_request(
+            &"baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            Some(1_700_000_000),
+        )
         .await
         .expect("Value expected to be present");
 
     let mut incoming = handler.incoming_requests().await;
     incoming.sort();
-    assert_eq!(incoming, vec!["a", "b"]);
+    assert_eq!(
+        incoming,
+        vec![
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ]
+    );
 }
 
 #[tokio::test]
 async fn test_accept_pairing_with_incoming_only() {
     let (handler, _temp) = setup();
     handler
-        .receive_pair_request(&"device-1".to_string(), Some(1_700_000_000))
+        .receive_pair_request(
+            &"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            Some(1_700_000_000),
+        )
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&handler, "device-1aaaaaaaaaaaaaaaaaaaaaaaaa").await;
 
     handler
-        .accept_pairing(&"device-1".to_string())
+        .accept_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
-    assert!(handler.is_paired(&"device-1".to_string()).await);
-    assert!(!handler.has_incoming_request(&"device-1".to_string()).await);
+    assert!(
+        handler
+            .is_paired(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
+    assert!(
+        !handler
+            .has_incoming_request(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
 }
 
 #[tokio::test]
@@ -1266,15 +1476,15 @@ async fn test_receive_pair_request_rate_limited() {
         .with_timeout(Duration::seconds(60));
 
     handler
-        .initiate_pairing(&"a".to_string())
+        .initiate_pairing(&"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
     handler
-        .initiate_pairing(&"b".to_string())
+        .initiate_pairing(&"baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
     handler
-        .initiate_pairing(&"c".to_string())
+        .initiate_pairing(&"caaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
@@ -1357,6 +1567,7 @@ async fn test_receive_pair_request_duplicate_ignored() {
         "the ignored duplicate's timestamp must not reach the SAS"
     );
 
+    stage_test_cert(&handler, &peer_id).await;
     handler
         .accept_pairing(&peer_id)
         .await
@@ -1373,12 +1584,18 @@ async fn test_receive_pair_request_without_timestamp_accepted_as_v7() {
     let (handler, _temp) = setup();
 
     handler
-        .receive_pair_request(&"device-1".to_string(), None)
+        .receive_pair_request(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string(), None)
         .await
         .expect("v7 timestamp-less request must be accepted");
-    assert!(handler.has_incoming_request(&"device-1".to_string()).await);
+    assert!(
+        handler
+            .has_incoming_request(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
     assert_eq!(
-        handler.pair_state(&"device-1".to_string()).await,
+        handler
+            .pair_state(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await,
         PairState::RequestedByPeer
     );
 }
@@ -1461,7 +1678,7 @@ async fn test_load_from_disk_corrupt_json() {
 async fn test_concurrent_initiate_pairing_same_device() {
     let (handler, _temp) = setup();
     let handler = Arc::new(handler);
-    let device_id: DeviceId = "device-1".to_string();
+    let device_id: DeviceId = "device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
 
     let h1 = handler.clone();
     let h2 = handler.clone();
@@ -1490,12 +1707,13 @@ async fn test_concurrent_initiate_pairing_same_device() {
 async fn test_concurrent_accept_and_initiate() {
     let (handler, _temp) = setup();
     let handler = Arc::new(handler);
-    let device_id: DeviceId = "device-1".to_string();
+    let device_id: DeviceId = "device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
 
     handler
         .initiate_pairing(&device_id)
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&handler, &device_id).await;
 
     let h1 = handler.clone();
     let h2 = handler.clone();
@@ -1516,7 +1734,9 @@ async fn test_concurrent_accept_and_initiate() {
 #[tokio::test]
 async fn test_get_verification_key_returns_none_when_no_pending() {
     let (handler, _temp) = setup();
-    let key = handler.get_verification_key(&"device-1".to_string()).await;
+    let key = handler
+        .get_verification_key(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        .await;
     assert!(key.is_ok());
     assert!(key.expect("Value expected to be present").is_none());
 }
@@ -1577,10 +1797,12 @@ async fn test_max_pending_boundary_at_one() {
         .with_timeout(Duration::seconds(60));
 
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
-    let result = handler.initiate_pairing(&"device-2".to_string()).await;
+    let result = handler
+        .initiate_pairing(&"device-2aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        .await;
     assert!(result.is_err());
     assert!(result
         .expect_err("pairing should be rejected")
@@ -1600,14 +1822,19 @@ async fn test_persistence_write_and_reload() {
         .with_timeout(Duration::seconds(60));
 
     handler
-        .initiate_pairing(&"device-1".to_string())
+        .initiate_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&handler, "device-1aaaaaaaaaaaaaaaaaaaaaaaaa").await;
     handler
-        .accept_pairing(&"device-1".to_string())
+        .accept_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
-    assert!(handler.is_paired(&"device-1".to_string()).await);
+    assert!(
+        handler
+            .is_paired(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
 
     let handler2 = PairingHandler::new(cert_manager)
         .with_persistence(path)
@@ -1616,7 +1843,11 @@ async fn test_persistence_write_and_reload() {
         .load_from_disk()
         .await
         .expect("Value expected to be present");
-    assert!(handler2.is_paired(&"device-1".to_string()).await);
+    assert!(
+        handler2
+            .is_paired(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+            .await
+    );
 }
 
 #[tokio::test]
@@ -1646,11 +1877,15 @@ async fn test_save_to_disk_unwritable_parent_fails() {
     let path = std::path::PathBuf::from("/proc/1/paired.json");
     let handler = PairingHandler::new(cert_manager).with_persistence(path);
     handler
-        .receive_pair_request(&"device-1".to_string(), Some(1_700_000_000))
+        .receive_pair_request(
+            &"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            Some(1_700_000_000),
+        )
         .await
         .expect("Value expected to be present");
+    stage_test_cert(&handler, "device-1aaaaaaaaaaaaaaaaaaaaaaaaa").await;
     handler
-        .accept_pairing(&"device-1".to_string())
+        .accept_pairing(&"device-1aaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         .await
         .expect("Value expected to be present");
 
@@ -1864,4 +2099,215 @@ async fn test_verification_key_available_while_incoming_request_pending() {
         key.is_some(),
         "SAS must be available while the incoming request is pending"
     );
+}
+
+// ---- vk #1056: pairing must require a peer certificate ----
+//
+// The TLS handshake can complete without the peer presenting a certificate
+// (outbound.rs:207/214 -> tls.rs:155 makes client auth optional when
+// device_id is None). The pre-fix code happily accepted such a pairing,
+// storing the device id into `paired` without ever persisting a fingerprint
+// -- and the SAS was uncomputable because get_verification_key requires
+// a peer cert. These tests pin the fix: both `accept_pairing` and
+// `force_accept_pairing` must refuse an accept that has neither a pending
+// cert from the live handshake nor an already-pinned peer cert on disk.
+
+fn make_external_cert_der(peer_id: &str) -> Vec<u8> {
+    // Build a peer's cert in a throwaway cert dir so we never collide
+    // with the handler-under-test's own cert storage. The cert manager's
+    // device_id validator requires 32-38 chars, so pad short test ids
+    // with `a` before generating the cert.
+    let cm_for_cert = Arc::new(CertificateManager::new(
+        tempfile::TempDir::new()
+            .expect("Value expected to be present")
+            .path()
+            .to_path_buf(),
+    ));
+    let valid_id = pad_device_id(peer_id);
+    make_cert_der(&cm_for_cert, &valid_id, "Peer")
+}
+
+/// Pads a short test device id out to the cert manager's 32-char minimum
+/// with trailing `a`s. Used only by test helpers that need to seed a
+/// peer cert for short, non-conformant ids.
+fn pad_device_id(id: &str) -> String {
+    const MIN_DEVICE_ID_LEN: usize = 32;
+    if id.len() >= MIN_DEVICE_ID_LEN {
+        id.to_string()
+    } else {
+        let mut padded = String::from(id);
+        while padded.len() < MIN_DEVICE_ID_LEN {
+            padded.push('a');
+        }
+        padded
+    }
+}
+
+/// Stages a synthetic peer cert in `pending_certs` so the cert-anchor
+/// gate (vk #1056) lets `accept_pairing` / `force_accept_pairing`
+/// through. Production code paths stage the cert via
+/// `receive_pair_request_with_cert` or the API layer; tests that go
+/// through `initiate_pairing` + `accept_pairing` must mirror that by
+/// calling this helper before the accept.
+async fn stage_test_cert(handler: &PairingHandler, device_id: &str) {
+    let cert_der = make_external_cert_der(device_id);
+    handler
+        .set_pending_peer_cert(&device_id.to_string(), cert_der)
+        .await;
+}
+
+#[tokio::test]
+async fn test_accept_pairing_refuses_cert_less_first_time_peer() {
+    let (handler, _temp) = setup();
+    let peer_id = "peer-certless-aaaaaaaaaaaaaaaaaaaa".to_string();
+
+    // Incoming pair request from a peer that did NOT present a cert --
+    // no set_pending_peer_cert call. Pre-fix: accept_pairing would mark
+    // the device paired with no fingerprint and an uncomputable SAS.
+    handler
+        .receive_pair_request(&peer_id, Some(1_700_000_000))
+        .await
+        .expect("Value expected to be present");
+
+    let result = handler.accept_pairing(&peer_id).await;
+    assert!(
+        matches!(result, Err(Error::PairingRejected(_))),
+        "cert-less accept must fail with PairingRejected, got {:?}",
+        result
+    );
+    assert!(
+        !handler.is_paired(&peer_id).await,
+        "device must NOT be marked paired when no cert anchor exists"
+    );
+    assert!(
+        !handler.cert_manager.has_peer_certificate(&peer_id),
+        "no cert may be written to disk when the accept failed"
+    );
+    assert!(
+        !handler.cert_manager.has_peer_fingerprint(&peer_id),
+        "no fingerprint may be written to disk when the accept failed"
+    );
+}
+
+#[tokio::test]
+async fn test_accept_pairing_with_pending_cert_still_works() {
+    // Control for the refuse test above: a pending cert (the happy path)
+    // must keep passing. Pinned on by existing tests, but listed here so
+    // the three accept-pairing cases sit side-by-side and a regression in
+    // any one of them is loud.
+    let (handler, _temp) = setup();
+    let peer_id = "peer-with-pending-cert-aaaaaaaaaaaaaa".to_string();
+
+    handler
+        .receive_pair_request(&peer_id, Some(1_700_000_000))
+        .await
+        .expect("Value expected to be present");
+    let cert_der = make_external_cert_der(&peer_id);
+    handler.set_pending_peer_cert(&peer_id, cert_der).await;
+
+    handler
+        .accept_pairing(&peer_id)
+        .await
+        .expect("Value expected to be present");
+    assert!(handler.is_paired(&peer_id).await);
+    assert!(handler.cert_manager.has_peer_certificate(&peer_id));
+    assert!(handler.cert_manager.has_peer_fingerprint(&peer_id));
+}
+
+#[tokio::test]
+async fn test_accept_pairing_repairs_via_pinned_cert() {
+    // Re-pairing a known device: no pending cert (the cert never made it
+    // across the new handshake), but a pinned cert from a prior pairing
+    // exists on disk. The accept must succeed -- the device is already
+    // identity-bound via TOFU and the new TLS session has not (yet) shown
+    // a fresh cert. We seed the pinned cert directly (without going
+    // through accept_pairing, which would also insert into `paired`) so
+    // the device is not yet paired but the cert anchor is present.
+    let (handler, _temp) = setup();
+    let peer_id = "peer-repair-pinned-aaaaaaaaaaaaaaaa".to_string();
+
+    let cert_der = make_external_cert_der(&peer_id);
+    handler
+        .cert_manager
+        .store_peer_certificate(&peer_id, &cert_der)
+        .expect("Value expected to be present");
+    assert!(handler.cert_manager.has_peer_certificate(&peer_id));
+    assert!(!handler.is_paired(&peer_id).await);
+
+    // A fresh incoming request, this time with no staged cert (cert-less
+    // handshake). Accept must succeed via the pinned-cert path.
+    handler
+        .receive_pair_request(&peer_id, Some(1_700_000_001))
+        .await
+        .expect("Value expected to be present");
+    handler
+        .accept_pairing(&peer_id)
+        .await
+        .expect("accept must succeed when pinned cert anchors the identity");
+    assert!(handler.is_paired(&peer_id).await);
+    // Pinned cert must be intact (no re-store with a different value --
+    // there was no new cert to store).
+    let pinned = handler
+        .cert_manager
+        .load_peer_certificate_pem(&peer_id)
+        .expect("Value expected to be present");
+    assert!(!pinned.is_empty());
+}
+
+#[tokio::test]
+async fn test_force_accept_pairing_refuses_cert_less_first_time_peer() {
+    let (handler, _temp) = setup();
+    let peer_id = "peer-force-certless-aaaaaaaaaaaaaaaaa".to_string();
+
+    // force_accept_pairing has no pending-request prerequisite, but the
+    // same cert anchor must hold: a first-time peer with no pinned cert
+    // and no staged cert must NOT be force-accepted.
+    let result = handler.force_accept_pairing(&peer_id).await;
+    assert!(
+        matches!(result, Err(Error::PairingRejected(_))),
+        "cert-less force_accept must fail with PairingRejected, got {:?}",
+        result
+    );
+    assert!(!handler.is_paired(&peer_id).await);
+    assert!(!handler.cert_manager.has_peer_certificate(&peer_id));
+    assert!(!handler.cert_manager.has_peer_fingerprint(&peer_id));
+}
+
+#[tokio::test]
+async fn test_force_accept_pairing_with_pending_cert_still_works() {
+    let (handler, _temp) = setup();
+    let peer_id = "peer-force-with-cert-aaaaaaaaaaaaaaaa".to_string();
+
+    let cert_der = make_external_cert_der(&peer_id);
+    handler.set_pending_peer_cert(&peer_id, cert_der).await;
+    handler
+        .force_accept_pairing(&peer_id)
+        .await
+        .expect("Value expected to be present");
+    assert!(handler.is_paired(&peer_id).await);
+    assert!(handler.cert_manager.has_peer_certificate(&peer_id));
+    assert!(handler.cert_manager.has_peer_fingerprint(&peer_id));
+}
+
+#[tokio::test]
+async fn test_force_accept_pairing_repairs_via_pinned_cert() {
+    let (handler, _temp) = setup();
+    let peer_id = "peer-force-repair-aaaaaaaaaaaaaaaaaaa".to_string();
+
+    // Seed the pinned cert directly (without pairing). The device is not
+    // paired but the cert anchor is present on disk.
+    let cert_der = make_external_cert_der(&peer_id);
+    handler
+        .cert_manager
+        .store_peer_certificate(&peer_id, &cert_der)
+        .expect("Value expected to be present");
+    assert!(handler.cert_manager.has_peer_certificate(&peer_id));
+    assert!(!handler.is_paired(&peer_id).await);
+
+    // Now force_accept with NO staged cert -- must succeed via pinned.
+    handler
+        .force_accept_pairing(&peer_id)
+        .await
+        .expect("force_accept must succeed when pinned cert anchors the identity");
+    assert!(handler.is_paired(&peer_id).await);
 }

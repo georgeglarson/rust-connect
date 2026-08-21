@@ -446,6 +446,24 @@ impl PairingHandler {
         Ok(false)
     }
 
+    /// Identity anchor pre-flight (vk #1056): true when a pending peer
+    /// cert is staged for this device (the happy path — captured at TLS
+    /// handshake time) or a TOFU fingerprint is already pinned (the
+    /// re-pair path). The anchor is the FINGERPRINT, not the PEM file:
+    /// later handshakes enforce the pin via `has_peer_fingerprint`
+    /// (verify_peer_certificate skips comparison when it is absent),
+    /// so a PEM without a fingerprint — the mid-store crash window in
+    /// store_peer_certificate — anchors nothing.
+    ///
+    /// Advisory, for callers that must decide BEFORE acting (the API
+    /// handler's pre-send check). The authoritative gate lives inside
+    /// accept_pairing / force_accept_pairing, which re-validate
+    /// atomically against the cert they remove under one write lock.
+    pub async fn has_identity_anchor(&self, device_id: &DeviceId) -> bool {
+        self.pending_certs.read().await.contains_key(device_id)
+            || self.cert_manager.has_peer_fingerprint(device_id)
+    }
+
     pub async fn accept_pairing(&self, device_id: &DeviceId) -> Result<()> {
         let had_request = self.remove_pending_request(device_id).await?;
 
@@ -457,7 +475,36 @@ impl PairingHandler {
         // confirmation time, as the only write path — never at request time.
         // If the store fails (e.g. fingerprint mismatch against a stale
         // entry), the pairing does not complete.
+        //
+        // Remove-first, then gate on the REMOVED value (panel ae22e5d6):
+        // take and check under one write lock, so a concurrent
+        // reject_pairing that won the race leaves `None` here and the
+        // gate refuses — a peek-then-remove gate would pass on a cert
+        // that no longer exists.
         let pending_cert = self.pending_certs.write().await.remove(device_id);
+
+        // Identity anchor gate (vk #1056): refuse the accept unless we
+        // have some peer certificate to bind the pairing to. The anchor
+        // is the staged cert just removed, or an already-pinned TOFU
+        // FINGERPRINT (the re-pair path — the fingerprint, not the PEM,
+        // is what later handshakes enforce). Without an anchor the
+        // pairing would carry no fingerprint, the SAS would be
+        // uncomputable (get_verification_key requires a peer cert), and
+        // a later attacker spoofing this device id would face no pin
+        // check.
+        if pending_cert.is_none() && !self.cert_manager.has_peer_fingerprint(device_id) {
+            warn!(
+                device_id = %device_id,
+                event = "pairing_accept_refused_no_peer_cert",
+                "Refusing pairing accept: no peer certificate (pending or pinned) is available"
+            );
+            return Err(Error::PairingRejected(format!(
+                "Refusing pairing with {}: no peer certificate (pending or pinned) was presented; \
+                 cert-less pairings are not accepted",
+                device_id
+            )));
+        }
+
         if let Some(cert_der) = pending_cert {
             self.cert_manager
                 .store_peer_certificate(device_id, &cert_der)?;
@@ -490,7 +537,25 @@ impl PairingHandler {
 
         let _ = self.remove_pending_request(device_id).await;
 
+        // Same identity anchor gate as accept_pairing (vk #1056),
+        // same remove-first atomicity (panel ae22e5d6): force_accept
+        // has no pending-request prerequisite, but the anchor
+        // requirement is identical — a first-time peer must not be
+        // admitted without one.
         let pending_cert = self.pending_certs.write().await.remove(device_id);
+        if pending_cert.is_none() && !self.cert_manager.has_peer_fingerprint(device_id) {
+            warn!(
+                device_id = %device_id,
+                event = "force_accept_pairing_refused_no_peer_cert",
+                "Refusing force-accept: no peer certificate (pending or pinned) is available"
+            );
+            return Err(Error::PairingRejected(format!(
+                "Refusing force-accept of pairing with {}: no peer certificate (pending or pinned) was presented; \
+                 cert-less pairings are not accepted",
+                device_id
+            )));
+        }
+
         if let Some(cert_der) = pending_cert {
             self.cert_manager
                 .store_peer_certificate(device_id, &cert_der)?;

@@ -114,6 +114,15 @@ pub async fn run_packet_loop(
                                     // accept. Android: pairingDone, no reply.
                                     if let Err(e) = pairing.accept_pairing(device_id).await {
                                         warn!(device_id = %device_id, error = %e, event = "pair_accept_failed", "Failed to complete pairing");
+                                        // Unwind the peer's committed state
+                                        // (vk #1056, panel 69644ef8): it sent
+                                        // pair=true and considers the pairing
+                                        // done; a refusal here — e.g. the
+                                        // cert-anchor gate — must not leave it
+                                        // split-brained. Best-effort: the link
+                                        // may already be gone.
+                                        let unpair_pkt = crate::protocol::types::Packet::pair_response(false);
+                                        let _ = cm.send_packet(device_id, &unpair_pkt).await;
                                         continue;
                                     }
                                     info!(

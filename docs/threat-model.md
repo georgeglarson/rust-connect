@@ -21,6 +21,10 @@ capabilities) sent every 60 s by default — inherent to the protocol.
   type is dropped before reaching plugins.
 - TOFU SHA256 fingerprint pinning enforced during the TLS handshake by
   custom certificate verifiers (`src/protocol/connection/tls.rs`).
+- Pairing acceptance itself is refused without a peer certificate —
+  either presented on the live session or already pinned — so a
+  pairing can never exist without an identity anchor
+  (`src/protocol/pairing/mod.rs` `has_identity_anchor`, vk #1056).
 - Pairing requires a human-confirmed 32-bit SAS (Short Authentication
   String) with a 1800 s freshness window, matching Android's
   `PairingHandler`; pairing rate-limited to 10 concurrent pending.
