@@ -62,6 +62,7 @@ pub use screensaver_inhibit::ScreensaverInhibitPlugin;
 pub use sendnotifications::SendNotificationsPlugin;
 pub use sftp::SftpPlugin;
 pub use share::SharePlugin;
+pub use shareinputdevices::ShareInputDevicesPlugin;
 pub use sms::SmsPlugin;
 pub use systemvolume::SystemVolumePlugin;
 pub use telephony::TelephonyPlugin;
@@ -93,6 +94,7 @@ pub struct PluginAccess {
     pub digitizer: Arc<DigitizerPlugin>,
     pub screensaver_inhibit: Arc<ScreensaverInhibitPlugin>,
     pub remotecommands: Arc<RemoteCommandsPlugin>,
+    pub shareinputdevices: Arc<ShareInputDevicesPlugin>,
 }
 
 impl PluginAccess {
@@ -123,6 +125,7 @@ impl PluginAccess {
             self.digitizer.clone(),
             self.screensaver_inhibit.clone(),
             self.remotecommands.clone(),
+            self.shareinputdevices.clone(),
         ]
     }
 }
