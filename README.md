@@ -152,10 +152,11 @@ GET    /api/v1/health                            Liveness, no auth required
 GET    /docs                                     Swagger UI (spec: /api-docs/openapi.json)
 ```
 
-All endpoints except `/api/v1/health` require the API key, either as an
-`X-API-Key` header or an `api_key` query parameter. Responses follow
-`{ status, data, metadata }` format. Errors use structured codes like
-`DEVICE_NOT_FOUND`.
+All endpoints except `/api/v1/health` require the API key as an
+`X-API-Key` header. The `api_key` query parameter is accepted only on
+`/api/v1/events` (browser `EventSource` cannot set headers). Responses
+follow `{ status, data, metadata }` format. Errors use structured codes
+like `DEVICE_NOT_FOUND`.
 
 The event stream is Server-Sent Events, not a WebSocket. Each event is one
 `data:` line carrying a JSON object, so `curl` reads it directly:
