@@ -11,6 +11,11 @@ use crate::config::settings::AppSettings;
 use crate::utils::{init_logging_from_env, Result};
 
 /// Loads configuration from file or defaults, applies CLI overrides.
+///
+/// An explicit `--config` path wins. Without one, the default config path
+/// (`~/.config/rust-connect/config.toml`) is loaded when it exists — the
+/// shipped systemd unit passes no `--config`, so without this fallback the
+/// documented "edit config.toml and restart" flow configures nothing.
 pub fn load_config(
     config_path: Option<&str>,
     port: Option<u16>,
@@ -22,22 +27,31 @@ pub fn load_config(
 ) -> Result<AppSettings> {
     let mut settings = AppSettings::new();
 
-    if let Some(path) = config_path {
-        let path_buf = std::path::PathBuf::from(path);
-        if path_buf.exists() {
-            let mut loaded = AppSettings::load_from_file(&path_buf)?;
-            // A config file without api_keys must not silently disable auth:
-            // give it the same persisted/generated-key treatment as the
-            // default path.
+    let default_path = AppSettings::config_path();
+    match config_path {
+        Some(path) => {
+            let path_buf = std::path::PathBuf::from(path);
+            if path_buf.exists() {
+                let mut loaded = AppSettings::load_from_file(&path_buf)?;
+                // A config file without api_keys must not silently disable auth:
+                // give it the same persisted/generated-key treatment as the
+                // default path.
+                loaded.ensure_api_key();
+                settings = loaded;
+            } else {
+                warn!(
+                    path = path,
+                    event = "config_not_found",
+                    "Config file not found, using defaults"
+                );
+            }
+        }
+        None if default_path.exists() => {
+            let mut loaded = AppSettings::load_from_file(&default_path)?;
             loaded.ensure_api_key();
             settings = loaded;
-        } else {
-            warn!(
-                path = path,
-                event = "config_not_found",
-                "Config file not found, using defaults"
-            );
         }
+        None => {}
     }
 
     if let Some(p) = port {
@@ -182,5 +196,91 @@ async fn load_persisted_data(state: &Arc<AppState>) {
             event = "stale_devices_pruned",
             "Pruned stale device records at startup"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+    use super::*;
+
+    /// XDG env guard: `dirs::config_dir()`/`dirs::data_dir()` read these at
+    /// call time, so tests point them at a tempdir and restore on drop —
+    /// parallel tests must never see the override or the real home.
+    struct XdgGuard {
+        prev_config: Option<std::ffi::OsString>,
+        prev_data: Option<std::ffi::OsString>,
+    }
+
+    impl XdgGuard {
+        fn new(temp: &std::path::Path) -> Self {
+            let guard = Self {
+                prev_config: std::env::var_os("XDG_CONFIG_HOME"),
+                prev_data: std::env::var_os("XDG_DATA_HOME"),
+            };
+            std::env::set_var("XDG_CONFIG_HOME", temp.join("config"));
+            std::env::set_var("XDG_DATA_HOME", temp.join("data"));
+            guard
+        }
+    }
+
+    impl Drop for XdgGuard {
+        fn drop(&mut self) {
+            match &self.prev_config {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match &self.prev_data {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+    }
+
+    /// Panel P1 (review-20260820T235242Z, codex + grok-46): without
+    /// `--config`, the default config path was never read, so a documented
+    /// `config.toml` edit configured nothing. One test, three sequential
+    /// scenarios — the XDG env override is process-wide, so parallel tests
+    /// would race on it.
+    #[test]
+    fn test_load_config_default_path_fallback() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let _xdg = XdgGuard::new(temp.path());
+        let cfg_dir = temp.path().join("config").join("rust-connect");
+
+        // (a) No flag, default file present -> the default path is loaded.
+        std::fs::create_dir_all(&cfg_dir).expect("mkdir");
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "device_name = \"from-default-path\"\napi_port = 19090\n",
+        )
+        .expect("write config");
+        let settings = load_config(None, None, None, None, None, false, None)
+            .expect("load_config should succeed");
+        assert_eq!(settings.device_name, "from-default-path");
+        assert_eq!(settings.api_port, 19090);
+
+        // (b) An explicit `--config` path still wins over the default path.
+        let explicit = temp.path().join("explicit.toml");
+        std::fs::write(&explicit, "device_name = \"explicit-path\"\n").expect("write explicit");
+        let settings = load_config(
+            Some(explicit.to_str().expect("utf8 path")),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("load_config should succeed");
+        assert_eq!(settings.device_name, "explicit-path");
+
+        // (c) No flag and no default file -> plain defaults, no error.
+        std::fs::remove_file(cfg_dir.join("config.toml")).expect("remove config");
+        let settings = load_config(None, None, None, None, None, false, None)
+            .expect("load_config should succeed");
+        assert_ne!(settings.device_name, "from-default-path");
+        assert_eq!(settings.api_port, 9090);
     }
 }

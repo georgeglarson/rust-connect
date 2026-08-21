@@ -134,7 +134,9 @@ impl RuncommandPlugin {
     /// (deserialized from `[[runcommand.commands]]` entries in the config
     /// file). Called once at boot, after `RuncommandPlugin::new()`. No
     /// runtime write path exists — re-registering is the only way to
-    /// change the allowlist without restarting the daemon.
+    /// change the allowlist without restarting the daemon, and it
+    /// REPLACES the global set atomically: keys absent from the new
+    /// config stop being executable.
     ///
     /// Validation: entries with empty `key`, `name`, or `command` are
     /// skipped and `warn!`-ed (daemon boot must not fail on a bad row);
@@ -146,6 +148,7 @@ impl RuncommandPlugin {
     /// lookup.
     pub fn register_from_config(&self, cfg: &RuncommandConfig) {
         if let Ok(mut global) = self.global_commands.write() {
+            global.clear();
             for entry in &cfg.commands {
                 if entry.key.is_empty() || entry.name.is_empty() || entry.command.is_empty() {
                     warn!(
@@ -1129,5 +1132,51 @@ mod tests {
             assert!(result.is_none());
         }
         assert!(plugin.executed_commands().is_empty());
+    }
+
+    /// Panel NIT (review-20260820T235242Z, codex): re-registration must
+    /// REPLACE the global set — keys absent from the new config stop
+    /// being executable, and changed keys take the new definition.
+    #[tokio::test]
+    async fn test_register_from_config_re_registration_replaces_global_set() {
+        let plugin = RuncommandPlugin::new();
+        let cfg_a = RuncommandConfig {
+            commands: vec![
+                RuncommandCommand {
+                    key: "a".to_string(),
+                    name: "A".to_string(),
+                    command: "echo a".to_string(),
+                },
+                RuncommandCommand {
+                    key: "b".to_string(),
+                    name: "B".to_string(),
+                    command: "echo b".to_string(),
+                },
+            ],
+        };
+        plugin.register_from_config(&cfg_a);
+        assert!(plugin.lookup("any-device", "a").is_some());
+        assert!(plugin.lookup("any-device", "b").is_some());
+
+        let cfg_b = RuncommandConfig {
+            commands: vec![RuncommandCommand {
+                key: "b".to_string(),
+                name: "B2".to_string(),
+                command: "echo b2".to_string(),
+            }],
+        };
+        plugin.register_from_config(&cfg_b);
+
+        assert!(
+            plugin.lookup("any-device", "a").is_none(),
+            "a key absent from the new config must stop being executable"
+        );
+        assert_eq!(
+            plugin
+                .lookup("any-device", "b")
+                .expect("b should still be registered")
+                .command,
+            "echo b2"
+        );
     }
 }
