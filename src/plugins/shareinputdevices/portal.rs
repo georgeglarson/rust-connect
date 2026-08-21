@@ -645,7 +645,16 @@ impl PortalSession {
             )));
         }
 
-        // 6. Enable.
+        // 6. Subscribe to the session signals BEFORE Enable (panel
+        // 66ae8992): the portal can emit Activated/Disabled/
+        // ZonesChanged immediately on enable, and a match rule
+        // registered after the call would miss them. Creating the
+        // stream here (not inside the spawned task) is what makes the
+        // ordering real — the AddMatch is issued before Enable goes
+        // on the wire.
+        let signal_stream = session_signal_stream(&conn).await?;
+
+        // 7. Enable.
         let enable_body = (session_handle.clone(), Options::new().into_body());
         let _: () = call_input_capture(&conn, "Enable", &enable_body)
             .await
@@ -664,6 +673,7 @@ impl PortalSession {
         let barrier_origin = Arc::new(Mutex::new((barrier_rect.x1, barrier_rect.y1)));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         spawn_signal_handler(
+            signal_stream,
             conn.clone(),
             session_handle.clone(),
             edge,
@@ -688,10 +698,20 @@ impl PortalSession {
     /// Wire path for the phone's release packet — invoked from the
     /// M1 release callback with the peer-supplied delta. Mirrors
     /// inputcapturesession.cpp:275-279: cursor_position =
-    /// barrier.p1() + release_delta. M2 is position-only.
+    /// barrier.p1() + release_delta — the peer delta is RELATIVE to
+    /// the barrier origin; sending it raw would release the cursor
+    /// at (deltax, deltay) absolute, wrong on any barrier away from
+    /// (0,0) (panel be6019eb). M2 is position-only.
     pub async fn release(&self, deltax: i32, deltay: i32) -> Result<()> {
-        let opts =
-            Options::new().insert_doubles("cursor_position", f64::from(deltax), f64::from(deltay));
+        let (bx, by) = *self
+            .barrier_origin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let opts = Options::new().insert_doubles(
+            "cursor_position",
+            f64::from(bx + deltax),
+            f64::from(by + deltay),
+        );
         let body = (self.session_handle.clone(), opts.into_body());
         let _: () = call_input_capture(&self.conn, "Release", &body)
             .await
@@ -749,12 +769,37 @@ impl PortalSession {
     }
 }
 
+/// Build the InputCapture signal stream. The rule matches on
+/// PORTAL_PATH — the portal emits Activated/Deactivated/Disabled/
+/// ZonesChanged on the DESKTOP object with the session handle as the
+/// first body element (inputcapturesession.cpp:94-100 connects them
+/// on the InputCapture interface at portalPath(); panel 5c245d1a —
+/// matching on the session path would deliver nothing).
+/// `for_match_rule` issues `org.freedesktop.DBus.AddMatch` and queues
+/// `RemoveMatch` on stream drop — no manual bookkeeping.
+async fn session_signal_stream(conn: &Connection) -> Result<MessageStream> {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender(PORTAL_DESTINATION)
+        .and_then(|b| b.interface(INPUT_CAPTURE_IFACE))
+        .and_then(|b| b.path(PORTAL_PATH))
+        .map(|b| b.build())
+        .map_err(|e| internal(format!("signal MatchRule build: {e}")))?;
+    MessageStream::for_match_rule(rule, conn, Some(16))
+        .await
+        .map_err(|e| internal(format!("signal stream subscribe: {e}")))
+}
+
 /// Spawn the signal-handling task. It runs until the
 /// shutdown_rx fires OR the connection drops. Each signal is
 /// dispatched in order: Activated → tx; Deactivated/Disabled →
 /// logged; ZonesChanged → re-GetZones + re-SetPointerBarriers
 /// (filtered by zone_set id monotonicity — inputcapturesession.cpp:326).
+/// The `stream` is created by the CALLER (before Enable) so the
+/// AddMatch ordering against Enable is real.
+#[allow(clippy::too_many_arguments)]
 fn spawn_signal_handler(
+    mut stream: MessageStream,
     conn: Connection,
     session_handle: OwnedObjectPath,
     edge: Edge,
@@ -764,41 +809,6 @@ fn spawn_signal_handler(
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     tokio::spawn(async move {
-        // Subscribe to InputCapture signals on the session object via
-        // an explicit match rule. `MessageStream::from(&conn)` would
-        // not register any match rule with the bus daemon, so signals
-        // for our connection would be silently dropped at the daemon.
-        // `for_match_rule` issues `org.freedesktop.DBus.AddMatch` and
-        // queues `RemoveMatch` on stream drop — no manual bookkeeping.
-        let rule = match zbus::MatchRule::builder()
-            .msg_type(zbus::message::Type::Signal)
-            .sender(PORTAL_DESTINATION)
-            .and_then(|b| b.interface(INPUT_CAPTURE_IFACE))
-            .and_then(|b| b.path(session_handle.as_str()))
-            .map(|b| b.build())
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    event = "shareinputdevices_signal_handler_match_rule_build_failed",
-                    "Could not build signal match rule; signal handler exits"
-                );
-                return;
-            }
-        };
-        let mut stream = match MessageStream::for_match_rule(rule, &conn, Some(16)).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    event = "shareinputdevices_signal_handler_subscribe_failed",
-                    "Could not subscribe to InputCapture signals; signal handler exits"
-                );
-                return;
-            }
-        };
-        let path_owned = session_handle.clone();
         let iface: InterfaceName<'static> = INPUT_CAPTURE_IFACE.try_into().expect("iface parse");
         loop {
             tokio::select! {
@@ -817,10 +827,22 @@ fn spawn_signal_handler(
                         }
                     };
                     let header = msg.header();
-                    if header.path().map(|p| p.as_str() != path_owned.as_str()).unwrap_or(true) {
+                    if header.path().map(|p| p.as_str() != PORTAL_PATH).unwrap_or(true) {
                         continue;
                     }
                     if header.interface().map(|i| i != &iface).unwrap_or(true) {
+                        continue;
+                    }
+                    // Session discrimination: all InputCapture signals
+                    // share the desktop path, so the session handle is
+                    // the first body element `(o, a{sv})` — act only on
+                    // OUR session.
+                    let (sig_session, _): (OwnedObjectPath, HashMap<String, OwnedValue>) =
+                        match msg.body().deserialize() {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                    if sig_session != session_handle {
                         continue;
                     }
                     let member = match header.member() {
@@ -872,7 +894,6 @@ fn spawn_signal_handler(
                             }
                             if let Err(e) = rearm_barriers(
                                 &conn,
-                                &mut stream,
                                 &session_handle,
                                 edge,
                                 &current_zone_set,
@@ -937,20 +958,40 @@ fn handle_activated(
     }
 }
 
+/// Re-fetch zones and re-arm barriers after ZonesChanged. Builds its
+/// OWN Request-Response stream (panel 81ce9641 / 6bf0f9b7): the
+/// signal handler's stream matches the InputCapture interface, but
+/// Response signals arrive on the Request object path under
+/// org.freedesktop.portal.Request — awaiting them on the signal
+/// stream could only ever time out (and drained real session signals
+/// while doing so). Same path-less rule shape as PortalSession::start.
 async fn rearm_barriers(
     conn: &Connection,
-    stream: &mut MessageStream,
     session_handle: &OwnedObjectPath,
     edge: Edge,
     current_zone_set: &Arc<Mutex<u32>>,
     barrier_origin: &Arc<Mutex<(i32, i32)>>,
 ) -> Result<()> {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender(PORTAL_DESTINATION)
+        .and_then(|b| b.interface(REQUEST_IFACE))
+        .and_then(|b| b.member("Response"))
+        .map(|b| b.build())
+        .map_err(|e| internal(format!("rearm MatchRule build: {e}")))?;
+    let mut response_stream = MessageStream::for_match_rule(rule, conn, Some(16))
+        .await
+        .map_err(|e| internal(format!("rearm response stream: {e}")))?;
     let zones_token = unique_token();
     let get_opts = Options::new().insert_str("handle_token", &zones_token);
     let get_body = (session_handle.clone(), get_opts.into_body());
     let zones_req: OwnedObjectPath = call_input_capture(conn, "GetZones", &get_body).await?;
-    let (code, results) =
-        await_request_response(stream, zones_req.as_str(), Duration::from_secs(5)).await?;
+    let (code, results) = await_request_response(
+        &mut response_stream,
+        zones_req.as_str(),
+        Duration::from_secs(5),
+    )
+    .await?;
     require_success(code, "GetZones(rearm)")?;
     let zones = decode_zones(&results)?;
     let barrier_id: u32 = 1;
@@ -978,8 +1019,12 @@ async fn rearm_barriers(
     );
     let barriers_req: OwnedObjectPath =
         call_input_capture(conn, "SetPointerBarriers", &set_body).await?;
-    let (code, results) =
-        await_request_response(stream, barriers_req.as_str(), Duration::from_secs(5)).await?;
+    let (code, results) = await_request_response(
+        &mut response_stream,
+        barriers_req.as_str(),
+        Duration::from_secs(5),
+    )
+    .await?;
     require_success(code, "SetPointerBarriers(rearm)")?;
     let failed: Vec<u32> = results
         .get("failed_barriers")

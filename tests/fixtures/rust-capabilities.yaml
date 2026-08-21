@@ -124,6 +124,11 @@ plugins:
       - kdeconnect.share.request.update
     outgoing_capabilities:
       - kdeconnect.share.request
+  - name: shareinputdevices
+    incoming_capabilities:
+      - kdeconnect.shareinputdevices
+    outgoing_capabilities:
+      []
   - name: sms
     incoming_capabilities:
       - kdeconnect.sms.messages

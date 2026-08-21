@@ -320,6 +320,10 @@ pub struct ShareInputDevicesPlugin {
     /// succeeds (or for the whole process lifetime when the probe
     /// fails).
     portal_session: Arc<Mutex<Option<Arc<portal::PortalSession>>>>,
+    /// The session-bus connection the probe ran on, stashed for
+    /// `activate_portal_session` (M3's entry point) so the EI
+    /// transport attaches on the SAME connection the probe used.
+    portal_conn: Arc<Mutex<Option<zbus::Connection>>>,
     /// Probe result — `true` after the portal probe gate has
     /// confirmed the InputCapture interface is present and
     /// capable. The Plugin trait's `is_backend_available()` reads
@@ -342,6 +346,7 @@ impl ShareInputDevicesPlugin {
             last_release: Arc::new(Mutex::new(None)),
             release_callback: Arc::new(Mutex::new(None)),
             portal_session: Arc::new(Mutex::new(None)),
+            portal_conn: Arc::new(Mutex::new(None)),
             backend_available: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -444,12 +449,13 @@ impl ShareInputDevicesPlugin {
     /// 3. If probe fails, log loudly and leave the plugin inert —
     ///    `is_backend_available()` returns false, capability
     ///    advertisement gates off, no session is started.
-    /// 4. If probe passes, call `PortalSession::start` to drive the
-    ///    full v1 sequence (CreateSession → ConnectToEIS →
-    ///    GetZones → SetPointerBarriers → Enable), wire the
-    ///    release callback to `session.release()`, and spawn the
-    ///    Activated → wire-packet consumer task that pumps
-    ///    `kdeconnect.shareinputdevices.request` packets to peers.
+    /// 4. If probe passes, stash the connection and STOP. The
+    ///    barrier is NOT armed here (panel 0e230438 / 573c501e):
+    ///    an armed InputCapture barrier with no EI consumer would
+    ///    capture the user's cursor with nothing forwarding the
+    ///    promised mousepad.request stream. Session start waits for
+    ///    the M3 EI transport, which calls
+    ///    `activate_portal_session` once its receiver exists.
     pub async fn enable_session_backend(&self) {
         let conn = match zbus::Connection::session().await {
             Ok(c) => c,
@@ -470,6 +476,35 @@ impl ShareInputDevicesPlugin {
             // false because we never set backend_available.
             return;
         }
+
+        *self.portal_conn.lock().unwrap_or_else(|e| e.into_inner()) = Some(conn);
+        info!(
+            event = "shareinputdevices_probe_passed_inert",
+            "InputCapture portal available; producer stays INERT until the M3 EI transport attaches (no barrier armed, nothing advertised)"
+        );
+    }
+
+    /// M3's entry point: start the portal session and go live. Called
+    /// once the EI transport is ready to consume the session's event
+    /// stream — never before, because Enable arms the capture
+    /// barrier. Runs the full v1 sequence (CreateSession →
+    /// ConnectToEIS → GetZones → SetPointerBarriers → Enable), wires
+    /// the release callback to `session.release()`, and spawns the
+    /// Activated → wire-packet consumer task that pumps
+    /// `kdeconnect.shareinputdevices.request` packets to peers.
+    pub async fn activate_portal_session(&self) {
+        let conn = self
+            .portal_conn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(conn) = conn else {
+            warn!(
+                event = "shareinputdevices_activate_without_probe",
+                "activate_portal_session called before a successful probe; refusing"
+            );
+            return;
+        };
 
         // Build a channel for Activated events. The PortalSession
         // owns the sender; we own the receiver and turn each event

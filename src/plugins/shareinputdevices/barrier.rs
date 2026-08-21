@@ -8,6 +8,10 @@
 //! which the M1 plugin already uses.
 //!
 //! **Upstream quirk, replicated:** the cpp's `QRect::bottom` /
+//! `QRect::right` are INCLUSIVE pixel coordinates
+//! (`x + width - 1`, `y + height - 1`), and the barrier coordinates
+//! depend on it (inputcapturesession.cpp:200,:213) — see
+//! `Zone::inclusive_right` / `Zone::inclusive_bottom`.
 use crate::plugins::shareinputdevices::Edge;
 
 /// A rectangular zone returned by the portal's GetZones call.
