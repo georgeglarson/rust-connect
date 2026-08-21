@@ -23,21 +23,25 @@ use std::os::fd::{AsFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
+use enumflags2::BitFlags;
 use reis::eis::device::DeviceType;
 use reis::eis::keyboard::{KeyState as EisKeyState, KeymapType as EisKeymapType};
 use reis::eis::{self};
 use reis::event::DeviceCapability;
 use reis::handshake::EisHandshaker;
-use reis::request::{Connection as EisConnection, Device as EisDevice};
+use reis::request::{Connection as EisConnection, Device as EisDevice, EisRequest};
 use tokio::time::timeout;
 
 use rust_connect::plugins::shareinputdevices::ei::EiReceiver;
 
 /// Minimal valid XKB keymap. KEY_H is evdev 35 → xkbcommon keycode
-/// 43 (the evdev +8 offset documented at ei.rs:73). We bind the
-/// "HKTG" semantic at keycode 43 so the test's KEY_H lookup hits
-/// XK_h. The keymap doesn't have to be production-quality — it just
-/// has to parse, and one key needs to be addressable.
+/// 43 (the evdev +8 offset lives in `XKB_KEYCODE_OFFSET`). We bind
+/// the "HKTG" semantic at keycode 43 so the test's KEY_H lookup hits
+/// XK_h, and "AC03" at 54 (evdev KEY_C = 46) so the Ctrl-shortcut
+/// test has a letter key whose state-based lookup would collapse to
+/// a control byte. The keymap doesn't have to be production-quality
+/// — it just has to parse, and the keys under test need to be
+/// addressable.
 const TEST_KEYMAP: &str = r#"xkb_keymap {
 xkb_keycodes {
 	minimum = 8;
@@ -47,6 +51,7 @@ xkb_keycodes {
 	<AE02> = 11;
 	<BKSP> = 22;
 	<HKTG> = 43;
+	<AC03> = 54;
 	<HOME> = 110;
 	<UP> = 111;
 	<RIGHT> = 114;
@@ -75,6 +80,7 @@ xkb_symbols {
 	key <DOWN> {	[ Down	]	};
 	key <CAPS> {	[ Caps_Lock	]	};
 	key <HKTG> {	[ h	]	};
+	key <AC03> {	[ c	]	};
 };
 };
 "#;
@@ -89,11 +95,22 @@ xkb_symbols {
 /// We do this by spawning the EIS read loop as `spawn_local` inside
 /// the same LocalSet as the test body.
 ///
+/// **The fake keeps reading after the handshake.** A fake EIS that
+/// stops draining its socket cannot distinguish a request the
+/// receiver merely buffered from one it actually flushed — both look
+/// like silence. Draining post-handshake is what lets
+/// `seat_bind_reaches_the_eis_peer_before_devices` observe the
+/// `ei_seat.bind` request as a real wire event. The bound capability
+/// set from the first `EisRequest::Bind` is published on the returned
+/// oneshot; every other request is drained and dropped (the receiver
+/// is a pure consumer and sends nothing else).
+///
 /// **Caller contract:** this must be invoked from within a
 /// `tokio::task::LocalSet` (each test builds its own with
 /// `LocalSet::new()` and `local.block_on(&rt, ...)` — see the test
 /// bodies below). The test body, the eis drive task, and the
 /// `receiver.start()` future all run on the same thread.
+#[allow(clippy::type_complexity)]
 async fn setup() -> (
     EisConnection,
     std::sync::Arc<EiReceiver>,
@@ -101,6 +118,7 @@ async fn setup() -> (
     tokio::sync::watch::Receiver<bool>,
     impl std::future::Future<Output = ()>,
     Option<tokio::sync::oneshot::Sender<()>>,
+    tokio::sync::oneshot::Receiver<BitFlags<DeviceCapability>>,
 ) {
     let (peer_stream, client_stream) = UnixStream::pair().expect("UnixStream::pair");
 
@@ -116,6 +134,7 @@ async fn setup() -> (
     // once it sees the `Connection` event.
     let (conn_tx, conn_rx) = tokio::sync::oneshot::channel();
     let (eis_done_tx, eis_done_rx) = tokio::sync::oneshot::channel::<()>();
+    let (bind_tx, bind_rx) = tokio::sync::oneshot::channel::<BitFlags<DeviceCapability>>();
     let eis_ctx = eis::Context::new(peer_stream).expect("eis Context::new");
     let handshaker = std::sync::Arc::new(std::sync::Mutex::new(EisHandshaker::new(&eis_ctx, 1)));
     let eis_drive = {
@@ -148,14 +167,42 @@ async fn setup() -> (
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             };
-            let converter = reis::request::EisRequestConverter::new(&eis_ctx, resp, 1);
+            let mut converter = reis::request::EisRequestConverter::new(&eis_ctx, resp, 1);
             let connection = converter.handle().clone();
             let _ = conn_tx.send(connection);
-            // Hold the converter alive until the test signals teardown,
-            // then drop it — which closes the eis-side socket and lets
-            // the receiver's pump see EOF. (Without this, the converter
-            // stays alive forever and the socket never closes.)
-            let _ = eis_done_rx.await;
+            // Keep draining the socket until the test signals teardown,
+            // then drop the converter — which closes the eis-side
+            // socket and lets the receiver's pump see EOF. (Without
+            // the drop the converter stays alive forever and the
+            // socket never closes.)
+            let mut bind_tx = Some(bind_tx);
+            let mut done = std::pin::pin!(eis_done_rx);
+            loop {
+                let _ = eis_ctx.read();
+                while let Some(result) = eis_ctx.pending_request() {
+                    let request = match result {
+                        reis::PendingRequestResult::Request(r) => r,
+                        reis::PendingRequestResult::ParseError(e) => panic!("parse error: {e}"),
+                        reis::PendingRequestResult::InvalidObject(id) => {
+                            panic!("invalid object: {id}")
+                        }
+                    };
+                    converter
+                        .handle_request(request)
+                        .expect("post-handshake handle_request");
+                }
+                while let Some(request) = converter.next_request() {
+                    if let EisRequest::Bind(bind) = request {
+                        if let Some(tx) = bind_tx.take() {
+                            let _ = tx.send(bind.capabilities);
+                        }
+                    }
+                }
+                tokio::select! {
+                    _ = &mut done => break,
+                    () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+            }
             drop(converter);
         }
     };
@@ -191,6 +238,7 @@ async fn setup() -> (
         disconnect_rx,
         drive,
         Some(eis_done_tx),
+        bind_rx,
     )
 }
 
@@ -266,7 +314,8 @@ fn pointer_motion_round_trip() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
-        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
         let pump = tokio::task::spawn_local(drive);
 
         // Add a seat with pointer capability.
@@ -324,7 +373,8 @@ fn button_press_release_round_trip() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
-        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
         let pump = tokio::task::spawn_local(drive);
 
         let seat = connection.add_seat(
@@ -382,7 +432,8 @@ fn activation_gate_queues_until_activated() {
         // dance. We send start_emulating(7), then a motion, then call
         // handle_activated(7) — the motion should NOT arrive on the wire
         // until activated, then it should be replayed.
-        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
         let pump = tokio::task::spawn_local(drive);
 
         let seat = connection.add_seat(
@@ -436,7 +487,8 @@ fn events_passthrough_when_not_armed() {
         // The default state: no start_emulating has run. Events should
         // flow straight through (matches the cpp's initial 0/0 gate
         // condition).
-        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
         let pump = tokio::task::spawn_local(drive);
 
         let seat = connection.add_seat(
@@ -483,7 +535,8 @@ fn keyboard_keymap_loads_and_emits_text() {
         // KEY_H (evdev 35). We don't pin exact wire shape (special_key
         // codes come from a Qt::Key→int table that lives outside M3) —
         // only that the body shape is a JSON object with a string `key`.
-        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
         let pump = tokio::task::spawn_local(drive);
 
         let seat = connection.add_seat(Some("test"), DeviceCapability::Keyboard.into());
@@ -592,7 +645,8 @@ fn scroll_delta_round_trip() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
-        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
         let pump = tokio::task::spawn_local(drive);
 
         let seat = connection.add_seat(
@@ -646,7 +700,8 @@ fn scroll_discrete_round_trip() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
-        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
         let pump = tokio::task::spawn_local(drive);
 
         let seat = connection.add_seat(
@@ -699,7 +754,8 @@ fn scroll_stop_and_cancel_are_noops() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
-        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
         let pump = tokio::task::spawn_local(drive);
 
         let seat = connection.add_seat(
@@ -764,7 +820,8 @@ fn gate_queues_scroll_until_activated() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
-        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
         let pump = tokio::task::spawn_local(drive);
 
         let seat = connection.add_seat(
@@ -843,7 +900,7 @@ fn disconnect_via_explicit_event_signals_and_completes() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
-        let (connection, _receiver, _wire_rx, mut disconnect_rx, drive, eis_done_tx) =
+        let (connection, _receiver, _wire_rx, mut disconnect_rx, drive, eis_done_tx, _bind_rx) =
             setup().await;
         let pump = tokio::task::spawn_local(drive);
 
@@ -891,7 +948,7 @@ fn disconnect_event_alone_completes_pump_without_socket_close() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
-        let (connection, _receiver, _wire_rx, mut disconnect_rx, drive, _eis_done_tx) =
+        let (connection, _receiver, _wire_rx, mut disconnect_rx, drive, _eis_done_tx, _bind_rx) =
             setup().await;
         let pump = tokio::task::spawn_local(drive);
 
@@ -935,7 +992,7 @@ fn disconnect_via_eof_signals_and_completes() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
-        let (connection, _receiver, _wire_rx, mut disconnect_rx, drive, eis_done_tx) =
+        let (connection, _receiver, _wire_rx, mut disconnect_rx, drive, eis_done_tx, _bind_rx) =
             setup().await;
         let pump = tokio::task::spawn_local(drive);
 
@@ -981,7 +1038,8 @@ fn unmapped_keycode_does_not_panic_pump_survives() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
-        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
         let pump = tokio::task::spawn_local(drive);
 
         let seat = connection.add_seat(Some("test"), DeviceCapability::Keyboard.into());
@@ -1064,7 +1122,8 @@ fn latched_shift_modifier_surfaces_as_shift_on_wire() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
-        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
         let pump = tokio::task::spawn_local(drive);
 
         let seat = connection.add_seat(Some("test"), DeviceCapability::Keyboard.into());
@@ -1158,7 +1217,8 @@ fn control_char_keys_emit_empty_text() {
         .unwrap();
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
-        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
         let pump = tokio::task::spawn_local(drive);
 
         let seat = connection.add_seat(Some("test"), DeviceCapability::Keyboard.into());
@@ -1198,6 +1258,95 @@ fn control_char_keys_emit_empty_text() {
             obj.get("key").and_then(|v| v.as_str()),
             Some(""),
             "Escape must produce empty text on the wire (filter <0x20); got {}",
+            json
+        );
+
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit");
+    });
+}
+
+#[test]
+fn ctrl_shortcut_keeps_the_letter_text_on_the_wire() {
+    // Red-before-green oracle for the state-free text lookup. The cpp
+    // producer's KeyboardKey arm calls
+    // `QXkbCommon::lookupStringNoKeysymTransformations(sym)`, whose
+    // Qt-side body is `xkb_keysym_to_utf8` on the BARE keysym — it
+    // deliberately skips xkbcommon's Control and capitalization
+    // transformations. `xkb_state_key_get_utf8` applies them: with
+    // Control active and unconsumed it collapses `c` to "\x03", which
+    // the `< 0x20` filter then erases entirely. Every Ctrl shortcut
+    // would reach the phone as `{key: "", ctrl: true}` — nothing to
+    // type. Post-fix the transport looks the text up from the keysym,
+    // so the wire body carries `key: "c"` alongside `ctrl: true`.
+    //
+    // XKB real-modifier index 2 = Control (mask bit 2 = 4).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        let seat = connection.add_seat(Some("test"), DeviceCapability::Keyboard.into());
+        let keymap_text = TEST_KEYMAP.to_string();
+        let device = seat.add_device(
+            Some("test-kb"),
+            DeviceType::Virtual,
+            DeviceCapability::Keyboard.into(),
+            move |device| {
+                let kb: eis::Keyboard = device
+                    .interface()
+                    .expect("keyboard interface available pre-done");
+                let (memfd, size) = keymap_fd(&keymap_text);
+                kb.keymap(EisKeymapType::Xkb, size, memfd.as_fd());
+            },
+        );
+        device.resumed();
+        device.start_emulating(1);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Arm-then-clear the activation gate.
+        _receiver.handle_activated(1).await;
+
+        // Depress Control (mask bit 2). Nothing latched, nothing locked.
+        {
+            let kb: eis::Keyboard = device.interface().expect("device has keyboard interface");
+            kb.modifiers(
+                0, /* depressed */ 4, /* locked */ 0, /* latched */ 0,
+                /* group */ 0,
+            );
+            device.frame(0);
+            connection.flush().expect("flush modifiers+frame");
+        }
+
+        // Press KEY_C (evdev 46 → xkb 54 → XK_c).
+        key_event(&connection, &device, 46, true);
+
+        let body = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("key timed out")
+            .expect("wire rx closed");
+        let json = body.into_json();
+        let obj = json.as_object().expect("key body is an object");
+        assert_eq!(
+            obj.get("ctrl").and_then(|v| v.as_bool()),
+            Some(true),
+            "depressed Control must surface as ctrl:true; got {}",
+            json
+        );
+        assert_eq!(
+            obj.get("key").and_then(|v| v.as_str()),
+            Some("c"),
+            "Ctrl+C must keep the letter text on the wire (state-free \
+             keysym lookup); got {}",
             json
         );
 

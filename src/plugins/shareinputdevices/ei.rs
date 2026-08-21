@@ -585,7 +585,7 @@ impl EiReceiver {
                     );
                     return;
                 }
-                let text = keysym_to_text(state, xkb_keycode);
+                let text = keysym_to_text(keysym);
                 let m = Modifiers::from_xkb_state(state);
                 drop(guard);
                 // The cpp's :435 derives a Qt::Key + int code via
@@ -756,17 +756,26 @@ fn build_xkb_state(fd: &OwnedFd, size: u32) -> Result<xkb::State, Error> {
     Ok(xkb::State::new(&keymap))
 }
 
-/// Look up the text representation of the keycode's keysym,
-/// mirroring `QXkbCommon::lookupStringNoKeysymTransformations(sym)`
-/// at `inputcapturesession.cpp:436`. The xkbcommon crate has
-/// `key_get_utf8` for the no-transformation path, but unlike Qt's
-/// equivalent it does NOT filter control bytes — it yields the raw
-/// `\x1b`/`\x08`/`\t` for Escape/Backspace/Tab. Qt's
-/// `QKeyEvent::text()` strips anything `< 0x20` before delivering;
-/// we mirror that filter here so the wire packet's `key` field
-/// matches the upstream cpp's behavior.
-fn keysym_to_text(state: &xkb::State, keycode: u32) -> String {
-    let raw = state.key_get_utf8(xkb::Keycode::new(keycode));
+/// Look up the text representation of a keysym, mirroring
+/// `QXkbCommon::lookupStringNoKeysymTransformations(sym)` at
+/// `inputcapturesession.cpp:436`. Qt's body is `xkb_keysym_to_utf8`
+/// on the BARE keysym; the "NoKeysymTransformations" in the name is
+/// the whole point — it deliberately skips the Control and
+/// capitalization transformations that `xkb_state_key_get_utf8`
+/// applies. Using the state-based lookup here would collapse every
+/// Ctrl shortcut: with Control active and unconsumed, xkbcommon
+/// turns `c` into `"\x03"`, and the `< 0x20` filter below then
+/// erases it, putting `{key: "", ctrl: true}` on the wire — nothing
+/// for the consumer to type. Level selection (shift / caps) is
+/// already baked into the keysym by `key_get_one_sym`, which is the
+/// same split the cpp uses.
+///
+/// The filter that remains is Qt's, not xkbcommon's:
+/// `QKeyEvent::text()` strips anything `< 0x20` before delivering,
+/// so Escape / Backspace / Tab reach the wire as empty text.
+/// `xkb_keysym_to_utf8` does not filter, so we do.
+fn keysym_to_text(keysym: xkb::Keysym) -> String {
+    let raw = xkb::keysym_to_utf8(keysym);
     raw.chars().filter(|&c| (c as u32) >= 0x20).collect()
 }
 
