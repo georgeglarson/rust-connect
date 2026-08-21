@@ -33,19 +33,6 @@ use tokio::time::timeout;
 
 use rust_connect::plugins::shareinputdevices::ei::EiReceiver;
 
-/// Helper: build a current-thread runtime + LocalSet, then run a
-/// test future on it. Each test embeds this directly because the
-/// macro form interferes with the closure body.
-#[allow(dead_code)]
-fn make_local_set() -> (tokio::runtime::Runtime, tokio::task::LocalSet) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let local = tokio::task::LocalSet::new();
-    (rt, local)
-}
-
 /// Minimal valid XKB keymap. KEY_H is evdev 35 → xkbcommon keycode
 /// 43 (the evdev +8 offset documented at ei.rs:73). We bind the
 /// "HKTG" semantic at keycode 43 so the test's KEY_H lookup hits
@@ -103,8 +90,9 @@ xkb_symbols {
 /// the same LocalSet as the test body.
 ///
 /// **Caller contract:** this must be invoked from within a
-/// `tokio::task::LocalSet` (the `each_test_local_set` macro below
-/// sets one up). The test body, the eis drive task, and the
+/// `tokio::task::LocalSet` (each test builds its own with
+/// `LocalSet::new()` and `local.block_on(&rt, ...)` — see the test
+/// bodies below). The test body, the eis drive task, and the
 /// `receiver.start()` future all run on the same thread.
 async fn setup() -> (
     EisConnection,
@@ -191,7 +179,10 @@ async fn setup() -> (
         start_result.expect("receiver start failed")
     };
 
-    let connection = conn_rx.await.expect("EIS handshake setup");
+    let connection = timeout(Duration::from_secs(5), conn_rx)
+        .await
+        .expect("EIS handshake setup timed out")
+        .expect("EIS handshake setup");
 
     (
         connection,
@@ -840,18 +831,12 @@ fn gate_queues_scroll_until_activated() {
 fn disconnect_via_explicit_event_signals_and_completes() {
     // Oracle: the cpp at inputcapturesession.cpp:372-374 logs the
     // EI disconnect and falls through. The receiver's `dispatch`
-    // (ei.rs:410-417) fires `disconnect_tx.send(true)` on the event.
-    // In production, the portal closes the socket too — the pump
-    // exits on the EOF that follows the Disconnected event.
-    //
-    // **Caveat pinned in FINDINGS.md.** reis's `Connection::disconnected`
-    // (reis request.rs:106) calls `shutdown_read` on the EIS-side
-    // socket, NOT `shutdown_write`. That makes the EIS unable to read
-    // but does NOT cause the Receiver's read end to see EOF — a
-    // half-open scenario the cpp's own `break` (inputcapturesession.cpp:373)
-    // implicitly assumes will not happen (the portal closes the socket
-    // too). To make the pump exit in this test we close the socket
-    // ourselves by ending the eis_drive task — same as production.
+    // (ei.rs:410-417) fires `disconnect_tx.send(true)` on the event
+    // AND exits the pump (the M3 fix-lane break — reis does not EOF
+    // the stream on `connection.disconnected`, so a Disconnected
+    // event alone would otherwise hang the pump until the socket
+    // closes). The eis drive task here is also torn down for
+    // hygiene, but the pump exits on the protocol event itself.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -865,9 +850,8 @@ fn disconnect_via_explicit_event_signals_and_completes() {
         // 1. Send the explicit Disconnected event from the EIS side.
         connection.disconnected(reis::ei::connection::DisconnectReason::Disconnected, None);
 
-        // 2. disconnect_rx flips to true once dispatch sees the event
-        //    (ei.rs:417). This is the oracle assertion for the
-        //    Disconnected event itself.
+        // 2. disconnect_rx flips to true once dispatch sees the event.
+        //    This is the oracle assertion for the Disconnected event.
         let _ = timeout(Duration::from_secs(2), disconnect_rx.changed())
             .await
             .expect("disconnect_rx did not flip on Disconnected event");
@@ -876,18 +860,63 @@ fn disconnect_via_explicit_event_signals_and_completes() {
             "disconnect_rx must be true after Disconnected event"
         );
 
-        // 3. Close the socket to simulate the production follow-up
-        //    (portal closing the socket after sending Disconnected).
-        //    The eis_drive task ends and drops eis::Context, which
-        //    owns the UnixStream.
+        // 3. Close the socket to end the eis_drive task (hygiene;
+        //    the pump has already exited on the protocol event above).
         let _ = eis_done_tx.unwrap().send(());
         drop(connection);
 
-        // 4. drive future completes once the pump exits on EOF
-        //    (ei.rs:392).
+        // 4. drive future completes — primary oracle: pump exits on the
+        //    Disconnected event itself, not on socket EOF.
         let _ = timeout(Duration::from_secs(2), pump)
             .await
-            .expect("pump did not exit after Disconnected event + socket close");
+            .expect("pump did not exit after Disconnected event");
+    });
+}
+
+#[test]
+fn disconnect_event_alone_completes_pump_without_socket_close() {
+    // Red-before-green oracle for the M3 fix-lane B: the receiver's
+    // pump must exit on the explicit Disconnected protocol event
+    // alone — no socket close, no `eis_done_tx` send. reis's
+    // `Connection::disconnected` (reis request.rs:106) calls
+    // `shutdown_read` on the EIS side, NOT `shutdown_write` — that
+    // half-shutdown does not produce an EOF on the Receiver's read
+    // end. Without the fix, the pump's `while let Some(event) =
+    // stream.next().await` blocks forever after dispatching the
+    // Disconnected event. This test pins the post-fix invariant:
+    // the terminal protocol event ends the pump on its own.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, _receiver, _wire_rx, mut disconnect_rx, drive, _eis_done_tx) =
+            setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        // Send ONLY the explicit Disconnected event. Keep the
+        // socket open (`connection` stays in scope; `eis_done_tx`
+        // is dropped without being sent so the eis_drive task
+        // continues holding its end of the socketpair).
+        connection.disconnected(reis::ei::connection::DisconnectReason::Disconnected, None);
+
+        // Oracle 1: disconnect_rx flips to true on the event.
+        let _ = timeout(Duration::from_secs(2), disconnect_rx.changed())
+            .await
+            .expect("disconnect_rx did not flip on Disconnected event");
+        assert!(
+            *disconnect_rx.borrow_and_update(),
+            "disconnect_rx must be true after Disconnected event"
+        );
+
+        // Oracle 2: drive completes WITHOUT any socket close.
+        // Pre-fix this hangs forever; post-fix the pump's
+        // Disconnected arm breaks out of the dispatch loop and
+        // the function returns.
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit on Disconnected event alone");
     });
 }
 
@@ -934,21 +963,262 @@ fn disconnect_via_eof_signals_and_completes() {
     });
 }
 
-// ---------- memfd helper ----------
+#[test]
+fn unmapped_keycode_does_not_panic_pump_survives() {
+    // Red-before-green oracle for fix C: a keycode the delivered
+    // keymap maps to XKB_KEY_NoSymbol (real keymaps have
+    // unmapped/vendor codes) must NOT panic the pump. Pre-fix, the
+    // `debug_assert!(keysym.raw() != 0)` in the KeyboardKey arm
+    // would panic debug builds, killing the pump task silently.
+    // `disconnect_tx` is dropped without `send(true)`, so
+    // `disconnect_rx.changed()` resolves to `Err(closed)` and the
+    // receiver is dead without a signal. Post-fix: warn + drop the
+    // event (no wire body), pump survives, subsequent mapped keys
+    // still emit normally.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        let seat = connection.add_seat(Some("test"), DeviceCapability::Keyboard.into());
+        let keymap_text = TEST_KEYMAP.to_string();
+        let device = seat.add_device(
+            Some("test-kb"),
+            DeviceType::Virtual,
+            DeviceCapability::Keyboard.into(),
+            move |device| {
+                let kb: eis::Keyboard = device
+                    .interface()
+                    .expect("keyboard interface available pre-done");
+                let (memfd, size) = keymap_fd(&keymap_text);
+                kb.keymap(EisKeymapType::Xkb, size, memfd.as_fd());
+            },
+        );
+        device.resumed();
+        device.start_emulating(1);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Arm-then-clear the activation gate.
+        _receiver.handle_activated(1).await;
+
+        // Send an unmapped keycode. The TEST_KEYMAP does not bind
+        // anything at keycode 50 (evdev) → xkb 58; key_get_one_sym
+        // returns NoSymbol (raw 0). Pre-fix this panicked the pump.
+        key_event(&connection, &device, 50, true);
+
+        // No body should arrive — the unmapped event is dropped.
+        let spurious = timeout(Duration::from_millis(200), wire_rx.recv()).await;
+        assert!(
+            spurious.is_err(),
+            "unmapped keycode must NOT produce a wire body"
+        );
+
+        // The pump must still be alive — a subsequent mapped key
+        // (KEY_H=35 → xkb 43 → XK_h) must produce a body.
+        key_event(&connection, &device, 35, true);
+        let body = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("mapped key after unmapped timed out — pump must survive")
+            .expect("wire rx closed");
+        let json = body.into_json();
+        let obj = json.as_object().expect("key body is an object");
+        assert_eq!(
+            obj.get("key").and_then(|v| v.as_str()),
+            Some("h"),
+            "subsequent mapped key still emits; got {}",
+            json
+        );
+
+        // Cleanup.
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit");
+    });
+}
+
+#[test]
+fn latched_shift_modifier_surfaces_as_shift_on_wire() {
+    // Red-before-green oracle for fix D: modifiers must be read from
+    // STATE_MODS_EFFECTIVE (depressed | latched | locked), not
+    // STATE_MODS_DEPRESSED alone. The cpp at
+    // inputcapturesession.cpp:422-426 calls
+    // `xkb_state_update_mask(depressed, latched, locked, ...)` and
+    // reads modifiers from the resulting effective state via
+    // QXkbCommon::modifiers. Sticky-key (latched) shift must show
+    // up on the wire as `shift: true`. Pre-fix, the receiver read
+    // DEPRESSED only — the latched mask was dropped while
+    // `key_get_utf8` (effective-state) already emitted the shifted
+    // text, producing inconsistent wire packets.
+    //
+    // XKB modifier mask bit 0 = Shift (xkbcommon.h XKB_MOD_SHIFT).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        let seat = connection.add_seat(Some("test"), DeviceCapability::Keyboard.into());
+        let keymap_text = TEST_KEYMAP.to_string();
+        let device = seat.add_device(
+            Some("test-kb"),
+            DeviceType::Virtual,
+            DeviceCapability::Keyboard.into(),
+            move |device| {
+                let kb: eis::Keyboard = device
+                    .interface()
+                    .expect("keyboard interface available pre-done");
+                let (memfd, size) = keymap_fd(&keymap_text);
+                kb.keymap(EisKeymapType::Xkb, size, memfd.as_fd());
+            },
+        );
+        device.resumed();
+        device.start_emulating(1);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Arm-then-clear the activation gate.
+        _receiver.handle_activated(1).await;
+
+        // Send a KeyboardModifiers event with LATCHED Shift set
+        // (bit 0 of the XKB modifier mask), depressed=0, locked=0.
+        // The current keymap has no Shift binding, so the latched
+        // shift does not transform the keysym text — but the
+        // modifiers on the wire MUST still report `shift: true`
+        // because the consumer relies on them for control flow.
+        {
+            let kb: eis::Keyboard = device.interface().expect("device has keyboard interface");
+            // serial=0 is fine for tests; group=0 (no layout switch).
+            kb.modifiers(
+                0, /* depressed */ 0, /* locked */ 0, /* latched */ 1,
+                /* group */ 0,
+            );
+            device.frame(0);
+            connection.flush().expect("flush modifiers+frame");
+        }
+
+        // Now press KEY_H. Pre-fix this emits shift:false; post-fix
+        // it emits shift:true.
+        key_event(&connection, &device, 35, true);
+
+        let body = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("key timed out")
+            .expect("wire rx closed");
+        let json = body.into_json();
+        let obj = json.as_object().expect("key body is an object");
+        assert_eq!(
+            obj.get("key").and_then(|v| v.as_str()),
+            Some("h"),
+            "KEY_H should still emit 'h'; got {}",
+            json
+        );
+        assert_eq!(
+            obj.get("shift").and_then(|v| v.as_bool()),
+            Some(true),
+            "LATCHED Shift must surface as shift:true on the wire; got {}",
+            json
+        );
+
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit");
+    });
+}
+
+#[test]
+fn control_char_keys_emit_empty_text() {
+    // Red-before-green oracle for fix E: the cpp producer at
+    // inputcapturesession.cpp:436 calls
+    // `QXkbCommon::lookupStringNoKeysymTransformations(sym)`, whose
+    // Qt-side equivalent strips chars < 0x20 before emitting —
+    // Escape, Backspace, and Tab all produce empty text on the wire.
+    // Our transport's equivalent (`xkb_state_key_get_utf8`) yields
+    // the raw control byte (`\x1b` for Escape, `\x08` for Backspace,
+    // `\t` for Tab). Pre-fix the wire body carried the control byte
+    // in its `key` field; the Android consumer would then key a
+    // unicode glyph that maps to nothing. Post-fix the transport
+    // filters chars < 0x20, so the wire body carries `key: ""`.
+    //
+    // We test Escape here (keycode 9 → xkb 17 → XK_Escape → "\x1b").
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx) = setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        let seat = connection.add_seat(Some("test"), DeviceCapability::Keyboard.into());
+        let keymap_text = TEST_KEYMAP.to_string();
+        let device = seat.add_device(
+            Some("test-kb"),
+            DeviceType::Virtual,
+            DeviceCapability::Keyboard.into(),
+            move |device| {
+                let kb: eis::Keyboard = device
+                    .interface()
+                    .expect("keyboard interface available pre-done");
+                let (memfd, size) = keymap_fd(&keymap_text);
+                kb.keymap(EisKeymapType::Xkb, size, memfd.as_fd());
+            },
+        );
+        device.resumed();
+        device.start_emulating(1);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Arm-then-clear the activation gate.
+        _receiver.handle_activated(1).await;
+
+        // Press KEY_ESCAPE (evdev 1) → xkb 9. The keymap binds
+        // <ESC>=9 → Escape, so key_get_utf8 returns "\x1b" pre-fix
+        // (a control char that should be filtered).
+        key_event(&connection, &device, 1, true);
+
+        let body = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("key timed out")
+            .expect("wire rx closed");
+        let json = body.into_json();
+        let obj = json.as_object().expect("key body is an object");
+        assert_eq!(
+            obj.get("key").and_then(|v| v.as_str()),
+            Some(""),
+            "Escape must produce empty text on the wire (filter <0x20); got {}",
+            json
+        );
+
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit");
+    });
+}
 
 fn memfd_create() -> std::io::Result<std::fs::File> {
     use std::ffi::CString;
-    use std::io::Error;
-    // memfd_create syscall number is 319 on x86_64 Linux.
-    const SYS_MEMFD_CREATE: libc::c_long = 319;
+    // libc::memfd_create dispatches the right syscall per
+    // architecture — number 319 on x86_64, 279 on aarch64, etc.
+    // The hand-rolled syscall(constant) form here was x86_64-only
+    // and would break cross-arch builds.
     let name = CString::new("reis-test-keymap").expect("cstring");
-    let res = unsafe { libc::syscall(SYS_MEMFD_CREATE, name.as_ptr(), 0u32) };
-    if res < 0 {
-        return Err(Error::last_os_error());
-    }
-    let fd = res as std::os::unix::io::RawFd;
-    unsafe {
-        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }

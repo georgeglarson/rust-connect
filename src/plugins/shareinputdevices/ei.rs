@@ -8,8 +8,8 @@
 //! `ActivationGate` and is invoked by the PortalSession signal
 //! handler.
 //!
-//! **Crate choice: reis 0.7.1 with the `tokio` feature.** Recorded in
-//! `plans/task-1042-m3-brief` § Crate spike. The decision matrix:
+//! **Crate choice: reis 0.7.1 with the `tokio` feature.** The
+//! decision matrix:
 //!
 //! - reis is the prior-art Rust binding for libei/libeis (lan-mouse
 //!   uses it for the same portal half). The upstream cpp uses raw
@@ -95,20 +95,22 @@ pub struct Modifiers {
 }
 
 impl Modifiers {
-    /// Project an xkbcommon `State` into our 4-bool shape. Tests
-    /// only the DEPRESSED mask — that is the modifier state the
-    /// consumer (mousepad.request) expects. Latched/locked are
-    /// tracked but not surfaced (the cpp's :423-426 calls
-    /// `xkb_state_update_mask` with all four masks, and :434 reads
-    /// modifiers from the resulting state, so the consumer sees the
-    /// union; "depressed" is the dominant case).
+    /// Project an xkbcommon `State` into our 4-bool shape. Reads
+    /// from `STATE_MODS_EFFECTIVE` (depressed | latched | locked)
+    /// to match the cpp's `QXkbCommon::modifiers` call at
+    /// inputcapturesession.cpp:434, which derives the four booleans
+    /// from the state that `xkb_state_update_mask(depressed, latched,
+    /// locked, …)` produces. Reading DEPRESSED alone would drop
+    /// sticky (latched) and toggle (locked) modifiers while
+    /// `key_get_utf8` already emits the shifted text — producing
+    /// wire packets whose text and modifiers disagree.
     #[must_use]
     pub fn from_xkb_state(state: &xkb::State) -> Self {
         Self {
-            shift: state.mod_name_is_active(MOD_SHIFT, xkb::STATE_MODS_DEPRESSED),
-            ctrl: state.mod_name_is_active(MOD_CONTROL, xkb::STATE_MODS_DEPRESSED),
-            alt: state.mod_name_is_active(MOD_ALT, xkb::STATE_MODS_DEPRESSED),
-            super_key: state.mod_name_is_active(MOD_SUPER, xkb::STATE_MODS_DEPRESSED),
+            shift: state.mod_name_is_active(MOD_SHIFT, xkb::STATE_MODS_EFFECTIVE),
+            ctrl: state.mod_name_is_active(MOD_CONTROL, xkb::STATE_MODS_EFFECTIVE),
+            alt: state.mod_name_is_active(MOD_ALT, xkb::STATE_MODS_EFFECTIVE),
+            super_key: state.mod_name_is_active(MOD_SUPER, xkb::STATE_MODS_EFFECTIVE),
         }
     }
 }
@@ -271,7 +273,6 @@ pub struct EiReceiver {
     handshake_name: String,
     /// The capabilities we bind on the seat at `SeatAdded` — pinned
     /// for tests that want to assert the binding surface.
-    #[allow(dead_code)]
     bound_caps: BitFlags<DeviceCapability>,
 }
 
@@ -357,7 +358,8 @@ impl EiReceiver {
     }
 
     /// The event-pump task. Loops until the stream returns `None`
-    /// (EOF) or an error; on exit, signals disconnect.
+    /// (EOF), an error, or the EI peer sends the terminal
+    /// `Disconnected` protocol event; on exit, signals disconnect.
     async fn pump(
         bound_caps: BitFlags<DeviceCapability>,
         gate: Arc<Mutex<ActivationGate>>,
@@ -368,16 +370,26 @@ impl EiReceiver {
     ) {
         while let Some(event) = stream.next().await {
             match event {
+                Ok(EiEvent::Disconnected(d)) => {
+                    warn!(
+                        reason = ?d.reason,
+                        explanation = ?d.explanation,
+                        event = "shareinputdevices_ei_disconnect",
+                        "Disconnected from EIS"
+                    );
+                    let _ = disconnect_tx.send(true);
+                    // reis does NOT EOF the stream on `Disconnected`
+                    // — its `Connection::disconnected` calls
+                    // `shutdown_read` on the EIS side, which leaves
+                    // the Receiver's read end open. Without this
+                    // break the pump would block forever on the next
+                    // `stream.next().await` even though the protocol
+                    // is over. The cpp gets away with relying on the
+                    // portal closing the socket; we don't.
+                    break;
+                }
                 Ok(ei_event) => {
-                    Self::dispatch(
-                        ei_event,
-                        &bound_caps,
-                        &gate,
-                        &xkb_state,
-                        &wire_tx,
-                        &disconnect_tx,
-                    )
-                    .await;
+                    Self::dispatch(ei_event, &bound_caps, &gate, &xkb_state, &wire_tx).await;
                 }
                 Err(e) => {
                     warn!(
@@ -397,25 +409,18 @@ impl EiReceiver {
     }
 
     /// One-event dispatch. Mirrors the cpp's `handleEiEvent`
-    /// (:344-449).
+    /// (:344-449) minus the `EI_EVENT_DISCONNECT` arm — that is
+    /// handled in `pump` directly so the terminal protocol event
+    /// ends the pump on its own (reis does not EOF the stream on
+    /// `Disconnected`, see pump's break).
     async fn dispatch(
         event: EiEvent,
         bound_caps: &BitFlags<DeviceCapability>,
         gate: &Arc<Mutex<ActivationGate>>,
         xkb_state: &Arc<Mutex<Option<xkb::State>>>,
         wire_tx: &mpsc::UnboundedSender<WireBody>,
-        disconnect_tx: &tokio::sync::watch::Sender<bool>,
     ) {
         match event {
-            EiEvent::Disconnected(d) => {
-                warn!(
-                    reason = ?d.reason,
-                    explanation = ?d.explanation,
-                    event = "shareinputdevices_ei_disconnect",
-                    "Disconnected from EIS"
-                );
-                let _ = disconnect_tx.send(true);
-            }
             EiEvent::SeatAdded(seat) => {
                 // Mirrors inputcapturesession.cpp:375-378.
                 seat.seat.bind_capabilities(*bound_caps);
@@ -467,10 +472,12 @@ impl EiReceiver {
             EiEvent::PointerMotion(motion) => {
                 let dx = f64::from(motion.dx);
                 let dy = f64::from(motion.dy);
-                let body = plan_motion(dx, dy);
-                if gate.lock().await.should_queue() {
-                    gate.lock().await.queue(PendingInput::Motion(dx, dy));
+                let mut g = gate.lock().await;
+                if g.should_queue() {
+                    g.queue(PendingInput::Motion(dx, dy));
                 } else {
+                    drop(g);
+                    let body = plan_motion(dx, dy);
                     let _ = wire_tx.send(WireBody::Motion(body));
                 }
             }
@@ -484,16 +491,18 @@ impl EiReceiver {
                     button.state == reis::ei::button::ButtonState::Press,
                 );
                 if let Some((btn, edge)) = mapped {
-                    let body = plan_button(btn, edge);
-                    if body.is_null() {
-                        // plan_button returns Null for BTN_RIGHT
-                        // release (cpp :85 `pressed` branch). Drop
-                        // silently — same as the cpp's no-emit.
-                        return;
-                    }
-                    if gate.lock().await.should_queue() {
-                        gate.lock().await.queue(PendingInput::Button(btn, edge));
+                    let mut g = gate.lock().await;
+                    if g.should_queue() {
+                        g.queue(PendingInput::Button(btn, edge));
                     } else {
+                        drop(g);
+                        let body = plan_button(btn, edge);
+                        if body.is_null() {
+                            // plan_button returns Null for BTN_RIGHT
+                            // release (cpp :85 `pressed` branch).
+                            // Drop silently — same as the cpp's no-emit.
+                            return;
+                        }
                         let _ = wire_tx.send(WireBody::Button(body));
                     }
                 }
@@ -501,22 +510,24 @@ impl EiReceiver {
             EiEvent::ScrollDelta(delta) => {
                 let dx = f64::from(delta.dx);
                 let dy = f64::from(delta.dy);
-                let body = plan_scroll(dx, dy, 0, 0);
-                if gate.lock().await.should_queue() {
-                    gate.lock().await.queue(PendingInput::ScrollDelta(dx, dy));
+                let mut g = gate.lock().await;
+                if g.should_queue() {
+                    g.queue(PendingInput::ScrollDelta(dx, dy));
                 } else {
+                    drop(g);
+                    let body = plan_scroll(dx, dy, 0, 0);
                     let _ = wire_tx.send(WireBody::Scroll(body));
                 }
             }
             EiEvent::ScrollDiscrete(discrete) => {
                 let dx = discrete.discrete_dx;
                 let dy = discrete.discrete_dy;
-                let body = plan_scroll_discrete(dx, dy);
-                if gate.lock().await.should_queue() {
-                    gate.lock()
-                        .await
-                        .queue(PendingInput::ScrollDiscrete(dx, dy));
+                let mut g = gate.lock().await;
+                if g.should_queue() {
+                    g.queue(PendingInput::ScrollDiscrete(dx, dy));
                 } else {
+                    drop(g);
+                    let body = plan_scroll_discrete(dx, dy);
                     let _ = wire_tx.send(WireBody::Scroll(body));
                 }
             }
@@ -557,7 +568,23 @@ impl EiReceiver {
                     return;
                 }
                 let keysym = state.key_get_one_sym(xkb::Keycode::new(xkb_keycode));
-                debug_assert!(keysym.raw() != 0, "no keysym for keycode {xkb_keycode}");
+                // Deliberate divergence from the cpp: the cpp emits
+                // `key(Key_unknown, mods, "")` for unmapped keys (the
+                // Qt::Key 0 placeholder), but with `specialKey`
+                // hardcoded 0 here a faithful `Key_unknown` is not
+                // representable — emitting a contentless packet would
+                // confuse the consumer. Treat NoSymbol like the
+                // no-keymap path: warn + drop. M4's keysym→Qt::Key
+                // table restores cpp parity by mapping NoSymbol to
+                // the literal Key_unknown code.
+                if keysym.raw() == 0 {
+                    warn!(
+                        keycode = xkb_keycode,
+                        event = "shareinputdevices_ei_unmapped_keycode",
+                        "Keycode has no keysym in the current keymap; dropping event"
+                    );
+                    return;
+                }
                 let text = keysym_to_text(state, xkb_keycode);
                 let m = Modifiers::from_xkb_state(state);
                 drop(guard);
@@ -571,14 +598,16 @@ impl EiReceiver {
                 // shape, and the consumer side of the wire (the
                 // phone) treats `specialKey: 0` as "no special key,
                 // use text".
-                let body = plan_key(&text, 0, m.shift, m.ctrl, m.alt, m.super_key);
-                if gate.lock().await.should_queue() {
-                    gate.lock().await.queue(PendingInput::Key {
+                let mut g = gate.lock().await;
+                if g.should_queue() {
+                    g.queue(PendingInput::Key {
                         text,
                         special_key: 0,
                         mods: m,
                     });
                 } else {
+                    drop(g);
+                    let body = plan_key(&text, 0, m.shift, m.ctrl, m.alt, m.super_key);
                     let _ = wire_tx.send(WireBody::Key(body));
                 }
             }
@@ -616,7 +645,20 @@ impl EiReceiver {
         for event in pending {
             let body = match event {
                 PendingInput::Motion(dx, dy) => WireBody::Motion(plan_motion(dx, dy)),
-                PendingInput::Button(b, e) => WireBody::Button(plan_button(b, e)),
+                PendingInput::Button(b, e) => {
+                    // Mirror the live-path Null-body drop
+                    // (ei.rs:486-490 in the dispatch arm): the live
+                    // path's gate-queuing path dropped the BTN_RIGHT
+                    // release before queueing, but since the gate
+                    // refactor queues raw and rebuilds at drain, a
+                    // Null body can appear here. Skip it so the wire
+                    // stays clean.
+                    let body = plan_button(b, e);
+                    if body.is_null() {
+                        continue;
+                    }
+                    WireBody::Button(body)
+                }
                 PendingInput::ScrollDelta(dx, dy) => WireBody::Scroll(plan_scroll(dx, dy, 0, 0)),
                 PendingInput::ScrollDiscrete(dx, dy) => {
                     WireBody::Scroll(plan_scroll_discrete(dx, dy))
@@ -714,12 +756,18 @@ fn build_xkb_state(fd: &OwnedFd, size: u32) -> Result<xkb::State, Error> {
     Ok(xkb::State::new(&keymap))
 }
 
-/// Look up the text representation of the keycode's keysym, mirroring
-/// `QXkbCommon::lookupStringNoKeysymTransformations(sym)` at
-/// `inputcapturesession.cpp:436`. The xkbcommon crate has
-/// `key_get_utf8` for the no-transformation path.
+/// Look up the text representation of the keycode's keysym,
+/// mirroring `QXkbCommon::lookupStringNoKeysymTransformations(sym)`
+/// at `inputcapturesession.cpp:436`. The xkbcommon crate has
+/// `key_get_utf8` for the no-transformation path, but unlike Qt's
+/// equivalent it does NOT filter control bytes — it yields the raw
+/// `\x1b`/`\x08`/`\t` for Escape/Backspace/Tab. Qt's
+/// `QKeyEvent::text()` strips anything `< 0x20` before delivering;
+/// we mirror that filter here so the wire packet's `key` field
+/// matches the upstream cpp's behavior.
 fn keysym_to_text(state: &xkb::State, keycode: u32) -> String {
-    state.key_get_utf8(xkb::Keycode::new(keycode))
+    let raw = state.key_get_utf8(xkb::Keycode::new(keycode));
+    raw.chars().filter(|&c| (c as u32) >= 0x20).collect()
 }
 
 impl EiReceiver {
