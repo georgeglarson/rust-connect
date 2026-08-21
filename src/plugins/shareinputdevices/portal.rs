@@ -45,7 +45,7 @@
 //!      with results.zones = `a(uuii)`, results.zone_set = `u`.
 //!   4. Compute the one barrier (pure: `barrier::plan_barrier`),
 //!      then SetPointerBarriers(session_handle, {handle_token},
-//!      [{barrier_id:1, position:(x1,y1,x2,y2)}], zone_set) →
+//!      [{barrier_id:1, position:[x1,y1,x2,y2] as `ai`}], zone_set) →
 //!      request → Response with results.failed_barriers = `au`. Empty
 //!      ⇒ success; non-empty ⇒ portal refused; the cpp logs and
 //!      continues (inputcapturesession.cpp:248-250) — same policy
@@ -370,6 +370,18 @@ fn decode_zones(results: &HashMap<String, OwnedValue>) -> Result<Zones> {
     Ok(Zones { zone_set, zones })
 }
 
+/// The `position` vardict value of a barrier entry: an `ai` array of
+/// `[x1, y1, x2, y2]`. Upstream sends `QVariant::fromValue(QList<int>
+/// {x1, y1, x2, y2})` (inputcapturesession.cpp:230), and Qt marshals
+/// QList<int> as a D-Bus ARRAY, not a struct — the StructureBuilder
+/// route is wrong here: it wraps each field in a variant, putting
+/// `(vvvv)` on the wire instead of `ai`.
+fn barrier_position(rect: &barrier::Barrier) -> Value<'static> {
+    Value::Array(zbus::zvariant::Array::from(vec![
+        rect.x1, rect.y1, rect.x2, rect.y2,
+    ]))
+}
+
 /// The portal's failure code for a non-zero Response is a u32:
 /// 0 = success, 1 = user cancelled, 2 = "other". The cpp logs and
 /// continues at non-zero (inputcapturesession.cpp:128-131, :169-172,
@@ -417,6 +429,9 @@ pub struct Zones {
 pub struct PortalSession {
     conn: Connection,
     session_handle: OwnedObjectPath,
+    /// Set by `close()` so Drop's best-effort Close doesn't fire a
+    /// second time (the explicit path already Disabled + Closed).
+    closed: bool,
     /// The current zone_set id, kept for the stale-discard filter on
     /// ZonesChanged (inputcapturesession.cpp:326).
     current_zone_set: Arc<Mutex<u32>>,
@@ -535,6 +550,15 @@ impl PortalSession {
                 ))
             })?;
 
+        // From here on, every error return must not leak the portal
+        // session (panel 1a18cf7b) — the guard fires Session.Close
+        // best-effort unless `defuse()` runs on the success path.
+        let close_guard = SessionCloseGuard {
+            conn: conn.clone(),
+            session_handle: session_handle.clone(),
+            armed: true,
+        };
+
         // 2. ConnectToEIS — MUST precede Enable (spec InputCapture.xml:359-360).
         //    Inlined (not via `call_input_capture`) because the
         //    `h` handle is a borrowed `Fd<'m>` tied to the message
@@ -591,16 +615,7 @@ impl PortalSession {
             .ok_or_else(|| internal("barrier::plan_barrier returned None"))?;
         let mut barrier_entry = HashMap::new();
         barrier_entry.insert("barrier_id".to_string(), Value::U32(barrier_id));
-        let position = Value::Structure(
-            zbus::zvariant::StructureBuilder::new()
-                .add_field(Value::I32(barrier_rect.x1))
-                .add_field(Value::I32(barrier_rect.y1))
-                .add_field(Value::I32(barrier_rect.x2))
-                .add_field(Value::I32(barrier_rect.y2))
-                .build()
-                .expect("static (i32, i32, i32, i32) tuple cannot fail to build"),
-        );
-        barrier_entry.insert("position".to_string(), position);
+        barrier_entry.insert("position".to_string(), barrier_position(&barrier_rect));
         let barriers_arg: Vec<HashMap<String, Value<'static>>> = vec![barrier_entry];
 
         // 5. SetPointerBarriers.
@@ -683,9 +698,11 @@ impl PortalSession {
             shutdown_rx,
         );
 
+        close_guard.defuse();
         Ok(Self {
             conn,
             session_handle,
+            closed: false,
             current_zone_set,
             _ei_fd: ei_fd,
             edge,
@@ -728,6 +745,7 @@ impl PortalSession {
     /// Disable + Close. Idempotent. The cpp's destructor calls Close
     /// unconditionally (inputcapturesession.cpp:118-124); we mirror.
     pub async fn close(mut self) -> Result<()> {
+        self.closed = true;
         let _ = self._shutdown_tx.take();
         // Disable first (best-effort; the portal may have already
         // disabled itself).
@@ -766,6 +784,85 @@ impl PortalSession {
     /// and for tests asserting the session object is exposed.
     pub fn session_handle(&self) -> &OwnedObjectPath {
         &self.session_handle
+    }
+}
+
+impl Drop for PortalSession {
+    /// Backstop for the explicit `close()` (panel 1a18cf7b — the type
+    /// doc promised this and nothing delivered it): a dropped session
+    /// must not leak its portal object in xdp until the bus
+    /// connection dies. Best-effort, skipped after `close()`.
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let conn = self.conn.clone();
+            let handle = self.session_handle.clone();
+            rt.spawn(async move {
+                close_session_best_effort(&conn, &handle).await;
+            });
+        }
+    }
+}
+
+/// Best-effort `Session.Close` guard for `PortalSession::start`'s
+/// error paths (panel 1a18cf7b): every early return between
+/// CreateSession succeeding and the session being armed would
+/// otherwise leak the portal session. `defuse()` on the success path.
+struct SessionCloseGuard {
+    conn: Connection,
+    session_handle: OwnedObjectPath,
+    armed: bool,
+}
+
+impl SessionCloseGuard {
+    fn defuse(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SessionCloseGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let conn = self.conn.clone();
+            let handle = self.session_handle.clone();
+            rt.spawn(async move {
+                close_session_best_effort(&conn, &handle).await;
+            });
+        }
+    }
+}
+
+/// Fire-and-forget `Session.Close` (inputcapturesession.cpp:118-120).
+/// Errors are logged, never propagated — this runs from Drop, where
+/// there is no caller left to disappoint.
+async fn close_session_best_effort(conn: &Connection, session_handle: &OwnedObjectPath) {
+    let result = async {
+        let session_proxy = zbus::proxy::Proxy::new(
+            conn,
+            PORTAL_DESTINATION,
+            session_handle.as_str(),
+            SESSION_IFACE,
+        )
+        .await
+        .map_err(|e| internal(format!("Session proxy: {e}")))?;
+        session_proxy
+            .call_method("Close", &())
+            .await
+            .map_err(|e| internal(format!("Session.Close: {e}")))?;
+        Ok::<(), crate::utils::errors::Error>(())
+    }
+    .await;
+    if let Err(e) = result {
+        warn!(
+            error = %e,
+            event = "shareinputdevices_session_close_best_effort_failed",
+            "Best-effort Session.Close failed (session may already be gone)"
+        );
     }
 }
 
@@ -999,16 +1096,7 @@ async fn rearm_barriers(
         .ok_or_else(|| internal("barrier::plan_barrier returned None on rearm"))?;
     let mut barrier_entry = HashMap::new();
     barrier_entry.insert("barrier_id".to_string(), Value::U32(barrier_id));
-    let position = Value::Structure(
-        zbus::zvariant::StructureBuilder::new()
-            .add_field(Value::I32(barrier_rect.x1))
-            .add_field(Value::I32(barrier_rect.y1))
-            .add_field(Value::I32(barrier_rect.x2))
-            .add_field(Value::I32(barrier_rect.y2))
-            .build()
-            .expect("static (i32, i32, i32, i32) tuple cannot fail to build"),
-    );
-    barrier_entry.insert("position".to_string(), position);
+    barrier_entry.insert("position".to_string(), barrier_position(&barrier_rect));
     let barriers_token = unique_token();
     let set_opts = Options::new().insert_str("handle_token", &barriers_token);
     let set_body = (

@@ -78,11 +78,12 @@ async fn wait_for_socket(path: &std::path::Path) {
 }
 
 /// Recorded call. The fake populates these and tests assert on the
-/// exact sequence. SetPointerBarriers / Enable are not reached by
-/// the current test (empty zones aborts earlier) but exist for
-/// completeness when more end-to-end coverage lands.
+/// exact sequence — the full five-call v1 lifecycle when the fake
+/// returns a real zone, the three-call prefix on the empty-zones
+/// abort path. `SessionClose` lands when the test drives an explicit
+/// `close()` against the served session object.
 #[derive(Debug, Clone)]
-#[allow(clippy::large_enum_variant, dead_code)]
+#[allow(clippy::large_enum_variant)]
 enum Call {
     CreateSession {
         capabilities: Option<u32>,
@@ -101,6 +102,7 @@ enum Call {
     Enable {
         session_handle: String,
     },
+    SessionClose,
 }
 
 #[derive(Default)]
@@ -116,6 +118,11 @@ struct FakePortalState {
     /// Connection the fake uses to emit Response signals inline.
     /// `None` until `setup()` runs.
     pub conn: Option<zbus::Connection>,
+    /// The zones GetZones returns, as `(width, height, x, y)` tuples
+    /// (the portal's `a(uuii)` wire order). Empty = the abort path
+    /// ("no pointer barriers can be set"); one real zone drives the
+    /// sequence through SetPointerBarriers + Enable.
+    pub zones: Vec<(u32, u32, i32, i32)>,
 }
 
 /// The fake portal. Interface methods record the call, return a
@@ -222,16 +229,17 @@ impl FakePortal {
             (request_path, conn_for_signal)
         };
 
-        // Reply with an empty zones list + zone_set=0. Production
-        // code aborts at the empty-zones check, so we never reach
-        // SetPointerBarriers / Enable. This is intentional: the
-        // test pins the call SEQUENCE without needing the planner
-        // to actually produce a barrier.
+        // Reply with the zones configured on the fake's state +
+        // zone_set=0. Empty zones = the production abort path ("no
+        // pointer barriers can be set", spec InputCapture.xml:138-139);
+        // a real zone drives the sequence through SetPointerBarriers
+        // and Enable.
+        let zones = self.state.lock().unwrap().zones.clone();
         let mut results: HashMap<String, OwnedValue> = HashMap::new();
         results.insert(
             "zones".to_string(),
             OwnedValue::try_from(zbus::zvariant::Value::Array(zbus::zvariant::Array::from(
-                Vec::<(u32, u32, i32, i32)>::new(),
+                zones,
             )))
             .expect("zones OwnedValue"),
         );
@@ -249,15 +257,45 @@ impl FakePortal {
     #[zbus(name = "SetPointerBarriers")]
     async fn set_pointer_barriers(
         &self,
-        _session_handle: zbus::zvariant::OwnedObjectPath,
+        session_handle: zbus::zvariant::OwnedObjectPath,
         _options: HashMap<String, OwnedValue>,
-        _barriers: Vec<HashMap<String, OwnedValue>>,
-        _zone_set: u32,
+        barriers: Vec<HashMap<String, OwnedValue>>,
+        zone_set: u32,
     ) -> zbus::fdo::Result<zbus::zvariant::OwnedObjectPath> {
-        // Not reached by this test (empty zones aborts earlier),
-        // but kept for completeness.
+        // Record the call incl. the first barrier's id + position so
+        // the test can pin the wire encoding (the `aa{sv}` barrier
+        // entry is hand-built in portal.rs). Position must arrive as
+        // `ai` — QList<int> in upstream (inputcapturesession.cpp:230).
+        let (barrier_id, position) = barriers
+            .first()
+            .map(|entry| {
+                let id = entry
+                    .get("barrier_id")
+                    .and_then(|v| u32::try_from(v.clone()).ok());
+                let pos = entry.get("position").and_then(|v| match &**v {
+                    zbus::zvariant::Value::Array(arr) => {
+                        let mut nums = Vec::new();
+                        for item in arr.iter() {
+                            match item {
+                                zbus::zvariant::Value::I32(n) => nums.push(*n),
+                                _ => return None,
+                            }
+                        }
+                        (nums.len() == 4).then_some(nums)
+                    }
+                    _ => None,
+                });
+                (id, pos)
+            })
+            .unwrap_or((None, None));
         let (request_path, conn_for_signal) = {
-            let guard = self.state.lock().unwrap();
+            let mut guard = self.state.lock().unwrap();
+            let _ = session_handle;
+            guard.calls.push(Call::SetPointerBarriers {
+                barrier_id,
+                position,
+                zone_set,
+            });
             let id = guard.request_id.fetch_add(1, Ordering::SeqCst);
             let request_path = format!("/org/freedesktop/portal/desktop/request/{id}");
             let conn_for_signal = guard.conn.as_ref().expect("conn").clone();
@@ -279,10 +317,30 @@ impl FakePortal {
 
     async fn enable(
         &self,
-        _session_handle: zbus::zvariant::OwnedObjectPath,
+        session_handle: zbus::zvariant::OwnedObjectPath,
         _options: HashMap<String, OwnedValue>,
     ) -> zbus::fdo::Result<()> {
-        // Not reached by this test.
+        self.state.lock().unwrap().calls.push(Call::Enable {
+            session_handle: session_handle.to_string(),
+        });
+        Ok(())
+    }
+}
+
+/// Minimal session object at the session_handle path. Production's
+/// `PortalSession::close()` calls `org.freedesktop.portal.Session.
+/// Close` there (portal.rs close()); without this object the call
+/// fails with UnknownObject. Only the full-sequence test serves it —
+/// the abort test deliberately leaves it out so the guard's
+/// best-effort Close has nothing to land on.
+struct FakeSession {
+    state: Arc<Mutex<FakePortalState>>,
+}
+
+#[zbus::interface(name = "org.freedesktop.portal.Session")]
+impl FakeSession {
+    async fn close(&self) -> zbus::fdo::Result<()> {
+        self.state.lock().unwrap().calls.push(Call::SessionClose);
         Ok(())
     }
 }
@@ -408,14 +466,18 @@ async fn probe_fails_when_version_below_one() {
     assert!(!result, "probe must FAIL when version is < 1");
 }
 
-/// Drives the v1 sequence against a fake that emits Response
-/// signals inline. The fake's GetZones returns an empty zones
-/// list, which the production code treats as
-/// "no pointer barriers can be set" (spec InputCapture.xml:138-139)
-/// and aborts. So this test pins the first three calls in order:
-/// CreateSession → ConnectToEIS → GetZones, with CreateSession
-/// carrying capabilities=3 and ConnectToEIS/GetZones carrying the
-/// session_handle the fake returned.
+/// Drives the FULL v1 sequence against a fake that returns one real
+/// zone (1920x1080 at origin) and emits Response signals inline.
+/// This is the test the raw-zbus dependency choice is justified with
+/// (portal.rs module doc): it pins the exact five-call order
+/// CreateSession → ConnectToEIS → GetZones → SetPointerBarriers →
+/// Enable (ConnectToEIS strictly before Enable, spec), the
+/// capabilities=3 body, the session_handle carried through every
+/// call, and the hand-built `aa{sv}` barrier entry's wire contents —
+/// position as an `ai` array (QList<int> in upstream,
+/// inputcapturesession.cpp:230), with the Left-edge barrier on a
+/// single zone being the vertical line x=0 from y=0 to the INCLUSIVE
+/// bottom y=1079 (the QRect quirk barrier.rs replicates).
 #[tokio::test(flavor = "multi_thread")]
 async fn v1_session_records_call_sequence_in_spec_order() {
     let _bus_lock = BUS.lock().await;
@@ -423,20 +485,45 @@ async fn v1_session_records_call_sequence_in_spec_order() {
         version: 1,
         supported_caps: 3,
         session_handle: "/org/freedesktop/portal/desktop/session/test1".to_string(),
+        // (width, height, x, y) — the portal's a(uuii) wire order.
+        zones: vec![(1920, 1080, 0, 0)],
         ..Default::default()
     }));
     let Some(_daemon) = setup(state.clone()).await else {
         return;
     };
 
+    // Serve the session object the explicit close() at the end of
+    // this test calls Session.Close on.
+    let fake_conn = state
+        .lock()
+        .unwrap()
+        .conn
+        .clone()
+        .expect("setup() stores the fake's connection");
+    let session_path = zbus::zvariant::ObjectPath::from_string_unchecked(
+        state.lock().unwrap().session_handle.clone(),
+    );
+    assert!(
+        fake_conn
+            .object_server()
+            .at(
+                session_path,
+                FakeSession {
+                    state: state.clone()
+                }
+            )
+            .await
+            .expect("session object registration must not error"),
+        "fake session object must register at the session_handle path"
+    );
+
     let conn = zbus::Connection::session().await.unwrap();
     let (activated_tx, _activated_rx) = tokio::sync::mpsc::unbounded_channel::<
         rust_connect::plugins::shareinputdevices::portal::ActivatedEvent,
     >();
 
-    // PortalSession::start will fail (empty zones) — that's the
-    // intended path. We just need the calls recorded in order.
-    let _ = tokio::time::timeout(
+    let session = tokio::time::timeout(
         Duration::from_secs(5),
         rust_connect::plugins::shareinputdevices::portal::PortalSession::start(
             conn,
@@ -444,7 +531,9 @@ async fn v1_session_records_call_sequence_in_spec_order() {
             activated_tx,
         ),
     )
-    .await;
+    .await
+    .expect("PortalSession::start must complete well under the timeout")
+    .expect("PortalSession::start must succeed with one real zone");
 
     let calls = state.lock().unwrap().calls.clone();
     let kinds: Vec<&'static str> = calls
@@ -455,14 +544,20 @@ async fn v1_session_records_call_sequence_in_spec_order() {
             Call::GetZones { .. } => "GetZones",
             Call::SetPointerBarriers { .. } => "SetPointerBarriers",
             Call::Enable { .. } => "Enable",
+            Call::SessionClose => "SessionClose",
         })
         .collect();
     assert_eq!(
         kinds,
-        vec!["CreateSession", "ConnectToEIS", "GetZones"],
-        "v1 sequence through GetZones must be: CreateSession -> ConnectToEIS -> GetZones. \
-         SetPointerBarriers/Enable are NOT reached because GetZones returned empty zones \
-         (spec: 'no pointer barriers can be set')"
+        vec![
+            "CreateSession",
+            "ConnectToEIS",
+            "GetZones",
+            "SetPointerBarriers",
+            "Enable"
+        ],
+        "full v1 sequence must be CreateSession -> ConnectToEIS -> GetZones -> \
+         SetPointerBarriers -> Enable, with ConnectToEIS strictly before Enable (spec)"
     );
 
     // Pin CreateSession body: capabilities = 3 (keyboard | pointer).
@@ -489,4 +584,98 @@ async fn v1_session_records_call_sequence_in_spec_order() {
             "GetZones must carry the session_handle"
         );
     }
+
+    // Pin the hand-built barrier entry: Left edge of the only zone —
+    // vertical line at x=0, y from 0 to the inclusive bottom 1079 —
+    // and the zone_set passthrough (the 0 GetZones returned).
+    if let Call::SetPointerBarriers {
+        barrier_id,
+        position,
+        zone_set,
+    } = &calls[3]
+    {
+        assert_eq!(*barrier_id, Some(1), "barrier_id must be 1");
+        assert_eq!(
+            position.as_deref(),
+            Some(&[0, 0, 0, 1079][..]),
+            "Left-edge barrier on one 1920x1080 zone must be (0,0)-(0,1079) \
+             (inclusive bottom — the QRect quirk)"
+        );
+        assert_eq!(
+            *zone_set, 0,
+            "SetPointerBarriers must carry the zone_set GetZones returned"
+        );
+    }
+
+    // Enable carries the session handle; the session is live now —
+    // close it explicitly so Drop's best-effort Close stays the
+    // backstop, not the path under test.
+    if let Call::Enable { session_handle } = &calls[4] {
+        assert_eq!(session_handle, &expected_handle);
+    }
+    session.close().await.expect("explicit close must succeed");
+    let calls = state.lock().unwrap().calls.clone();
+    assert!(
+        matches!(calls.last(), Some(Call::SessionClose)),
+        "explicit close must land Session.Close on the session object; got {calls:?}"
+    );
+}
+
+/// The empty-zones abort path: GetZones returning no zones means
+/// "no pointer barriers can be set" (spec InputCapture.xml:138-139),
+/// so production must error out after exactly three calls — and the
+/// SessionCloseGuard must keep the aborted session from leaking
+/// (best-effort Close; the fake serves no session object, so only
+/// the call sequence is asserted, not the Close itself).
+#[tokio::test(flavor = "multi_thread")]
+async fn v1_session_aborts_on_empty_zones() {
+    let _bus_lock = BUS.lock().await;
+    let state = Arc::new(Mutex::new(FakePortalState {
+        version: 1,
+        supported_caps: 3,
+        session_handle: "/org/freedesktop/portal/desktop/session/test1".to_string(),
+        zones: Vec::new(),
+        ..Default::default()
+    }));
+    let Some(_daemon) = setup(state.clone()).await else {
+        return;
+    };
+
+    let conn = zbus::Connection::session().await.unwrap();
+    let (activated_tx, _activated_rx) = tokio::sync::mpsc::unbounded_channel::<
+        rust_connect::plugins::shareinputdevices::portal::ActivatedEvent,
+    >();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        rust_connect::plugins::shareinputdevices::portal::PortalSession::start(
+            conn,
+            rust_connect::plugins::shareinputdevices::Edge::Left,
+            activated_tx,
+        ),
+    )
+    .await
+    .expect("empty-zones abort must complete well under the timeout");
+    assert!(
+        result.is_err(),
+        "PortalSession::start must FAIL when GetZones returns no zones"
+    );
+
+    let calls = state.lock().unwrap().calls.clone();
+    let kinds: Vec<&'static str> = calls
+        .iter()
+        .map(|c| match c {
+            Call::CreateSession { .. } => "CreateSession",
+            Call::ConnectToEIS { .. } => "ConnectToEIS",
+            Call::GetZones { .. } => "GetZones",
+            Call::SetPointerBarriers { .. } => "SetPointerBarriers",
+            Call::Enable { .. } => "Enable",
+            Call::SessionClose => "SessionClose",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["CreateSession", "ConnectToEIS", "GetZones"],
+        "empty zones must abort after GetZones — SetPointerBarriers/Enable unreachable"
+    );
 }

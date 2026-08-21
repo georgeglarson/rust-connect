@@ -547,6 +547,12 @@ impl ShareInputDevicesPlugin {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
         self.backend_available.store(true, Ordering::SeqCst);
+        // The daemon's capability collection ran at boot, before this
+        // activation — push the delta or the advertisement never goes
+        // out (panel b152dcc0).
+        if let Some(cm) = &self.connection_manager {
+            cm.add_capabilities(&[], &["kdeconnect.shareinputdevices.request".to_string()]);
+        }
         info!(
             event = "shareinputdevices_backend_enabled",
             session_handle = session.session_handle().as_str(),

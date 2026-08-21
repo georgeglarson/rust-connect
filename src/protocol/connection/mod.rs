@@ -235,6 +235,37 @@ impl ConnectionManager {
             .unwrap_or_else(|e| e.into_inner()) = outgoing;
     }
 
+    /// Merge additional capabilities into the advertised sets (panel
+    /// b152dcc0). The daemon's capability collection runs ONCE at
+    /// boot (daemon.rs:101-118), so a backend that comes alive later
+    /// — e.g. shareinputdevices' portal session when M3 attaches the
+    /// EI transport — must push its delta through here or its
+    /// capability is never advertised. Duplicates are skipped;
+    /// `get_identity` reads the sets live, so the next identity
+    /// exchange carries the addition. Already-connected peers keep
+    /// the boot-time identity until a re-advertisement — pushing one
+    /// is the activating plugin's follow-up concern.
+    pub fn add_capabilities(&self, incoming: &[String], outgoing: &[String]) {
+        let mut inc = self
+            .incoming_caps
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        for cap in incoming {
+            if !inc.contains(cap) {
+                inc.push(cap.clone());
+            }
+        }
+        let mut out = self
+            .outgoing_caps
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        for cap in outgoing {
+            if !out.contains(cap) {
+                out.push(cap.clone());
+            }
+        }
+    }
+
     pub fn set_device_identity(&self, device_id: &str, device_name: &str) {
         *self.device_id.write().unwrap_or_else(|e| e.into_inner()) = device_id.to_string();
         *self.device_name.write().unwrap_or_else(|e| e.into_inner()) = device_name.to_string();

@@ -91,8 +91,9 @@ pub struct Barrier {
 impl Barrier {
     /// Build the wire-shape entry the portal's `SetPointerBarriers`
     /// expects: a single-element dict with keys `barrier_id` (uint)
-    /// and `position` (tuple of 4 ints). Replicated from the cpp
-    /// at `inputcapturesession.cpp:227-231`.
+    /// and `position` (array of 4 ints — QList<int> on the wire,
+    /// `ai`). Replicated from the cpp at
+    /// `inputcapturesession.cpp:227-231`.
     pub fn to_wire_entry(&self, barrier_id: u32) -> serde_json::Value {
         serde_json::json!({
             "barrier_id": barrier_id,
