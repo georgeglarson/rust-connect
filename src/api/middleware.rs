@@ -116,17 +116,27 @@ pub async fn auth_middleware(
     req: Request,
     next: Next,
 ) -> Result<Response, impl IntoResponse> {
+    // security-audit-2026-08-20 P3: query-string `api_key` is honored on every
+    // route today. EventSource (the UI's `/api/v1/events` consumer) cannot
+    // set request headers, so the SSE route must keep accepting the query
+    // form. Everywhere else the header is mandatory — a leaked query key
+    // (Referer, server access logs, shell history) would otherwise
+    // authenticate pairing, sharing, clipboard, SMS, and lock endpoints.
+    let allow_query = req.uri().path() == "/api/v1/events";
+
     let mut api_key = None;
 
     if let Some(key) = req.headers().get("X-API-Key").and_then(|h| h.to_str().ok()) {
         api_key = Some(key.to_string());
-    } else if let Some(query) = req.uri().query() {
-        for param in query.split('&') {
-            let mut parts = param.splitn(2, '=');
-            if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                if k == "api_key" {
-                    api_key = Some(v.to_string());
-                    break;
+    } else if allow_query {
+        if let Some(query) = req.uri().query() {
+            for param in query.split('&') {
+                let mut parts = param.splitn(2, '=');
+                if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                    if k == "api_key" {
+                        api_key = Some(v.to_string());
+                        break;
+                    }
                 }
             }
         }
