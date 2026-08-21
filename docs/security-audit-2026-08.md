@@ -94,8 +94,9 @@ leak; the key can still land in browser history or a reverse-proxy access log
 if the deployment shape changes. Compounds the existing "treat the key as
 compromised if rebound to LAN" note. Confidence: high.
 **Disposition: FIXED 2026-08-20** — query-string auth is now honored only on
-`/api/v1/events` (the EventSource constraint); every other route requires
-`X-API-Key`. Pinned by `test_query_api_key_rejected_on_non_sse_routes` and
+`/api/v1/events` (the EventSource constraint); every other authenticated
+route requires `X-API-Key` (`/api/v1/health` stays keyless). Pinned by
+`test_query_api_key_rejected_on_non_sse_routes` and
 `test_query_api_key_accepted_on_sse_route` (tests/api_integration.rs).
 Surfaced again as P3 of the 2026-08-20 codex scan (vk #1059).
 
