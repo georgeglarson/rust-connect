@@ -808,6 +808,21 @@ impl EiReceiver {
             "D-Bus Activated received; queued events replayed"
         );
     }
+
+    /// Test seam: read the gate's current `activation_id`. Returns
+    /// the most recent id that a `handle_activated` replay stored
+    /// — the M4 replay-on-populate fix verifies by calling this
+    /// after `PortalSession::populate_ei_receiver` and asserting
+    /// the deferred D-Bus `Activated` id landed here.
+    ///
+    /// Unconditional `pub` (not `#[cfg(test)]`) because the M4
+    /// wiring tests live under `tests/` — `cfg(test)` is not set
+    /// there, and the seam has no caller in production code. The
+    /// method is cheap (a single mutex acquire and a u32 read)
+    /// and named to make the seam's intent obvious.
+    pub async fn gate_activation_id_for_test(&self) -> u32 {
+        self.gate.lock().await.activation_id
+    }
 }
 
 /// Map a Linux input-event-codes button number + state into our

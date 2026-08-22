@@ -451,17 +451,32 @@ pub struct PortalSession {
     /// reads it on every `Activated` and drains the gate if it is
     /// populated; until populate-time (activate_portal_session
     /// constructs the receiver from the fd) the slot is `None` and
-    /// the drain step is a no-op. A late populate is safe because
-    /// the gate's `should_queue()` condition (eis_sequence >
-    /// activation_id) remains armed while slot is empty: any EI
-    /// events that arrive between session start and receiver
-    /// construction queue and replay when the receiver finally
-    /// attaches AND the D-Bus Activated signal arrives. The
-    /// `std::sync::Mutex` is held only long enough to clone the
-    /// `Arc`; the async `handle_activated` runs without the guard
-    /// (the M3 lock-ordering contract — `ei::EiReceiver::handle_activated`
-    /// is self-contained once the `Arc` is in hand).
+    /// the drain step is a no-op. **The empty-slot window is NOT
+    /// safe** — it is closed by `pending_activation_id` + the
+    /// populate-time replay below. Without the replay, an
+    /// `Activated` arriving between `PortalSession::start`'s
+    /// `Enable` and the caller's `populate_ei_receiver` call
+    /// (panel M4 panel round 1 — the portal CAN emit `Activated`
+    /// immediately on `Enable`, and we arm the barrier before we
+    /// hold an `EiReceiver`) would drop the id on the floor:
+    /// `should_queue()` stays true, queued EI input never drains
+    /// for that cycle, and the next `Activated` carries a NEW id
+    /// that lets the gate drain stale events at the wrong start
+    /// position. The `std::sync::Mutex` is held only long enough
+    /// to clone the `Arc`; the async `handle_activated` runs
+    /// without the guard (the M3 lock-ordering contract —
+    /// `ei::EiReceiver::handle_activated` is self-contained once
+    /// the `Arc` is in hand).
     ei_receiver_slot: Arc<Mutex<Option<Arc<EiReceiver>>>>,
+    /// Holds the most recent `Activated` activation_id the signal
+    /// handler saw while `ei_receiver_slot` was `None`. Popped
+    /// and replayed by `populate_ei_receiver` immediately after
+    /// the receiver Arc lands, closing the Enable-before-
+    /// populate window described on `ei_receiver_slot`. The
+    /// `std::sync::Mutex` is held only long enough to read/
+    /// replace the `Option`; the async `handle_activated` runs
+    /// without the guard.
+    pending_activation_id: Arc<Mutex<Option<u32>>>,
     edge: Edge,
     /// Sender for Activated events. The owner translates each into
     /// the M1 planner's `ShareInputDevicesRequest` body and pushes
@@ -710,6 +725,7 @@ impl PortalSession {
         let barrier_origin = Arc::new(Mutex::new((barrier_rect.x1, barrier_rect.y1)));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let ei_receiver_slot: Arc<Mutex<Option<Arc<EiReceiver>>>> = Arc::new(Mutex::new(None));
+        let pending_activation_id: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
         spawn_signal_handler(
             signal_stream,
             conn.clone(),
@@ -719,6 +735,7 @@ impl PortalSession {
             barrier_origin.clone(),
             activated_tx.clone(),
             ei_receiver_slot.clone(),
+            pending_activation_id.clone(),
             shutdown_rx,
         );
 
@@ -730,6 +747,7 @@ impl PortalSession {
             current_zone_set,
             ei_fd: Some(ei_fd),
             ei_receiver_slot,
+            pending_activation_id,
             edge,
             activated_tx,
             _shutdown_tx: Some(shutdown_tx),
@@ -835,11 +853,43 @@ impl PortalSession {
     /// `activate_portal_session` calls overlap is a programming
     /// error (the plugin guards against re-entry elsewhere; here
     /// we just keep the slot's most-recent value).
-    pub fn populate_ei_receiver(&self, receiver: Arc<EiReceiver>) {
+    ///
+    /// Async (not sync) because the M4 wiring's Enable-before-
+    /// populate window can leave the signal handler with a
+    /// deferred `activation_id` to replay — see
+    /// `pending_activation_id`. The replay fires
+    /// `receiver.handle_activated(id).await` immediately after the
+    /// Arc lands in the slot, so the gate drains before any
+    /// subsequent Activated cycle and the brief's drain-before-
+    /// first-relayed-body contract holds. The replay runs
+    /// synchronously inside this `.await`; `handle_activated` is
+    /// a no-op when `wire_tx` is `None` (pump hasn't started —
+    /// the M4 wiring's case for a brand-new receiver that has
+    /// not yet been `start()`ed), but it still sets
+    /// `gate.activation_id` so the next pump iteration sees the
+    /// gate open and any EI events that arrive between this
+    /// call and the next Activated do not get re-queued.
+    pub async fn populate_ei_receiver(&self, receiver: Arc<EiReceiver>) {
         *self
             .ei_receiver_slot
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(receiver);
+            .unwrap_or_else(|e| e.into_inner()) = Some(receiver.clone());
+        // Take the deferred id BEFORE we hand the lock back so a
+        // racing Activated between the unlock and the `.await`
+        // below can't overwrite the value we are about to replay.
+        let deferred = self
+            .pending_activation_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(activation_id) = deferred {
+            debug!(
+                activation_id,
+                event = "shareinputdevices_populate_replaying_deferred_activated",
+                "Replaying deferred Activated id onto freshly populated EI receiver"
+            );
+            receiver.handle_activated(activation_id).await;
+        }
     }
 
     /// Read-only access to the receiver slot — used by tests that
@@ -976,6 +1026,20 @@ async fn session_signal_stream(conn: &Connection) -> Result<MessageStream> {
 /// shareinputdevices.request because the consumer cannot make
 /// progress until it observes the channel — and the channel
 /// received both events before it was scheduled to run.
+///
+/// **Empty-slot window.** When `ei_receiver_slot` is `None` at
+/// the moment `Activated` lands (the Enable-before-populate
+/// window — `PortalSession::start` returns an `EiReceiver`-less
+/// session and `populate_ei_receiver` lands later in
+/// `activate_portal_session`), step 2's `handle_activated` has
+/// no `Arc` to call. The handler stores the activation_id in
+/// `pending_activation_id` instead, where
+/// `populate_ei_receiver` finds it on the next call and replays
+/// the drain. Storing only the most-recent id is correct: the
+/// cpp consumer is the consumer of `shareinputdevices.request`,
+/// not the activator — only one `Activated` cycle is live at a
+/// time, and a newer one obsoletes the older one (its queued
+/// input would be at the wrong start position).
 #[allow(clippy::too_many_arguments)]
 fn spawn_signal_handler(
     mut stream: MessageStream,
@@ -986,6 +1050,7 @@ fn spawn_signal_handler(
     barrier_origin: Arc<Mutex<(i32, i32)>>,
     activated_tx: mpsc::UnboundedSender<ActivatedEvent>,
     ei_receiver_slot: Arc<Mutex<Option<Arc<EiReceiver>>>>,
+    pending_activation_id: Arc<Mutex<Option<u32>>>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     tokio::spawn(async move {
@@ -1044,15 +1109,21 @@ fn spawn_signal_handler(
                                 // Step 2: drain the EI gate. The slot
                                 // is None while the M4 wiring is
                                 // mid-construct (between PortalSession
-                                // ::start and populate_ei_receiver);
-                                // those events stay queued and replay
-                                // on the next Activated once the
-                                // receiver is in place. We clone the
-                                // Arc out of the slot and release the
-                                // std::sync lock BEFORE awaiting —
-                                // guards are !Send and the receiver's
-                                // pump future is !Send, but the
-                                // already-running task here is on a
+                                // ::start and populate_ei_receiver).
+                                // The receiver's drain can't run in
+                                // that window — store the
+                                // activation_id on the session so
+                                // `populate_ei_receiver` can replay
+                                // it immediately after the Arc lands
+                                // (panel M4 panel round 1 fix —
+                                // pre-fix, the id was dropped here
+                                // and queued EI input was orphaned).
+                                // We clone the Arc out of the slot
+                                // and release the std::sync lock
+                                // BEFORE awaiting — guards are
+                                // !Send and the receiver's pump
+                                // future is !Send, but the already-
+                                // running task here is on a
                                 // multithread runtime; holding the
                                 // std::sync::Mutex across an .await
                                 // would block the runtime.
@@ -1065,6 +1136,15 @@ fn spawn_signal_handler(
                                 if let Some(r) = receiver {
                                     r.handle_activated(activation_id).await;
                                 } else {
+                                    // Empty slot — defer to populate.
+                                    // Storing only the most-recent id
+                                    // is intentional: see
+                                    // `spawn_signal_handler` doc on
+                                    // `pending_activation_id`.
+                                    *pending_activation_id
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner()) =
+                                        Some(activation_id);
                                     debug!(
                                         activation_id,
                                         event = "shareinputdevices_activated_no_receiver",
