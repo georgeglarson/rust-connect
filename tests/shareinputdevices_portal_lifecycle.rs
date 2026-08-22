@@ -123,6 +123,12 @@ struct FakePortalState {
     /// ("no pointer barriers can be set"); one real zone drives the
     /// sequence through SetPointerBarriers + Enable.
     pub zones: Vec<(u32, u32, i32, i32)>,
+    /// If set, the fake hands THIS fd back from ConnectToEIS
+    /// instead of /dev/null. The M4 wiring test installs one end of
+    /// a UnixStream::pair() here so the production code's
+    /// `take_ei_fd()` receives a real EIS peer, not a dead handle.
+    /// `take()`'d on the call → at most one ConnectToEIS per test.
+    pub connect_to_eis_socketpair: Option<std::os::fd::OwnedFd>,
 }
 
 /// The fake portal. Interface methods record the call, return a
@@ -199,16 +205,25 @@ impl FakePortal {
         _options: HashMap<String, OwnedValue>,
     ) -> zbus::fdo::Result<zbus::zvariant::Fd<'static>> {
         let sh_str = session_handle.to_string();
-        self.state.lock().unwrap().calls.push(Call::ConnectToEIS {
-            session_handle: sh_str,
-        });
-        // Return a placeholder fd. The test never reads the fd; we
-        // just need a value with the right wire shape (`h` handle).
-        // zbus's owned-fd semantics: take one from ourselves by
-        // dup'ing /dev/null — never actually read by either side.
-        let f = std::fs::File::open("/dev/null").expect("/dev/null");
-        let owned = std::os::fd::OwnedFd::from(f);
-        Ok(zbus::zvariant::Fd::from(owned))
+        let socketpair_handoff = {
+            let mut guard = self.state.lock().unwrap();
+            guard.calls.push(Call::ConnectToEIS {
+                session_handle: sh_str,
+            });
+            guard.connect_to_eis_socketpair.take()
+        };
+        // If the test installed a socketpair fd (M4 wiring test),
+        // hand the client end to the production code; the peer end
+        // stays in the test's state for the fake EIS harness to
+        // play. Otherwise fall back to /dev/null — the test never
+        // reads the fd and we just need the right wire shape.
+        if let Some(owned) = socketpair_handoff {
+            Ok(zbus::zvariant::Fd::from(owned))
+        } else {
+            let f = std::fs::File::open("/dev/null").expect("/dev/null");
+            let owned = std::os::fd::OwnedFd::from(f);
+            Ok(zbus::zvariant::Fd::from(owned))
+        }
     }
 
     #[zbus(name = "GetZones")]
