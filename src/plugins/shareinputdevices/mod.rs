@@ -69,6 +69,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -518,6 +519,33 @@ impl ShareInputDevicesPlugin {
     /// `backend_available`, which is only flipped true on the
     /// success path.
     pub async fn activate_portal_session(&self) {
+        // Re-entry guard (panel M4 panel round 1 hygiene pass):
+        // the brief's previous doc claim was "the plugin guards
+        // against re-entry elsewhere" — there was no guard. A
+        // second call with a live session would start a SECOND
+        // v1 sequence on the same connection (illegal: the
+        // portal is one-session-per-handle), spawn a SECOND
+        // drive thread on a fresh receiver (each takes the fd,
+        // and only one wins — the second's `EiReceiver::new`
+        // would block on the EIS handshake against an
+        // already-handshaken fd), and silently overwrite
+        // `portal_session` and `backend_available`. Detect and
+        // warn-return — the caller is responsible for not
+        // re-entering.
+        let already_active = self
+            .portal_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        if already_active {
+            warn!(
+                event = "shareinputdevices_activate_reentry",
+                "activate_portal_session called while a portal session is already live; \
+                 refusing (single-activation contract)"
+            );
+            return;
+        }
+
         let conn = self
             .portal_conn
             .lock()
@@ -585,7 +613,7 @@ impl ShareInputDevicesPlugin {
         // clones the Arc out of the slot and releases the
         // std::sync lock before any `.await` — see portal.rs
         // `spawn_signal_handler` Activated arm.
-        session.populate_ei_receiver(Arc::clone(&receiver));
+        session.populate_ei_receiver(Arc::clone(&receiver)).await;
 
         // M4: drive the EI pump on a dedicated thread. The daemon's
         // main runtime is `#[tokio::main]` (multithread), which
@@ -665,12 +693,17 @@ impl ShareInputDevicesPlugin {
                 return;
             }
         };
-        // Detach: the drive future ends when the pump's
+        // Detach: dropping the `JoinHandle` does NOT join the
+        // thread — the comment used to claim "exits and joins
+        // implicitly", which is wrong (`JoinHandle::drop`
+        // detaches; nothing waits for the OS thread). The pump
+        // drive future ends when the pump's
         // `disconnect_tx.send(true)` lands (EOF / error /
-        // Disconnected); the dedicated thread then exits and joins
-        // implicitly. We do not hold the JoinHandle because the
-        // consumer task below has no business waiting on the pump
-        // and the disconnect watcher has its own signal path.
+        // Disconnected), at which point the dedicated thread's
+        // runtime exits and the OS reclaims the thread. We do
+        // not hold the JoinHandle because the consumer task below
+        // has no business waiting on the pump and the disconnect
+        // watcher has its own signal path.
         drop(drive_thread);
         // Pull the wire + disconnect receivers back from the
         // dedicated thread. `start()` succeeded before we got
@@ -679,26 +712,60 @@ impl ShareInputDevicesPlugin {
         // channels would have closed and these recvs would error,
         // which we treat as the same inert-outcome as start()
         // failure above.
-        let mut wire_rx = match wire_rx_rx.await {
-            Ok(rx) => rx,
-            Err(_) => {
-                warn!(
-                    event = "shareinputdevices_ei_pump_wire_rx_dropped",
-                    "EI pump did not deliver wire_rx; shareinputdevices plugin stays inert"
-                );
-                return;
-            }
-        };
-        let disconnect_rx = match disconnect_rx_rx.await {
-            Ok(rx) => rx,
-            Err(_) => {
-                warn!(
+        //
+        // Both awaits get a bounded timeout (panel M4 panel round
+        // 1 fix — P2 — for the boot-path hang): the dedicated
+        // thread runs `receiver.start()` (EIS handshake + pump),
+        // and a portal that hands back a valid-but-silent EIS fd
+        // can leave the handshake stuck forever. The boot path
+        // would otherwise park here, blocking `bootstrap → create
+        // _state → Daemon::new` from ever returning, which means
+        // listeners, the API, and the watchdog never start. The
+        // pump thread keeps running to its own end (the
+        // `drop(drive_thread)` detach below); only the boot path
+        // stops waiting. The constant is named so the rationale is
+        // auditable without grep.
+        const BOOT_PATH_PUMP_DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+        let mut wire_rx =
+            match tokio::time::timeout(BOOT_PATH_PUMP_DELIVERY_TIMEOUT, wire_rx_rx).await {
+                Ok(Ok(rx)) => rx,
+                Ok(Err(_)) => {
+                    warn!(
+                        event = "shareinputdevices_ei_pump_wire_rx_dropped",
+                        "EI pump did not deliver wire_rx; shareinputdevices plugin stays inert"
+                    );
+                    return;
+                }
+                Err(_) => {
+                    warn!(
+                        timeout_secs = BOOT_PATH_PUMP_DELIVERY_TIMEOUT.as_secs(),
+                        event = "shareinputdevices_ei_pump_wire_rx_timeout",
+                        "EI pump did not deliver wire_rx within the boot-path timeout; \
+                     shareinputdevices plugin stays inert (pump thread continues independently)"
+                    );
+                    return;
+                }
+            };
+        let disconnect_rx =
+            match tokio::time::timeout(BOOT_PATH_PUMP_DELIVERY_TIMEOUT, disconnect_rx_rx).await {
+                Ok(Ok(rx)) => rx,
+                Ok(Err(_)) => {
+                    warn!(
                     event = "shareinputdevices_ei_pump_disconnect_rx_dropped",
                     "EI pump did not deliver disconnect_rx; shareinputdevices plugin stays inert"
                 );
-                return;
-            }
-        };
+                    return;
+                }
+                Err(_) => {
+                    warn!(
+                        timeout_secs = BOOT_PATH_PUMP_DELIVERY_TIMEOUT.as_secs(),
+                        event = "shareinputdevices_ei_pump_disconnect_rx_timeout",
+                        "EI pump did not deliver disconnect_rx within the boot-path timeout; \
+                     shareinputdevices plugin stays inert (pump thread continues independently)"
+                    );
+                    return;
+                }
+            };
 
         // M4: watch `disconnect_rx` per the cpp oracle. The cpp
         // at inputcapturesession.cpp:372-374 only logs the
@@ -711,17 +778,27 @@ impl ShareInputDevicesPlugin {
         // the capability to newly-connecting peers, but we do NOT
         // drop the portal session — `release()` and `close()` keep
         // working.
+        //
+        // **Ordering (panel M4 panel round 1 fix — P2):** the
+        // `backend_available.store(true)` below runs BEFORE this
+        // watcher is spawned. The pre-fix order (watcher first,
+        // store(true) later) allowed an EOF in the gap to flip
+        // `false` and have `store(true)` overwrite it, advertising
+        // the capability on a dead transport. With the fix, the
+        // capability is only ever advertised after the watcher is
+        // ready to retract it; an EOF that races ahead of the
+        // watcher's spawn lands in the watch channel, the watcher
+        // reads it on first `.changed().await`, and the final
+        // value is `false` — never the silent overwrite. The
+        // brief's drain-before-first-relayed-body contract is
+        // unaffected: nothing the consumer emits depends on the
+        // watcher's spawn point.
         let backend_available = self.backend_available.clone();
-        let mut disconnect_rx_watcher = disconnect_rx.clone();
-        tokio::spawn(async move {
-            if disconnect_rx_watcher.changed().await.is_ok() {
-                warn!(
-                    event = "shareinputdevices_ei_disconnect_backend_flip",
-                    "EI transport disconnected; shareinputdevices backend no longer available"
-                );
-                backend_available.store(false, Ordering::SeqCst);
-            }
-        });
+        // `disconnect_rx` is not used after this `tokio::spawn`,
+        // so we move the watch receiver rather than clone —
+        // saves one `watch::Receiver::clone` (cheap but not
+        // free) and matches the single-consumer semantic.
+        let mut disconnect_rx_watcher = disconnect_rx;
 
         // Wrap the session in `Arc` now that the M4 wiring is done
         // — `take_ei_fd` and `populate_ei_receiver` both required
@@ -754,6 +831,11 @@ impl ShareInputDevicesPlugin {
             .portal_session
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
+
+        // Store `true` BEFORE spawning the watcher (the fix).
+        // Pre-fix, this happened AFTER the watcher was spawned,
+        // leaving a window where an EOF could flip `false` and
+        // be silently overwritten by `true`.
         self.backend_available.store(true, Ordering::SeqCst);
         // The daemon's capability collection ran at boot, before this
         // activation — push the delta or the advertisement never goes
@@ -768,10 +850,28 @@ impl ShareInputDevicesPlugin {
             "shareinputdevices session backend wired"
         );
 
-        // Spawn the unified wire consumer. We hold the
-        // connection_manager accessor for late binding (the plugin's
-        // CM may be wired after enable_session_backend returns —
-        // see bootstrap.rs), and we feed BOTH the Activated events
+        tokio::spawn(async move {
+            if disconnect_rx_watcher.changed().await.is_ok() {
+                warn!(
+                    event = "shareinputdevices_ei_disconnect_backend_flip",
+                    "EI transport disconnected; shareinputdevices backend no longer available"
+                );
+                backend_available.store(false, Ordering::SeqCst);
+            }
+        });
+
+        // Spawn the unified wire consumer. The connection manager is
+        // wired once via `with_connection_manager` at construction;
+        // `enable_session_backend` is called from bootstrap AFTER the
+        // plugin is built (and after bootstrap may wire the CM), so a
+        // late-binding accessor was originally attractive — but the
+        // accessor was never actually late-bound (the consumer used
+        // whatever was on the plugin at activation time and never
+        // re-read). The Mutex is therefore dead weight; capture the
+        // `Option<Arc<ConnectionManager>>` clone directly. The brief
+        // hygiene pass (panel M4 panel round 1) collapses the
+        // `Arc<Mutex<Option<Arc<CM>>>>` to a plain
+        // `Option<Arc<CM>>`. We feed BOTH the Activated events
         // (→ `kdeconnect.shareinputdevices.request`) and the EI
         // wire bodies (→ `kdeconnect.mousepad.request`) through the
         // same task. `tokio::select!` with `biased;` guarantees the
@@ -780,8 +880,7 @@ impl ShareInputDevicesPlugin {
         // ordering the cpp emits (started signal first, queued
         // events after) and the ordering the brief mandates (drain
         // before first relayed body).
-        let cm_accessor: Arc<Mutex<Option<Arc<crate::protocol::ConnectionManager>>>> =
-            Arc::new(Mutex::new(self.connection_manager.clone()));
+        let cm = self.connection_manager.clone();
         let edge = self.edge;
         tokio::spawn(async move {
             let mut activated_closed = false;
@@ -799,11 +898,7 @@ impl ShareInputDevicesPlugin {
                     event = activated_rx.recv(), if !activated_closed => {
                         match event {
                             Some(event) => {
-                                let cm_opt = cm_accessor
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .clone();
-                                let Some(cm) = cm_opt else {
+                                let Some(cm) = cm.as_ref() else {
                                     warn!(
                                         event = "shareinputdevices_activated_no_connection_manager",
                                         "No connection manager wired; Activated event dropped"
@@ -857,11 +952,7 @@ impl ShareInputDevicesPlugin {
                     body = wire_rx.recv(), if !wire_closed => {
                         match body {
                             Some(wire_body) => {
-                                let cm_opt = cm_accessor
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .clone();
-                                let Some(cm) = cm_opt else {
+                                let Some(cm) = cm.as_ref() else {
                                     debug!(
                                         event = "shareinputdevices_wire_no_connection_manager",
                                         "No connection manager wired; wire body dropped"
