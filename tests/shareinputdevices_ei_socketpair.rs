@@ -99,7 +99,7 @@ xkb_symbols {
 /// stops draining its socket cannot distinguish a request the
 /// receiver merely buffered from one it actually flushed — both look
 /// like silence. Draining post-handshake is what lets
-/// `seat_bind_reaches_the_eis_peer_before_devices` observe the
+/// `seat_bind_reaches_the_eis_peer` observe the
 /// `ei_seat.bind` request as a real wire event. The bound capability
 /// set from the first `EisRequest::Bind` is published on the returned
 /// oneshot; every other request is drained and dropped (the receiver
@@ -281,10 +281,9 @@ fn key_event(connection: &EisConnection, device: &EisDevice, keycode: u32, is_pr
     connection.flush().expect("flush key+frame");
 }
 
-/// Build a keymap memfd and return the fd to bind via before_done_cb.
-/// Writes the raw xkb text bytes and reports `size = text.len()` —
-/// no trailing NUL, no `+1`. This matches the helper's pre-fix
-/// contract and is the shape most of the suite uses.
+/// Writes the raw xkb text bytes to a memfd and reports
+/// `size = text.len()` — no trailing NUL, no `+1`. This is the
+/// NUL-less shape most of the suite uses.
 ///
 /// NOTE: real portals send the keymap with `size = strlen + 1`
 /// (Wayland convention); see `keymap_fd_with_trailing_nul` for
@@ -1431,9 +1430,12 @@ fn latched_shift_modifier_surfaces_as_shift_on_wire() {
         // because the consumer relies on them for control flow.
         {
             let kb: eis::Keyboard = device.interface().expect("device has keyboard interface");
-            // serial=0 is fine for tests; group=0 (no layout switch).
+            // group=0 (no layout switch); serial=0 is fine for tests.
             kb.modifiers(
-                0, /* depressed */ 0, /* locked */ 0, /* latched */ 1,
+                /* serial */ 0,
+                /* depressed */ 0,
+                /* locked */ 0,
+                /* latched */ 1,
                 /* group */ 0,
             );
             device.frame(0);
@@ -1715,8 +1717,12 @@ fn ctrl_shortcut_keeps_the_letter_text_on_the_wire() {
         // Depress Control (mask bit 2). Nothing latched, nothing locked.
         {
             let kb: eis::Keyboard = device.interface().expect("device has keyboard interface");
+            // serial=0; group=0 (no layout switch).
             kb.modifiers(
-                0, /* depressed */ 4, /* locked */ 0, /* latched */ 0,
+                /* serial */ 0,
+                /* depressed */ 4,
+                /* locked */ 0,
+                /* latched */ 0,
                 /* group */ 0,
             );
             device.frame(0);
@@ -1755,7 +1761,7 @@ fn ctrl_shortcut_keeps_the_letter_text_on_the_wire() {
 }
 
 #[test]
-fn seat_bind_reaches_the_eis_peer_before_devices() {
+fn seat_bind_reaches_the_eis_peer() {
     // Red-before-green oracle for fix F (the M3 fix-lane P1): reis's
     // `seat.bind_capabilities(...)` buffers the request into the EI
     // context's write buffer; the bytes don't leave the socket until
@@ -1770,9 +1776,12 @@ fn seat_bind_reaches_the_eis_peer_before_devices() {
     // The fake EIS in this suite keeps reading after the handshake
     // (see `setup`'s doc block) and publishes the first
     // `EisRequest::Bind` it observes on the oneshot returned as
-    // `bind_rx`. This test asserts that the bind arrives — BEFORE we
-    // call `add_device` on the seat, mirroring the production
-    // ordering. Pre-fix the bind is silently buffered, the fake
+    // `bind_rx`. This test pins the lower bound: the bind must reach
+    // the EIS peer AT ALL. It does NOT exercise the device-creation
+    // path (no `add_device` call follows the bind assertion) —
+    // that's covered by the keyboard / pointer / scroll / button
+    // tests in this suite, each of which depends on the bind being
+    // received. Pre-fix the bind is silently buffered, the fake
     // never sees it, and `bind_rx` times out. Post-fix the bind
     // flushes immediately after `bind_capabilities` returns, the
     // fake observes it on its next read, and `bind_rx` resolves
@@ -1812,14 +1821,9 @@ fn seat_bind_reaches_the_eis_peer_before_devices() {
         // can't observe the bind at all.
         connection.flush().expect("flush seat");
 
-        // The bind must reach the EIS peer — and specifically reach
-        // it BEFORE we ever call `add_device`. Production mirrors
-        // this: a real EIS creates devices only after the bind has
-        // been received, so any test that calls `add_device` first
-        // would be testing an ordering the protocol doesn't allow.
-        //
-        // Pre-fix this times out (bind sits in the write buffer
-        // forever); post-fix it resolves within milliseconds.
+        // The bind must reach the EIS peer. Pre-fix this times out
+        // (bind sits in the write buffer forever); post-fix it
+        // resolves within milliseconds.
         let observed = timeout(Duration::from_secs(2), bind_rx)
             .await
             .expect(
@@ -1839,7 +1843,14 @@ fn seat_bind_reaches_the_eis_peer_before_devices() {
             observed
         );
 
-        // Hygiene: close the eis drive so the pump exits cleanly.
+        // The pump is abandoned at teardown — there is no path that
+        // signals it to stop (no eis_done_tx is sent; the local
+        // block_on returns when its body completes and the runtime
+        // is dropped, which drops the in-flight pump task). Drop
+        // the connection so the EIS-side socket goes away with the
+        // test scope; the pump never sees a clean EOF in this test
+        // and that's fine because its lifetime is bounded by the
+        // runtime, not by the wire.
         drop(connection);
     });
 }
