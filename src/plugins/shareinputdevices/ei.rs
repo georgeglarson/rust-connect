@@ -65,11 +65,12 @@ use std::os::unix::io::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
-use enumflags2::BitFlags;
 use futures_util::StreamExt;
+use reis::ei;
+use reis::enumflags2::BitFlags;
 use reis::event::{DeviceCapability, EiEvent};
 use reis::tokio::EiConvertEventStream;
-use reis::{ei, Error as ReisError};
+use reis::Error as ReisError;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, warn};
 use xkbcommon::xkb;

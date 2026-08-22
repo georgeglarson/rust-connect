@@ -116,9 +116,10 @@ tempfile = "3"
 # directly).
 reis = { version = "0.7.1", default-features = false, features = ["tokio"] }
 xkbcommon = "0.9"
-# reis re-exports enumflags2::BitFlags; futures-util supplies StreamExt
-# for the EiConvertEventStream (already transitive via reis/tokio).
-enumflags2 = "0.7"
+# reis re-exports enumflags2 (`pub use enumflags2;` at lib.rs:38), so
+# `BitFlags` is reachable as `reis::enumflags2::BitFlags` without a
+# direct dep on enumflags2. futures-util supplies StreamExt for the
+# EiConvertEventStream (already transitive via reis/tokio).
 futures-util = "0.3"
 
 [dev-dependencies]

@@ -2874,7 +2874,6 @@ dependencies = [
  "config",
  "criterion",
  "dirs",
- "enumflags2",
  "evdev",
  "futures",
  "futures-util",

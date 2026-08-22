@@ -23,10 +23,10 @@ use std::os::fd::{AsFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use enumflags2::BitFlags;
 use reis::eis::device::DeviceType;
 use reis::eis::keyboard::{KeyState as EisKeyState, KeymapType as EisKeymapType};
 use reis::eis::{self};
+use reis::enumflags2::BitFlags;
 use reis::event::DeviceCapability;
 use reis::handshake::EisHandshaker;
 use reis::request::{Connection as EisConnection, Device as EisDevice, EisRequest};
