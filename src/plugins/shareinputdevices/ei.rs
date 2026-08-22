@@ -830,12 +830,21 @@ fn build_xkb_state(fd: &OwnedFd, size: u32) -> Result<xkb::State, Error> {
         size,
         err: format!("keymap fd read: {e}"),
     })?;
-    // The xkbcommon Rust binding wraps `xkb_keymap_new_from_buffer`
-    // (explicit length, NOT null-terminated), so any trailing `\0`
-    // from a C-string-styled source lands inside the keymap text
-    // and the parser rejects it. Strip defensively: the keymap
-    // grammar treats `\0` as a non-token byte, so a stray trailing
-    // NUL is never legitimate.
+    // Load-bearing, not defensive. The Wayland keymap convention
+    // compositors reuse for EIS sends `size = strlen + 1` -- the
+    // trailing `\0` is part of the byte count. The xkbcommon Rust
+    // binding wraps `xkb_keymap_new_from_buffer` (explicit length,
+    // NOT NUL-terminated), so a trailing NUL lands inside the
+    // keymap text and xkb's parser rejects it with
+    // `[XKB-822] Failed to parse input xkb string`. Stripping
+    // every trailing `\0` is what makes the production-shape
+    // payload work; without it the keymap would never parse and
+    // `build_xkb_state` would Err, taking the keymap-less path
+    // (see `EiEvent::DeviceAdded` -- the existing fallback that
+    // returns Err and currently leaves `xkb_state` None). The
+    // strip also tolerates buffers written WITHOUT the NUL (the
+    // test fixture's helper), since the loop only fires when the
+    // last byte is `\0`.
     while matches!(buf.last(), Some(0)) {
         buf.pop();
     }

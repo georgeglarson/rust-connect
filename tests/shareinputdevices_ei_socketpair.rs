@@ -282,27 +282,35 @@ fn key_event(connection: &EisConnection, device: &EisDevice, keycode: u32, is_pr
 }
 
 /// Build a keymap memfd and return the fd to bind via before_done_cb.
-/// xkb_keymap_new_from_string (the C-side parser the upstream cpp
-/// calls at inputcapturesession.cpp:57) consumes the buffer as a
-/// null-terminated string — without the trailing null, the parse
-/// silently fails and the cpp falls back to the default keymap
-/// (:63). For our tests we want a known keymap, so we append the
-/// null. The reis side passes `size` through as the byte count.
+/// Writes the raw xkb text bytes and reports `size = text.len()` —
+/// no trailing NUL, no `+1`. This matches the helper's pre-fix
+/// contract and is the shape most of the suite uses.
 ///
-/// NOTE: the xkbcommon Rust binding wraps the buffer-style C entry
-/// point `xkb_keymap_new_from_buffer` (explicit length, NOT null-
-/// terminated), so the trailing `\0` here would land inside the
-/// keymap text and xkb's parser rejects it with
-/// `[XKB-822] Failed to parse input xkb string`. We strip any
-/// trailing NUL after reading in `build_xkb_state`, and we pass the
-/// buffer length WITHOUT the null from this helper. Real portal
-/// delivery writes the raw xkb text, not a NUL-padded buffer.
+/// NOTE: real portals send the keymap with `size = strlen + 1`
+/// (Wayland convention); see `keymap_fd_with_trailing_nul` for
+/// the production-shape helper used by the strip test.
 fn keymap_fd(text: &str) -> (std::fs::File, u32) {
     let memfd = memfd_create().expect("memfd_create");
     use std::io::Write;
     let bytes = text.as_bytes();
     let size = bytes.len() as u32;
     (&memfd).write_all(bytes).expect("write keymap");
+    (memfd, size)
+}
+
+/// Production-shape keymap delivery: the buffer ends with a
+/// trailing NUL and the size INCLUDES the NUL. The on-the-wire
+/// `keymap.size` value coming out of libei is whatever the sender
+/// put there, and compositors write `strlen + 1`. The receiver
+/// must cope (the trailing-NUL strip in `build_xkb_state` is
+/// load-bearing — see ei.rs for the WHY).
+fn keymap_fd_with_trailing_nul(text: &str) -> (std::fs::File, u32) {
+    let memfd = memfd_create().expect("memfd_create");
+    use std::io::Write;
+    let mut bytes = text.as_bytes().to_vec();
+    bytes.push(0);
+    let size = bytes.len() as u32;
+    (&memfd).write_all(&bytes).expect("write keymap+NUL");
     (memfd, size)
 }
 
@@ -610,6 +618,84 @@ fn keyboard_keymap_loads_and_emits_text() {
         );
         assert_eq!(obj.get("shift").and_then(|v| v.as_bool()), Some(false));
         assert_eq!(obj.get("ctrl").and_then(|v| v.as_bool()), Some(false));
+
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit");
+    });
+}
+
+#[test]
+fn keymap_with_trailing_nul_parses_and_emits_text() {
+    // Red-before-green oracle for the trailing-NUL strip in
+    // `build_xkb_state`. Real portal delivery writes the keymap
+    // with `size = strlen + 1` (the Wayland convention
+    // compositors reuse for EIS); the xkbcommon Rust binding
+    // wraps `xkb_keymap_new_from_buffer` (explicit length, NOT
+    // null-terminated), so the trailing `\0` would land INSIDE
+    // the keymap text and xkb's parser would reject it with
+    // `[XKB-822]`. The strip removes the trailing NUL bytes
+    // before handing the buffer to the parser; without it the
+    // parse fails and key delivery dies silently.
+    //
+    // This test writes the keymap with a trailing NUL and passes
+    // `size` INCLUDING the NUL (the production shape), then
+    // asserts the same key delivery behavior as the existing
+    // NUL-less `keyboard_keymap_loads_and_emits_text` test:
+    // press KEY_H and observe `{key: "h", ...}` on the wire.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        let seat = connection.add_seat(
+            Some("test"),
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
+        );
+        let keymap_text = TEST_KEYMAP.to_string();
+        let device = seat.add_device(
+            Some("test-kb"),
+            DeviceType::Virtual,
+            DeviceCapability::Keyboard.into(),
+            move |device| {
+                let kb: eis::Keyboard = device
+                    .interface()
+                    .expect("keyboard interface available pre-done");
+                let (memfd, size) = keymap_fd_with_trailing_nul(&keymap_text);
+                kb.keymap(EisKeymapType::Xkb, size, memfd.as_fd());
+            },
+        );
+        device.resumed();
+        device.start_emulating(1);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        _receiver.handle_activated(1).await;
+
+        key_event(&connection, &device, 35, true);
+
+        let body = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("key timed out — strip must remove the trailing NUL and the keymap must parse")
+            .expect("wire rx closed");
+        let json = body.into_json();
+        let obj = json.as_object().expect("key body is an object");
+        assert_eq!(
+            obj.get("key").and_then(|v| v.as_str()),
+            Some("h"),
+            "keymap-with-NUL must produce the same wire body as the NUL-less path; got {}",
+            json
+        );
 
         let _ = eis_done_tx.unwrap().send(());
         drop(connection);
