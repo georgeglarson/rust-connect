@@ -234,16 +234,16 @@ impl ActivationGate {
 }
 
 /// Errors surfaced by the EI transport. `Reis` is reis's own error
-/// type — protocol errors (handshake failure, unexpected event) and
-/// io errors (socket closed). `Xkb` wraps a keymap parse failure
-/// from libxkbcommon.
+/// type — protocol errors (handshake failure, unexpected event).
+/// `Xkb` wraps every failure mode on the keymap-load path: the
+/// `OwnedFd::try_clone` that backs the positionless read, the read
+/// itself, the UTF-8 conversion, and the xkbcommon parse / default
+/// RMLVO fallback — all surface here as `Xkb { size, err }`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("reis handshake error: {0}")]
     Reis(#[from] ReisError),
-    #[error("reis io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("xkb keymap parse failed (size={size}, err={err})")]
+    #[error("xkb keymap load failed (size={size}, err={err})")]
     Xkb { size: u32, err: String },
 }
 
@@ -307,7 +307,12 @@ impl EiReceiver {
     /// so an EIS debug log shows our origin.
     pub fn new(fd: OwnedFd, handshake_name: &str) -> Result<Arc<Self>, Error> {
         let stream = UnixStream::from(fd);
-        let context = ei::Context::new(stream)?;
+        // `ei::Context::new` returns `std::io::Error` directly
+        // (reis's `Context::new` body is a `set_nonblocking` on the
+        // raw fd); the io-error variant is reachable only here.
+        // Wrap into `ReisError::Io` so the `Reis` arm of `Error`
+        // covers every reis-side failure mode the caller sees.
+        let context = ei::Context::new(stream).map_err(ReisError::Io)?;
         let caps = DeviceCapability::Keyboard
             | DeviceCapability::Pointer
             | DeviceCapability::Button
