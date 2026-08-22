@@ -131,41 +131,54 @@ impl From<i32> for Edge {
 /// (InputDevicesReceiver.kt:120 `supportedPacketTypes`). We send these
 /// packet types to the phone, so they're incoming on its side.
 ///
-/// The matching is OR — a peer with either capability counts. The
+/// **Matching is AND (panel M4 round 2 fix — P5).** Pre-fix the gate
+/// matched OR: a peer advertising only one of the two caps
+/// qualified, but an activated session emits BOTH
+/// `shareinputdevices.request` and `mousepad.request`. Arming the
+/// barrier for a peer that cannot consume motion is the
+/// trapped-cursor shape this redesign exists to prevent. The
 /// `shareinputdevices.request` cap proves the phone runs the
 /// activation-arm consumer; `mousepad.request` proves it runs the
-/// motion-arm consumer (Qt mousepad plugin and remote-keyboard plugin
-/// both deliver to it on Android). A phone that has only the latter
-/// can still consume the wire stream — the activated event is rare
-/// (one per barrier crossing) and the gate's only requirement is "at
-/// least one peer can drain this stuff".
+/// motion-arm consumer (Qt mousepad plugin and remote-keyboard
+/// plugin both deliver to it on Android). **What a real phone
+/// advertises is unverified until the M4b live leg.** If phones
+/// turn out to advertise only one cap, this invariant is what
+/// surfaces it loudly instead of silently half-working — the
+/// activation gate's first-capable-peer arm will simply never
+/// fire, and `backend_available` stays false. Tests asserting
+/// "phone-shaped" peers must register BOTH caps.
 pub const CONSUMER_INCOMING_CAPS: &[&str] = &[
     "kdeconnect.shareinputdevices.request",
     "kdeconnect.mousepad.request",
 ];
-
-/// True iff `device_id` is currently a connected peer AND advertises
-/// at least one of `CONSUMER_INCOMING_CAPS` as an incoming capability.
-/// The plugin's activation gate runs this against a freshly-Connected
-/// peer; the deactivation gate runs an equivalent snapshot across the
-/// whole `connections` map.
-#[allow(dead_code)] // kept for symmetry with `capable_consumer_ids`; the
-                    // gate uses the snapshot form in production.
-pub(crate) async fn is_capable_consumer(
-    cm: &crate::protocol::ConnectionManager,
-    device_id: &str,
-) -> bool {
-    cm.has_incoming_capability_any(device_id, CONSUMER_INCOMING_CAPS)
-        .await
-}
 
 /// Snapshot the set of currently-connected, capability-advertising
 /// consumers. Used both by the gate's last-capable-leaves transition
 /// (count drops to 0 → deactivate) and by the wire consumer's
 /// per-packet fan-out filter (capability-filtered fan-out, brief item
 /// 4 — send only to peers that can consume what we're sending).
+///
+/// **AND match (panel M4 round 2 fix — P5).** Wraps
+/// `ConnectionManager::capable_consumer_ids` (OR semantics) and
+/// post-filters to peers advertising EVERY entry of
+/// `CONSUMER_INCOMING_CAPS`. The fan-out filter must require the
+/// full set so an activated session (which emits BOTH packet
+/// types) cannot arm against a peer that consumes only one arm.
 pub(crate) async fn capable_consumer_ids(cm: &crate::protocol::ConnectionManager) -> Vec<String> {
-    cm.capable_consumer_ids(CONSUMER_INCOMING_CAPS).await
+    let any_match = cm.capable_consumer_ids(CONSUMER_INCOMING_CAPS).await;
+    // AND post-filter: keep only peers advertising EVERY entry.
+    let wanted: std::collections::HashSet<&str> = CONSUMER_INCOMING_CAPS.iter().copied().collect();
+    let mut out = Vec::with_capacity(any_match.len());
+    for device_id in any_match {
+        let Some(incoming) = cm.peer_incoming_capabilities(&device_id).await else {
+            continue;
+        };
+        let all_present = wanted.iter().all(|w| incoming.iter().any(|c| c == w));
+        if all_present {
+            out.push(device_id);
+        }
+    }
+    out
 }
 
 /// Body of a `kdeconnect.shareinputdevices.request` packet.
@@ -686,17 +699,19 @@ impl ShareInputDevicesPlugin {
         // concern).
         let edge = self.edge;
 
-        // Eager re-evaluation on boot: a peer that connected
-        // BEFORE the gate subscribed may already have published
-        // its StateChanged event (the broadcast channel does not
-        // replay missed events to late subscribers). Run the
-        // gate's activate arm once against the current
-        // capability snapshot so we don't miss a peer that
-        // connected during `enable_session_backend`. The check
-        // is a no-op if no capable peer is connected; if one
-        // is, this races the eventual StateChanged event but
-        // `activation_in_flight` + `backend_available` +
-        // `portal_session` guard against double activation.
+        // **Subscribe BEFORE the eager re-eval (panel M4 round 2
+        // fix — P4).** The pre-fix order spawned the eager re-eval
+        // task first, then called `broadcaster.subscribe()`. A peer
+        // connecting in the gap broadcast to no subscriber AND the
+        // eager eval ran against a consumer snapshot that already
+        // included that peer — so the eager eval activated
+        // cleanly, but the subsequent subscription saw nothing.
+        // Subscribing first ensures the broadcaster's ring buffer
+        // starts capturing from THIS point; the eager eval that
+        // follows checks the same consumer set it would have
+        // pre-fix, but no events are lost in the gap between
+        // subscribe and snapshot.
+        let mut rx = broadcaster.subscribe();
         let cm_for_eager = cm.clone();
         let portal_conn_for_eager = portal_conn.clone();
         let portal_session_for_eager = portal_session.clone();
@@ -717,7 +732,6 @@ impl ShareInputDevicesPlugin {
             .await;
         });
 
-        let mut rx = broadcaster.subscribe();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -748,14 +762,35 @@ impl ShareInputDevicesPlugin {
                         .await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Slow consumer; missed events. The next
-                        // event will be the latest state; the
-                        // eager re-evaluation above already
-                        // covered the boot case. Log and continue.
-                        debug!(
-                            event = "shareinputdevices_gate_lagged",
-                            "Capability gate lagged on the broadcast channel; skipping missed events"
-                        );
+                        // **Lagged re-evaluation (panel M4 round 2
+                        // fix — P3 part 1).** The pre-fix shape
+                        // only logged and continued — a missed
+                        // last-peer disconnect with no later
+                        // event left the session armed with no
+                        // consumer, and `do_activate` blocked the
+                        // subscriber for the whole v1 sequence
+                        // while the device channel (capacity 256,
+                        // all device events) overflowed. Re-run
+                        // the gate's evaluation against the
+                        // current snapshot; an empty consumer set
+                        // + a live session triggers the
+                        // deactivate path (which the Lagged arm
+                        // would have skipped). The `None`
+                        // device-id signals "full snapshot" so
+                        // `do_evaluate_after_event` does the same
+                        // Connected/disconnect logic without
+                        // filtering on a specific device.
+                        do_evaluate_after_event(
+                            None,
+                            &cm,
+                            &portal_conn,
+                            &portal_session,
+                            &release_callback,
+                            &backend_available,
+                            &activation_in_flight,
+                            edge,
+                        )
+                        .await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         info!(
@@ -1209,12 +1244,22 @@ async fn do_activate(
     // disconnect — it does NOT close the session (the
     // destructor still holds `m_session` for explicit
     // Session.Close; the portal `Disabled` signal is the
-    // session-side teardown trigger, see :281-286). We mirror
-    // that: log the disconnect and flip
-    // `backend_available=false` so the plugin stops advertising
-    // the capability to newly-connecting peers, but we do NOT
-    // drop the portal session — `release()` and `close()` keep
-    // working.
+    // session-side teardown trigger, see :281-286).
+    //
+    // **Departure from the cpp observe-don't-close shape
+    // (panel M4 round 2 fix — P2).** The cpp's session is
+    // per-device and dies with the plugin instance, so an EOF
+    // on the EI fd does not need to release the session —
+    // nothing else can reuse it. OUR session is shared across
+    // the plugin's lifetime, so an EI EOF that leaves the
+    // session slot populated would block re-activation while
+    // any capable peer stays connected (the activate arm's
+    // re-entry guard refuses a populated slot). The disconnect
+    // watcher MUST call the deactivate machinery — clear the
+    // slot, flip `backend_available=false`, close the session
+    // — so the next peer can re-arm. The portal `Disabled`
+    // signal does the same; both paths funnel through
+    // `do_deactivate` for symmetry.
     //
     // **Ordering (panel M4 panel round 1 fix — P2):** the
     // `backend_available.store(true)` below runs BEFORE this
@@ -1261,6 +1306,26 @@ async fn do_activate(
     });
     *release_callback.lock().unwrap_or_else(|e| e.into_inner()) = Some(cb);
 
+    // Wire the portal `Disabled`-signal callback (panel M4 round 2
+    // fix — P2 part 2). The signal handler was spawned inside
+    // `PortalSession::start` with an empty late-binding slot;
+    // install the deactivate machinery now that we own the cells.
+    // The callback fires `do_deactivate` with the same shared
+    // cells the EI-disconnect watcher uses, so both dead-session
+    // paths funnel through one path. The closure is `Send + Sync`
+    // because the cells are Arc-shared.
+    let disabled_session = portal_session.clone();
+    let disabled_release_cb = release_callback.clone();
+    let disabled_backend_available = backend_available.clone();
+    session.set_on_disabled(Arc::new(move || {
+        let s = disabled_session.clone();
+        let rc = disabled_release_cb.clone();
+        let ba = disabled_backend_available.clone();
+        tokio::spawn(async move {
+            do_deactivate(&s, &rc, &ba).await;
+        });
+    }));
+
     *portal_session.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
 
     // Store `true` BEFORE spawning the watcher (the fix).
@@ -1279,6 +1344,33 @@ async fn do_activate(
     if let Some(cm) = cm {
         cm.add_capabilities(&[], &["kdeconnect.shareinputdevices.request".to_string()]);
     }
+
+    // **Post-activate consumer re-check (panel M4 round 2 fix —
+    // P3 part 2).** A peer can disconnect mid-activation: the
+    // gate's deactivation arm runs and sees the slot is empty
+    // (we haven't stored the session yet) — no-op. Without this
+    // re-check, the completed activation leaves the barrier
+    // armed with zero consumers. We just stored the session and
+    // flipped `backend_available=true`; if the consumer set
+    // snapshot is now empty, self-deactivate so the next capable
+    // peer can re-arm cleanly. The `cm` is required because the
+    // activation path may have been invoked without one (the
+    // eager re-eval test); in that case skip the check — the
+    // gate wouldn't have activated without a CM anyway.
+    if let Some(cm) = cm {
+        let post_consumers = capable_consumer_ids(cm).await;
+        if post_consumers.is_empty() {
+            warn!(
+                event = "shareinputdevices_post_activate_no_consumers",
+                "Activation completed but no capable consumers connected; self-deactivating"
+            );
+            // `backend_available` was rebound to `Arc<AtomicBool>`
+            // above (line ~1264); `do_deactivate` takes
+            // `&Arc<AtomicBool>`, so deref the Arc.
+            do_deactivate(portal_session, release_callback, &backend_available).await;
+            return;
+        }
+    }
     info!(
         event = "shareinputdevices_backend_enabled",
         session_handle = session.session_handle().as_str(),
@@ -1286,13 +1378,30 @@ async fn do_activate(
         "shareinputdevices session backend wired"
     );
 
+    // EI-disconnect watcher (panel M4 round 2 fix — P2 part 1).
+    // The pre-fix shape flipped `backend_available=false` but
+    // left the session slot populated, which blocked re-activation
+    // while any capable peer stayed connected (the activate arm's
+    // re-entry guard refuses a populated slot). Now wires through
+    // the same `do_deactivate` machinery the gate uses on
+    // last-capable-leaves, so the slot is cleared and a fresh
+    // peer can re-arm cleanly. Departure from cpp observe-don't-
+    // close is documented at the spawn block.
+    let disconnect_session = portal_session.clone();
+    let disconnect_release_cb = release_callback.clone();
+    let disconnect_backend_available = backend_available.clone();
     tokio::spawn(async move {
         if disconnect_rx_watcher.changed().await.is_ok() {
             warn!(
-                event = "shareinputdevices_ei_disconnect_backend_flip",
-                "EI transport disconnected; shareinputdevices backend no longer available"
+                event = "shareinputdevices_ei_disconnect_deactivate",
+                "EI transport disconnected; tearing down portal session"
             );
-            backend_available.store(false, Ordering::SeqCst);
+            do_deactivate(
+                &disconnect_session,
+                &disconnect_release_cb,
+                &disconnect_backend_available,
+            )
+            .await;
         }
     });
 

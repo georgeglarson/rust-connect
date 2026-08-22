@@ -346,27 +346,14 @@ impl ConnectionManager {
         caps.insert(device_id.clone(), incoming.to_vec());
     }
 
-    /// True iff `device_id` has a recorded `peer_capabilities` entry
-    /// whose incoming list contains at least one of `wanted`.
-    ///
-    /// **The seam for shareinputdevices' peer-gated activation** (Task
-    /// #1042 fix lane B, panel M4 round 1). The activation gate must
-    /// run AFTER identity exchange (`record_peer_capabilities` is
-    /// called before the `Connected` state transition is broadcast),
-    /// so by the time the capability-gate subscription reads this,
-    /// the entry is live. `wanted` is matched against the peer's
-    /// INCOMING capabilities: a phone that runs the
-    /// InputDevicesReceiver consumer advertises
-    /// `kdeconnect.shareinputdevices.request` (and
-    /// `kdeconnect.mousepad.request`) as incoming, since WE send
-    /// those packet types TO it. A device with no recorded entry
-    /// (mid-pairing or never exchanged) returns false.
-    pub async fn has_incoming_capability_any(&self, device_id: &str, wanted: &[&str]) -> bool {
+    /// Read-only access to the recorded incoming-capability list
+    /// for `device_id`. Returns `Some(list)` when an entry exists
+    /// (post-identity-exchange), `None` otherwise. Used by
+    /// `shareinputdevices::capable_consumer_ids` to AND-match the
+    /// full set (panel M4 round 2 fix — P5).
+    pub async fn peer_incoming_capabilities(&self, device_id: &str) -> Option<Vec<String>> {
         let caps = self.peer_capabilities.read().await;
-        match caps.get(device_id) {
-            Some(incoming) => wanted.iter().any(|w| incoming.iter().any(|c| c == w)),
-            None => false,
-        }
+        caps.get(device_id).cloned()
     }
 
     /// Snapshot the live set of device IDs that BOTH have a live
@@ -426,8 +413,11 @@ impl ConnectionManager {
 
     /// Test-only mutator: declare `device_id` as live for the
     /// capability gate without a real TLS connection. The shadow
-    /// set is consulted by `is_connected` and
-    /// `capable_consumer_ids` only, and only in cfg(test) /
+    /// set is consulted by `capable_consumer_ids` only
+    /// (panel M4 round 2 fix — P8c — narrowed from also being
+    /// read by `is_connected`, which only had one test-assertion
+    /// consumer and now consults the real `connections` map
+    /// exclusively), and only in cfg(test) /
     /// `feature = "test-helpers"` builds — production builds see an
     /// empty set, and `mark` itself is compiled out, so the path
     /// cannot leak.
@@ -766,25 +756,7 @@ impl ConnectionManager {
 
     pub async fn is_connected(&self, device_id: &DeviceId) -> bool {
         let connections = self.connections.read().await;
-        if connections.contains_key(device_id) {
-            return true;
-        }
-        // Test-only fast-path: a peer declared via
-        // `mark_fake_connected_for_test` counts as live for the
-        // capability gate. Production builds never populate the
-        // set; the cost is one mutex acquire on a near-empty
-        // map. Lock-free in steady state in cfg(test).
-        #[cfg(any(test, feature = "test-helpers"))]
-        {
-            let fake = self
-                .fake_connected
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if fake.contains(device_id) {
-                return true;
-            }
-        }
-        false
+        connections.contains_key(device_id)
     }
 
     pub async fn get_generation(&self, device_id: &DeviceId) -> Option<u64> {
