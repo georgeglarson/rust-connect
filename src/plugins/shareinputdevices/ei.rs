@@ -655,6 +655,19 @@ impl EiReceiver {
                     return;
                 }
                 let text = keysym_to_text(keysym);
+                // M4-deferred suppression: until the keysym→Qt::Key
+                // table restores cpp parity (each named key carries
+                // its specialKey code), an empty text + specialKey 0
+                // body has nothing for either phone consumer to act
+                // on — Escape/Backspace/Tab reach the wire as
+                // `{key: "", specialKey: 0, mods…}` and so does every
+                // cursor/function key whose UTF-8 representation is
+                // empty. Drop them at the source, mirroring the
+                // NoSymbol branch above; M4's table is purely
+                // additive.
+                if text.is_empty() {
+                    return;
+                }
                 let m = Modifiers::from_xkb_state(state);
                 drop(guard);
                 // The cpp's :435 derives a Qt::Key + int code via
@@ -737,14 +750,27 @@ impl EiReceiver {
                     text,
                     special_key,
                     mods,
-                } => WireBody::Key(plan_key(
-                    &text,
-                    special_key,
-                    mods.shift,
-                    mods.ctrl,
-                    mods.alt,
-                    mods.super_key,
-                )),
+                } => {
+                    // M4-deferred suppression mirror of the live
+                    // dispatch path — a queued key with empty text
+                    // and specialKey 0 has nothing for the consumer
+                    // to type. The live path drops before queueing
+                    // today, so this branch only fires if a caller
+                    // hand-queues; keep the safety net so the
+                    // replay cannot leak a contentless body to the
+                    // wire.
+                    if text.is_empty() {
+                        continue;
+                    }
+                    WireBody::Key(plan_key(
+                        &text,
+                        special_key,
+                        mods.shift,
+                        mods.ctrl,
+                        mods.alt,
+                        mods.super_key,
+                    ))
+                }
             };
             let _ = wire_tx.send(body);
         }
@@ -846,12 +872,22 @@ fn build_xkb_state(fd: &OwnedFd, size: u32) -> Result<xkb::State, Error> {
 /// same split the cpp uses.
 ///
 /// The filter that remains is Qt's, not xkbcommon's:
-/// `QKeyEvent::text()` strips anything `< 0x20` before delivering,
-/// so Escape / Backspace / Tab reach the wire as empty text.
-/// `xkb_keysym_to_utf8` does not filter, so we do.
+/// `QKeyEvent::text()` discards the WHOLE string when it contains
+/// `char < 0x20` (the `QChar` text codec drops the string rather
+/// than passing control bytes through), so Escape / Backspace / Tab
+/// reach the wire as empty text. `xkb_keysym_to_utf8` does not
+/// filter, so we mirror Qt's all-or-nothing: any byte `< 0x20` in
+/// the result drops the entire string. A per-char strip would leave
+/// residue if a control byte appeared inside a multi-byte string
+/// (e.g. an incomplete UTF-8 sequence under transformation); Qt's
+/// codec rejects the whole string in that case.
 fn keysym_to_text(keysym: xkb::Keysym) -> String {
     let raw = xkb::keysym_to_utf8(keysym);
-    raw.chars().filter(|&c| (c as u32) >= 0x20).collect()
+    if raw.bytes().any(|b| b < 0x20) {
+        String::new()
+    } else {
+        raw
+    }
 }
 
 #[cfg(test)]

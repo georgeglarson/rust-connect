@@ -1271,20 +1271,24 @@ fn latched_shift_modifier_surfaces_as_shift_on_wire() {
 }
 
 #[test]
-fn control_char_keys_emit_empty_text() {
-    // Red-before-green oracle for fix E: the cpp producer at
+fn control_char_keys_emit_no_body_until_m4_table() {
+    // Red-before-green oracle for the M4-deferred contentless-body
+    // suppression. Pre-suppression the cpp producer at
     // inputcapturesession.cpp:436 calls
     // `QXkbCommon::lookupStringNoKeysymTransformations(sym)`, whose
     // Qt-side equivalent strips chars < 0x20 before emitting —
-    // Escape, Backspace, and Tab all produce empty text on the wire.
-    // Our transport's equivalent (`xkb_state_key_get_utf8`) yields
-    // the raw control byte (`\x1b` for Escape, `\x08` for Backspace,
-    // `\t` for Tab). Pre-fix the wire body carried the control byte
-    // in its `key` field; the Android consumer would then key a
-    // unicode glyph that maps to nothing. Post-fix the transport
-    // filters chars < 0x20, so the wire body carries `key: ""`.
+    // Escape, Backspace, and Tab all produce empty text on the
+    // wire. Our transport's `keysym_to_text` mirrors the same filter
+    // (all-or-nothing, see the function's doc) so the keysym text is
+    // also empty, AND we do not yet have the cpp's keysym→Qt::Key
+    // table to assign a non-zero specialKey. The M3 fix is to drop
+    // the body entirely at the source — neither phone consumer can
+    // act on `{key: "", specialKey: 0, mods…}` — and let M4's table
+    // restore cpp parity by becoming purely additive (no consumer
+    // code paths need to change).
     //
-    // We test Escape here (keycode 9 → xkb 17 → XK_Escape → "\x1b").
+    // We test Escape here (evdev 1 → xkb 9 → XK_Escape → "\x1b" →
+    // filtered to empty text). The body must NEVER reach the wire.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1323,21 +1327,126 @@ fn control_char_keys_emit_empty_text() {
         // Arm-then-clear the activation gate.
         _receiver.handle_activated(1).await;
 
-        // Press KEY_ESCAPE (evdev 1) → xkb 9. The keymap binds
-        // <ESC>=9 → Escape, so key_get_utf8 returns "\x1b" pre-fix
-        // (a control char that should be filtered).
+        // Press KEY_ESCAPE (evdev 1) → xkb 9 → XK_Escape. The
+        // M4-deferred suppression drops the body at the source.
         key_event(&connection, &device, 1, true);
 
+        let spurious = timeout(Duration::from_millis(300), wire_rx.recv()).await;
+        assert!(
+            spurious.is_err(),
+            "Escape must NOT produce a wire body (M4-deferred contentless suppression); \
+             got {:?}",
+            spurious.ok().flatten().map(|b| b.into_json())
+        );
+
+        // The pump must still be alive — a subsequent mapped key
+        // (KEY_H=35 → xkb 43 → XK_h) must produce a body, proving
+        // the suppression did not break the dispatch loop.
+        key_event(&connection, &device, 35, true);
         let body = timeout(Duration::from_secs(2), wire_rx.recv())
             .await
-            .expect("key timed out")
+            .expect("mapped key after Escape timed out — pump must survive")
             .expect("wire rx closed");
         let json = body.into_json();
         let obj = json.as_object().expect("key body is an object");
         assert_eq!(
             obj.get("key").and_then(|v| v.as_str()),
-            Some(""),
-            "Escape must produce empty text on the wire (filter <0x20); got {}",
+            Some("h"),
+            "subsequent mapped key still emits; got {}",
+            json
+        );
+
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit");
+    });
+}
+
+#[test]
+fn cursor_keys_emit_no_body_until_m4_table() {
+    // Red-before-green oracle for cursor keys (Up/Down/Home/End):
+    // the brief's claimed mechanism — that cursor keysyms emit CSI
+    // escape sequences like "\x1b[D" from `xkb_keysym_to_utf8` —
+    // was empirically disproved: an integrator probe on this
+    // libxkbcommon showed n=0 (empty string) for Left/Home/F1, and
+    // raw control bytes only for Escape ("\x1b") and Tab ("\t").
+    // See FINDINGS.md § Fix 1 — the suppression still applies
+    // because the resulting text is empty, so cursor keys reach the
+    // same `{key: "", specialKey: 0}` body and the M4-deferred drop
+    // catches them at the source.
+    //
+    // Each cursor key has a TEST_KEYMAP binding (<HOME>=110,
+    // <UP>=111, <RIGHT>=114, <END>=115, <DOWN>=116) so the
+    // keymap's `key_get_one_sym` lookup hits a real keysym rather
+    // than NoSymbol. The test then asserts none of them produces
+    // a wire body.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        let seat = connection.add_seat(
+            Some("test"),
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
+        );
+        let keymap_text = TEST_KEYMAP.to_string();
+        let device = seat.add_device(
+            Some("test-kb"),
+            DeviceType::Virtual,
+            DeviceCapability::Keyboard.into(),
+            move |device| {
+                let kb: eis::Keyboard = device
+                    .interface()
+                    .expect("keyboard interface available pre-done");
+                let (memfd, size) = keymap_fd(&keymap_text);
+                kb.keymap(EisKeymapType::Xkb, size, memfd.as_fd());
+            },
+        );
+        device.resumed();
+        device.start_emulating(1);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Arm-then-clear the activation gate.
+        _receiver.handle_activated(1).await;
+
+        // Press each cursor key. TEST_KEYMAP binds the xkb keycodes
+        // <HOME>=110, <UP>=111, <RIGHT>=114, <END>=115, <DOWN>=116;
+        // evdev keycode is xkb - XKB_KEYCODE_OFFSET (8) → 102, 103,
+        // 106, 107, 108 respectively.
+        for evdev in [102u32, 103, 106, 107, 108] {
+            key_event(&connection, &device, evdev, true);
+            let spurious = timeout(Duration::from_millis(150), wire_rx.recv()).await;
+            assert!(
+                spurious.is_err(),
+                "cursor key evdev={evdev} must NOT produce a wire body \
+                 (M4-deferred contentless suppression); got {:?}",
+                spurious.ok().flatten().map(|b| b.into_json())
+            );
+        }
+
+        // Pump alive after the burst: a mapped letter still emits.
+        key_event(&connection, &device, 35, true);
+        let body = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("mapped key after cursor burst timed out — pump must survive")
+            .expect("wire rx closed");
+        let json = body.into_json();
+        let obj = json.as_object().expect("key body is an object");
+        assert_eq!(
+            obj.get("key").and_then(|v| v.as_str()),
+            Some("h"),
+            "subsequent mapped key still emits; got {}",
             json
         );
 
