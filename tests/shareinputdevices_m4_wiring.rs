@@ -1088,11 +1088,15 @@ async fn m4_input_relays_through_gate_and_consumer() {
         premature.ok().flatten().map(|p| (p.packet_type, p.body))
     );
 
-    // Emit Activated with `activation_id = 7` (matching the EIS
-    // sequence above). The barrier's p1 is (0, 0) (1920×1080 zone
-    // with Edge::Left), so deltax/deltay = cursor_position verbatim.
-    // cursor = (50, 100), activation_id = 42 (the M4-agnostic
-    // signal value — only the gate cares about it), barrier_id = 1.
+    // Emit Activated with `activation_id = 42` — deliberately NOT the
+    // EIS sequence (7): production always passes the matching id, but
+    // the drain does not depend on it (`handle_activated` opens the
+    // gate and replays the queue in arrival order whatever id it is
+    // given), so the mismatch here is incidental and pins that the
+    // consumer reads the queued WIRE BODIES, not the activation id.
+    // The barrier's p1 is (0, 0) (1920×1080 zone with Edge::Left), so
+    // deltax/deltay = cursor_position verbatim. cursor = (50, 100),
+    // barrier_id = 1.
     let handle = harness.session_handle.clone();
     eprintln!("[m4-test-relay] emitting Activated signal via fake portal conn");
     emit_activated_signal(&harness.fake_conn, &handle, 42, 50.0, 100.0, 1).await;
