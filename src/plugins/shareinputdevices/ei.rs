@@ -756,14 +756,14 @@ impl EiReceiver {
             let body = match event {
                 PendingInput::Motion(dx, dy) => WireBody::Motion(plan_motion(dx, dy)),
                 PendingInput::Button(b, e) => {
-                    // Mirror the live-path Null-body drop
-                    // (mirrors the Button arm of dispatch's
-                    // `plan_button.is_null()` drop): the live path's
-                    // gate-queuing path dropped the BTN_RIGHT release
-                    // before queueing, but since the gate refactor
-                    // queues raw and rebuilds at drain, a Null body
-                    // can appear here. Skip it so the wire stays
-                    // clean.
+                    // The live dispatch path queues raw `PendingInput::Button`
+                    // values whenever the activation gate is armed (see
+                    // `dispatch`'s Button arm at the `g.queue(...)` call site)
+                    // and only checks `plan_button(...).is_null()` on the
+                    // pass-through (gate open) path. So a Null body CAN appear
+                    // here at drain time: drop it so the wire stays clean.
+                    // The drain-side check is required because the
+                    // gate-queuing path has no Null visibility until drain.
                     let body = plan_button(b, e);
                     if body.is_null() {
                         continue;
