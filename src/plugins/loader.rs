@@ -4,6 +4,7 @@
 
 use super::registry::PluginRegistry;
 use super::{PluginAccess, PluginEventBroadcaster};
+use crate::device::EventBroadcaster;
 use std::sync::Arc;
 
 pub fn load_default_plugins(
@@ -13,6 +14,7 @@ pub fn load_default_plugins(
     pairing_handler: Arc<crate::protocol::pairing::PairingHandler>,
     data_dir: std::path::PathBuf,
     enable_input: bool,
+    device_broadcaster: Arc<EventBroadcaster>,
 ) -> PluginAccess {
     let mousepad = if enable_input {
         super::mousepad::MousepadPlugin::new()
@@ -91,9 +93,16 @@ pub fn load_default_plugins(
         // Session portal backend is enabled only at the production
         // entry point (bootstrap.rs create_state), same gate as
         // clipboard/mpris/screensaver_inhibit/pausemusic/systemvolume.
+        //
+        // The capability gate (Task #1042 fix lane B) needs the
+        // device-event broadcaster — the subscription lives in
+        // `spawn_capability_gate` and reacts to
+        // `StateChanged(Connected/Disconnected)` to activate on the
+        // first capable peer and deactivate on the last one leaving.
         shareinputdevices: Arc::new(
             super::ShareInputDevicesPlugin::new()
-                .with_connection_manager(connection_manager.clone()),
+                .with_connection_manager(connection_manager.clone())
+                .with_event_broadcaster(device_broadcaster.clone()),
         ),
     }
 }
