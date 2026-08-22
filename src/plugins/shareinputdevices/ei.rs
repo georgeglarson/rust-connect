@@ -93,15 +93,6 @@ const BTN_MIDDLE: u32 = 0x112;
 /// them with `xkb_state_key_get_one_sym`.
 const XKB_KEYCODE_OFFSET: u32 = 8;
 
-/// Canonical XKB modifier names. The cpp uses `QXkbCommon::modifiers`
-/// (inputcapturesession.cpp:434) which names them the same way:
-/// "Shift", "Control", "Mod1" (conventional Alt), "Mod4" (conventional
-/// Super/Win).
-const MOD_SHIFT: &str = "Shift";
-const MOD_CONTROL: &str = "Control";
-const MOD_ALT: &str = "Mod1";
-const MOD_SUPER: &str = "Mod4";
-
 /// The four booleans the cpp populates from xkbcommon. Mirrors the
 /// `QXkbCommon::modifiers(state, sym)` result at
 /// `inputcapturesession.cpp:434`. Mirrors the `shift`/`ctrl`/`alt`/
@@ -127,10 +118,10 @@ impl Modifiers {
     #[must_use]
     pub fn from_xkb_state(state: &xkb::State) -> Self {
         Self {
-            shift: state.mod_name_is_active(MOD_SHIFT, xkb::STATE_MODS_EFFECTIVE),
-            ctrl: state.mod_name_is_active(MOD_CONTROL, xkb::STATE_MODS_EFFECTIVE),
-            alt: state.mod_name_is_active(MOD_ALT, xkb::STATE_MODS_EFFECTIVE),
-            super_key: state.mod_name_is_active(MOD_SUPER, xkb::STATE_MODS_EFFECTIVE),
+            shift: state.mod_name_is_active(xkb::MOD_NAME_SHIFT, xkb::STATE_MODS_EFFECTIVE),
+            ctrl: state.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE),
+            alt: state.mod_name_is_active(xkb::MOD_NAME_ALT, xkb::STATE_MODS_EFFECTIVE),
+            super_key: state.mod_name_is_active(xkb::MOD_NAME_LOGO, xkb::STATE_MODS_EFFECTIVE),
         }
     }
 }
