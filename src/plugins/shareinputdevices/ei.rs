@@ -853,16 +853,38 @@ fn build_xkb_state(fd: &OwnedFd, size: u32) -> Result<xkb::State, Error> {
         err: format!("keymap utf8: {e}"),
     })?;
     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-    let keymap = xkb::Keymap::new_from_string(
+    // M3 keymap-parse fallback mirrors inputcapturesession.cpp:61-64.
+    // The cpp warns + falls back to `xkb_keymap_new_from_names(ctx,
+    // nullptr, NO_FLAGS)` (the default RMLVO keymap) when the
+    // delivered buffer does not parse; without the fallback the
+    // keymap-less path leaves `xkb_state` None and the transport
+    // silently drops every key event. The empty strings here are
+    // the binding's "use defaults" convention — empty CStrings
+    // dereference to `\0`, which libxkbcommon treats identically to
+    // NULL for each RMLVO field. Only if the default keymap itself
+    // fails do we surface Err to the caller.
+    let keymap = match xkb::Keymap::new_from_string(
         &context,
         text,
         xkb::KEYMAP_FORMAT_TEXT_V1,
         xkb::KEYMAP_COMPILE_NO_FLAGS,
-    )
-    .ok_or_else(|| Error::Xkb {
-        size,
-        err: "xkb_keymap_new_from_string returned null".into(),
-    })?;
+    ) {
+        Some(km) => km,
+        None => {
+            warn!(
+                size,
+                event = "shareinputdevices_ei_keymap_parse_failed",
+                "Failed to parse keymap; falling back to the default RMLVO keymap"
+            );
+            xkb::Keymap::new_from_names(
+                &context, "", "", "", "", None, xkb::KEYMAP_COMPILE_NO_FLAGS,
+            )
+            .ok_or_else(|| Error::Xkb {
+                size,
+                err: "default keymap (new_from_names) also failed".into(),
+            })?
+        }
+    };
     Ok(xkb::State::new(&keymap))
 }
 

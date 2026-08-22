@@ -628,6 +628,121 @@ fn keyboard_keymap_loads_and_emits_text() {
 }
 
 #[test]
+fn garbage_keymap_falls_back_to_default_and_key_delivery_survives() {
+    // Red-before-green oracle for Fix 5: the cpp producer at
+    // inputcapturesession.cpp:61-64 falls back to
+    // `xkb_keymap_new_from_names(ctx, nullptr, NO_FLAGS)` (the
+    // default RMLVO keymap) when the delivered buffer doesn't
+    // parse, keeping key delivery alive. Our `build_xkb_state`
+    // pre-fix returned Err on parse failure, the dispatch path
+    // left `xkb_state` None, and every `KeyboardKey` event after
+    // that was silently dropped — total key loss.
+    //
+    // Deliver a keymap fd whose bytes are NOT a valid
+    // xkb_keymap_text_v1 document (random ASCII garbage). The
+    // receiver must (a) not panic, (b) warn + parse the default
+    // keymap, and (c) deliver the next key event normally. We
+    // press KEY_H (any letter key on a default keymap yields a
+    // non-empty UTF-8 keysym text) and assert a WireBody::Key
+    // arrives. The exact text is environment-dependent (the
+    // default RMLVO layout is whatever the host's XKB env
+    // resolves), so we do not pin it — only that key delivery
+    // survived the parse failure.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        let seat = connection.add_seat(
+            Some("test"),
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
+        );
+        let garbage = "this is definitely not a valid xkb keymap \
+                       text -- it should fail parsing and trigger the \
+                       fallback path"
+            .to_string();
+        let device = seat.add_device(
+            Some("test-kb"),
+            DeviceType::Virtual,
+            DeviceCapability::Keyboard.into(),
+            move |device| {
+                let kb: eis::Keyboard = device
+                    .interface()
+                    .expect("keyboard interface available pre-done");
+                let (memfd, size) = keymap_fd(&garbage);
+                kb.keymap(EisKeymapType::Xkb, size, memfd.as_fd());
+            },
+        );
+        device.resumed();
+        device.start_emulating(1);
+
+        // Give the pump time to (a) receive DeviceAdded, (b) run
+        // build_xkb_state, (c) hit the parse failure, (d) fall
+        // back to the default keymap, (e) install the new state.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        _receiver.handle_activated(1).await;
+
+        // Press KEY_H. Default RMLVO keymaps always bind H to a
+        // printable keysym (text != empty), so the M4-deferred
+        // suppression does NOT fire and a body must arrive.
+        key_event(&connection, &device, 35, true);
+
+        let body = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("key timed out — garbage keymap must NOT kill key delivery")
+            .expect("wire rx closed");
+        // We don't pin text: the default layout is environment-
+        // provided and varies across CI hosts. We do pin that
+        // the body is a Key event (not a scroll, motion, button)
+        // so a regression that drops the dispatch arm entirely
+        // would still fail this assertion loudly.
+        match body {
+            rust_connect::plugins::shareinputdevices::ei::WireBody::Key(json) => {
+                let obj = json.as_object().expect("key body is an object");
+                // Sanity: the key text field exists and is a
+                // string. Default layouts bind H to a non-empty
+                // keysym on every libxkbcommon-equipped host
+                // we've observed; if a future CI host produces an
+                // empty text here, the fallback path is still
+                // sound (we'd just hit the M4-deferred
+                // suppression) — fail loudly so the change is
+                // visible, not silent.
+                let text = obj
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .expect("key field must be present and a string");
+                assert!(
+                    !text.is_empty(),
+                    "default keymap on this host bound KEY_H to an empty \
+                     keysym; the fallback did not actually install a usable \
+                     keymap (got json={})",
+                    json
+                );
+            }
+            other => panic!(
+                "expected a WireBody::Key from KEY_H on the default keymap; got {:?}",
+                other
+            ),
+        }
+
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit");
+    });
+}
+
+#[test]
 fn keymap_with_trailing_nul_parses_and_emits_text() {
     // Red-before-green oracle for the trailing-NUL strip in
     // `build_xkb_state`. Real portal delivery writes the keymap
