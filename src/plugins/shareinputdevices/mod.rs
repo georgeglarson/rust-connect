@@ -671,32 +671,11 @@ impl ShareInputDevicesPlugin {
         let release_callback = self.release_callback.clone();
         let activation_in_flight = self.activation_in_flight.clone();
 
-        // `self` in the spawn closure is `&ShareInputDevicesPlugin`
-        // — every method we need is `&self`. We rebuild an
-        // activate/deactivate call site as plain `self.method()`
-        // calls via the helper closures below, but the cleanest
-        // path is to use the methods through a typed trait
-        // object... actually the methods are inherent so a
-        // self-clone would work, but plugin construction is
-        // locked behind `new()` not `Arc::new()`. The right
-        // shape here: capture `self`'s pieces we need into Arcs
-        // (already done above), and rebuild the activate call
-        // site by reaching into the same `Arc`-wrapped state.
-        //
-        // For activate/deactivate we call back into the plugin's
-        // inherent methods on a clone; the methods themselves are
-        // `&self`, so cloning via Arc is the only way. We don't
-        // have an `Arc<ShareInputDevicesPlugin>` yet — add a
-        // helper that takes `&self` and returns an `Arc` only
-        // if a probe has stashed state, OR have activate/
-        // deactivate take `Arc<Self>`.
-        //
-        // Simplest path: split activate/deactivate so each takes
-        // a shared bundle of Arc fields rather than `self`. That
-        // keeps the gate's spawned task free of plugin-Arc
-        // ownership. We do that by adding free-function helpers
-        // keyed on the Arc bundle; the plugin methods become thin
-        // wrappers. See `do_activate` / `do_deactivate` below.
+        // The gate's spawned task cannot hold the plugin (it is not
+        // Arc-wrapped at construction), so activation/deactivation
+        // live in the free functions `do_activate` / `do_deactivate`,
+        // keyed on the Arc-shared field bundle cloned above; the
+        // plugin methods are thin wrappers.
 
         // Capture the configured edge — the gate is a free
         // function call site, not `self.method()`, so it can't
@@ -973,15 +952,15 @@ async fn do_activate(
     // call bails here. Together: concurrent arms are serialised;
     // post-success re-entries are guarded.
     //
-    // The guard MUST be installed BEFORE the swap: an early-bail
-    // path that returns without resetting the flag would leave
-    // `activation_in_flight` stuck at TRUE, and no future
-    // `do_activate` call could ever succeed again (the swap would
-    // always observe the stuck TRUE and bail). The guard's Drop
-    // runs whether the function exits via early return, error, or
-    // normal completion — by binding the guard first, every path
-    // is covered.
-    let _guard = ActivationGuard::new(activation_in_flight);
+    // Swap FIRST, bind the guard only if this call won the flag.
+    // Binding the guard before the swap would be wrong: the losing
+    // arm's Drop would clear a flag it never owned, unblocking a
+    // THIRD arm while the winner's v1 sequence is still running —
+    // the double-CreateSession shape this flag exists to prevent.
+    // Binding after a successful swap still covers every exit from
+    // this point (early return, error, completion) via Drop, which
+    // is what closes the stuck-TRUE failure the pre-fix guard had
+    // (an early-bail path that returned without resetting the flag).
     if activation_in_flight.swap(true, Ordering::SeqCst) {
         warn!(
             event = "shareinputdevices_activate_in_flight",
@@ -990,6 +969,7 @@ async fn do_activate(
         );
         return;
     }
+    let _guard = ActivationGuard::new(activation_in_flight);
 
     let already_active = portal_session
         .lock()
