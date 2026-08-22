@@ -77,7 +77,11 @@
 //! release either (:275-279).
 //!
 //! **Teardown** (inputcapturesession.cpp:116-124): Session.Close +
-//! ei_unref. M2 does Close only; ei_unref is M3.
+//! ei_unref. M2 does Close only; ei_unref is M3. M4 owns the receiver
+//! across the dedicated-thread boundary; the disconnect watcher flips
+//! `backend_available=false` but does NOT close the session (mirrors
+//! the cpp's `~InputCaptureSession` keeping `m_session` alive across
+//! EI death).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -91,6 +95,7 @@ use zbus::zvariant::{Fd, OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MessageStream};
 
 use crate::plugins::shareinputdevices::barrier::{self, Zone};
+use crate::plugins::shareinputdevices::ei::EiReceiver;
 use crate::plugins::shareinputdevices::Edge;
 use crate::utils::errors::{Error, Result};
 
@@ -435,11 +440,28 @@ pub struct PortalSession {
     /// The current zone_set id, kept for the stale-discard filter on
     /// ZonesChanged (inputcapturesession.cpp:326).
     current_zone_set: Arc<Mutex<u32>>,
-    /// The fd returned by ConnectToEIS. Stashed only; M3 will wrap
-    /// it in a libei / reis receiver. Storing it in the struct
-    /// keeps it alive past `start()` — dropping the OwnedFd would
-    /// close the socket and break the EI receiver M3 will install.
-    _ei_fd: std::os::unix::io::OwnedFd,
+    /// The fd returned by ConnectToEIS. M4 moves ownership into the
+    /// `EiReceiver` via `take_ei_fd()`; before that call the field
+    /// is `Some` and the fd is alive (dropping the OwnedFd would
+    /// close the socket and break the EI receiver the caller is
+    /// about to install). After `take_ei_fd` returns, the field is
+    /// `None`; the receiver owns the fd for the rest of its life.
+    ei_fd: Option<std::os::unix::io::OwnedFd>,
+    /// Late-binding slot for the M4 EI receiver. The signal handler
+    /// reads it on every `Activated` and drains the gate if it is
+    /// populated; until populate-time (activate_portal_session
+    /// constructs the receiver from the fd) the slot is `None` and
+    /// the drain step is a no-op. A late populate is safe because
+    /// the gate's `should_queue()` condition (eis_sequence >
+    /// activation_id) remains armed while slot is empty: any EI
+    /// events that arrive between session start and receiver
+    /// construction queue and replay when the receiver finally
+    /// attaches AND the D-Bus Activated signal arrives. The
+    /// `std::sync::Mutex` is held only long enough to clone the
+    /// `Arc`; the async `handle_activated` runs without the guard
+    /// (the M3 lock-ordering contract — `ei::EiReceiver::handle_activated`
+    /// is self-contained once the `Arc` is in hand).
+    ei_receiver_slot: Arc<Mutex<Option<Arc<EiReceiver>>>>,
     edge: Edge,
     /// Sender for Activated events. The owner translates each into
     /// the M1 planner's `ShareInputDevicesRequest` body and pushes
@@ -687,6 +709,7 @@ impl PortalSession {
         let current_zone_set = Arc::new(Mutex::new(zones.zone_set));
         let barrier_origin = Arc::new(Mutex::new((barrier_rect.x1, barrier_rect.y1)));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let ei_receiver_slot: Arc<Mutex<Option<Arc<EiReceiver>>>> = Arc::new(Mutex::new(None));
         spawn_signal_handler(
             signal_stream,
             conn.clone(),
@@ -695,6 +718,7 @@ impl PortalSession {
             current_zone_set.clone(),
             barrier_origin.clone(),
             activated_tx.clone(),
+            ei_receiver_slot.clone(),
             shutdown_rx,
         );
 
@@ -704,7 +728,8 @@ impl PortalSession {
             session_handle,
             closed: false,
             current_zone_set,
-            _ei_fd: ei_fd,
+            ei_fd: Some(ei_fd),
+            ei_receiver_slot,
             edge,
             activated_tx,
             _shutdown_tx: Some(shutdown_tx),
@@ -784,6 +809,46 @@ impl PortalSession {
     /// and for tests asserting the session object is exposed.
     pub fn session_handle(&self) -> &OwnedObjectPath {
         &self.session_handle
+    }
+
+    /// Move the ConnectToEIS fd out of the session. After this call
+    /// the session no longer owns the fd; the caller has. M4 wiring
+    /// in `activate_portal_session` calls this exactly once and hands
+    /// the fd to `EiReceiver::new`. Dropping the fd would close the
+    /// EIS stream — the receiver takes ownership so the socket stays
+    /// open for the lifetime of the EI handshake + event pump. A
+    /// second call panics: the session cannot resurrect an fd it no
+    /// longer holds, and an unrecorded call site would silently leave
+    /// the receiver side broken.
+    pub fn take_ei_fd(&mut self) -> std::os::unix::io::OwnedFd {
+        self.ei_fd
+            .take()
+            .expect("PortalSession::take_ei_fd called twice — second call has no fd to hand")
+    }
+
+    /// Late-binding slot for the M4 EI receiver. M4 wiring in
+    /// `activate_portal_session` calls this once after building
+    /// the receiver, populating the slot the signal handler's
+    /// `Activated` arm reads. A second call replaces — the test
+    /// seam can swap a fake receiver without disturbing the
+    /// handler's lifetime, and a production race where two
+    /// `activate_portal_session` calls overlap is a programming
+    /// error (the plugin guards against re-entry elsewhere; here
+    /// we just keep the slot's most-recent value).
+    pub fn populate_ei_receiver(&self, receiver: Arc<EiReceiver>) {
+        *self
+            .ei_receiver_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(receiver);
+    }
+
+    /// Read-only access to the receiver slot — used by tests that
+    /// want to observe whether the populate path has run. The
+    /// production code never reads the slot (only the signal
+    /// handler task spawned in `start` does).
+    #[cfg(test)]
+    pub fn ei_receiver_slot(&self) -> Arc<Mutex<Option<Arc<EiReceiver>>>> {
+        self.ei_receiver_slot.clone()
     }
 }
 
@@ -889,11 +954,28 @@ async fn session_signal_stream(conn: &Connection) -> Result<MessageStream> {
 
 /// Spawn the signal-handling task. It runs until the
 /// shutdown_rx fires OR the connection drops. Each signal is
-/// dispatched in order: Activated → tx; Deactivated/Disabled →
+/// dispatched in order: Activated → tx (consumer) + drain EI gate
+/// if the receiver slot is populated; Deactivated/Disabled →
 /// logged; ZonesChanged → re-GetZones + re-SetPointerBarriers
 /// (filtered by zone_set id monotonicity — inputcapturesession.cpp:326).
 /// The `stream` is created by the CALLER (before Enable) so the
 /// AddMatch ordering against Enable is real.
+///
+/// **Activated ordering.** The handler does (1) decode +
+/// `activated_tx.send` (sync, non-blocking) THEN (2) `.await`
+/// `receiver.handle_activated(activation_id)`. Step 1 queues the
+/// `shareinputdevices.request` packet event in the consumer's
+/// mpsc; step 2 drains the EI gate and queues the
+/// `kdeconnect.mousepad.request` packet events. The consumer
+/// uses `tokio::select!` with `biased;` so the shareinputdevices
+/// request is processed BEFORE the first mousepad packet on
+/// every select iteration — the wire order on the receiver side
+/// matches the cpp's `started(deltax, deltay)` → `for (event :
+/// queuedEiEvents) handleEiEvent(event)` order (inputcapturesession
+/// .cpp:296-300). The drain cannot land AFTER the first relayed
+/// shareinputdevices.request because the consumer cannot make
+/// progress until it observes the channel — and the channel
+/// received both events before it was scheduled to run.
 #[allow(clippy::too_many_arguments)]
 fn spawn_signal_handler(
     mut stream: MessageStream,
@@ -903,6 +985,7 @@ fn spawn_signal_handler(
     current_zone_set: Arc<Mutex<u32>>,
     barrier_origin: Arc<Mutex<(i32, i32)>>,
     activated_tx: mpsc::UnboundedSender<ActivatedEvent>,
+    ei_receiver_slot: Arc<Mutex<Option<Arc<EiReceiver>>>>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     tokio::spawn(async move {
@@ -948,11 +1031,48 @@ fn spawn_signal_handler(
                     };
                     match member.as_str() {
                         "Activated" => {
-                            handle_activated(
+                            // Step 1: decode + send ActivatedEvent to
+                            // the consumer. Returns the activation_id
+                            // so we can drive the EI gate drain in
+                            // step 2 with the same value the consumer
+                            // just saw.
+                            if let Some(activation_id) = handle_activated(
                                 &msg.body(),
                                 &activated_tx,
                                 &barrier_origin,
-                            );
+                            ) {
+                                // Step 2: drain the EI gate. The slot
+                                // is None while the M4 wiring is
+                                // mid-construct (between PortalSession
+                                // ::start and populate_ei_receiver);
+                                // those events stay queued and replay
+                                // on the next Activated once the
+                                // receiver is in place. We clone the
+                                // Arc out of the slot and release the
+                                // std::sync lock BEFORE awaiting —
+                                // guards are !Send and the receiver's
+                                // pump future is !Send, but the
+                                // already-running task here is on a
+                                // multithread runtime; holding the
+                                // std::sync::Mutex across an .await
+                                // would block the runtime.
+                                let receiver = {
+                                    let guard = ei_receiver_slot
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    guard.as_ref().cloned()
+                                };
+                                if let Some(r) = receiver {
+                                    r.handle_activated(activation_id).await;
+                                } else {
+                                    debug!(
+                                        activation_id,
+                                        event = "shareinputdevices_activated_no_receiver",
+                                        "Activated received before EI receiver attached; \
+                                         gate drain deferred until receiver populates"
+                                    );
+                                }
+                            }
                         }
                         "Deactivated" => {
                             debug!(event = "shareinputdevices_portal_deactivated",
@@ -1013,13 +1133,13 @@ fn handle_activated(
     body: &zbus::message::Body,
     activated_tx: &mpsc::UnboundedSender<ActivatedEvent>,
     barrier_origin: &Arc<Mutex<(i32, i32)>>,
-) {
+) -> Option<u32> {
     let (_, opts): (OwnedObjectPath, HashMap<String, OwnedValue>) = match body.deserialize() {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, event = "shareinputdevices_activated_decode",
                   "Activated body decode failed");
-            return;
+            return None;
         }
     };
     let activation_id = opts
@@ -1038,7 +1158,7 @@ fn handle_activated(
                 event = "shareinputdevices_activated_no_cursor",
                 "Activated signal missing cursor_position (dd)"
             );
-            return;
+            return None;
         }
     };
     let (bx, by) = *barrier_origin.lock().unwrap_or_else(|e| e.into_inner());
@@ -1053,6 +1173,7 @@ fn handle_activated(
         warn!(error = %e, event = "shareinputdevices_activated_send_failed",
               "Activated receiver dropped");
     }
+    Some(activation_id)
 }
 
 /// Re-fetch zones and re-arm barriers after ZonesChanged. Builds its
