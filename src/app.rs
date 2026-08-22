@@ -82,6 +82,7 @@ impl AppState {
             pairing_handler.clone(),
             settings.data_dir.clone(),
             enable_input,
+            broadcaster.clone(),
         );
 
         // Populate the runcommand allowlist from the config file at boot.
