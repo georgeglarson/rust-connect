@@ -1,4 +1,15 @@
 #!/bin/bash
+# Build host requirements (NOT installed by this script — install them
+# yourself before running):
+#   - Rust toolchain (rustup)
+#   - pkg-config, libssl-dev, libdbus-1-dev, libxkbcommon-dev
+#     libxkbcommon-dev is required because the shareinputdevices M3
+#     EI transport links libxkbcommon unconditionally (the xkbcommon
+#     crate's #[link]); the release binary's DT_NEEDS includes
+#     libxkbcommon.so.0, so the .deb's Depends line in
+#     packaging/deb/DEBIAN/control carries libxkbcommon0 too. This
+#     script only invokes cargo + dpkg-deb; it does not install
+#     apt packages itself.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
