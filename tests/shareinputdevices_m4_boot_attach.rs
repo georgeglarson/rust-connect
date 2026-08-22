@@ -1,17 +1,23 @@
-//! Integration test for the M4-wire boot-time activation hookup
-//! (Task #1042) — proves that calling `enable_session_backend()`
-//! against a passed probe drives the full v1 session sequence
+//! Integration test for the peer-gated activation boot path (Task
+//! #1042 fix lane B, panel M4 round 1) — proves that a CAPABLE
+//! peer connect drives the full v1 session sequence
 //! (CreateSession → ConnectToEIS → GetZones → SetPointerBarriers →
-//! Enable) WITHOUT a manual `activate_portal_session()` call.
+//! Enable) on the activation gate, NOT the boot path.
 //!
-//! **The contract this pins.** Before this lane,
-//! `enable_session_backend` probed the portal, stashed the
-//! connection, and STOPPED — the producer stayed INERT. The M3 EI
-//! transport attaching was supposed to be the trigger. That trigger
-//! never came, so the plugin's capability never advertised. This
-//! test pins the lane's fix: the boot path now drives the full v1
-//! sequence in one shot, mirroring the cpp upstream where the
-//! plugin's `enable()` slot starts the InputCapture session.
+//! **What changed in this lane.** Pre-fix, `enable_session_backend`
+//! probed + stashed + immediately drove v1 on the spot. The fix
+//! splits the boot path from the activation path: the boot path
+//! probes + stashes + spawns the capability gate, and the gate
+//! drives v1 when a `StateChanged{Connected}` event whose device
+//! advertises `kdeconnect.shareinputdevices.request` arrives.
+//!
+//! **What this test still pins (the preserved contract).**
+//! - The order of v1 calls, with `ConnectToEIS` strictly before
+//!   `Enable` (spec InputCapture.xml:359-360).
+//! - The capability-honesty contract: once the sequence completes,
+//!   `is_backend_available()` returns true and
+//!   `outgoing_capabilities()` advertises
+//!   `kdeconnect.shareinputdevices.request`.
 //!
 //! **The seam it uses.** `enable_session_backend` opens
 //! `zbus::Connection::session()` itself (mirroring
@@ -48,8 +54,11 @@ use reis::eis::{self};
 use reis::handshake::EisHandshaker;
 use zbus::zvariant::OwnedValue;
 
+use rust_connect::device::types::{DeviceEvent, DeviceState};
+use rust_connect::device::EventBroadcaster;
 use rust_connect::plugins::shareinputdevices::ShareInputDevicesPlugin;
 use rust_connect::plugins::Plugin;
+use rust_connect::protocol::{CertificateManager, ConnectionManager};
 
 // ============ Private-bus plumbing (mirrors shareinputdevices_portal_lifecycle) ============
 
@@ -459,17 +468,21 @@ fn spawn_minimal_eis_peer(
 
 // ============ TESTS ============
 
-/// The lane's load-bearing test. One call to
-/// `enable_session_backend()` against a passed probe drives the
-/// FULL v1 session sequence (CreateSession → ConnectToEIS →
+/// The lane's load-bearing test. A capable peer connect drives
+/// the FULL v1 session sequence (CreateSession → ConnectToEIS →
 /// GetZones → SetPointerBarriers → Enable) on the fake's call
 /// ledger — with NO manual `activate_portal_session()` call. The
 /// plugin's `portal_backend_available()` flips true and the
 /// `portal_session` slot is populated.
 ///
-/// **What this pins:**
-/// - The brief's contract: boot-time activation after a passed
-///   probe, mirroring the cpp upstream's plugin enable path.
+/// **What changed in this lane.** Pre-fix, `enable_session_backend`
+/// probed + stashed + immediately drove v1 on the spot. The fix
+/// splits the boot path from the activation path: the boot path
+/// probes + stashes + spawns the capability gate, and the gate
+/// drives v1 when a `StateChanged{Connected}` event whose device
+/// advertises `kdeconnect.shareinputdevices.request` arrives.
+///
+/// **What this still pins (the preserved contract).**
 /// - The order of v1 calls, with `ConnectToEIS` strictly before
 ///   `Enable` (spec InputCapture.xml:359-360).
 /// - The capability-honesty contract: once the sequence completes,
@@ -477,7 +490,7 @@ fn spawn_minimal_eis_peer(
 ///   `outgoing_capabilities()` advertises
 ///   `kdeconnect.shareinputdevices.request`.
 #[tokio::test(flavor = "multi_thread")]
-async fn enable_session_backend_drives_full_v1_sequence() {
+async fn capable_peer_connect_drives_full_v1_sequence() {
     let _bus_lock = BUS.lock().await;
 
     // Install the socketpair fd BEFORE the fake is set up: the
@@ -500,27 +513,60 @@ async fn enable_session_backend_drives_full_v1_sequence() {
 
     // The minimal EIS peer completes the handshake so the
     // receiver's `start()` returns, then KEEPS ITS END ALIVE
-    // until this scope ends — Fix 3 narrows the boot-path
-    // ordering race between `backend_available.store(true)` and
-    // the disconnect watcher, but does not eliminate it. Keeping
-    // the peer alive across the assertion removes the EOF path
-    // that the watcher would otherwise observe. Passing `None`
-    // means "stay alive until the JoinHandle drops"; tests that
-    // care about the disconnect path drop their own oneshot.
+    // until this scope ends. Without a peer the pump would see
+    // EOF and the disconnect watcher would flip
+    // `backend_available=false` before the test asserts. Passing
+    // `None` means "stay alive until the JoinHandle drops".
     let _peer_thread = spawn_minimal_eis_peer(peer_stream, None);
 
-    // The boot path. `enable_session_backend` is what bootstrap.rs
-    // calls; with this lane's hookup it now drives the v1 sequence
-    // in one shot.
-    let plugin = ShareInputDevicesPlugin::new();
-    plugin.enable_session_backend().await;
+    // Build a real ConnectionManager + EventBroadcaster so the
+    // gate can read peer caps + receive the StateChanged event.
+    // The plugin needs both wired for the activation gate to
+    // fire (see ShareInputDevicesPlugin::with_event_broadcaster).
+    let cert_dir = tempfile::tempdir().expect("cert tempdir");
+    let cert_manager = Arc::new(CertificateManager::new(cert_dir.path().to_path_buf()));
+    let cm = Arc::new(ConnectionManager::new(cert_manager).expect("ConnectionManager::new"));
+    let broadcaster = Arc::new(EventBroadcaster::new(64, "device"));
+    let plugin = ShareInputDevicesPlugin::new()
+        .with_connection_manager(cm.clone())
+        .with_event_broadcaster(broadcaster.clone());
 
-    // The v1 sequence is driven synchronously inside
-    // `PortalSession::start` (zbus call_method + Response await), so
-    // by the time `enable_session_backend` returns, the ledger has
-    // the full sequence. A short poll guards against any
-    // unlikely delay between the EI thread's `start()` returning
-    // and the disconnect watcher firing.
+    // Boot path: probe + stash + spawn gate. The fake portal
+    // sees NO CreateSession yet — that's the headline behavior
+    // the fix introduces.
+    plugin.enable_session_backend().await;
+    assert!(
+        state.lock().unwrap().calls.is_empty(),
+        "boot path alone must not drive v1; saw calls: {:?}",
+        state.lock().unwrap().calls
+    );
+
+    // Mark the test peer as capable + connected, then broadcast
+    // the StateChanged{Connected} event. The gate's
+    // subscription receives the event, evaluates the consumer
+    // set, and runs the v1 sequence.
+    let device_id = "bootattach-peer";
+    cm.record_peer_capabilities(
+        &device_id.to_string(),
+        &[
+            "kdeconnect.shareinputdevices.request".to_string(),
+            "kdeconnect.mousepad.request".to_string(),
+        ],
+        &["kdeconnect.ping".to_string()],
+    )
+    .await;
+    cm.mark_fake_connected_for_test(device_id);
+    broadcaster.broadcast(DeviceEvent::StateChanged {
+        device_id: device_id.to_string(),
+        old_state: DeviceState::Paired,
+        new_state: DeviceState::Connected,
+    });
+
+    // Wait for the v1 sequence to land. The v1 calls themselves
+    // happen synchronously inside `PortalSession::start`
+    // (zbus call_method + Response await). The async bit is the
+    // gate's subscription waking up + scheduling the activation;
+    // a 2s bound is plenty for a tokio task to wake and run.
     let deadline = Instant::now() + Duration::from_secs(2);
     let calls = loop {
         let calls = state.lock().unwrap().calls.clone();
@@ -555,46 +601,65 @@ async fn enable_session_backend_drives_full_v1_sequence() {
             "SetPointerBarriers",
             "Enable"
         ],
-        "enable_session_backend must drive the full v1 sequence in one shot"
+        "capable peer connect must drive the full v1 sequence"
     );
 
-    // Capability honesty: after a successful start the plugin
-    // advertises its outgoing capability (the contract
-    // outgoing_capabilities() asserts on — see mod.rs:919-925).
+    // Capability honesty: once activation completes, the plugin
+    // advertises its outgoing capability. The EI pump must also
+    // have delivered wire_rx + disconnect_rx to the main thread
+    // before `backend_available` flips — poll the flag with a
+    // generous bound.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if plugin.portal_backend_available() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(
         plugin.portal_backend_available(),
-        "portal_backend_available must be true after enable_session_backend completes the v1 sequence"
+        "portal_backend_available must be true after activation completes"
     );
     assert_eq!(
         plugin.outgoing_capabilities(),
         vec!["kdeconnect.shareinputdevices.request".to_string()],
-        "outgoing capability must advertise after enable_session_backend completes the v1 sequence"
+        "outgoing capability must advertise after activation completes"
     );
 }
 
-/// Fix 2 (P2) — bound the boot-path awaits with a timeout. The
-/// production code awaits `wire_rx_rx` / `disconnect_rx_rx` while
-/// the dedicated pump thread completes the EIS handshake; a
+/// Fix 2 (P2) — bound the activation-pump awaits with a timeout.
+/// The production code awaits `wire_rx_rx` / `disconnect_rx_rx`
+/// while the dedicated pump thread completes the EIS handshake; a
 /// portal that returns a valid-but-silent EIS fd (a peer that
-/// completes the D-Bus handshake but never speaks EI) parks
-/// `enable_session_backend` forever — that sits inline on the
-/// daemon boot path (`bootstrap → create_state → Daemon::new`),
-/// so the entire daemon never reaches `run()`, listeners never
-/// bind, and the watchdog never starts. The fix wraps both
-/// awaits in `tokio::time::timeout(BOOT_PATH_PUMP_DELIVERY_TIMEOUT)`
-/// and degrades to the documented warn-and-stay-inert shape on
+/// accepts the socketpair but never speaks EI) parks the
+/// activation forever. Pre-fix the boot path called
+/// `activate_portal_session` synchronously and the hang wedged the
+/// daemon boot; the fix wraps both awaits in
+/// `tokio::time::timeout(BOOT_PATH_PUMP_DELIVERY_TIMEOUT)` and
+/// degrades to the documented warn-and-stay-inert shape on
 /// expiry; the pump thread keeps running to its own end.
+///
+/// **Trigger shape.** With the peer-gated activation, the boot
+/// path no longer activates — it probes + stashes + spawns the
+/// gate. Activation now happens on a capable peer connect, which
+/// is the path this test exercises. The boot path's
+/// `enable_session_backend` returns near-instantly because it
+/// never tries to talk to an EIS peer; the hang it used to guard
+/// against is structurally impossible. The boot-path pump
+/// timeout is still load-bearing — it just lives inside
+/// `do_activate` now, and this test pins that it still bounds the
+/// wait when activation fires against a silent EIS peer.
 ///
 /// **Test shape (per the brief).** A fake EIS peer that completes
 /// the portal handshake but never speaks EI: the fake portal's
 /// ConnectToEIS hands back the socketpair fd; the peer thread
 /// holds the other end alive (so the socket doesn't EOF) but
 /// never sends a HELLO, so `receiver.start()` blocks inside
-/// `handshake_tokio`. `enable_session_backend` MUST return
-/// within the boot-path timeout (NOT hang), and the backend MUST
-/// stay un-advertised.
+/// `handshake_tokio`. Activation MUST return within the
+/// boot-path timeout (NOT hang), and the backend MUST stay
+/// un-advertised.
 #[tokio::test(flavor = "multi_thread")]
-async fn enable_session_backend_times_out_on_silent_eis_peer() {
+async fn activation_times_out_on_silent_eis_peer() {
     let _bus_lock = BUS.lock().await;
 
     let (client_stream, peer_stream) = UnixStream::pair().expect("UnixStream::pair");
@@ -618,52 +683,104 @@ async fn enable_session_backend_times_out_on_silent_eis_peer() {
     // reads, writes, or runs an `eis::Context`. The receiver's
     // `handshake_tokio` blocks waiting for a peer's HELLO that
     // never arrives — exactly the silent-EIS shape the brief
-    // targets. The thread's only purpose is to keep `peer_stream`
-    // alive across the test; when the thread exits (test end +
-    // `peer_stream` drop in this scope) the socketpair closes
-    // and the pump thread's EOF arm would fire — irrelevant to
-    // this test, but it's why the thread is alive for the
-    // `enable_session_backend` call's duration.
+    // targets.
     let _silent_peer = std::thread::spawn(move || {
         let _hold_open = peer_stream;
         std::thread::sleep(Duration::from_secs(30));
     });
 
-    let plugin = ShareInputDevicesPlugin::new();
+    // Wire a real ConnectionManager + EventBroadcaster so the
+    // gate can drive activation.
+    let cert_dir = tempfile::tempdir().expect("cert tempdir");
+    let cert_manager = Arc::new(CertificateManager::new(cert_dir.path().to_path_buf()));
+    let cm = Arc::new(ConnectionManager::new(cert_manager).expect("ConnectionManager::new"));
+    let broadcaster = Arc::new(EventBroadcaster::new(64, "device"));
+    let plugin = ShareInputDevicesPlugin::new()
+        .with_connection_manager(cm.clone())
+        .with_event_broadcaster(broadcaster.clone());
 
-    // The boot path. With the fix, the await on `wire_rx_rx`
-    // times out after `BOOT_PATH_PUMP_DELIVERY_TIMEOUT` (5s) and
-    // the function returns inert. Without the fix, this would
-    // hang forever — and the outer `tokio::time::timeout` below
-    // would fire instead. We give the test a generous outer
-    // bound (15s — 3x the production timeout) so the test fails
-    // loudly if either the fix is missing or the timeout
-    // constant drifts to a much larger value.
-    let outer = Duration::from_secs(15);
+    // The boot path is now fast — it just probes + stashes. The
+    // brief hangs it used to guard against are structurally
+    // impossible here. We time the boot-path call to pin that
+    // it stays near-instant.
     let inner_start = Instant::now();
-    let result = tokio::time::timeout(outer, plugin.enable_session_backend()).await;
-    let inner_elapsed = inner_start.elapsed();
+    plugin.enable_session_backend().await;
+    let boot_elapsed = inner_start.elapsed();
+    assert!(
+        boot_elapsed < Duration::from_secs(2),
+        "boot path must not hang on a silent EIS peer (took {:?}); \
+         the brief's hang-on-silent-peer footgun is structurally \
+         impossible after the boot/activation split",
+        boot_elapsed,
+    );
+
+    // Now drive activation via the gate. The capability map
+    // advertises the consumer cap; the broadcast tells the gate
+    // the device is connected. The gate schedules activation,
+    // which awaits the EI pump's `wire_rx_rx` oneshot — and the
+    // silent peer never delivers, so the
+    // `BOOT_PATH_PUMP_DELIVERY_TIMEOUT` (5s) bounds the wait.
+    let device_id = "silent-peer";
+    cm.record_peer_capabilities(
+        &device_id.to_string(),
+        &[
+            "kdeconnect.shareinputdevices.request".to_string(),
+            "kdeconnect.mousepad.request".to_string(),
+        ],
+        &["kdeconnect.ping".to_string()],
+    )
+    .await;
+    cm.mark_fake_connected_for_test(device_id);
+    broadcaster.broadcast(DeviceEvent::StateChanged {
+        device_id: device_id.to_string(),
+        old_state: DeviceState::Paired,
+        new_state: DeviceState::Connected,
+    });
+
+    // Wait for the activation arm to time out. The brief asks
+    // for a generous outer bound (15s — 3x the production
+    // timeout) so the test fails loudly if either the fix is
+    // missing or the timeout constant drifts to a much larger
+    // value. We poll `portal_backend_available` because the
+    // activation runs asynchronously in a spawned task — the
+    // broadcast itself returns immediately, the timeout fires
+    // inside the spawned task after ~5s.
+    let outer = Duration::from_secs(15);
+    let poll_start = Instant::now();
+    let timed_out_cleanly = loop {
+        // The activation-in-flight flag should be cleared by
+        // the timeout path (the guard's Drop runs on every
+        // early-return). If we observe it still TRUE after 6s,
+        // the timeout did NOT fire — the activation hung.
+        if poll_start.elapsed() > Duration::from_secs(6) && !plugin.activation_in_flight_is_clear()
+        {
+            break false;
+        }
+        // Once backend_available stays false for a window AFTER
+        // the 5s timeout would have fired, we know activation
+        // degraded to inert cleanly.
+        if poll_start.elapsed() > Duration::from_secs(7) && !plugin.portal_backend_available() {
+            break true;
+        }
+        if poll_start.elapsed() > outer {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let inner_elapsed = poll_start.elapsed();
 
     assert!(
-        result.is_ok(),
-        "enable_session_backend must return within the boot-path timeout \
-         (got: {:?}, hung at outer {:?})",
+        timed_out_cleanly,
+        "activation must return within the boot-path timeout and stay inert \
+         (elapsed: {:?}, hung at outer {:?}, backend_available: {})",
         inner_elapsed,
         outer,
+        plugin.portal_backend_available(),
     );
-    // Also assert it didn't burn the full outer window — that
-    // would mean the production timeout isn't firing (either the
-    // fix is missing or the constant is misconfigured).
     assert!(
         inner_elapsed < outer,
-        "enable_session_backend returned at the outer timeout bound ({:?}); \
+        "activation returned at the outer timeout bound ({:?}); \
          the production boot-path timeout did not fire",
-        inner_elapsed,
-    );
-    assert!(
-        inner_elapsed >= Duration::from_secs(4),
-        "enable_session_backend returned too fast ({:?}); did the boot-path \
-         timeout actually engage, or did the test fire before the pump could block?",
         inner_elapsed,
     );
 
