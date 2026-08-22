@@ -191,6 +191,22 @@ impl ActivationGate {
         std::mem::take(&mut self.pending).into_iter().collect()
     }
 
+    /// Set `activation_id` WITHOUT draining the pending queue. Used
+    /// by `handle_activated` when the EI pump's `wire_tx` is not
+    /// yet installed (panel M4 round 2 fix — P6): the D-Bus
+    /// `Activated` signal can arrive between `EiReceiver::new` and
+    /// `receiver.start()`, and the EI fd may have captured pointer
+    /// motion in that gap. Draining the queue to a `None` sink
+    /// would discard captured input — instead we leave the queue
+    /// intact and let `start()`'s post-install replay drain it
+    /// when the pump becomes ready. The gate's
+    /// `should_queue()` returns false (we just set
+    /// `activation_id`), so any further events pass through
+    /// normally.
+    pub fn note_activated_retain_pending(&mut self, activation_id: u32) {
+        self.activation_id = activation_id;
+    }
+
     /// The gate condition from `inputcapturesession.cpp:362` —
     /// `m_currentEisSequence > m_currentActivationId`. When true, an
     /// input event should be queued, not passed through.
@@ -376,6 +392,61 @@ impl EiReceiver {
         let (disconnect_tx, disconnect_rx) = tokio::sync::watch::channel(false);
         // Install the sender so handle_activated can drain into it.
         *self.wire_tx.lock().await = Some(wire_tx.clone());
+
+        // **Lossless replay at pump startup (panel M4 round 2 fix
+        // — P6 — start side).** If `handle_activated` saw `wire_tx =
+        // None` (the populate-before-start shape), it set
+        // `activation_id` but LEFT the pending queue intact so the
+        // events could be drained when the pump is ready. Drain
+        // the queue NOW that wire_tx is installed. The gate guard
+        // + wire_tx guard are held together (same lock order as
+        // `handle_activated`) so no pump event can interleave a
+        // re-queue here.
+        let mut gate_guard = self.gate.lock().await;
+        let wire_tx_guard = self.wire_tx.lock().await;
+        if let Some(wire_tx) = wire_tx_guard.as_ref() {
+            let activation_id = gate_guard.activation_id;
+            let pending = gate_guard.note_activated(activation_id);
+            for event in pending {
+                let body = match event {
+                    PendingInput::Motion(dx, dy) => WireBody::Motion(plan_motion(dx, dy)),
+                    PendingInput::Button(b, e) => {
+                        let body = plan_button(b, e);
+                        if body.is_null() {
+                            continue;
+                        }
+                        WireBody::Button(body)
+                    }
+                    PendingInput::ScrollDelta(dx, dy) => {
+                        WireBody::Scroll(plan_scroll(dx, dy, 0, 0))
+                    }
+                    PendingInput::ScrollDiscrete(dx, dy) => {
+                        WireBody::Scroll(plan_scroll_discrete(dx, dy))
+                    }
+                    PendingInput::Key {
+                        text,
+                        special_key,
+                        mods,
+                    } => {
+                        if text.is_empty() {
+                            continue;
+                        }
+                        WireBody::Key(plan_key(
+                            &text,
+                            special_key,
+                            mods.shift,
+                            mods.ctrl,
+                            mods.alt,
+                            mods.super_key,
+                        ))
+                    }
+                };
+                let _ = wire_tx.send(body);
+            }
+        }
+        drop(wire_tx_guard);
+        drop(gate_guard);
+
         let gate = self.gate.clone();
         let bound_caps = self.bound_caps;
         let drive = Self::pump(
@@ -742,13 +813,29 @@ impl EiReceiver {
     pub async fn handle_activated(&self, activation_id: u32) {
         let mut gate_guard = self.gate.lock().await;
         let wire_tx_guard = self.wire_tx.lock().await;
-        let pending = gate_guard.note_activated(activation_id);
+        // **Lossless replay when pump hasn't started (panel M4 round
+        // 2 fix — P6).** Pre-fix this called `note_activated` which
+        // unconditionally drained `pending` and discarded the events
+        // when `wire_tx` was None. The populate-before-start shape
+        // (portal `Activated` lands between `EiReceiver::new` and
+        // `receiver.start()`) drops captured pointer motion in that
+        // window — the populate doc claimed "no-op" but it isn't.
+        // Fix: when `wire_tx` is None, set `activation_id` only and
+        // leave `pending` in place; `start()`'s post-install drain
+        // picks the queue up when the pump is ready. The doc on
+        // `note_activated_retain_pending` records the why.
+        let pending = if wire_tx_guard.is_some() {
+            gate_guard.note_activated(activation_id)
+        } else {
+            gate_guard.note_activated_retain_pending(activation_id);
+            Vec::new()
+        };
         drop(gate_guard);
         let Some(wire_tx) = wire_tx_guard.as_ref() else {
             debug!(
                 activation_id,
                 event = "shareinputdevices_ei_activated_no_pump",
-                "D-Bus Activated arrived before start(); events dropped"
+                "D-Bus Activated arrived before start(); events held pending for pump startup"
             );
             return;
         };
@@ -815,11 +902,16 @@ impl EiReceiver {
     /// after `PortalSession::populate_ei_receiver` and asserting
     /// the deferred D-Bus `Activated` id landed here.
     ///
-    /// Unconditional `pub` (not `#[cfg(test)]`) because the M4
-    /// wiring tests live under `tests/` — `cfg(test)` is not set
-    /// there, and the seam has no caller in production code. The
-    /// method is cheap (a single mutex acquire and a u32 read)
-    /// and named to make the seam's intent obvious.
+    /// **Gated under `test-helpers` (panel M4 round 2 fix — P8
+    /// part 1).** Pre-fix this was unconditional `pub` because
+    /// the M4 wiring tests live under `tests/` where `cfg(test)`
+    /// is not set. The hygiene pass moves it under
+    /// `feature = "test-helpers"` (which the integration test
+    /// Cargo target already enables), so production builds cannot
+    /// reach the seam. The method is cheap (a single mutex acquire
+    /// and a u32 read); the gating is the change, not the access
+    /// cost.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub async fn gate_activation_id_for_test(&self) -> u32 {
         self.gate.lock().await.activation_id
     }
