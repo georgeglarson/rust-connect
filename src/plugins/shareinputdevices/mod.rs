@@ -454,13 +454,18 @@ impl ShareInputDevicesPlugin {
     /// 3. If probe fails, log loudly and leave the plugin inert —
     ///    `is_backend_available()` returns false, capability
     ///    advertisement gates off, no session is started.
-    /// 4. If probe passes, stash the connection and STOP. The
-    ///    barrier is NOT armed here (panel 0e230438 / 573c501e):
-    ///    an armed InputCapture barrier with no EI consumer would
-    ///    capture the user's cursor with nothing forwarding the
-    ///    promised mousepad.request stream. Session start waits for
-    ///    the M3 EI transport, which calls
-    ///    `activate_portal_session` once its receiver exists.
+    /// 4. If probe passes, hand the connection to
+    ///    `activate_portal_session` which runs the full v1
+    ///    sequence and wires the EI receiver. The probe
+    ///    succeeded; the barrier is armed in production. The cpp
+    ///    upstream starts the InputCapture session at plugin
+    ///    enable — boot-time activation after a passed probe is
+    ///    parity, not invention.
+    ///
+    /// A failed activation logs a warn and stays inert (no
+    /// `backend_available` flip, no capability advertisement); the
+    /// plugin never panics or fails daemon boot on a portal-side
+    /// error.
     pub async fn enable_session_backend(&self) {
         let conn = match zbus::Connection::session().await {
             Ok(c) => c,
@@ -483,24 +488,35 @@ impl ShareInputDevicesPlugin {
         }
 
         *self.portal_conn.lock().unwrap_or_else(|e| e.into_inner()) = Some(conn);
-        info!(
-            event = "shareinputdevices_probe_passed_inert",
-            "InputCapture portal available; producer stays INERT until the M3 EI transport attaches (no barrier armed, nothing advertised)"
-        );
+        // Hand the stashed connection to the activation path.
+        // Activation logs its own outcome (success →
+        // shareinputdevices_backend_enabled; failure → one of the
+        // shareinputdevices_*_failed event names) — no need for a
+        // separate "passed" log here.
+        self.activate_portal_session().await;
     }
 
-    /// M3's entry point: start the portal session and go live. Called
-    /// once the EI transport is ready to consume the session's event
-    /// stream — never before, because Enable arms the capture
-    /// barrier. Runs the full v1 sequence (CreateSession →
-    /// ConnectToEIS → GetZones → SetPointerBarriers → Enable), wires
-    /// the release callback to `session.release()`, constructs the
-    /// M4 EI receiver from the ConnectToEIS fd, spawns its drive on a
-    /// dedicated thread (the receiver's pump is `!Send` — see ei.rs
-    /// module doc), and spawns a single consumer task that pumps
-    /// BOTH the `kdeconnect.shareinputdevices.request` packets (from
+    /// Start the portal session and go live. Called from
+    /// `enable_session_backend` after a passed probe (boot path)
+    /// and, in principle, from any other code path that has a
+    /// stashed session-bus connection ready. Runs the full v1
+    /// sequence (CreateSession → ConnectToEIS → GetZones →
+    /// SetPointerBarriers → Enable), wires the release callback to
+    /// `session.release()`, constructs the M4 EI receiver from the
+    /// ConnectToEIS fd, spawns its drive on a dedicated thread
+    /// (the receiver's pump is `!Send` — see ei.rs module doc),
+    /// and spawns a single consumer task that pumps BOTH the
+    /// `kdeconnect.shareinputdevices.request` packets (from
     /// Activated events) and the `kdeconnect.mousepad.request`
     /// packets (from the EI receiver's wire body stream) to peers.
+    ///
+    /// Every internal failure mode (no stashed conn, PortalSession
+    /// start error, EiReceiver::new error, dedicated-thread spawn
+    /// error) degrades to a `warn!` and returns inert — the
+    /// caller (and the daemon boot path) see an ordinary return,
+    /// not a panic. Capability advertisement stays gated on
+    /// `backend_available`, which is only flipped true on the
+    /// success path.
     pub async fn activate_portal_session(&self) {
         let conn = self
             .portal_conn
