@@ -494,9 +494,13 @@ impl ShareInputDevicesPlugin {
     /// stream — never before, because Enable arms the capture
     /// barrier. Runs the full v1 sequence (CreateSession →
     /// ConnectToEIS → GetZones → SetPointerBarriers → Enable), wires
-    /// the release callback to `session.release()`, and spawns the
-    /// Activated → wire-packet consumer task that pumps
-    /// `kdeconnect.shareinputdevices.request` packets to peers.
+    /// the release callback to `session.release()`, constructs the
+    /// M4 EI receiver from the ConnectToEIS fd, spawns its drive on a
+    /// dedicated thread (the receiver's pump is `!Send` — see ei.rs
+    /// module doc), and spawns a single consumer task that pumps
+    /// BOTH the `kdeconnect.shareinputdevices.request` packets (from
+    /// Activated events) and the `kdeconnect.mousepad.request`
+    /// packets (from the EI receiver's wire body stream) to peers.
     pub async fn activate_portal_session(&self) {
         let conn = self
             .portal_conn
@@ -515,8 +519,13 @@ impl ShareInputDevicesPlugin {
         // owns the sender; we own the receiver and turn each event
         // into a kdeconnect.shareinputdevices.request packet.
         let (activated_tx, mut activated_rx) = mpsc::unbounded_channel::<portal::ActivatedEvent>();
-        let session = match portal::PortalSession::start(conn, self.edge, activated_tx).await {
-            Ok(s) => Arc::new(s),
+        // The session is `mut` so we can call `take_ei_fd`
+        // (`PortalSession::take_ei_fd` takes `&mut self` and an
+        // `Arc<PortalSession>` doesn't implement `DerefMut`). We
+        // wrap into `Arc` only after the M4 wiring finishes taking
+        // the fd and populating the receiver slot.
+        let mut session = match portal::PortalSession::start(conn, self.edge, activated_tx).await {
+            Ok(s) => s,
             Err(e) => {
                 warn!(
                     error = %e,
@@ -526,6 +535,184 @@ impl ShareInputDevicesPlugin {
                 return;
             }
         };
+
+        // M4: take the ConnectToEIS fd and construct the EI
+        // receiver. The fd is the hand-off boundary between the
+        // portal half (M2) and the EI half (M3 → M4) — see portal.rs
+        // module doc §2. Once the receiver holds the fd, dropping
+        // either the session or the receiver closes the EIS stream.
+        let ei_fd = session.take_ei_fd();
+        // `EiReceiver::new` returns `Arc<Self>` directly — the
+        // receiver is `Send + Sync` (compile-pinned in ei.rs) so the
+        // Arc can be shared between the signal handler (multithread
+        // runtime, calls `handle_activated`) and the dedicated EI
+        // pump thread (current-thread runtime, awaits `drive`).
+        let receiver = match ei::EiReceiver::new(ei_fd, "shareinputdevices") {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    event = "shareinputdevices_ei_receiver_new_failed",
+                    "EiReceiver::new failed; shareinputdevices plugin stays inert"
+                );
+                return;
+            }
+        };
+        // Late-bind one Arc into the signal handler's slot BEFORE
+        // the second Arc is moved into the dedicated thread. The
+        // signal handler was spawned inside PortalSession::start
+        // with the slot empty; populating it now arms the
+        // Activated-side drain. Safe across the gap because the
+        // gate's `should_queue()` condition holds the line: any EI
+        // events that arrived in the window stay queued and replay
+        // when the D-Bus Activated signal arrives. The handler
+        // clones the Arc out of the slot and releases the
+        // std::sync lock before any `.await` — see portal.rs
+        // `spawn_signal_handler` Activated arm.
+        session.populate_ei_receiver(Arc::clone(&receiver));
+
+        // M4: drive the EI pump on a dedicated thread. The daemon's
+        // main runtime is `#[tokio::main]` (multithread), which
+        // requires `Send` futures. The drive is `!Send` — verified
+        // by the `ei_receiver_is_send` compile-time pin in ei.rs
+        // (reis's `EiConvertEventStream` carries a raw-pointer
+        // callback registry; the xkb state, now pump-local,
+        // inherits that limitation). We can't `tokio::spawn` the
+        // drive on the main runtime, and we can't `move` it into a
+        // `std::thread::spawn` closure (the closure's `Send` bound
+        // would reject the !Send future). The shape the brief
+        // mandates is the same one ei.rs' module doc calls out: a
+        // dedicated thread hosting a `current_thread` runtime.
+        // The thread's runtime calls `receiver.start()` ITSELF,
+        // so the drive future is created on the dedicated thread
+        // and never crosses a thread boundary. The mpsc receiver +
+        // watch receiver (both Send) come back to the main thread
+        // via oneshot channels; the `!Send` drive stays where it
+        // was born. Verified by the build (`cargo build --lib` +
+        // `cargo test`).
+        let (wire_rx_tx, wire_rx_rx) =
+            tokio::sync::oneshot::channel::<mpsc::UnboundedReceiver<ei::WireBody>>();
+        let (disconnect_rx_tx, disconnect_rx_rx) =
+            tokio::sync::oneshot::channel::<tokio::sync::watch::Receiver<bool>>();
+        let drive_thread = match std::thread::Builder::new()
+            .name("shareinputdevices-ei-pump".to_string())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            event = "shareinputdevices_ei_pump_runtime_build_failed",
+                            "EI pump current-thread runtime build failed"
+                        );
+                        return;
+                    }
+                };
+                // The pump future lives entirely on this thread.
+                // `receiver` is `Send + Sync` (compile-pinned in
+                // ei.rs), so moving it into the thread is safe; the
+                // resulting `drive` future is `!Send` and is
+                // awaited here, never crossing the thread boundary.
+                rt.block_on(async move {
+                    let (wire_rx, disconnect_rx, drive) = match receiver.start().await {
+                        Ok(parts) => parts,
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                event = "shareinputdevices_ei_pump_start_failed",
+                                "EI pump start failed on dedicated thread"
+                            );
+                            return;
+                        }
+                    };
+                    // Ship the wire + disconnect receivers back to
+                    // the main thread. The channels are oneshot so
+                    // the senders drop after one send — if the main
+                    // thread has already given up (recv returned
+                    // Err), the send is a no-op and the drive
+                    // continues to run until the EI peer hangs up.
+                    let _ = wire_rx_tx.send(wire_rx);
+                    let _ = disconnect_rx_tx.send(disconnect_rx);
+                    drive.await;
+                });
+            }) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    event = "shareinputdevices_ei_pump_thread_spawn_failed",
+                    "EI pump thread spawn failed; shareinputdevices plugin stays inert"
+                );
+                return;
+            }
+        };
+        // Detach: the drive future ends when the pump's
+        // `disconnect_tx.send(true)` lands (EOF / error /
+        // Disconnected); the dedicated thread then exits and joins
+        // implicitly. We do not hold the JoinHandle because the
+        // consumer task below has no business waiting on the pump
+        // and the disconnect watcher has its own signal path.
+        drop(drive_thread);
+        // Pull the wire + disconnect receivers back from the
+        // dedicated thread. `start()` succeeded before we got
+        // here, so the sends inside the thread will land; if the
+        // dedicated thread's runtime build failed earlier the
+        // channels would have closed and these recvs would error,
+        // which we treat as the same inert-outcome as start()
+        // failure above.
+        let mut wire_rx = match wire_rx_rx.await {
+            Ok(rx) => rx,
+            Err(_) => {
+                warn!(
+                    event = "shareinputdevices_ei_pump_wire_rx_dropped",
+                    "EI pump did not deliver wire_rx; shareinputdevices plugin stays inert"
+                );
+                return;
+            }
+        };
+        let disconnect_rx = match disconnect_rx_rx.await {
+            Ok(rx) => rx,
+            Err(_) => {
+                warn!(
+                    event = "shareinputdevices_ei_pump_disconnect_rx_dropped",
+                    "EI pump did not deliver disconnect_rx; shareinputdevices plugin stays inert"
+                );
+                return;
+            }
+        };
+
+        // M4: watch `disconnect_rx` per the cpp oracle. The cpp
+        // at inputcapturesession.cpp:372-374 only logs the
+        // disconnect — it does NOT close the session (the
+        // destructor still holds `m_session` for explicit
+        // Session.Close; the portal `Disabled` signal is the
+        // session-side teardown trigger, see :281-286). We mirror
+        // that: log the disconnect and flip
+        // `backend_available=false` so the plugin stops advertising
+        // the capability to newly-connecting peers, but we do NOT
+        // drop the portal session — `release()` and `close()` keep
+        // working.
+        let backend_available = self.backend_available.clone();
+        let mut disconnect_rx_watcher = disconnect_rx.clone();
+        tokio::spawn(async move {
+            if disconnect_rx_watcher.changed().await.is_ok() {
+                warn!(
+                    event = "shareinputdevices_ei_disconnect_backend_flip",
+                    "EI transport disconnected; shareinputdevices backend no longer available"
+                );
+                backend_available.store(false, Ordering::SeqCst);
+            }
+        });
+
+        // Wrap the session in `Arc` now that the M4 wiring is done
+        // — `take_ei_fd` and `populate_ei_receiver` both required
+        // `&mut` / `&self` access on the bare struct; the rest of
+        // the lifecycle (release callback closure, portal_session
+        // stash, info! log) only needs a shared handle.
+        let session = Arc::new(session);
 
         // Wire release callback to session.release(). The callback
         // is async-required (D-Bus call) so we spawn a tokio task.
@@ -565,68 +752,140 @@ impl ShareInputDevicesPlugin {
             "shareinputdevices session backend wired"
         );
 
-        // Spawn the Activated → wire-packet consumer. We hold the
-        // receiver here; the plugin's connection_manager may be
-        // wired later (after enable_session_backend returns — see
-        // bootstrap.rs), so this consumer needs to be tolerant of
-        // CM being None at the time it spawns. Easiest: capture an
-        // Option<Arc<CM>>-like accessor that the consumer polls.
+        // Spawn the unified wire consumer. We hold the
+        // connection_manager accessor for late binding (the plugin's
+        // CM may be wired after enable_session_backend returns —
+        // see bootstrap.rs), and we feed BOTH the Activated events
+        // (→ `kdeconnect.shareinputdevices.request`) and the EI
+        // wire bodies (→ `kdeconnect.mousepad.request`) through the
+        // same task. `tokio::select!` with `biased;` guarantees the
+        // shareinputdevices.request is processed before any
+        // mousepad.request on every select iteration — the
+        // ordering the cpp emits (started signal first, queued
+        // events after) and the ordering the brief mandates (drain
+        // before first relayed body).
         let cm_accessor: Arc<Mutex<Option<Arc<crate::protocol::ConnectionManager>>>> =
             Arc::new(Mutex::new(self.connection_manager.clone()));
         let edge = self.edge;
         tokio::spawn(async move {
-            while let Some(event) = activated_rx.recv().await {
-                let cm_opt = cm_accessor
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                let Some(cm) = cm_opt else {
-                    warn!(
-                        event = "shareinputdevices_activated_no_connection_manager",
-                        "No connection manager wired; Activated event dropped"
-                    );
-                    continue;
-                };
-                let body = plan_shareinputdevices_request(edge, event.deltax, event.deltay);
-                let packet = Packet::new(
-                    "kdeconnect.shareinputdevices.request".to_string(),
-                    serde_json::to_value(&body).unwrap_or_else(|e| {
-                        warn!(
-                            error = %e,
-                            event = "shareinputdevices_request_serialize_failed",
-                            "ShareInputDevicesRequest serialize failed"
-                        );
-                        serde_json::json!({})
-                    }),
-                );
-                // No "broadcast" method on ConnectionManager; iterate
-                // connected device ids and send per peer (mirrors the
-                // pattern at src/plugins/share.rs / 359 — both
-                // fan-out one packet at a time). An Activated with
-                // no peers drops the packet at the broker.
-                let peers = cm.connected_device_ids().await;
-                if peers.is_empty() {
+            let mut activated_closed = false;
+            let mut wire_closed = false;
+            loop {
+                if activated_closed && wire_closed {
                     debug!(
-                        event = "shareinputdevices_activated_no_peers",
-                        "Activated: no peers connected; request dropped"
+                        event = "shareinputdevices_wire_consumer_exit",
+                        "Wire consumer task ended (both channels closed)"
                     );
-                    continue;
+                    return;
                 }
-                for device_id in peers {
-                    if let Err(e) = cm.send_packet(&device_id, &packet).await {
-                        warn!(
-                            device_id = %device_id,
-                            error = %e,
-                            event = "shareinputdevices_activated_send_failed",
-                            "Send of shareinputdevices.request failed"
-                        );
+                tokio::select! {
+                    biased;
+                    event = activated_rx.recv(), if !activated_closed => {
+                        match event {
+                            Some(event) => {
+                                let cm_opt = cm_accessor
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .clone();
+                                let Some(cm) = cm_opt else {
+                                    warn!(
+                                        event = "shareinputdevices_activated_no_connection_manager",
+                                        "No connection manager wired; Activated event dropped"
+                                    );
+                                    continue;
+                                };
+                                let body = plan_shareinputdevices_request(
+                                    edge,
+                                    event.deltax,
+                                    event.deltay,
+                                );
+                                let packet = Packet::new(
+                                    "kdeconnect.shareinputdevices.request".to_string(),
+                                    serde_json::to_value(&body).unwrap_or_else(|e| {
+                                        warn!(
+                                            error = %e,
+                                            event = "shareinputdevices_request_serialize_failed",
+                                            "ShareInputDevicesRequest serialize failed"
+                                        );
+                                        serde_json::json!({})
+                                    }),
+                                );
+                                let peers = cm.connected_device_ids().await;
+                                if peers.is_empty() {
+                                    debug!(
+                                        event = "shareinputdevices_activated_no_peers",
+                                        "Activated: no peers connected; request dropped"
+                                    );
+                                    continue;
+                                }
+                                for device_id in peers {
+                                    if let Err(e) = cm.send_packet(&device_id, &packet).await {
+                                        warn!(
+                                            device_id = %device_id,
+                                            error = %e,
+                                            event = "shareinputdevices_activated_send_failed",
+                                            "Send of shareinputdevices.request failed"
+                                        );
+                                    }
+                                }
+                            }
+                            None => {
+                                debug!(
+                                    event = "shareinputdevices_activated_channel_closed",
+                                    "Activated channel closed"
+                                );
+                                activated_closed = true;
+                            }
+                        }
+                    }
+                    body = wire_rx.recv(), if !wire_closed => {
+                        match body {
+                            Some(wire_body) => {
+                                let cm_opt = cm_accessor
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .clone();
+                                let Some(cm) = cm_opt else {
+                                    debug!(
+                                        event = "shareinputdevices_wire_no_connection_manager",
+                                        "No connection manager wired; wire body dropped"
+                                    );
+                                    continue;
+                                };
+                                let packet = Packet::new(
+                                    "kdeconnect.mousepad.request".to_string(),
+                                    wire_body.into_json(),
+                                );
+                                let peers = cm.connected_device_ids().await;
+                                if peers.is_empty() {
+                                    debug!(
+                                        event = "shareinputdevices_wire_no_peers",
+                                        "Wire body: no peers connected; packet dropped"
+                                    );
+                                    continue;
+                                }
+                                for device_id in peers {
+                                    if let Err(e) = cm.send_packet(&device_id, &packet).await {
+                                        warn!(
+                                            device_id = %device_id,
+                                            error = %e,
+                                            event = "shareinputdevices_wire_send_failed",
+                                            "Send of mousepad.request failed"
+                                        );
+                                    }
+                                }
+                            }
+                            None => {
+                                debug!(
+                                    event = "shareinputdevices_wire_channel_closed",
+                                    "Wire channel closed"
+                                );
+                                wire_closed = true;
+                            }
+                        }
                     }
                 }
             }
-            debug!(
-                event = "shareinputdevices_activated_consumer_exit",
-                "Activated consumer task ended (channel closed)"
-            );
         });
     }
 }
