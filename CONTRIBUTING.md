@@ -10,17 +10,21 @@ Requirements:
 
 - Rust 1.91 or newer. Install via [rustup](https://rustup.rs/). The MSRV is
   declared as `rust-version` in `Cargo.toml` and checked in CI.
-- `pkg-config`, `libdbus-1-dev`, and `libssl-dev`. D-Bus is needed by the
-  MPRIS and notification plugins; OpenSSL is a dev-dependency only, used to
-  build certificate fixtures for the test suite. The production binary does
-  not link OpenSSL.
+- `pkg-config`, `libdbus-1-dev`, `libssl-dev`, and `libxkbcommon-dev`.
+  D-Bus is needed by the MPRIS and notification plugins; OpenSSL is a
+  dev-dependency only, used to build certificate fixtures for the test
+  suite. The production binary does not link OpenSSL. `libxkbcommon-dev`
+  is linked unconditionally by the `xkbcommon` crate (the shareinputdevices
+  M3 EI transport uses it to parse keymaps delivered over the
+  InputCapture portal); the release binary's DT_NEEDS includes
+  `libxkbcommon.so.0`.
 - An Android device running the KDE Connect app, if you want to exercise
   the live-device tests. Everything else runs without hardware.
 
 On Debian or Ubuntu:
 
 ```bash
-sudo apt-get install -y pkg-config libdbus-1-dev libssl-dev
+sudo apt-get install -y pkg-config libdbus-1-dev libssl-dev libxkbcommon-dev
 ```
 
 Then:

@@ -109,6 +109,19 @@ moka = { version = "0.12", features = ["sync"] }
 async-trait = "0.1.89"
 tempfile = "3"
 
+# shareinputdevices M3 EI transport. reis is the pure-Rust libei/libeis
+# binding; the lan-mouse upstream uses ashpd+reis for the same portal half
+# we drive from raw zbus. xkbcommon wraps libxkbcommon for keysym/modifier
+# lookup (the cpp producer at inputcapturesession.cpp:43-89 mirrors this
+# directly).
+reis = { version = "0.7.1", default-features = false, features = ["tokio"] }
+xkbcommon = "0.9"
+# reis re-exports enumflags2 (`pub use enumflags2;` at lib.rs:38), so
+# `BitFlags` is reachable as `reis::enumflags2::BitFlags` without a
+# direct dep on enumflags2. futures-util supplies StreamExt for the
+# EiConvertEventStream (already transitive via reis/tokio).
+futures-util = "0.3"
+
 [dev-dependencies]
 rust-connect = { path = ".", features = ["test-helpers"] }
 
