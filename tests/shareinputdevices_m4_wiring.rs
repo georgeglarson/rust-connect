@@ -72,6 +72,14 @@ struct FakePortalState {
     pub zones: Vec<(u32, u32, i32, i32)>,
     pub request_id: Arc<AtomicU32>,
     pub connect_to_eis_socketpair: Option<OwnedFd>,
+    /// If `Some`, the fake's `Enable` handler emits an `Activated`
+    /// D-Bus signal with the listed `(activation_id, cursor_x,
+    /// cursor_y)` BEFORE returning. Used by the M4 replay-on-
+    /// populate test to deterministically reproduce the
+    /// Enable-before-populate window: the portal's `Activated`
+    /// reaches the signal handler while `populate_ei_receiver` has
+    /// not yet been called.
+    pub emit_activated_in_enable: Option<(u32, f64, f64)>,
 }
 
 struct DaemonGuard(Option<std::process::Child>);
@@ -242,9 +250,25 @@ impl FakePortal {
 
     async fn enable(
         &self,
-        _session_handle: zbus::zvariant::OwnedObjectPath,
+        session_handle: zbus::zvariant::OwnedObjectPath,
         _options: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
     ) -> zbus::fdo::Result<()> {
+        // Test seam: when the harness arms `emit_activated_in_enable`,
+        // emit Activated on this conn BEFORE returning. The signal
+        // handler's match rule is registered before Enable, so the
+        // signal is delivered to the producer's connection while
+        // `PortalSession::start` is still in Enable — the precise
+        // window the M4 replay-on-populate fix targets.
+        let (to_emit, conn_for_signal) = {
+            let guard = self.state.lock().unwrap();
+            (
+                guard.emit_activated_in_enable,
+                guard.conn.as_ref().expect("conn").clone(),
+            )
+        };
+        if let Some((id, x, y)) = to_emit {
+            emit_activated_signal(&conn_for_signal, session_handle.as_str(), id, x, y, 1).await;
+        }
         Ok(())
     }
 }
@@ -269,8 +293,18 @@ async fn setup(state: Arc<Mutex<FakePortalState>>) -> Option<DaemonGuard> {
         .output()
         .is_err()
     {
-        eprintln!("dbus-daemon not on PATH — skipping");
-        return None;
+        // Loud-skip (panel M4 panel round 1 hygiene pass): the
+        // previous silent-skip returned `None` and the caller
+        // early-returned, marking the test as PASS — but no
+        // coverage was actually exercised. A bare `eprintln` is
+        // invisible in the test summary; a `panic!` makes the
+        // absence a hard failure with the dependency name
+        // surfaced. CI environments must provide dbus-daemon.
+        panic!(
+            "shareinputdevices integration tests require `dbus-daemon` on PATH \
+             (panel M4 round 1 hygiene: silent-skip reported coverage that \
+             was not exercised; install dbus-daemon to run these tests)"
+        );
     }
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket_path = tmp.path().join("bus");
@@ -770,7 +804,7 @@ async fn setup_m4_harness(session_handle: &str, with_emitter: bool) -> Option<M4
         None
     };
 
-    session.populate_ei_receiver(Arc::clone(&receiver));
+    session.populate_ei_receiver(Arc::clone(&receiver)).await;
 
     // Drive the receiver pump on a dedicated thread BEFORE
     // awaiting the handshake — the pump and the EIS peer make
@@ -1202,5 +1236,125 @@ async fn m4_input_relays_through_gate_and_consumer() {
             .ok()
             .and_then(|o| o.as_ref())
             .map(|p| (p.packet_type.clone(), p.body.clone()))
+    );
+}
+
+/// M4 wiring test 4: D-Bus `Activated` arriving BEFORE the EI
+/// receiver is populated must still drain the activation gate
+/// when the populate call lands. The bug shape (pre-fix): the
+/// signal handler ran in the empty slot, found no receiver, logged
+/// "drain deferred", and dropped the activation_id on the floor —
+/// the gate.activation_id stayed at 0 and queued EI input was
+/// never replayed for that cycle. The fix shape: the signal
+/// handler stores the deferred id on `PortalSession`; the
+/// `populate_ei_receiver` call replays `handle_activated(id)` on
+/// the receiver immediately after the Arc lands.
+///
+/// **How this test is deterministic.** The fake portal's
+/// `Enable` handler is wired (via `FakePortalState::
+/// emit_activated_in_enable`) to emit an `Activated` signal
+/// BEFORE returning. With the match rule registered before
+/// `Enable` (panel 66ae8992), the signal reaches the producer's
+/// own connection while `PortalSession::start` is still inside
+/// `Enable`. The signal handler is spawned AFTER `Enable`
+/// returns but during `start()`, so by the time `start()` yields
+/// `Self`, the signal handler may or may not have read the
+/// signal — we deterministically drive the determinism barrier
+/// by polling `activated_rx` for the corresponding `Activated`
+/// event (step 1 of the signal handler — the sync `send`) BEFORE
+/// we call `populate_ei_receiver`. At that moment the slot was
+/// empty, so the handler's step 2 hit the deferred branch.
+///
+/// **What this pins:**
+/// - `populate_ei_receiver` is async; awaiting it lands the
+///   deferred id onto the receiver's gate.
+/// - `EiReceiver::gate_activation_id_for_test()` reports the
+///   replayed id — i.e. the gate was drained despite the slot
+///   being empty at the moment `Activated` arrived.
+/// - The `activated_tx` channel still receives the consumer-side
+///   event regardless — that path is independent of the slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn m4_activated_before_populate_is_replayed_on_populate() {
+    use rust_connect::plugins::shareinputdevices::ei::EiReceiver;
+    use rust_connect::plugins::shareinputdevices::portal::{ActivatedEvent, PortalSession};
+
+    let _bus_lock = BUS.lock().await;
+
+    // Install the socketpair fd BEFORE the fake is set up.
+    let (client_stream, peer_stream) = UnixStream::pair().expect("UnixStream::pair");
+    let connect_to_eis_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(client_stream.into_raw_fd()) };
+
+    // The session runs at (0, 0)..(1920, 1080) with Edge::Left →
+    // barrier p1 (0, 0). cursor_position (50, 100) yields
+    // deltax = 50, deltay = 100 verbatim.
+    let session_handle = "/org/freedesktop/portal/desktop/session/m4_replay".to_string();
+    let state = Arc::new(Mutex::new(FakePortalState {
+        version: 1,
+        supported_caps: 3,
+        session_handle: session_handle.clone(),
+        zones: vec![(1920, 1080, 0, 0)],
+        connect_to_eis_socketpair: Some(connect_to_eis_fd),
+        emit_activated_in_enable: Some((42, 50.0, 100.0)),
+        ..Default::default()
+    }));
+
+    let Some(_daemon) = setup(state.clone()).await else {
+        return;
+    };
+
+    // The other half of the socketpair goes unused for this test —
+    // `EiReceiver::new` only `set_nonblocking`s the fd and stores
+    // it; no handshake or pump I/O runs here. Closing the peer
+    // end immediately is safe. (A real production wire keeps
+    // this end alive for the EIS peer's lifetime; the rest of the
+    // wiring is exercised by `m4_input_relays_through_gate_and_
+    // consumer`.)
+    drop(peer_stream);
+
+    // Build the PortalSession. The fake's Enable emits Activated
+    // BEFORE returning; the signal handler task is spawned inside
+    // `start()` and will read the signal asynchronously. We then
+    // POLL `activated_rx` to deterministically wait for step 1
+    // (the sync `activated_tx.send`) to land — at that moment the
+    // slot was empty, so the handler's step 2 hit the deferred
+    // branch and (post-fix) the id is stored on `PortalSession`.
+    let (activated_tx, mut activated_rx) = tokio::sync::mpsc::unbounded_channel::<ActivatedEvent>();
+    let conn = zbus::Connection::session().await.unwrap();
+    let mut session = tokio::time::timeout(
+        Duration::from_secs(5),
+        PortalSession::start(conn, Edge::Left, activated_tx),
+    )
+    .await
+    .expect("PortalSession::start timed out")
+    .expect("PortalSession::start must succeed");
+
+    let activated_event = tokio::time::timeout(Duration::from_secs(2), activated_rx.recv())
+        .await
+        .expect("signal handler did not deliver ActivatedEvent within 2s")
+        .expect("activated_rx closed before producing an event");
+    assert_eq!(
+        activated_event.activation_id, 42,
+        "consumer-side Activated event must carry the id the fake emitted in Enable"
+    );
+
+    // Build the EI receiver from the fd ConnectToEIS handed back.
+    // `EiReceiver::new` is sync and does NOT start the pump — the
+    // pump would normally start on the dedicated drive thread, but
+    // this test does not care about pump events (the gate is
+    // empty); we only need a valid receiver to populate.
+    let ei_fd = session.take_ei_fd();
+    let receiver = EiReceiver::new(ei_fd, "shareinputdevices-m4-replay-test")
+        .expect("EiReceiver::new must succeed against the socketpair");
+
+    // Pre-fix: this just stored the receiver in the slot. The
+    // deferred id was lost; gate.activation_id stays 0.
+    // Post-fix: the populate replays handle_activated(42) on the
+    // receiver; gate.activation_id becomes 42.
+    session.populate_ei_receiver(Arc::clone(&receiver)).await;
+
+    assert_eq!(
+        receiver.gate_activation_id_for_test().await,
+        42,
+        "populate_ei_receiver must replay the deferred Activated id onto the receiver's gate"
     );
 }
