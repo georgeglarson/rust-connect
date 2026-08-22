@@ -717,7 +717,24 @@ async fn last_capable_peer_disconnect_closes_and_reconnect_reactivates() {
         Duration::from_secs(10),
     )
     .await;
-    assert!(h.plugin.portal_backend_available());
+    // **Polled backend_available (panel M4 round 2 fix — P7).**
+    // `store(true)` lands only after `take_fd` + `EiReceiver::new`
+    // + populate + pump handshake + oneshot delivery — the
+    // sibling test on line ~677 polls for 10s; the pre-fix
+    // immediate assert at this site flaked when the EI pump's
+    // oneshot delivery took longer than expected. Poll the flag
+    // with the same bound.
+    let backend_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < backend_deadline {
+        if h.plugin.portal_backend_available() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        h.plugin.portal_backend_available(),
+        "backend_available must flip true after the first capable peer activates"
+    );
 
     // Last capable peer leaves: unmark + broadcast Disconnected.
     // The gate's subscription sees the non-Connected transition,
@@ -880,8 +897,21 @@ async fn fan_out_filter_only_targets_capable_peers() {
         "re-marking the capable peer must restore it to the fan-out set"
     );
 
-    // And `is_connected` agrees: capable is live, passive is
-    // not (and never comes back unless re-marked).
-    assert!(cm.is_connected(&capable.to_string()).await);
-    assert!(!cm.is_connected(&passive.to_string()).await);
+    // And the fan-out agrees: capable is in the set, passive is
+    // not (and never comes back unless re-marked). We use
+    // `capable_consumer_ids` here rather than `is_connected`
+    // directly because the fake_connected shadow set is a test-only
+    // seam consumed solely by the capability gate (see
+    // ConnectionManager::capable_consumer_ids).
+    let final_fanout = cm.capable_consumer_ids(CONSUMER_INCOMING_CAPS).await;
+    assert!(
+        final_fanout.contains(&capable.to_string()),
+        "capable peer must be in the fan-out after re-mark; saw {:?}",
+        final_fanout
+    );
+    assert!(
+        !final_fanout.contains(&passive.to_string()),
+        "passive peer must not be in the fan-out after disconnect; saw {:?}",
+        final_fanout
+    );
 }

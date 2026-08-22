@@ -613,6 +613,16 @@ struct OutboundPacket {
 /// instead of a `ConnectionManager`. The structural shape matches
 /// production byte-for-byte: `biased;` select, mpsc::UnboundedReceiver
 /// for both Activated + wire bodies, build Packet, send to recording.
+///
+/// **Sync to planner (panel M4 round 2 fix — P7 part 3).** Pre-fix
+/// this consumer hand-rolled the request body via a raw
+/// `serde_json::json!` macro instead of calling
+/// `plan_shareinputdevices_request`. Planner-shape regressions
+/// (e.g. field renames, new required fields) wouldn't fail the
+/// wiring tests — the consumer would happily emit the OLD body
+/// shape and the test would still see it. Now both arms call the
+/// planner so any planner change is reflected on the recording
+/// side without the test fixtures drifting.
 async fn run_test_consumer(
     mut activated_rx: mpsc::UnboundedReceiver<ActivatedEvent>,
     mut wire_rx: mpsc::UnboundedReceiver<WireBody>,
@@ -630,10 +640,14 @@ async fn run_test_consumer(
             event = activated_rx.recv(), if !activated_closed => {
                 match event {
                     Some(event) => {
-                        let body = serde_json::json!({
-                            "exitEdge": i32::from(edge),
-                            "deltax": event.deltax,
-                            "deltay": event.deltay,
+                        let req =
+                            rust_connect::plugins::shareinputdevices::plan_shareinputdevices_request(
+                                edge,
+                                event.deltax,
+                                event.deltay,
+                            );
+                        let body = serde_json::to_value(&req).unwrap_or_else(|e| {
+                            panic!("request serialize failed: {e}")
                         });
                         let _ = tx.send(OutboundPacket {
                             packet_type: "kdeconnect.shareinputdevices.request".to_string(),

@@ -737,6 +737,33 @@ async fn activation_times_out_on_silent_eis_peer() {
         new_state: DeviceState::Connected,
     });
 
+    // **Wait for ConnectToEIS on the ledger (panel M4 round 2 fix
+    // — P7 part 2).** The pre-fix shape went straight from the
+    // broadcast into the timeout poll, but the activation runs
+    // asynchronously and `ConnectToEIS` is the marker that the
+    // activation arm actually got as far as opening the EI fd.
+    // Without this, a test that races fast (e.g. the gate has
+    // not yet picked up the broadcast) can observe
+    // `activation_in_flight_is_clear()` AND a still-false
+    // `backend_available` — the "not activated" state — and
+    // satisfy every assertion without activation ever running.
+    // Pin the ledger entry so we know the activation sequence
+    // reached the EI half before we wait for it to time out.
+    let connect_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < connect_deadline {
+        let calls = state.lock().unwrap().calls.clone();
+        if calls.iter().any(|c| matches!(c, Call::ConnectToEIS { .. })) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let calls = state.lock().unwrap().calls.clone();
+    assert!(
+        calls.iter().any(|c| matches!(c, Call::ConnectToEIS { .. })),
+        "activation must reach ConnectToEIS before the timeout window starts; saw {:?}",
+        calls
+    );
+
     // Wait for the activation arm to time out. The brief asks
     // for a generous outer bound (15s — 3x the production
     // timeout) so the test fails loudly if either the fix is
