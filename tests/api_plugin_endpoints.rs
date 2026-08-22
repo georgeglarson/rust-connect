@@ -148,6 +148,21 @@ async fn test_contacts_get_returns_stored_contacts() {
 
     let (state, _temp, api_key) = create_test_app().await;
 
+    // Real protocol flow: phone first reports uids/timestamps (the answer
+    // to our outgoing request_all_uids_timestamps), then answers our
+    // request_vcards_by_uid. The snapshot gate only admits vCards whose
+    // UID is in that report.
+    let snap = Packet::new(
+        "kdeconnect.contacts.response_uids_timestamps".to_string(),
+        serde_json::json!({ "uids": ["1"], "1": "1721950000000" }),
+    );
+    state
+        .plugins
+        .contacts
+        .handle_packet("test-phoneaaaaaaaaaaaaaaaaaaaaaa", snap)
+        .await
+        .unwrap();
+
     // Drive the plugin directly with the EXACT body shape the phone sends
     // (kdeconnect-android ContactsPlugin.kt:140-155): a "uids" list plus one
     // raw-vCard field per uid.

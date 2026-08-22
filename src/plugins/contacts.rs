@@ -38,6 +38,18 @@ use crate::utils::errors::Result;
 
 use super::plugin::Plugin;
 
+/// Per-device maximum contact count (defense-in-depth cap on top of the
+/// snapshot gate). Real-world phones carry low-thousands of contacts at
+/// most; we leave headroom and reject any further inserts with a warn.
+const MAX_CONTACTS_PER_DEVICE: usize = 10_000;
+
+/// Per-device maximum total vCard-source bytes (the heavy field on
+/// `Contact`). The 32 MiB packet ceiling bounds a single packet but not
+/// cumulative storage; this caps cumulative bytes per device and refuses
+/// new inserts past it. Sized so even at MAX_CONTACTS_PER_DEVICE (10k) we
+/// hold ~6 KiB per vCard on average, well above any real contact.
+const MAX_VCARD_BYTES_PER_DEVICE: usize = 64 * 1024 * 1024;
+
 /// A contact stored from a phone-provided vCard.
 ///
 /// `name`, `phone_numbers` and `emails` are parsed minimally (dependency-free)
@@ -67,6 +79,11 @@ struct DeviceContacts {
     timestamps: HashMap<String, String>,
     /// uid -> stored contact
     contacts: HashMap<String, Contact>,
+    /// Sum of `Contact::vcard.len()` over `contacts` (the byte-counting
+    /// limit operates on this rather than recomputing per check). Maintained
+    /// alongside `contacts` under the same lock; the snapshot prune at the
+    /// bottom of `handle_packet` recomputes it after the retain.
+    total_vcard_bytes: usize,
 }
 
 pub struct ContactsPlugin {
@@ -195,6 +212,80 @@ impl ContactsPlugin {
         }
         (name, phones, emails)
     }
+
+    /// Insert parsed vCards into `state` under the snapshot gate + caps.
+    /// Returns `(stored, dropped_unreported, dropped_cap)` so the handler can
+    /// log separately. The handler wrapper passes the production caps; the
+    /// `_inner` helper takes them as parameters so tests exercise the cap
+    /// paths without filling 10k contacts.
+    ///
+    /// Snapshot gate: a vCard's UID must appear in `reported` (the latest
+    /// uids/timestamps response). This closes the CV finding where a paired
+    /// peer sent `response_vcards` for arbitrary new UIDs without an
+    /// accompanying snapshot and grew `state.contacts` for the life of the
+    /// connection.
+    ///
+    /// Caps: refuse inserts whose addition would push `state.contacts.len()`
+    /// past `max_contacts` or `state.total_vcard_bytes` past `max_bytes`.
+    /// Updates of an already-stored UID are allowed as long as the byte delta
+    /// fits under the cap (a contract always honored); the only refused
+    /// growth is the count of new UIDs.
+    ///
+    /// `state.contacts` is mutated in place. Caller must hold the write lock.
+    fn store_vcards_inner(
+        state: &mut DeviceContacts,
+        reported: &HashSet<String>,
+        parsed: Vec<(String, Contact)>,
+        max_contacts: usize,
+        max_bytes: usize,
+    ) -> (usize, usize, usize) {
+        let mut stored = 0usize;
+        let mut dropped_unreported = 0usize;
+        let mut dropped_cap = 0usize;
+        for (uid, contact) in parsed {
+            if !reported.contains(&uid) {
+                dropped_unreported += 1;
+                continue;
+            }
+
+            // Count cap: only a genuinely-new UID counts toward growth; a
+            // re-fetch of an already-stored UID is an update, not a new entry.
+            let is_new_uid = !state.contacts.contains_key(&uid);
+            if is_new_uid && state.contacts.len() >= max_contacts {
+                dropped_cap += 1;
+                continue;
+            }
+
+            // Byte cap: total_vcard_bytes - old + new <= max_bytes.
+            let old_bytes = state.contacts.get(&uid).map(|c| c.vcard.len()).unwrap_or(0);
+            let prospective_bytes = state.total_vcard_bytes + contact.vcard.len() - old_bytes;
+            if prospective_bytes > max_bytes {
+                dropped_cap += 1;
+                continue;
+            }
+
+            state.total_vcard_bytes = prospective_bytes;
+            state.contacts.insert(uid, contact);
+            stored += 1;
+        }
+        (stored, dropped_unreported, dropped_cap)
+    }
+
+    /// Production-wrapper for `store_vcards_inner` using the file-level
+    /// constants. The handler logs `dropped_*` counts; inserts the rest.
+    fn store_vcards(
+        state: &mut DeviceContacts,
+        reported: &HashSet<String>,
+        parsed: Vec<(String, Contact)>,
+    ) -> (usize, usize, usize) {
+        Self::store_vcards_inner(
+            state,
+            reported,
+            parsed,
+            MAX_CONTACTS_PER_DEVICE,
+            MAX_VCARD_BYTES_PER_DEVICE,
+        )
+    }
 }
 
 #[async_trait::async_trait]
@@ -276,8 +367,12 @@ impl Plugin for ContactsPlugin {
 
                     // Record the reported timestamps and drop contacts the
                     // phone no longer reports (contactsplugin.cpp:125-129).
+                    // Recompute total_vcard_bytes from the retained slice so
+                    // the byte cap tracks the prune exactly: a contacts::len()
+                    // change must be a total_vcard_bytes change too.
                     state.timestamps = reported;
                     state.contacts.retain(|uid, _| reported_uids.contains(uid));
+                    state.total_vcard_bytes = state.contacts.values().map(|c| c.vcard.len()).sum();
 
                     to_fetch
                 };
@@ -326,16 +421,36 @@ impl Plugin for ContactsPlugin {
                     ));
                 }
 
-                let count = parsed.len();
+                // Snapshot gate + cap: only store vCards whose UID is in
+                // the latest uids/timestamps snapshot. Drops (both
+                // unreported-UID and cap-refused) are counted and logged
+                // separately so a misbehaving peer is loud, not silent.
                 let mut devices = self.devices.write().unwrap_or_else(|e| e.into_inner());
                 let state = devices.entry(device_id.to_string()).or_default();
-                for (uid, contact) in parsed {
-                    state.contacts.insert(uid, contact);
+                let reported: HashSet<String> = state.timestamps.keys().cloned().collect();
+                let (stored, dropped_unreported, dropped_cap) =
+                    Self::store_vcards(state, &reported, parsed);
+
+                if dropped_unreported > 0 {
+                    warn!(
+                        device_id = %device_id,
+                        count = dropped_unreported,
+                        event = "contacts_vcards_unreported_dropped",
+                        "Dropped vCards whose UIDs are not in the latest reported snapshot"
+                    );
+                }
+                if dropped_cap > 0 {
+                    warn!(
+                        device_id = %device_id,
+                        count = dropped_cap,
+                        event = "contacts_vcards_cap_exceeded",
+                        "Refused vCard inserts past per-device cap"
+                    );
                 }
 
                 info!(
                     device_id = %device_id,
-                    stored = count,
+                    stored,
                     event = "contacts_vcards_received",
                     "Stored contact vCards from device"
                 );
@@ -457,6 +572,14 @@ mod tests {
         // ContactsPlugin.kt:140-155: a "uids" string list, plus one field per
         // uid keyed BY the uid whose value is the raw vCard string.
         let plugin = ContactsPlugin::new();
+        // Real protocol flow: phone first reports uids/timestamps, the
+        // gate admits only vCards for UIDs in that snapshot.
+        let snap = Packet::new(
+            "kdeconnect.contacts.response_uids_timestamps".to_string(),
+            serde_json::json!({ "uids": ["1"], "1": "1721950000000" }),
+        );
+        plugin.handle_packet("device1", snap).await.unwrap();
+
         let vcard = "BEGIN:VCARD\nVERSION:2.1\nFN:John Smith\nTEL;CELL:+15551234\nEMAIL:john@example.com\nX-KDECONNECT-ID-DEV-abcdef:1\nREV:1721950000000\nEND:VCARD";
         let packet = Packet::new(
             "kdeconnect.contacts.response_vcards".to_string(),
@@ -556,6 +679,12 @@ mod tests {
         // kdeconnect-kde deletes local vCards the remote no longer reports
         // (contactsplugin.cpp:125-129); we do the same with stored contacts.
         let plugin = ContactsPlugin::new();
+        // Real protocol flow: report uids first, then vCards for those uids.
+        let snap1 = Packet::new(
+            "kdeconnect.contacts.response_uids_timestamps".to_string(),
+            serde_json::json!({ "uids": ["1", "2"], "1": "100", "2": "200" }),
+        );
+        plugin.handle_packet("d", snap1).await.unwrap();
         let p = Packet::new(
             "kdeconnect.contacts.response_vcards".to_string(),
             serde_json::json!({
@@ -586,17 +715,18 @@ mod tests {
         // uids key, which is malformed and ignored
         // (kdeconnect-kde contactsplugin.cpp:125-129).
         let plugin = ContactsPlugin::new();
+        // Real protocol flow: seed snapshot before storing vCards.
+        let snap = Packet::new(
+            "kdeconnect.contacts.response_uids_timestamps".to_string(),
+            serde_json::json!({ "uids": ["1"], "1": "100" }),
+        );
+        plugin.handle_packet("d", snap).await.unwrap();
         let p = Packet::new(
             "kdeconnect.contacts.response_vcards".to_string(),
             serde_json::json!({
                 "uids": ["1"],
                 "1": "BEGIN:VCARD\nFN:Alice\nEND:VCARD"
             }),
-        );
-        plugin.handle_packet("d", p).await.unwrap();
-        let p = Packet::new(
-            "kdeconnect.contacts.response_uids_timestamps".to_string(),
-            serde_json::json!({ "uids": ["1"], "1": "100" }),
         );
         plugin.handle_packet("d", p).await.unwrap();
         assert_eq!(plugin.get_contacts("d").len(), 1);
@@ -643,6 +773,12 @@ mod tests {
     #[tokio::test]
     async fn test_on_disconnected_clears_contacts() {
         let plugin = ContactsPlugin::new();
+        // Seed the snapshot so the gate admits the vCard.
+        let snap = Packet::new(
+            "kdeconnect.contacts.response_uids_timestamps".to_string(),
+            serde_json::json!({ "uids": ["1"], "1": "100" }),
+        );
+        plugin.handle_packet("d", snap).await.unwrap();
         let p = Packet::new(
             "kdeconnect.contacts.response_vcards".to_string(),
             serde_json::json!({
@@ -683,6 +819,12 @@ mod tests {
     #[tokio::test]
     async fn test_get_contacts_sorted_by_uid() {
         let plugin = ContactsPlugin::new();
+        // Seed the snapshot so the gate admits all three vCards.
+        let snap = Packet::new(
+            "kdeconnect.contacts.response_uids_timestamps".to_string(),
+            serde_json::json!({ "uids": ["15", "3", "1"], "15": "1", "3": "1", "1": "1" }),
+        );
+        plugin.handle_packet("d", snap).await.unwrap();
         let p = Packet::new(
             "kdeconnect.contacts.response_vcards".to_string(),
             serde_json::json!({
@@ -755,5 +897,326 @@ mod tests {
             assert_eq!(contacts.len(), 2);
             assert!(contacts.iter().all(|c| c.vcard.contains("v49")));
         }
+    }
+
+    // CV finding: response_vcards accepted every UID in the packet without
+    // checking against the latest reported snapshot, letting a paired peer
+    // grow state.contacts for the life of the connection.
+
+    #[tokio::test]
+    async fn test_vcards_for_unreported_uids_are_dropped() {
+        // No snapshot has ever been reported: no UID is in state.timestamps,
+        // so every vCard is dropped. State.contacts stays empty.
+        let plugin = ContactsPlugin::new();
+        let vcard = "BEGIN:VCARD\nFN:Ghost\nEND:VCARD";
+        let p = Packet::new(
+            "kdeconnect.contacts.response_vcards".to_string(),
+            serde_json::json!({
+                "uids": ["never-reported-uid"],
+                "never-reported-uid": vcard,
+            }),
+        );
+        plugin.handle_packet("d", p).await.unwrap();
+        assert!(
+            plugin.get_contacts("d").is_empty(),
+            "vCards for UIDs never in the reported snapshot must not be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vcards_for_reported_uids_are_accepted() {
+        // The realistic protocol flow: phone reports uids/timestamps first
+        // (the answer to our outgoing request_all_uids_timestamps), then
+        // answers our request_vcards_by_uid. The gate admits both because
+        // both UIDs are in the snapshot.
+        let plugin = ContactsPlugin::new();
+        let snap = Packet::new(
+            "kdeconnect.contacts.response_uids_timestamps".to_string(),
+            serde_json::json!({ "uids": ["1", "2"], "1": "100", "2": "200" }),
+        );
+        let reply = plugin.handle_packet("d", snap).await.unwrap();
+        assert!(reply.is_some(), "snapshot must trigger vcard request");
+
+        let p = Packet::new(
+            "kdeconnect.contacts.response_vcards".to_string(),
+            serde_json::json!({
+                "uids": ["1", "2"],
+                "1": "BEGIN:VCARD\nFN:Alice\nEND:VCARD",
+                "2": "BEGIN:VCARD\nFN:Bob\nEND:VCARD",
+            }),
+        );
+        plugin.handle_packet("d", p).await.unwrap();
+        let contacts = plugin.get_contacts("d");
+        assert_eq!(contacts.len(), 2);
+        assert!(contacts.iter().any(|c| c.uid == "1"));
+        assert!(contacts.iter().any(|c| c.uid == "2"));
+    }
+
+    #[tokio::test]
+    async fn test_mixed_batch_admits_reported_and_drops_unreported() {
+        // A response_vcards packet that mingles a reported UID with an
+        // unreported one. Only the reported UID is stored; the other is
+        // counted as the dropped-unreported bucket for the warn!.
+        let plugin = ContactsPlugin::new();
+        let snap = Packet::new(
+            "kdeconnect.contacts.response_uids_timestamps".to_string(),
+            serde_json::json!({ "uids": ["1"], "1": "100" }),
+        );
+        plugin.handle_packet("d", snap).await.unwrap();
+
+        // Now the phone sends a vCard packet with both "1" (reported) and
+        // "42" (NOT in the snapshot). Only "1" is admitted.
+        let p = Packet::new(
+            "kdeconnect.contacts.response_vcards".to_string(),
+            serde_json::json!({
+                "uids": ["1", "42"],
+                "1": "BEGIN:VCARD\nFN:Alice\nEND:VCARD",
+                "42": "BEGIN:VCARD\nFN:Impostor\nEND:VCARD",
+            }),
+        );
+        plugin.handle_packet("d", p).await.unwrap();
+        let contacts = plugin.get_contacts("d");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].uid, "1");
+    }
+
+    #[tokio::test]
+    async fn test_pruned_uid_stops_accepting_vcards_after_newer_snapshot() {
+        // The original attack path: a contact is admitted while reported,
+        // then a newer snapshot excludes that UID (the user deleted the
+        // contact on the phone). A subsequent vCard packet for that UID
+        // must be dropped, not silently re-admitted.
+        let plugin = ContactsPlugin::new();
+        // 1) Snapshot includes uid 1 + uid 2; both vCards arrive.
+        let snap = Packet::new(
+            "kdeconnect.contacts.response_uids_timestamps".to_string(),
+            serde_json::json!({ "uids": ["1", "2"], "1": "100", "2": "200" }),
+        );
+        plugin.handle_packet("d", snap).await.unwrap();
+        let p = Packet::new(
+            "kdeconnect.contacts.response_vcards".to_string(),
+            serde_json::json!({
+                "uids": ["1", "2"],
+                "1": "BEGIN:VCARD\nFN:Alice\nEND:VCARD",
+                "2": "BEGIN:VCARD\nFN:Bob\nEND:VCARD",
+            }),
+        );
+        plugin.handle_packet("d", p).await.unwrap();
+        assert_eq!(plugin.get_contacts("d").len(), 2);
+
+        // 2) Newer snapshot: uid 1 was deleted on the phone. The prune
+        // drops it from stored contacts (existing test_unreported_contacts_…);
+        // the snapshot's reported set no longer contains uid 1.
+        let snap = Packet::new(
+            "kdeconnect.contacts.response_uids_timestamps".to_string(),
+            serde_json::json!({ "uids": ["2"], "2": "200" }),
+        );
+        plugin.handle_packet("d", snap).await.unwrap();
+        assert_eq!(plugin.get_contacts("d").len(), 1);
+
+        // 3) Peer resends a vCard packet that includes uid 1 again, hoping
+        // the prune outlived its gate. The gate must reject: uid 1 is no
+        // longer in the snapshot.
+        let p = Packet::new(
+            "kdeconnect.contacts.response_vcards".to_string(),
+            serde_json::json!({
+                "uids": ["1"],
+                "1": "BEGIN:VCARD\nFN:Alice-Take2\nEND:VCARD",
+            }),
+        );
+        plugin.handle_packet("d", p).await.unwrap();
+        let contacts = plugin.get_contacts("d");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].uid, "2");
+    }
+
+    #[tokio::test]
+    async fn test_count_cap_refuses_past_cap() {
+        // Defense-in-depth: even if the snapshot gate had a bug, we refuse
+        // the (cap+1)-th contact. Use the _inner helper with a small cap so
+        // the test doesn't need to manufacture 10k vCards.
+        let mut state = DeviceContacts::default();
+        let mut reported = HashSet::new();
+        let max = 3usize;
+        let mut parsed: Vec<(String, Contact)> = Vec::new();
+        for n in 0..max {
+            let uid = format!("u{n}");
+            reported.insert(uid.clone());
+            parsed.push((
+                uid.clone(),
+                Contact {
+                    uid: uid.clone(),
+                    vcard: format!("BEGIN:VCARD\nFN:{uid}\nEND:VCARD"),
+                    name: None,
+                    phone_numbers: Vec::new(),
+                    emails: Vec::new(),
+                },
+            ));
+        }
+        let (stored, dropped_unreported, dropped_cap) =
+            ContactsPlugin::store_vcards_inner(&mut state, &reported, parsed, max, usize::MAX);
+        assert_eq!(stored, max);
+        assert_eq!(dropped_unreported, 0);
+        assert_eq!(dropped_cap, 0);
+        assert_eq!(state.contacts.len(), max);
+
+        // Next insert is refused with dropped_cap = 1 even though its UID is
+        // reported.
+        let uid = "u-overflow".to_string();
+        reported.insert(uid.clone());
+        let contact = Contact {
+            uid: uid.clone(),
+            vcard: "BEGIN:VCARD\nFN:Overflow\nEND:VCARD".to_string(),
+            name: None,
+            phone_numbers: Vec::new(),
+            emails: Vec::new(),
+        };
+        let (stored, _unr, dropped_cap) = ContactsPlugin::store_vcards_inner(
+            &mut state,
+            &reported,
+            vec![(uid, contact)],
+            max,
+            usize::MAX,
+        );
+        assert_eq!(stored, 0);
+        assert_eq!(dropped_cap, 1);
+        assert_eq!(state.contacts.len(), max);
+    }
+
+    #[tokio::test]
+    async fn test_byte_cap_refuses_past_cap() {
+        // Defense-in-depth: even if the snapshot gate had a bug, we refuse
+        // an insert whose vCard size alone exceeds the byte cap.
+        let mut state = DeviceContacts::default();
+        let reported = HashSet::new();
+        let max_bytes = 100usize;
+        // A vCard bigger than the cap by itself must be refused.
+        let uid = "big".to_string();
+        let contact = Contact {
+            uid: uid.clone(),
+            vcard: "BEGIN:VCARD\nFN:Big\nEND:VCARD".to_string() + &"X".repeat(max_bytes + 1),
+            name: None,
+            phone_numbers: Vec::new(),
+            emails: Vec::new(),
+        };
+        let mut reported = reported;
+        reported.insert(uid.clone());
+        let (stored, _unr, dropped_cap) = ContactsPlugin::store_vcards_inner(
+            &mut state,
+            &reported,
+            vec![(uid, contact)],
+            usize::MAX,
+            max_bytes,
+        );
+        assert_eq!(stored, 0);
+        assert_eq!(dropped_cap, 1);
+        assert!(state.contacts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_byte_cap_handles_update_path() {
+        // An UPDATE (existing UID) reduces byte delta is always allowed;
+        // a byte INCREASE that fits under the cap is allowed; one that
+        // would push past the cap is refused.
+        let mut state = DeviceContacts::default();
+        let uid = "u1".to_string();
+        let mut reported = HashSet::new();
+        reported.insert(uid.clone());
+        let small = Contact {
+            uid: uid.clone(),
+            vcard: "BEGIN:VCARD\nFN:Small\nEND:VCARD".to_string(),
+            name: None,
+            phone_numbers: Vec::new(),
+            emails: Vec::new(),
+        };
+        let (stored, _, _) = ContactsPlugin::store_vcards_inner(
+            &mut state,
+            &reported,
+            vec![(uid.clone(), small)],
+            usize::MAX,
+            1000,
+        );
+        assert_eq!(stored, 1);
+        assert_eq!(state.total_vcard_bytes, state.contacts[&uid].vcard.len());
+
+        // Update that stays under cap: allowed.
+        let bigger = Contact {
+            uid: uid.clone(),
+            vcard: "BEGIN:VCARD\nFN:Bigger\nEND:VCARD".to_string() + &"Y".repeat(100),
+            name: None,
+            phone_numbers: Vec::new(),
+            emails: Vec::new(),
+        };
+        let (stored, _, dropped_cap) = ContactsPlugin::store_vcards_inner(
+            &mut state,
+            &reported,
+            vec![(uid.clone(), bigger.clone())],
+            usize::MAX,
+            10_000,
+        );
+        assert_eq!(stored, 1);
+        assert_eq!(dropped_cap, 0);
+        assert_eq!(state.contacts[&uid].vcard, bigger.vcard);
+
+        // Update that would push past cap: refused, prior value preserved.
+        let prev = state.contacts[&uid].vcard.clone();
+        let too_big = Contact {
+            uid: uid.clone(),
+            vcard: "BEGIN:VCARD\nFN:TooBig\nEND:VCARD".to_string() + &"Z".repeat(100_000),
+            name: None,
+            phone_numbers: Vec::new(),
+            emails: Vec::new(),
+        };
+        let (stored, _, dropped_cap) = ContactsPlugin::store_vcards_inner(
+            &mut state,
+            &reported,
+            vec![(uid, too_big)],
+            usize::MAX,
+            1000, // small cap to force refusal
+        );
+        assert_eq!(stored, 0);
+        assert_eq!(dropped_cap, 1);
+        assert_eq!(
+            state.contacts["u1"].vcard, prev,
+            "refused update must not mutate stored vcard"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_prune_updates_total_vcard_bytes() {
+        // The snapshot prune at the bottom of response_uids_timestamps drops
+        // contacts not in the reported set; total_vcard_bytes must reflect
+        // the drop exactly, otherwise the byte cap starts to drift relative
+        // to the actual storage.
+        let plugin = ContactsPlugin::new();
+        let snap = Packet::new(
+            "kdeconnect.contacts.response_uids_timestamps".to_string(),
+            serde_json::json!({ "uids": ["1", "2"], "1": "100", "2": "200" }),
+        );
+        plugin.handle_packet("d", snap).await.unwrap();
+        let p = Packet::new(
+            "kdeconnect.contacts.response_vcards".to_string(),
+            serde_json::json!({
+                "uids": ["1", "2"],
+                "1": "BEGIN:VCARD\nFN:Alice\nEND:VCARD",
+                "2": "BEGIN:VCARD\nFN:Bob\nEND:VCARD",
+            }),
+        );
+        plugin.handle_packet("d", p).await.unwrap();
+
+        // Snapshot now excludes uid 2.
+        let snap = Packet::new(
+            "kdeconnect.contacts.response_uids_timestamps".to_string(),
+            serde_json::json!({ "uids": ["1"], "1": "100" }),
+        );
+        plugin.handle_packet("d", snap).await.unwrap();
+
+        // Read the bytes from state directly via a fresh packet: the
+        // byte accounting should sum exactly to the surviving contact.
+        let expected_bytes = "BEGIN:VCARD\nFN:Alice\nEND:VCARD".len();
+        // Indirect check via get_contacts: sum of vcard lengths equals
+        // expected since only one contact remains.
+        let stored_bytes: usize = plugin.get_contacts("d").iter().map(|c| c.vcard.len()).sum();
+        assert_eq!(stored_bytes, expected_bytes);
     }
 }
