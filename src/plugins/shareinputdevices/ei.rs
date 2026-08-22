@@ -422,7 +422,6 @@ impl EiReceiver {
                         event = "shareinputdevices_ei_disconnect",
                         "Disconnected from EIS"
                     );
-                    let _ = disconnect_tx.send(true);
                     // reis does NOT EOF the stream on `Disconnected`
                     // — its `Connection::disconnected` calls
                     // `shutdown_read` on the EIS side, which leaves
@@ -430,7 +429,10 @@ impl EiReceiver {
                     // break the pump would block forever on the next
                     // `stream.next().await` even though the protocol
                     // is over. The cpp gets away with relying on the
-                    // portal closing the socket; we don't.
+                    // portal closing the socket; we don't. The
+                    // trailer below sends the disconnect signal so
+                    // the caller is woken in both paths (this arm
+                    // and the EOF/error arms that fall through).
                     break;
                 }
                 Ok(ei_event) => {
