@@ -40,14 +40,25 @@
 //! receiver is transport-only — wire-shape decisions live in M1.
 //!
 //! **M4 integration cost.** The drive future this module returns is
-//! `!Send` (reis's `EiConvertEventStream` and xkbcommon's
-//! `xkb::State` are both `!Send`). The daemon's main is
-//! `#[tokio::main]` (multithreaded) at `main.rs:10`, so when M4
-//! wires this receiver into the live daemon it cannot use
-//! `tokio::spawn`. It must run the pump on a dedicated thread that
-//! hosts a `current_thread` runtime (or an explicit `LocalSet`) and
-//! forward the resulting `WireBody` mpsc across thread boundaries
-//! to the connection manager.
+//! still `!Send` (reis's `EiConvertEventStream` is the raw-pointer
+//! callback registry; the xkb state, now pump-local, inherits that
+//! limitation only because the pump future owns it). The daemon's
+//! main is `#[tokio::main]` (multithreaded) at `main.rs:10`, so when
+//! M4 wires this receiver into the live daemon it still cannot
+//! `tokio::spawn` the pump future. It runs the pump on a dedicated
+//! thread that hosts a `current_thread` runtime (or an explicit
+//! `LocalSet`) and forwards the resulting `WireBody` mpsc across
+//! thread boundaries to the connection manager.
+//!
+//! `EiReceiver` itself IS `Send + Sync` — the xkb state was moved
+//! out of the struct into the pump future (the Arc was `!Send` for
+//! no reason once we owned the state locally). The PortalSession's
+//! D-Bus signal task can now hold an `Arc<EiReceiver>` on the
+//! multithread runtime and call `handle_activated` (which never
+//! touches the keymap) without an extra `LocalSet` hop. The compile-
+//! time `Arc<EiReceiver>: Send` assertion in the test module below
+//! pins this property so a future re-introduction of a `!Send`
+//! field fails the build.
 
 use std::collections::VecDeque;
 use std::os::unix::io::OwnedFd;
@@ -259,14 +270,16 @@ impl WireBody {
 
 /// The EI receiver. Wraps a reis `ei::Context` over the portal's
 /// `ConnectToEIS` fd and pumps events through the M1 planners.
+///
+/// `EiReceiver` is **`Send + Sync`** — the xkb state is owned by
+/// the pump future (not the struct), so the Arc<Self> the
+/// PortalSession keeps can be shared with the D-Bus signal task
+/// running on the multithread runtime. See the M4 integration
+/// cost block at the top of the module for the threading shape
+/// this enables.
 pub struct EiReceiver {
     context: ei::Context,
     gate: Arc<Mutex<ActivationGate>>,
-    /// xkb state. `None` until the first `DeviceAdded` event with a
-    /// keymap arrives (mirrors the cpp's `m_xkb` being null until
-    /// :389). `Arc<Mutex<>>` because the pump task needs its own
-    /// clone to mutate alongside `handle_activated`'s callers.
-    xkb_state: Arc<Mutex<Option<xkb::State>>>,
     /// Sender for wire-body events. The pump task installs a fresh
     /// sender at `start()` time; `handle_activated` reuses it to
     /// replay queued events. `None` between construction and start.
@@ -285,7 +298,9 @@ impl EiReceiver {
     /// socket to non-blocking) and stores the context for the async
     /// `start()`. Returns an Arc so the PortalSession can hold a
     /// shared reference and call `handle_activated` from its D-Bus
-    /// signal task.
+    /// signal task — the receiver IS `Send + Sync`, so the D-Bus
+    /// signal task can drive `handle_activated` from a multithread
+    /// runtime without an additional `LocalSet`.
     ///
     /// `handshake_name` is the EIS "context name" string; cpp uses
     /// the plugin object name. We pass through `shareinputdevices`
@@ -297,17 +312,9 @@ impl EiReceiver {
             | DeviceCapability::Pointer
             | DeviceCapability::Button
             | DeviceCapability::Scroll;
-        // The `xkb_state` field holds an `xkb::State`, which is
-        // `!Send + !Sync` (raw-pointer-backed). All access is on a
-        // single `LocalSet`, so the lack of `Send`/`Sync` is safe in
-        // practice — clippy just can't prove it from the types alone.
-        #[allow(clippy::arc_with_non_send_sync)]
-        let xkb_state = Arc::new(Mutex::new(None));
-        #[allow(clippy::arc_with_non_send_sync)]
         Ok(Arc::new(Self {
             context,
             gate: Arc::new(Mutex::new(ActivationGate::new())),
-            xkb_state,
             wire_tx: Mutex::new(None),
             handshake_name: handshake_name.to_string(),
             bound_caps: caps,
@@ -373,13 +380,12 @@ impl EiReceiver {
         // Install the sender so handle_activated can drain into it.
         *self.wire_tx.lock().await = Some(wire_tx.clone());
         let gate = self.gate.clone();
-        let xkb_state = self.xkb_state.clone();
         let bound_caps = self.bound_caps;
         let drive = Self::pump(
             context,
             bound_caps,
             gate,
-            xkb_state,
+            None, // xkb_state set when DeviceAdded fires
             stream,
             wire_tx,
             disconnect_tx,
@@ -390,11 +396,19 @@ impl EiReceiver {
     /// The event-pump task. Loops until the stream returns `None`
     /// (EOF), an error, or the EI peer sends the terminal
     /// `Disconnected` protocol event; on exit, signals disconnect.
+    ///
+    /// `xkb_state` is owned by the pump future (not the struct) so
+    /// `EiReceiver` itself is `Send + Sync`. `xkb::State` is a raw
+    /// pointer (per reis's pinned `!Send` xkb_state convention);
+    /// threading it as a plain `Option` through pump→dispatch keeps
+    /// the mutability local without a Mutex, and lets `handle_activated`
+    /// — which never touches the keymap — run on a different task
+    /// wherever the caller wants.
     async fn pump(
         context: ei::Context,
         bound_caps: BitFlags<DeviceCapability>,
         gate: Arc<Mutex<ActivationGate>>,
-        xkb_state: Arc<Mutex<Option<xkb::State>>>,
+        mut xkb_state: Option<xkb::State>,
         mut stream: EiConvertEventStream,
         wire_tx: mpsc::UnboundedSender<WireBody>,
         disconnect_tx: tokio::sync::watch::Sender<bool>,
@@ -420,8 +434,15 @@ impl EiReceiver {
                     break;
                 }
                 Ok(ei_event) => {
-                    Self::dispatch(&context, ei_event, &bound_caps, &gate, &xkb_state, &wire_tx)
-                        .await;
+                    Self::dispatch(
+                        &context,
+                        ei_event,
+                        &bound_caps,
+                        &gate,
+                        &mut xkb_state,
+                        &wire_tx,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     warn!(
@@ -450,7 +471,7 @@ impl EiReceiver {
         event: EiEvent,
         bound_caps: &BitFlags<DeviceCapability>,
         gate: &Arc<Mutex<ActivationGate>>,
-        xkb_state: &Arc<Mutex<Option<xkb::State>>>,
+        xkb_state: &mut Option<xkb::State>,
         wire_tx: &mpsc::UnboundedSender<WireBody>,
     ) {
         match event {
@@ -482,11 +503,11 @@ impl EiReceiver {
             EiEvent::DeviceAdded(device) => {
                 // Mirrors inputcapturesession.cpp:382-391 — pull the
                 // keymap fd for keyboard devices, parse with xkb,
-                // stash the state.
+                // stash the state in the pump-local Option.
                 if let Some(keymap) = device.device.keymap() {
                     match build_xkb_state(&keymap.fd, keymap.size) {
                         Ok(state) => {
-                            *xkb_state.lock().await = Some(state);
+                            *xkb_state = Some(state);
                             debug!(
                                 size = keymap.size,
                                 event = "shareinputdevices_ei_keymap_loaded",
@@ -497,7 +518,7 @@ impl EiReceiver {
                             warn!(
                                 error = %e,
                                 event = "shareinputdevices_ei_keymap_parse_failed",
-                                "Failed to parse keymap; keys will not be decoded"
+                                "Failed to parse keymap (and fallback failed); keys will not be decoded"
                             );
                         }
                     }
@@ -589,14 +610,12 @@ impl EiReceiver {
                 // Mirrors inputcapturesession.cpp:422-427. Apply the
                 // full modifier mask to the xkb state; the next
                 // KeyboardKey lookup reads the union.
-                let mut guard = xkb_state.lock().await;
-                if let Some(state) = guard.as_mut() {
+                if let Some(state) = xkb_state.as_mut() {
                     state.update_mask(mods.depressed, mods.latched, mods.locked, 0, 0, mods.group);
                 }
             }
             EiEvent::KeyboardKey(key) => {
-                let mut guard = xkb_state.lock().await;
-                let Some(state) = guard.as_mut() else {
+                let Some(state) = xkb_state.as_mut() else {
                     // No keymap loaded yet — drop the key. Same
                     // effect as the cpp's switch being unreachable
                     // before DeviceAdded.
@@ -669,7 +688,6 @@ impl EiReceiver {
                     return;
                 }
                 let m = Modifiers::from_xkb_state(state);
-                drop(guard);
                 // The cpp's :435 derives a Qt::Key + int code via
                 // `QXkbCommon::keysymToQtKey(sym, modifiers)`; M1's
                 // `plan_key` takes the int directly. The mapping
@@ -1044,6 +1062,21 @@ mod tests {
         );
         // Non-mouse buttons are dropped (cpp :87 `else` branch).
         assert_eq!(map_button(0x100, true), None); // BTN_0 — joystick
+    }
+
+    #[test]
+    fn ei_receiver_is_send() {
+        // Compile-time pin for the M4 integration: the PortalSession
+        // holds `Arc<EiReceiver>` on the multithread runtime and
+        // calls `handle_activated` from a D-Bus signal task. If a
+        // future re-introduction of a `!Send` field (e.g. an
+        // `xkb::State` back in the struct) makes the assertion fail,
+        // the build breaks before any integration test runs. The
+        // function is `dead_code` from the runtime's perspective —
+        // it exists purely to anchor the bound — hence the allow.
+        #[allow(dead_code)]
+        fn assert_send<T: Send>() {}
+        assert_send::<Arc<EiReceiver>>();
     }
 
     #[test]
