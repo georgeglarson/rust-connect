@@ -728,12 +728,23 @@ impl EiReceiver {
     /// `PortalSession` signal handler. Updates the gate and replays
     /// any queued events in arrival order. Mirrors
     /// `inputcapturesession.cpp:288-301`.
+    ///
+    /// **Lock order: gate → wire.** The gate guard is held until
+    /// after the wire_tx guard is acquired. Pre-fix, the gate guard
+    /// was dropped BEFORE awaiting `wire_tx`; a pump event
+    /// dispatched in that window observed the now-disarmed gate
+    /// (`should_queue()` false because we just set
+    /// `activation_id`) and sent to the wire — landing BEFORE the
+    /// queued events this method is supposed to replay in order.
+    /// That reordering is exactly what the gate exists to prevent;
+    /// holding both locks across `note_activated` collapses the
+    /// window. No deadlock: the pump task takes gate alone, never
+    /// wire_tx, so the gate → wire order has no inverse holder.
     pub async fn handle_activated(&self, activation_id: u32) {
-        let pending = {
-            let mut g = self.gate.lock().await;
-            g.note_activated(activation_id)
-        };
+        let mut gate_guard = self.gate.lock().await;
         let wire_tx_guard = self.wire_tx.lock().await;
+        let pending = gate_guard.note_activated(activation_id);
+        drop(gate_guard);
         let Some(wire_tx) = wire_tx_guard.as_ref() else {
             debug!(
                 activation_id,
