@@ -269,6 +269,9 @@ impl ErrorCode {
             | Self::InvalidConfigValue
             | Self::CapabilityNotSupported => 400,
             Self::DeviceAlreadyExists => 409,
+            // Deliberate policy refusal (e.g. the #1056 cert-anchor gate):
+            // a conflict with the current state, not an internal fault.
+            Self::PairingRejected => 409,
             Self::PairingTimeout
             | Self::ConnectionError
             | Self::TlsError

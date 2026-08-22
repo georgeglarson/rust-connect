@@ -146,6 +146,7 @@ pub async fn get_device(
         (status = 200, description = "Pairing initiated", body = PairResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
+        (status = 409, description = "Pairing refused: no peer certificate presented", body = ApiError),
         (status = 503, description = "Pairing timeout", body = ApiError),
         (status = 500, description = "Internal error", body = ApiError),
     ),
@@ -169,6 +170,21 @@ pub async fn pair_device(
                 .pairing_handler
                 .set_pending_peer_cert(&device_id, cert_der)
                 .await;
+        }
+
+        // Identity anchor pre-check (vk #1056, panel f07ea4a3): the
+        // cert-anchor gate inside accept_pairing can REFUSE, and the
+        // send below runs first — a post-send refusal would leave the
+        // peer believing it is paired while we persist nothing (no
+        // unwind exists on that path). Refuse here, before pair:true
+        // goes on the wire.
+        if !state.pairing_handler.has_identity_anchor(&device_id).await {
+            let _ = state.pairing_handler.reject_pairing(&device_id).await;
+            return Err(api_err(Error::PairingRejected(format!(
+                "Refusing pairing with {}: no peer certificate (pending or pinned) was presented; \
+                 cert-less pairings are not accepted",
+                device_id
+            ))));
         }
 
         // Android acceptPairing (PairingHandler.kt:174-190): the pairing
@@ -738,6 +754,15 @@ mod tests {
             .receive_pair_request(&device_id.to_string(), Some(1_700_000_000))
             .await
             .expect("Value expected to be present");
+        // Stage a synthetic peer cert so the cert-anchor gate (vk #1056)
+        // lets the accept through. Production code paths stage via
+        // receive_pair_request_with_cert; this helper is the unit-test
+        // surface and the cert is generated in a throwaway cert dir.
+        let cert_der = make_test_peer_cert_der(device_id);
+        state
+            .pairing_handler
+            .set_pending_peer_cert(&device_id.to_string(), cert_der)
+            .await;
         state
             .pairing_handler
             .accept_pairing(&device_id.to_string())
@@ -749,6 +774,26 @@ mod tests {
                 .is_paired(&device_id.to_string())
                 .await
         );
+    }
+
+    /// Generate a peer cert DER for `device_id` in a throwaway cert dir.
+    /// The cert is generated via the manager's existing
+    /// `generate_certificate` so the resulting PEM round-trips through
+    /// `store_peer_certificate` cleanly when the accept fires.
+    fn make_test_peer_cert_der(device_id: &str) -> Vec<u8> {
+        let cm_for_cert = std::sync::Arc::new(crate::protocol::crypto::CertificateManager::new(
+            tempfile::TempDir::new()
+                .expect("Value expected to be present")
+                .path()
+                .to_path_buf(),
+        ));
+        let (cert_pem, _) = cm_for_cert
+            .generate_certificate(device_id, "Peer")
+            .expect("Value expected to be present");
+        openssl::x509::X509::from_pem(&cert_pem)
+            .expect("Value expected to be present")
+            .to_der()
+            .expect("Value expected to be present")
     }
     #[tokio::test]
     async fn test_unpair_connected_peer_sends_pair_false() {
