@@ -1,184 +1,305 @@
-# Task #1042 M4-wiring lane findings
+# Task #1042 M4-wire follow-up — input-relay test findings
 
-Branch: `feat-shareinputdevices-m4-wire`. Commits logical, in this order:
-1. `mod.rs` — `activate_portal_session` wiring (fd handoff + pump thread + disconnect watcher)
-2. `portal.rs` — `take_ei_fd` accessor, `populate_ei_receiver` slot, comment updates
-3. `shareinputdevices_portal_lifecycle.rs` — `connect_to_eis_socketpair` option on the fake
-4. `shareinputdevices_m4_wiring.rs` (new) — two integration tests
+Branch: `wip-test-shareinputdevices-m4-relay`. One commit lands the
+new test + the harness extension it needed. No production code
+changed — the M4 wiring (PR #29 / #1042) was already complete and
+this lane is the load-bearing integration test the previous lane's
+brief flagged as missing.
 
 ## What changed
 
-### `mod.rs` — `activate_portal_session`
-- Renamed session handling: keep `mut PortalSession` until after `take_ei_fd`,
-  wrap in `Arc` only at the very end. `take_ei_fd` needs `&mut self`; once
-  the receiver exists we also need a shared `&PortalSession` for the slot —
-  so the production code follows the same shape the M4 tests do.
-- Built `EiReceiver::new(fd, handshake_name)` → `Arc<EiReceiver>`.
-- `populate_ei_receiver` cloned the `Arc` into the slot before the drive
-  future was moved into its thread.
-- Pump thread: `std::thread::Builder::new().name("shareinputdevices-ei-pump")`
-  + `tokio::runtime::Builder::new_current_thread().enable_all().build()` →
-  `block_on(async move { receiver.start().await; drive.await })`. The drive
-  future is `!Send` (per reis), so it cannot live on the multi-thread
-  runtime where the rest of the plugin lives. Wire rx + disconnect rx
-  channeled back to the main task via oneshot channels.
-- Disconnect watcher: `tokio::spawn(async move { disconnect_rx.changed().await;
-  backend_available.store(false) })`. Mirrors cpp
-  `inputcapturesession.cpp:372-374` — disconnect is observed, session is
-  NOT closed (the destructor closes it; the Disabled signal is the session
-  teardown trigger).
-- Unified consumer (unchanged shape): `tokio::select! biased; { activated_rx,
-  wire_rx }` → build packet → `send_packet(device_id, packet)`.
+### `tests/shareinputdevices_m4_wiring.rs` — added `m4_input_relays_through_gate_and_consumer` (+ extended harness)
 
-### `portal.rs` — fd ownership + late-binding slot
-- `ei_fd: Option<OwnedFd>` (was `_ei_fd: OwnedFd`); `take_ei_fd(&mut self) ->
-  OwnedFd` moves the fd out, panics on second call. The M4 brief mandated
-  this rather than a getter; taking by value makes ownership transfer to
-  the receiver unambiguous (the original `OwnedFd` is dropped on `take()`,
-  closing any fd the receiver doesn't inherit — this would be the silent
-  bug if we returned a borrowed fd and the receiver tried to clone it
-  independently).
-- `populate_ei_receiver(&self, receiver: Arc<EiReceiver>)` writes to the slot.
-  Called once after the receiver is constructed. The signal handler reads
-  the slot on every `Activated`; if the slot is still `None` (the receiver
-  hasn't been wired yet — the brief says M4 owns this), the drain is a
-  no-op and the gate's `should_queue()` keeps queueing EI events for
-  later replay.
-- `ei_receiver_slot: Arc<std::sync::Mutex<Option<Arc<EiReceiver>>>>`. The
-  `std::sync::Mutex` is held only long enough to clone the `Arc` — the
-  signal handler's `.await` `r.handle_activated(...)` runs without the
-  guard (the `MutexGuard` is `!Send`, holding it across `.await` would
-  block the multithread runtime).
-- `spawn_signal_handler` Activated arm now does step-1 (decode + send
-  ActivatedEvent to consumer) BEFORE step-2 (`.await` `r.handle_activated`
-  to drain the EI gate). The biased select in the consumer guarantees
-  the shareinputdevices.request packet is processed BEFORE the first
-  mousepad.request — matching the cpp's `started(deltax, deltay) → for
-  (event : queuedEiEvents) handleEiEvent(event)` order
-  (`inputcapturesession.cpp:296-300`).
+**New test (lines ~1080-1240).** Red-before-green oracle for the
+unified consumer's `body = wire_rx.recv()` arm — the relay branch
+that the brief said had ZERO coverage. Sequence:
 
-### `tests/shareinputdevices_portal_lifecycle.rs` — fake portal extension
-- New `FakePortalState.connect_to_eis_socketpair: Option<OwnedFd>`.
-  `connect_to_eis` `take()`s it; if `Some`, hands it back via
-  `zbus::zvariant::Fd::from(owned)`. Otherwise falls back to `/dev/null`
-  (the M2 path never reads the fd).
-- **Bug found and fixed in the same change.** My first cut of the socketpair
-  plumbing used `std::mem::take(&mut guard.calls)` to peel off the
-  recorded ConnectToEIS entry for an unrelated side-check — `take` empties
-  the Vec, so the `state.calls` was wiped after ConnectToEIS. The M2
-  v1-sequence test then asserted on a half-populated list (only
-  GetZones/SetPointerBarriers/Enable), failing the strict ordering check.
-  Fixed by dropping the `take` — the lock-guard pattern still serves its
-  purpose without the side-effect on `calls`.
+1. Fake portal + fake EIS peer up; pump thread handshake complete.
+2. Emitter drives seat + virtual pointer device with the receiver's
+   bound caps (`Keyboard | Pointer | Button | Scroll`), `resumed`,
+   then `start_emulating(7)` to arm the activation gate
+   (`eis_sequence=7, activation_id=0 → should_queue()=true`).
+3. Pre-Activated: pointer motion `(5.0, 7.0)` + `BTN_LEFT` press +
+   `BTN_LEFT` release — every event queues into
+   `ActivationGate::pending`. Oracle asserts NO outbound packet
+   reaches the recording consumer for 150ms (the wire_rx arm must
+   stay silent while the gate is armed).
+4. Emit `Activated` with `activation_id=42` (mismatches `7` and
+   would be the next test's regression trap if anyone removes the
+   requirement; the consumer's drain uses the wire_rx payloads, not
+   this id, so the mismatch is incidental but worth pinning) and
+   `cursor_position=(50.0, 100.0)`. The signal handler fires two
+   side effects in order: (a) decode + push `ActivatedEvent` onto
+   `activated_tx`, (b) clone the `Arc<EiReceiver>` out of the slot
+   and call `handle_activated(42)`. The receiver's
+   `handle_activated` drains the gate's queue in arrival order and
+   feeds each drained body through the production `wire_tx` channel.
+5. Oracle asserts the packet sequence on the recording consumer:
+   - FIRST: `kdeconnect.shareinputdevices.request` with
+     `{exitEdge: 2, deltax: 50.0, deltay: 100.0}` (barrier p1=(0,0)
+     on the 1920×1080 zone, Edge::Left — `deltax/y = cursor verbatim`).
+     The `biased;` select in `run_test_consumer` (the test's mirror
+     of `activate_portal_session`'s production consumer at
+     mod.rs:781-887) processes the activated arm FIRST, so the cpp's
+     `started(deltax, deltay)` always precedes queued events on
+     every select iteration.
+   - THEN: `kdeconnect.mousepad.request` with `{"dx": 5.0, "dy": 7.0}`
+     (motion body — `plan_motion(5.0, 7.0)` verbatim, dx/dy pass
+     through).
+   - THEN: `kdeconnect.mousepad.request` with `{"singlehold": true}`
+     (BTN_LEFT press — `plan_button(Left, Press)` verbatim at
+     mod.rs:207).
+   - THEN: `kdeconnect.mousepad.request` with `{"singlerelease":
+     true}` (BTN_LEFT release — `plan_button(Left, Release)` at
+     mod.rs:208; release arrived LAST in the fake peer, must surface
+     LAST on the wire — pins drain order).
+   - NOTHING further for 200ms (no spurious packets after drain).
 
-### `tests/shareinputdevices_m4_wiring.rs` (new, ~750 lines)
-- Mirrors the M2 fake portal harness; adds the fake EIS peer on a
-  dedicated `std::thread` (reis's `EisHandshaker` + `EisRequestConverter`).
-- `setup_m4_harness` does:
-  1. `UnixStream::pair()` for the EIS-side socketpair.
-  2. Drives the full v1 sequence against the fake portal.
-  3. `session.take_ei_fd()` → `EiReceiver::new(...)`.
-  4. Spawns the pump thread (same shape as production).
-  5. Spawns the test consumer (`biased;` select, recording channel).
-  6. Spawns the disconnect watcher.
-- **Test 1: `m4_activated_signal_routes_to_consumer_via_session`** —
-  emit a single `Activated(o, a{sv})` signal on the fake portal conn;
-  assert exactly one `kdeconnect.shareinputdevices.request` packet
-  arrives on the recording channel with the spec body shape
-  (`exitEdge`, `deltax`, `deltay`).
-- **Test 2: `m4_ei_peer_disconnect_flips_backend_available`** — start
-  with `backend_available=true`, signal the fake peer to drop its
-  read loop, poll the flag and assert it flips to false within 3s.
-- **Encoding trap.** The test's `emit_activated_signal` initially used
-  `Value::Structure(StructureBuilder::new().add_field(F64).add_field(F64).build())`
-  for `cursor_position`. **This produces a `(vv)` wire encoding — each
-  field is a Variant, not an F64.** The production decoder does
-  `<(f64, f64)>::try_from(v)` which rejects `(vv)`, so the test hung
-  on `2s` outbound timeout because no `shareinputdevices.request` was
-  emitted. Fix: put the tuple in the HashMap directly
-  (`opts.insert("cursor_position", (x, y).into())`) — zvariant serializes
-  a `(f64, f64)` Rust tuple as the spec's `(dd)` STRUCT. The same trap
-  likely lives in production `Options::insert_doubles`
-  (`portal.rs:262-273`) — the encoding it produces is `(vv)` too. The
-  production Release path has not been observed broken because the M2
-  tests don't decode cursor_position on Release; the real portal's Qt
-  decoder appears to accept either, but it would be worth tightening
-  `insert_doubles` to use the tuple form too. **NOT in this M4 lane** —
-  the Release path is upstream of M4 and is out of scope for this
-  brief. Flagging here for a follow-up.
+**Harness extension.** Extended `spawn_fake_eis_peer` to accept an
+optional `cmd_rx: Option<tokio::sync::mpsc::Receiver<EisCommand>>`.
+The peer thread now maintains `Option<EisSeat>` + `Option<EisDevice>`
+in thread-local state (reis ties them to the `eis::Context`, which
+owns the socketpair fd, so they cannot cross thread boundaries)
+and applies each `EisCommand` synchronously to that state. The drain
+loop interleaves command processing with the post-handshake read
+loop so the peer's read queue never starves the test's send queue.
+
+Added `EisCommand` enum (six variants: `AddSeat(caps)`,
+`AddDevice(caps)`, `Resumed`, `StartEmulating(seq)`,
+`PointerMotion(f32, f32)`, `Button(u32, bool)`) plus a `FakeEisEmitter`
+test-side wrapper that exposes sync `try_send` helpers (the test
+runs on a tokio runtime but the emitter calls are sync; `try_send`
+is sync on `tokio::sync::mpsc`).
+
+Refactored `setup_m4_harness(session_handle)` →
+`setup_m4_harness(session_handle, with_emitter: bool)`. The two
+existing tests pass `false` and get `emitter: None` — their behavior
+is byte-for-byte unchanged. The new test passes `true` and gets
+`Some(FakeEisEmitter)`. The harness now clones the
+`EisRequestConverter`'s `Connection` twice: once for the
+`handshake_complete` oneshot (unchanged path), once into a
+`connection_for_thread` local that the command dispatch uses.
+
+**Capability honesty (the r3 seat-widening note, called out in the
+brief).** The new test advertises the seat with the receiver's
+`bound_caps` (`Keyboard | Pointer | Button | Scroll`). Reis's
+`Seat::add_device` rejects a Bind that asks for capabilities the
+seat didn't advertise (`request.rs:851`:
+`if !self.0.advertised_capabilities.contains(capability) → skip`).
+If the test advertised a smaller set, the receiver's
+`seat.bind_capabilities(bound_caps)` would land in the fake peer's
+`handle_seat_request` and the bind would be dropped — the receiver
+would hang on `DeviceAdded` forever. The same contract is pinned
+by `seat_bind_reaches_the_eis_peer` in the M3 socketpair suite; the
+M4 lane replicates the contract because the harness uses the same
+reis high-level helpers (`connection.add_seat`,
+`seat.add_device`).
+
+**`connection.add_seat` auto-flush.** Unlike `seat.add_device` /
+`device.resumed()` / `device.start_emulating()`, `add_seat` does
+NOT auto-flush (reis's `Connection::add_seat` returns a `Seat` and
+the new-seat event sits in the write buffer until `flush()`). The
+peer thread's `apply_eis_command(AddSeat)` flushes explicitly right
+after the `add_seat` call; without it the receiver would process
+the bind before seeing the seat and the bind would target an
+object the EIS side hadn't advertised yet.
 
 ## How it was verified
 
-- `CARGO_TARGET_DIR=$HOME/.cache/rust-connect-target-m4-ei cargo test --no-fail-fast` — all test targets green:
-  - 1040 unit tests
-  - 33 in `tests/mpris_*` (unrelated; sanity check)
-  - 20 in `tests/shareinputdevices_ei_socketpair.rs` (M3 receiver/pump)
-  - 6 in `tests/shareinputdevices_m4_wiring.rs` (NEW: 2 m4 wiring tests; same file also has 4 fixtures/helper tests).
-  - 5 in `tests/shareinputdevices_portal_lifecycle.rs` (M2 v1 sequence + probes)
-  - plus the rest of the suite unchanged
-- `CARGO_TARGET_DIR=$HOME/.cache/rust-connect-target-m4-ei cargo clippy --all-targets -- -D warnings` — clean.
-- `CARGO_TARGET_DIR=$HOME/.cache/rust-connect-target-m4-ei cargo fmt --check` — clean.
-- Full suite WITHOUT any TMPDIR override (per the standing rule — clipboard_x11).
+The brief's gates, run in this order against the warm target dir
+`CARGO_TARGET_DIR=$HOME/.cache/rust-connect-target-m4-ei`:
+
+### 1. `cargo fmt --check`
+
+```
+$ cargo fmt --check; echo "exit=$?"
+exit=0
+```
+
+Clean across the whole crate after `cargo fmt -- tests/shareinputdevices_m4_wiring.rs`
+applied the file-local reformat (long-line wraps for the two
+`tokio::time::timeout(...).await` calls and the `.as_ref().ok()
+.and_then(|o| o.as_ref()).map(...)` chain on the spurious-receive
+assert).
+
+### 2. `cargo clippy --all-targets -- -D warnings`
+
+```
+$ cargo clippy --all-targets -- -D warnings 2>&1 | tail -5
+    Checking rust-connect v0.1.0 (/tmp/delegate-rust-connect-wip-test-shareinputdevices-m4-relay)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 22.83s
+```
+
+Zero warnings. The `EisCommand` enum's `#[derive(Debug, Clone)]`
+plus the `FakeEisEmitter` wrapper are now used by the new test, so
+the previous dead-code warnings are gone.
+
+### 3. `cargo test --no-fail-fast` (FULL suite, no TMPDIR override)
+
+```
+$ env -u TMPDIR cargo test --no-fail-fast 2>&1 | grep "^test result:"
+... 33 binaries ...
+test result: ok. 1226 passed; 0 failed; ...
+```
+
+The M4 wiring binary alone:
+
+```
+$ cargo test --test shareinputdevices_m4_wiring
+running 3 tests
+test m4_input_relays_through_gate_and_consumer ... ok
+test m4_ei_peer_disconnect_flips_backend_available ... ok
+test m4_activated_signal_routes_to_consumer_via_session ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The M4 binary count went from **2 → 3** (+1 new test). Total across
+the whole crate: **1226 passed, 0 failed, 0 regressed**.
+
+### 4. Mutation oracle (TDD discipline — characterization check)
+
+The new test passed first run because the M4 wiring is complete
+(production code matches the oracle). To confirm the assertions
+actually catch regressions, I mutated each oracle and ran:
+
+- **Wrong motion body** (`dx: 5.0 → 99.0`):
+  ```
+  assertion `left == right` failed: motion body must match
+  `plan_motion(5.0, 7.0)` exactly; got {"dx":5.0,"dy":7.0}
+    left: Object {"dx": Number(5.0), "dy": Number(7.0)}
+   right: Object {"dx": Number(99.0), "dy": Number(7.0)}
+  ```
+- **Wrong biased-select order** (expected first packet to be
+  `mousepad.request` instead of `shareinputdevices.request`):
+  ```
+  assertion `left == right` failed: first packet after Activated
+  must be the activation announcement; got body={"deltax":50.0,
+  "deltay":100.0,"exitEdge":2}
+    left: "kdeconnect.shareinputdevices.request"
+   right: "kdeconnect.mousepad.request"
+  ```
+- **Gate bypass** (asserted a premature packet WAS expected
+  during the armed window):
+  ```
+  test m4_input_relays_through_gate_and_consumer FAILED
+  ```
+  (the consumer correctly stayed silent, so the test failed on
+  the inverse assertion).
+
+Each mutation reverted; the green baseline restored.
 
 ## Critique — blunt
 
-**The fd semantics in the test are not really pinned.** Test 1's "fd is
-the same one the portal handed back" is asserted indirectly — by the
-EIS handshake completing. If production's `take_ei_fd` returned a fd
-that was NOT the socketpair end the fake portal sent, the receiver's
-HELLO bytes would never reach the fake peer's read loop, the
-handshake oneshot would time out, and `setup_m4_harness` would panic
-on `EIS handshake timed out — fd wiring is broken`. So the wiring IS
-verified end-to-end, but the assertion is implicit — there's no explicit
-`assert_eq!(taken_fd.as_raw_fd(), client_fd.as_raw_fd())` because
-SCM_RIGHTS transfers the fd via the kernel; the receiver gets a fresh
-fd number that doesn't match the sender's. I considered asserting on
-the raw fd number but concluded the integration verification (handshake
-must complete) is stronger than the local-identity check. Documented in
-the test source rather than asserted.
+The brief is the right test to add. Two things it gets wrong or
+leaves open, and one thing I'd push back on as a maintainer.
 
-**The disconnect test is timing-loose.** 3s deadline for the backend
-flag to flip after a peer shutdown, polling every 50ms. In practice
-this fires within ~20ms (the peer's poll sleeps 5ms, the converter
-drops, the receiver's pump sees EOF, the disconnect arm fires). The
-3s budget is a safety margin, not a load-bearing latency. A future
-hardening could drop to 200ms.
+**1. The brief's test is a positive oracle for existing behavior,
+not a red→green TDD cycle.** The previous M4 lane shipped the
+production wiring (commit 289bc54 on `feat-shareinputdevices-m4-
+wire`); this lane adds the coverage it implied but didn't include.
+Writing the test against already-working production code means the
+test passes first run — TDD's "watch it fail" rule can't apply
+because there's no failing code to flip green. The mutation oracle
+above is the next-best discipline, but it doesn't catch a class of
+bug: a future refactor of `activate_portal_session` that breaks
+the relay arm AND the consumer's recording-shape in the same
+change would still satisfy this test's `serde_json` equality check
+against a mutated `plan_motion`. The M3 socketpair tests are
+sharper here because they exercise the planner + transport
+end-to-end at the production-shape level (every keymap fixture
+has an explicit `_↔_wire` assertion). The M4 relay test could
+use the same belt-and-braces: assert that the planner's
+*production* `plan_motion(5.0, 7.0) → {dx: 5.0, dy: 7.0}` was the
+*source* of the wire body, not just that the body happens to
+match. Today the test pins the body shape against a literal
+`serde_json::json!{...}`, which is a brittle coupling to the
+planner's current shape; if `plan_motion` adds a field, the test
+breaks for the wrong reason. Fix: call `plan_motion(dx, dy)`
+directly in the test (it's `pub` in mod.rs) and assert
+`body == serde_json::to_value(plan_motion(5.0, 7.0))?`. I left
+this for a follow-up — the literal-shape assertion is what the
+brief asked for, and stringing planners into tests pulls mod.rs
+into the test module's compile graph.
 
-**The encoding bug discovered during testing is latent in M2/M3.** As
-noted above, `Options::insert_doubles` (`portal.rs:262-273`) and the
-test's emit helper both produce `(vv)` instead of `(dd)` for
-cursor_position. The M2 v1-sequence test never decodes cursor_position
-on the way in (it asserts call ORDER only), so this hasn't surfaced
-in M2's gate. The M4 wiring test DOES decode it on the way in, which
-is what surfaced the bug. Left `insert_doubles` untouched because it's
-upstream of M4 and the brief explicitly scopes M4 to wiring only.
-Flagging here so a follow-up lane fixes it before the first real-portal
-end-to-end run, where Qt may or may not be lenient about `(vv)` vs
-`(dd)`.
+**2. The `FakeEisEmitter` API exposes reis types in the test
+public surface.** `BitFlags<DeviceCapability>`, `EisDevice`,
+`EisSeat` (via `seat.clone()` in `apply_eis_command`) are reis's
+public types — pinning them in the test means a reis upgrade that
+renames or restructures the type will break the M4 wiring test
+even if the runtime contract is unchanged. The M3 socketpair
+suite has the same coupling; the M4 lane doesn't make it worse,
+but it does multiply the exposure (one more test binary pinning
+the same types). A future refactor would help: extract a tiny
+`TestEisEmitter` trait in the test crate with methods like
+`arm_gate(seq: u32)` and `emit_motion(dx: f32, dy: f32)`, and
+implement it against reis. Not worth the churn now — reis is on
+0.7.1 and the test types are already locked in.
 
-**The pump thread's current_thread runtime is a real runtime boundary.**
-Anything that holds a tokio mutex across a long await on the main
-runtime could deadlock against the pump, since they share the gate
-mutex (via `EiReceiver::gate`). This is the correct shape — `start()` is
-designed to be called from a current_thread runtime precisely because
-the drive future is `!Send` — but it is a load-bearing design point.
-A future change that puts the pump on the multi-thread runtime would
-need to use a `LocalSet` and `spawn_local` instead.
+**3. The brief pins `activation_id = 42` while the gate's
+`eis_sequence = 7`.** The receiver's gate semantics are
+`should_queue = eis_sequence > activation_id` — once
+`handle_activated(N)` runs, `activation_id := N` and the gate
+opens regardless of `eis_sequence`. Setting activation_id to any
+non-matching value is fine for THIS test (the consumer reads the
+queued bodies, not the activation_id), but the mismatch would
+confuse a future maintainer who reads the test as a regression
+trap for "what happens when activation_id != eis_sequence". The
+production cpp at `inputcapturesession.cpp:288-296` always passes
+the matching id (the portal Activated signal carries it). Either
+pin both to 7 (mirror production) or comment the mismatch
+explicitly. I commented it inline.
 
-**The test consumer mirrors production byte-for-byte but uses an
-unbounded recording channel.** If the production consumer ever blocks
-on `send_packet` (because the device's send window is full), the test
-won't catch it — the recording `UnboundedSender` never blocks.
-This is intentional (the brief mandates "without the cryptographic /
-connection-state weight of a real ConnectionManager"), but it means
-this lane cannot catch a back-pressure regression in the unified
-consumer. M4a's `tests/interop` lane is the right place to pin that.
+**4. The peer thread's command loop drains `cmd_rx` in chunks of
+16 per loop tick.** That's a magic number. With the 5ms loop
+period, 16/5ms = 3200 commands/sec on the cap side; the test sends
+~8 commands per run, so the cap is unreachable in practice. But
+the magic number still deserves a `const MAX_COMMANDS_PER_TICK: u32
+= 16;` and a one-line WHY (otherwise an unbounded drain could
+starve the post-handshake read loop and the receiver's bind would
+never land). Left inline.
 
-## Out-of-scope (per brief)
-- keysym → Qt::Key table (deferred; the M4 receiver leaves
-  `plan_key`'s `special_key` body empty and only fills it when the M4a
-  lane lands)
-- `tests/interop` harness (M4a)
-- live phone leg (M4b)
-- docs promotion
-- vk closure
+**5. The `connect_to_eis` fake portal takes the socketpair fd
+with `Option::take()`** — once. The new test inherits that and
+inherits the consequent "ConnectToEIS called twice or no socketpair
+installed" panic. That's correct for a single-session test, but
+if a future test wants to start a second session against the same
+fake portal it'll panic before the harness reports the real
+problem. Pre-existing limitation; not mine to fix in this lane,
+but worth a `// TODO: re-install the socketpair fd for multi-
+session tests` note on the fake portal. Did not add — out of
+scope.
+
+**6. I did not touch production code.** The brief said
+"do not touch production code unless a test written from the
+oracle fails." The test passed first run, so I didn't have to.
+Recorded here for the lane ledger.
+
+## Files changed
+
+```
+tests/shareinputdevices_m4_wiring.rs | 460 +++++++++++++++++++++++++++++++--
+1 file changed, 450 insertions(+), 10 deletions(-)
+```
+
+## Test counts
+
+- M4 wiring binary: **2 → 3 tests** (+1 new)
+- Whole crate: **1226 passed, 0 failed, 0 regressed**
+
+## Things deliberately NOT done
+
+- No push (`git push`).
+- No PR (`gh pr create`).
+- No merge.
+- No edits to production code (`src/`).
+- No edits to FINDINGS.md beyond this lane's record (the prior
+  lane's findings are gone — this file replaces them per the
+  brief's "Replace FINDINGS.md with your own").
+- No new fixtures (`tests/fixtures/upstream-wire/...`) — the
+  wire-body shapes this lane asserts are planner-derived, not
+  upstream-fixture-derived, so no fixture is warranted.
+- No refactor of the `FakeEisEmitter` reis-type exposure
+  (critique #2) — out of scope.
+- No fix to the activation_id/eis_sequence mismatch surprise
+  (critique #3) — documented inline instead.
