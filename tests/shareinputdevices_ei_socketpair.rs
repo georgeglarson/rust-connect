@@ -1432,11 +1432,8 @@ fn latched_shift_modifier_surfaces_as_shift_on_wire() {
             let kb: eis::Keyboard = device.interface().expect("device has keyboard interface");
             // group=0 (no layout switch); serial=0 is fine for tests.
             kb.modifiers(
-                /* serial */ 0,
-                /* depressed */ 0,
-                /* locked */ 0,
-                /* latched */ 1,
-                /* group */ 0,
+                /* serial */ 0, /* depressed */ 0, /* locked */ 0,
+                /* latched */ 1, /* group */ 0,
             );
             device.frame(0);
             connection.flush().expect("flush modifiers+frame");
@@ -1719,11 +1716,8 @@ fn ctrl_shortcut_keeps_the_letter_text_on_the_wire() {
             let kb: eis::Keyboard = device.interface().expect("device has keyboard interface");
             // serial=0; group=0 (no layout switch).
             kb.modifiers(
-                /* serial */ 0,
-                /* depressed */ 4,
-                /* locked */ 0,
-                /* latched */ 0,
-                /* group */ 0,
+                /* serial */ 0, /* depressed */ 4, /* locked */ 0,
+                /* latched */ 0, /* group */ 0,
             );
             device.frame(0);
             connection.flush().expect("flush modifiers+frame");

@@ -905,7 +905,13 @@ fn build_xkb_state(fd: &OwnedFd, size: u32) -> Result<xkb::State, Error> {
                 "Failed to parse keymap; falling back to the default RMLVO keymap"
             );
             xkb::Keymap::new_from_names(
-                &context, "", "", "", "", None, xkb::KEYMAP_COMPILE_NO_FLAGS,
+                &context,
+                "",
+                "",
+                "",
+                "",
+                None,
+                xkb::KEYMAP_COMPILE_NO_FLAGS,
             )
             .ok_or_else(|| Error::Xkb {
                 size,
