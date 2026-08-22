@@ -85,6 +85,12 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// Late-binding slot for the portal's `Disabled` signal callback
+/// (panel M4 round 2 fix — P2). The signal handler reads this and
+/// invokes the closure if set; production wires
+/// `mod.rs::do_deactivate`'s path here, tests leave it `None`.
+pub(crate) type DisabledCallbackSlot = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -493,6 +499,12 @@ pub struct PortalSession {
     /// inputcapturesession.cpp:295-296). Updated on every rearm so
     /// that a ZonesChanged-driven rearm uses the new coordinates.
     barrier_origin: Arc<Mutex<(i32, i32)>>,
+    /// Late-binding `Disabled`-signal callback (panel M4 round 2
+    /// fix — P2). The signal handler reads this slot when the
+    /// portal emits Disabled and invokes the closure if set.
+    /// Production wires `mod.rs::do_deactivate`'s path here after
+    /// `start` returns; tests leave it `None`.
+    on_disabled: DisabledCallbackSlot,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -726,6 +738,12 @@ impl PortalSession {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let ei_receiver_slot: Arc<Mutex<Option<Arc<EiReceiver>>>> = Arc::new(Mutex::new(None));
         let pending_activation_id: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+        // Late-binding slot for the portal `Disabled`-signal
+        // callback (panel M4 round 2 fix — P2). The signal
+        // handler reads it on Disabled; the plugin's
+        // `do_activate` installs the deactivate closure AFTER
+        // `start` returns (see `PortalSession::set_on_disabled`).
+        let on_disabled_slot: DisabledCallbackSlot = Arc::new(Mutex::new(None));
         spawn_signal_handler(
             signal_stream,
             conn.clone(),
@@ -737,6 +755,7 @@ impl PortalSession {
             ei_receiver_slot.clone(),
             pending_activation_id.clone(),
             shutdown_rx,
+            on_disabled_slot.clone(),
         );
 
         close_guard.defuse();
@@ -752,6 +771,7 @@ impl PortalSession {
             activated_tx,
             _shutdown_tx: Some(shutdown_tx),
             barrier_origin,
+            on_disabled: on_disabled_slot,
         })
     }
 
@@ -869,19 +889,52 @@ impl PortalSession {
     /// `gate.activation_id` so the next pump iteration sees the
     /// gate open and any EI events that arrive between this
     /// call and the next Activated do not get re-queued.
+    ///
+    /// **Lock-order invariant (panel M4 round 2 fix — P1).** The
+    /// slot write AND the pending take must happen in one
+    /// critical section; otherwise an `Activated` landing
+    /// BETWEEN the two writes is observable in two bad ways:
+    /// (a) the handler sees the new slot, calls `handle_activated`
+    /// live, populate then replays the OLDER deferred id —
+    /// `note_activated` overwrites `activation_id` backwards and
+    /// `should_queue()` re-arms, draining at the wrong start
+    /// position; (b) the handler snapshots `slot=None`, populate
+    /// lands and takes a still-empty `pending`, the handler
+    /// writes `pending` AFTER populate — the deferred id is never
+    /// replayed and the first-cycle `activation_id` stays 0.
+    ///
+    /// Fix shape: acquire BOTH mutexes in the order the handler
+    /// uses (slot first, then pending), write the slot, take the
+    /// pending, drop both before the `.await`. The handler holds
+    /// the slot lock across its pending write (see
+    /// `spawn_signal_handler` Activated arm), so the two paths
+    /// are mutually serialised — populate either fully replays the
+    /// deferred id or sees `pending=None` because the handler
+    /// will commit its write only after populate releases.
     pub async fn populate_ei_receiver(&self, receiver: Arc<EiReceiver>) {
-        *self
-            .ei_receiver_slot
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(receiver.clone());
-        // Take the deferred id BEFORE we hand the lock back so a
-        // racing Activated between the unlock and the `.await`
-        // below can't overwrite the value we are about to replay.
-        let deferred = self
-            .pending_activation_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        // Single critical section: take the slot lock, write the
+        // Arc, take the pending lock, take the deferred id. The
+        // block scopes both guards so they are dropped before the
+        // `.await` — `std::sync::MutexGuard` is `!Send` and the
+        // spawned async block at mod.rs:706 (the gate's eager
+        // re-arm) requires Send. The handler holds the slot lock
+        // across its pending write (see `spawn_signal_handler`
+        // Activated arm) using the same handler-order acquisition
+        // (slot → pending), so this section is mutually
+        // serialised with the handler — populate either fully
+        // replays the deferred id or sees `pending=None` because
+        // the handler hasn't decided to defer yet.
+        let deferred = {
+            let mut slot_guard = self
+                .ei_receiver_slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *slot_guard = Some(receiver.clone());
+            self.pending_activation_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+        }; // both guards dropped at end of scope
         if let Some(activation_id) = deferred {
             debug!(
                 activation_id,
@@ -899,6 +952,20 @@ impl PortalSession {
     #[cfg(test)]
     pub fn ei_receiver_slot(&self) -> Arc<Mutex<Option<Arc<EiReceiver>>>> {
         self.ei_receiver_slot.clone()
+    }
+
+    /// Late-binding slot for the `Disabled`-signal callback. The
+    /// signal handler is spawned at `start` time, BEFORE the
+    /// plugin's deactivate machinery is wired (that wiring
+    /// happens in `mod.rs::do_activate` after `start` returns).
+    /// Production installs the deactivate callback here; the
+    /// signal handler reads the slot when it sees `Disabled`.
+    /// `None` until installed — tests can leave it unset since
+    /// they don't exercise the cross-module deactivate path.
+    /// See panel M4 round 2 fix — P2 part 2.
+    pub fn set_on_disabled(&self, cb: Arc<dyn Fn() + Send + Sync>) {
+        let mut slot = self.on_disabled.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some(cb);
     }
 }
 
@@ -1052,6 +1119,12 @@ fn spawn_signal_handler(
     ei_receiver_slot: Arc<Mutex<Option<Arc<EiReceiver>>>>,
     pending_activation_id: Arc<Mutex<Option<u32>>>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    // Late-binding slot for the `Disabled`-signal callback
+    // (panel M4 round 2 fix — P2). `start` clones this Arc into
+    // the spawned task and into `PortalSession::on_disabled`;
+    // `mod.rs::do_activate` installs the deactivate closure on
+    // the slot AFTER `start` returns. Reads on Disabled.
+    on_disabled_slot: DisabledCallbackSlot,
 ) {
     tokio::spawn(async move {
         let iface: InterfaceName<'static> = INPUT_CAPTURE_IFACE.try_into().expect("iface parse");
@@ -1118,39 +1191,64 @@ fn spawn_signal_handler(
                                 // (panel M4 panel round 1 fix —
                                 // pre-fix, the id was dropped here
                                 // and queued EI input was orphaned).
-                                // We clone the Arc out of the slot
-                                // and release the std::sync lock
-                                // BEFORE awaiting — guards are
-                                // !Send and the receiver's pump
-                                // future is !Send, but the already-
-                                // running task here is on a
-                                // multithread runtime; holding the
-                                // std::sync::Mutex across an .await
-                                // would block the runtime.
-                                let receiver = {
-                                    let guard = ei_receiver_slot
+                                //
+                                // **Atomic slot-check + pending-write
+                                // (panel M4 round 2 fix — P1).** The
+                                // handler must hold the slot lock
+                                // across the pending write so a
+                                // concurrent `populate_ei_receiver`
+                                // cannot interleave the slot-set and
+                                // the pending-take. The pre-fix shape
+                                // (snapshot slot, drop lock, lock
+                                // pending) had a window where the
+                                // handler had decided "defer" but
+                                // hadn't written yet — populate took
+                                // an empty pending and the deferred
+                                // id was lost. Holding the slot lock
+                                // through the pending write
+                                // serialises against
+                                // `populate_ei_receiver` (which
+                                // acquires slot first, then pending
+                                // — handler's order — and writes the
+                                // slot before taking pending), so
+                                // the handler either fully defers or
+                                // fully direct-calls; the populate
+                                // path either fully replays or
+                                // observes an empty pending.
+                                let snapshot = {
+                                    let slot_guard = ei_receiver_slot
                                         .lock()
                                         .unwrap_or_else(|e| e.into_inner());
-                                    guard.as_ref().cloned()
-                                };
-                                if let Some(r) = receiver {
-                                    r.handle_activated(activation_id).await;
-                                } else {
-                                    // Empty slot — defer to populate.
-                                    // Storing only the most-recent id
-                                    // is intentional: see
-                                    // `spawn_signal_handler` doc on
-                                    // `pending_activation_id`.
-                                    *pending_activation_id
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner()) =
-                                        Some(activation_id);
-                                    debug!(
-                                        activation_id,
-                                        event = "shareinputdevices_activated_no_receiver",
-                                        "Activated received before EI receiver attached; \
-                                         gate drain deferred until receiver populates"
-                                    );
+                                    if let Some(r) = slot_guard.as_ref().cloned() {
+                                        Some(r)
+                                    } else {
+                                        // Empty slot — defer to
+                                        // populate. The slot lock
+                                        // is held across the
+                                        // pending write so a
+                                        // concurrent
+                                        // `populate_ei_receiver`
+                                        // cannot read a stale
+                                        // "no pending" snapshot
+                                        // (see the P1 doc on
+                                        // `populate_ei_receiver`).
+                                        *pending_activation_id
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) =
+                                            Some(activation_id);
+                                        None
+                                    }
+                                }; // slot_guard dropped here
+                                match snapshot {
+                                    Some(r) => r.handle_activated(activation_id).await,
+                                    None => {
+                                        debug!(
+                                            activation_id,
+                                            event = "shareinputdevices_activated_no_receiver",
+                                            "Activated received before EI receiver attached; \
+                                             gate drain deferred until receiver populates"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1159,8 +1257,29 @@ fn spawn_signal_handler(
                                    "Portal Deactivated received");
                         }
                         "Disabled" => {
+                            // **Departure from cpp observe-don't-
+                            // close shape (panel M4 round 2 fix —
+                            // P2 part 2).** The cpp at
+                            // inputcapturesession.cpp only logs
+                            // Disabled — its session is
+                            // per-plugin-instance and dies with
+                            // it. Ours is shared; a Disabled that
+                            // leaves the slot populated would
+                            // block re-activation. Funnel through
+                            // the same deactivate machinery the
+                            // EI-disconnect watcher uses so the
+                            // two paths converge.
                             warn!(event = "shareinputdevices_portal_disabled",
-                                  "Portal Disabled received");
+                                  "Portal Disabled received; deactivating");
+                            let cb = {
+                                let slot = on_disabled_slot
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                slot.as_ref().cloned()
+                            };
+                            if let Some(cb) = cb {
+                                cb();
+                            }
                         }
                         "ZonesChanged" => {
                             let body = msg.body();
