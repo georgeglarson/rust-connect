@@ -344,8 +344,18 @@ async fn setup(state: Arc<Mutex<FakePortalState>>) -> Option<DaemonGuard> {
         .output()
         .is_err()
     {
-        eprintln!("dbus-daemon not on PATH — skipping");
-        return None;
+        // Loud-skip (panel M4 panel round 1 hygiene pass): the
+        // previous silent-skip returned `None` and the caller
+        // early-returned, marking the test as PASS — but no
+        // coverage was actually exercised. A bare `eprintln` is
+        // invisible in the test summary; a `panic!` makes the
+        // absence a hard failure with the dependency name
+        // surfaced. CI environments must provide dbus-daemon.
+        panic!(
+            "shareinputdevices integration tests require `dbus-daemon` on PATH \
+             (panel M4 round 1 hygiene: silent-skip reported coverage that \
+             was not exercised; install dbus-daemon to run these tests)"
+        );
     }
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket_path = tmp.path().join("bus");
@@ -384,10 +394,23 @@ async fn setup(state: Arc<Mutex<FakePortalState>>) -> Option<DaemonGuard> {
 // ============ Minimal fake EIS peer (handshake-only, no event traffic) ============
 
 /// Spawn a thread that completes the EIS handshake against the
-/// socketpair's peer end, then drops the EIS context so the
-/// receiver's pump sees EOF on its half. The thread owns the EIS
-/// state for its lifetime (reis's `eis::Context` is `!Send`).
-fn spawn_minimal_eis_peer(peer_stream: UnixStream) {
+/// socketpair's peer end, then keeps the EIS context alive until
+/// the optional `drop_tx` oneshot fires. **The peer MUST stay
+/// alive across the test's `portal_backend_available()` assertion**
+/// — pre-Fix-3, the previous version dropped the eis_ctx at the
+/// end of the handshake loop, which closed the socketpair end and
+/// caused the receiver's pump to fire the disconnect arm; the
+/// disconnect watcher was already running by then, so
+/// `backend_available` flipped to `false` between
+/// `enable_session_backend()` returning and the test's poll. The
+/// Fix-3 ordering narrows the race, but does not eliminate it —
+/// the peer is the synchronization point. The peer thread owns
+/// the EIS state for its lifetime (reis's `eis::Context` is
+/// `!Send`).
+fn spawn_minimal_eis_peer(
+    peer_stream: UnixStream,
+    drop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let eis_ctx = eis::Context::new(peer_stream).expect("eis Context::new");
         let handshaker = std::sync::Mutex::new(EisHandshaker::new(&eis_ctx, 1));
@@ -416,12 +439,22 @@ fn spawn_minimal_eis_peer(peer_stream: UnixStream) {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        // Drop our half → receiver's pump sees EOF → disconnect arm
-        // fires. We never bind a seat/device because the test
-        // doesn't care about input events — it only cares that the
-        // v1 portal sequence ran to completion.
+        // Hold the EIS context alive until the test signals. We
+        // never bind a seat/device because the test doesn't care
+        // about input events — it only cares that the v1 portal
+        // sequence ran to completion and that the capability
+        // advertisement sticks during the assertion window.
+        if let Some(tx) = drop_tx {
+            let _ = tx.send(());
+        }
+        // Park until the channel closes (test drops its rx) — at
+        // that point the socketpair end closes, the receiver's
+        // pump sees EOF, and the disconnect arm fires. Tests that
+        // don't care about the disconnect just let the function
+        // return and the JoinHandle drop their interest.
+        std::thread::sleep(Duration::from_secs(60));
         drop(eis_ctx);
-    });
+    })
 }
 
 // ============ TESTS ============
@@ -466,10 +499,15 @@ async fn enable_session_backend_drives_full_v1_sequence() {
     };
 
     // The minimal EIS peer completes the handshake so the
-    // receiver's `start()` returns; then drops its half so the
-    // pump's disconnect arm fires. The dedicated pump thread
-    // exits when the disconnect arm lands.
-    spawn_minimal_eis_peer(peer_stream);
+    // receiver's `start()` returns, then KEEPS ITS END ALIVE
+    // until this scope ends — Fix 3 narrows the boot-path
+    // ordering race between `backend_available.store(true)` and
+    // the disconnect watcher, but does not eliminate it. Keeping
+    // the peer alive across the assertion removes the EOF path
+    // that the watcher would otherwise observe. Passing `None`
+    // means "stay alive until the JoinHandle drops"; tests that
+    // care about the disconnect path drop their own oneshot.
+    let _peer_thread = spawn_minimal_eis_peer(peer_stream, None);
 
     // The boot path. `enable_session_backend` is what bootstrap.rs
     // calls; with this lane's hookup it now drives the v1 sequence
@@ -531,5 +569,113 @@ async fn enable_session_backend_drives_full_v1_sequence() {
         plugin.outgoing_capabilities(),
         vec!["kdeconnect.shareinputdevices.request".to_string()],
         "outgoing capability must advertise after enable_session_backend completes the v1 sequence"
+    );
+}
+
+/// Fix 2 (P2) — bound the boot-path awaits with a timeout. The
+/// production code awaits `wire_rx_rx` / `disconnect_rx_rx` while
+/// the dedicated pump thread completes the EIS handshake; a
+/// portal that returns a valid-but-silent EIS fd (a peer that
+/// completes the D-Bus handshake but never speaks EI) parks
+/// `enable_session_backend` forever — that sits inline on the
+/// daemon boot path (`bootstrap → create_state → Daemon::new`),
+/// so the entire daemon never reaches `run()`, listeners never
+/// bind, and the watchdog never starts. The fix wraps both
+/// awaits in `tokio::time::timeout(BOOT_PATH_PUMP_DELIVERY_TIMEOUT)`
+/// and degrades to the documented warn-and-stay-inert shape on
+/// expiry; the pump thread keeps running to its own end.
+///
+/// **Test shape (per the brief).** A fake EIS peer that completes
+/// the portal handshake but never speaks EI: the fake portal's
+/// ConnectToEIS hands back the socketpair fd; the peer thread
+/// holds the other end alive (so the socket doesn't EOF) but
+/// never sends a HELLO, so `receiver.start()` blocks inside
+/// `handshake_tokio`. `enable_session_backend` MUST return
+/// within the boot-path timeout (NOT hang), and the backend MUST
+/// stay un-advertised.
+#[tokio::test(flavor = "multi_thread")]
+async fn enable_session_backend_times_out_on_silent_eis_peer() {
+    let _bus_lock = BUS.lock().await;
+
+    let (client_stream, peer_stream) = UnixStream::pair().expect("UnixStream::pair");
+    let connect_to_eis_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(client_stream.into_raw_fd()) };
+
+    let state = Arc::new(Mutex::new(FakePortalState {
+        version: 1,
+        supported_caps: 3,
+        session_handle: "/org/freedesktop/portal/desktop/session/silenteis".to_string(),
+        zones: vec![(1920, 1080, 0, 0)],
+        connect_to_eis_socketpair: Some(connect_to_eis_fd),
+        ..Default::default()
+    }));
+
+    let Some(_daemon) = setup(state.clone()).await else {
+        return;
+    };
+
+    // The silent peer holds its end of the socketpair alive (so
+    // the kernel doesn't deliver EOF to the receiver) but never
+    // reads, writes, or runs an `eis::Context`. The receiver's
+    // `handshake_tokio` blocks waiting for a peer's HELLO that
+    // never arrives — exactly the silent-EIS shape the brief
+    // targets. The thread's only purpose is to keep `peer_stream`
+    // alive across the test; when the thread exits (test end +
+    // `peer_stream` drop in this scope) the socketpair closes
+    // and the pump thread's EOF arm would fire — irrelevant to
+    // this test, but it's why the thread is alive for the
+    // `enable_session_backend` call's duration.
+    let _silent_peer = std::thread::spawn(move || {
+        let _hold_open = peer_stream;
+        std::thread::sleep(Duration::from_secs(30));
+    });
+
+    let plugin = ShareInputDevicesPlugin::new();
+
+    // The boot path. With the fix, the await on `wire_rx_rx`
+    // times out after `BOOT_PATH_PUMP_DELIVERY_TIMEOUT` (5s) and
+    // the function returns inert. Without the fix, this would
+    // hang forever — and the outer `tokio::time::timeout` below
+    // would fire instead. We give the test a generous outer
+    // bound (15s — 3x the production timeout) so the test fails
+    // loudly if either the fix is missing or the timeout
+    // constant drifts to a much larger value.
+    let outer = Duration::from_secs(15);
+    let inner_start = Instant::now();
+    let result = tokio::time::timeout(outer, plugin.enable_session_backend()).await;
+    let inner_elapsed = inner_start.elapsed();
+
+    assert!(
+        result.is_ok(),
+        "enable_session_backend must return within the boot-path timeout \
+         (got: {:?}, hung at outer {:?})",
+        inner_elapsed,
+        outer,
+    );
+    // Also assert it didn't burn the full outer window — that
+    // would mean the production timeout isn't firing (either the
+    // fix is missing or the constant is misconfigured).
+    assert!(
+        inner_elapsed < outer,
+        "enable_session_backend returned at the outer timeout bound ({:?}); \
+         the production boot-path timeout did not fire",
+        inner_elapsed,
+    );
+    assert!(
+        inner_elapsed >= Duration::from_secs(4),
+        "enable_session_backend returned too fast ({:?}); did the boot-path \
+         timeout actually engage, or did the test fire before the pump could block?",
+        inner_elapsed,
+    );
+
+    // Capability honesty: a silent-EIS portal leaves the backend
+    // un-advertised. The plugin's outgoing_capabilities() must
+    // be empty.
+    assert!(
+        !plugin.portal_backend_available(),
+        "backend_available must stay false when the EIS peer is silent"
+    );
+    assert!(
+        plugin.outgoing_capabilities().is_empty(),
+        "outgoing_capabilities must be empty when the EIS peer is silent"
     );
 }
