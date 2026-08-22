@@ -62,6 +62,17 @@ pub struct ConnectionManager {
     /// everything) — see `record_peer_capabilities` and `send_packet`'s
     /// gate for why that distinction is load-bearing for the pairing flow.
     pub(crate) peer_capabilities: Arc<RwLock<HashMap<DeviceId, Vec<String>>>>,
+
+    /// Test-only shadow set: device IDs declared "connected" without
+    /// a real TLS link. The capability gate's
+    /// `capable_consumer_ids` checks this set in addition to the
+    /// real `connections` map, so integration tests can drive
+    /// peer-connect/disconnect cycles without standing up a real
+    /// TLS handshake. The set is empty in production — populated
+    /// only by `mark_fake_connected_for_test`. Gated on
+    /// `test-helpers` so production builds carry zero overhead.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) fake_connected: Arc<std::sync::Mutex<std::collections::HashSet<DeviceId>>>,
 }
 
 /// Android caps identity/packet lines at 512 KiB (LanLinkProvider.java:68,
@@ -201,6 +212,8 @@ impl ConnectionManager {
             generations: Arc::new(RwLock::new(HashMap::new())),
             tcp_port: Arc::new(std::sync::RwLock::new(None)),
             peer_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(any(test, feature = "test-helpers"))]
+            fake_connected: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         })
     }
 
@@ -320,7 +333,7 @@ impl ConnectionManager {
     /// empty pre-exchange identity, or a hostile empty-caps one, must not
     /// erase (or falsely establish) gating capabilities. Feeds
     /// `send_packet`'s gate (Task 2.3 gap D, `core/device.cpp:358-363`).
-    pub(crate) async fn record_peer_capabilities(
+    pub async fn record_peer_capabilities(
         &self,
         device_id: &DeviceId,
         incoming: &[String],
@@ -331,6 +344,112 @@ impl ConnectionManager {
         }
         let mut caps = self.peer_capabilities.write().await;
         caps.insert(device_id.clone(), incoming.to_vec());
+    }
+
+    /// True iff `device_id` has a recorded `peer_capabilities` entry
+    /// whose incoming list contains at least one of `wanted`.
+    ///
+    /// **The seam for shareinputdevices' peer-gated activation** (Task
+    /// #1042 fix lane B, panel M4 round 1). The activation gate must
+    /// run AFTER identity exchange (`record_peer_capabilities` is
+    /// called before the `Connected` state transition is broadcast),
+    /// so by the time the capability-gate subscription reads this,
+    /// the entry is live. `wanted` is matched against the peer's
+    /// INCOMING capabilities: a phone that runs the
+    /// InputDevicesReceiver consumer advertises
+    /// `kdeconnect.shareinputdevices.request` (and
+    /// `kdeconnect.mousepad.request`) as incoming, since WE send
+    /// those packet types TO it. A device with no recorded entry
+    /// (mid-pairing or never exchanged) returns false.
+    pub async fn has_incoming_capability_any(&self, device_id: &str, wanted: &[&str]) -> bool {
+        let caps = self.peer_capabilities.read().await;
+        match caps.get(device_id) {
+            Some(incoming) => wanted.iter().any(|w| incoming.iter().any(|c| c == w)),
+            None => false,
+        }
+    }
+
+    /// Snapshot the live set of device IDs that BOTH have a live
+    /// connection AND advertise at least one of `wanted` as an
+    /// incoming capability. The connection-manager half of the
+    /// capability gate — the lifecycle half is the broadcast
+    /// subscription that triggers the call.
+    ///
+    /// `peer_capabilities` entries are NOT removed on disconnect
+    /// (the live connection presence is the source of truth), so a
+    /// snapshot reads BOTH `is_connected` and the recorded caps.
+    /// A device that's disconnected is filtered out even if its
+    /// caps linger in the map — the next reconnect will re-rewrite
+    /// the entry, but until then it is not a consumer candidate.
+    pub async fn capable_consumer_ids(&self, wanted: &[&str]) -> Vec<String> {
+        // Gather the live set: real connections + (under cfg(test))
+        // the fake_connected shadow set. The fake set exists so the
+        // capability gate can drive activation/deactivation in
+        // integration tests without a real TLS handshake; in
+        // production it is always empty, so the cost is one map
+        // iteration.
+        let mut ids: Vec<String> = {
+            let connections = self.connections.read().await;
+            connections.keys().cloned().collect()
+        };
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            let fake = self
+                .fake_connected
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for id in fake.iter() {
+                if !ids.iter().any(|x| x == id) {
+                    ids.push(id.clone());
+                }
+            }
+        }
+        // Suppress the production-only "variable does not need to
+        // be mutable" warning: under cfg(test) the loop above pushes
+        // into `ids`, so it must be `mut`; in production the block
+        // is compiled out. Without this allow, the warning fires on
+        // every cargo build.
+        #[cfg(not(any(test, feature = "test-helpers")))]
+        let _ = &mut ids;
+        let caps = self.peer_capabilities.read().await;
+        let mut out = Vec::with_capacity(ids.len());
+        for device_id in &ids {
+            let Some(incoming) = caps.get(device_id) else {
+                continue;
+            };
+            if wanted.iter().any(|w| incoming.iter().any(|c| c == w)) {
+                out.push(device_id.clone());
+            }
+        }
+        out
+    }
+
+    /// Test-only mutator: declare `device_id` as live for the
+    /// capability gate without a real TLS connection. The shadow
+    /// set is consulted by `is_connected` and
+    /// `capable_consumer_ids` only, and only in cfg(test) /
+    /// `feature = "test-helpers"` builds — production builds see an
+    /// empty set, and `mark` itself is compiled out, so the path
+    /// cannot leak.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn mark_fake_connected_for_test(&self, device_id: &str) {
+        let mut fake = self
+            .fake_connected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fake.insert(device_id.to_string());
+    }
+
+    /// Test-only mutator: remove `device_id` from the shadow
+    /// connected set. Symmetric with
+    /// `mark_fake_connected_for_test`. Idempotent.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn unmark_fake_connected_for_test(&self, device_id: &str) {
+        let mut fake = self
+            .fake_connected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fake.remove(device_id);
     }
 
     pub async fn send_packet(&self, device_id: &DeviceId, packet: &Packet) -> Result<()> {
@@ -647,7 +766,25 @@ impl ConnectionManager {
 
     pub async fn is_connected(&self, device_id: &DeviceId) -> bool {
         let connections = self.connections.read().await;
-        connections.contains_key(device_id)
+        if connections.contains_key(device_id) {
+            return true;
+        }
+        // Test-only fast-path: a peer declared via
+        // `mark_fake_connected_for_test` counts as live for the
+        // capability gate. Production builds never populate the
+        // set; the cost is one mutex acquire on a near-empty
+        // map. Lock-free in steady state in cfg(test).
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            let fake = self
+                .fake_connected
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if fake.contains(device_id) {
+                return true;
+            }
+        }
+        false
     }
 
     pub async fn get_generation(&self, device_id: &DeviceId) -> Option<u64> {
