@@ -407,6 +407,14 @@ impl NotificationPlugin {
         self.record_icon(device_id, hash);
     }
 
+    /// Test accessor: number of (device_id, id) keys the desktop dedupe map
+    /// currently holds. Used by `dedupe_bound_tests` to assert the map stays
+    /// bounded as history evicts. Not part of the public API.
+    #[cfg(test)]
+    pub fn dedupe_size(&self) -> usize {
+        self.dedupe.read().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     /// Decide the desktop action for an incoming (non-cancel) notification
     /// and track it. The map records INTENT (replaces_id 0 until a show
     /// succeeds and fills it in), so a failed or headless show simply keeps
@@ -788,8 +796,29 @@ impl Plugin for NotificationPlugin {
                     icon_url,
                     received_at: chrono::Utc::now(),
                 });
+                let mut evicted_keys: Vec<(String, String)> = Vec::new();
                 while history.len() > MAX_NOTIFICATION_HISTORY {
-                    history.pop_front();
+                    if let Some(evicted) = history.pop_front() {
+                        // Empty-id notifications never enter the dedupe map
+                        // (`dedupe_track` is gated on `id.is_empty()`), so only
+                        // evict the matching key when one could exist.
+                        if !evicted.id.is_empty() {
+                            evicted_keys.push((evicted.device_id, evicted.id));
+                        }
+                    }
+                }
+                // Release the history guard before taking the dedupe guard to
+                // avoid nesting write locks across the plugin's other paths
+                // (cancel/dismiss acquire history then dedupe, not the other
+                // way around). The race window — another caller inserting a
+                // fresh dedupe entry for an id we just recorded as evicted —
+                // is benign: it costs one duplicate popup on the next re-send.
+                drop(history);
+                if !evicted_keys.is_empty() {
+                    let mut dedupe = self.dedupe.write().unwrap_or_else(|e| e.into_inner());
+                    for key in &evicted_keys {
+                        dedupe.remove(key);
+                    }
                 }
             }
         }
@@ -1804,6 +1833,140 @@ mod task_1_4_state_tests {
                 .as_deref(),
             Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
             "reply-by-notification-id must route through the replacement's current phone handle"
+        );
+    }
+}
+
+// =====================================================================
+// Dedup map bound (P2 — codex-security-scan-2026-08-20):
+// the desktop dedupe map must not grow without bound when a paired peer
+// sends notifications with unique ids. Eviction from history must remove
+// the corresponding (device_id, id) dedupe key. The bound is the same as
+// history size, because every dedupe entry corresponds to a history entry
+// in normal operation (see critique in FINDINGS.md for the edge cases).
+// =====================================================================
+
+#[cfg(test)]
+mod dedupe_bound_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn make_plugin() -> NotificationPlugin {
+        NotificationPlugin::new_without_desktop(Arc::new(PluginEventBroadcaster::new(16, "plugin")))
+    }
+
+    /// A paired peer sending more than MAX_NOTIFICATION_HISTORY unique-id
+    /// notifications must not grow the dedupe map past the history bound.
+    /// Pre-fix, the map grew linearly with the unique-id count while
+    /// history stayed capped at 100 (memory exhaustion: remote).
+    #[tokio::test]
+    async fn test_dedupe_map_stays_bounded_under_unique_id_flood() {
+        let plugin = make_plugin();
+        let dev = "devabcdef0123456789abcdef01234567";
+        let total = MAX_NOTIFICATION_HISTORY * 5;
+
+        for i in 0..total {
+            let packet = Packet::new(
+                "kdeconnect.notification".to_string(),
+                serde_json::json!({
+                    "id": format!("notif-{}", i),
+                    "appName": "TestApp",
+                    "title": format!("Notification {}", i),
+                    "text": "Body"
+                }),
+            );
+            plugin
+                .handle_packet(dev, packet)
+                .await
+                .expect("Value expected to be present");
+        }
+
+        assert_eq!(
+            plugin.dedupe_size(),
+            MAX_NOTIFICATION_HISTORY,
+            "dedupe map must be bounded by the history cap"
+        );
+        assert_eq!(
+            plugin.get_history(Some(dev), usize::MAX).len(),
+            MAX_NOTIFICATION_HISTORY,
+            "history must be at its cap"
+        );
+    }
+
+    /// When history evicts an entry, the corresponding dedupe key must be
+    /// removed. Probe: re-send an evicted id with the same signature —
+    /// the dedupe map has no entry, so the action is `Post`, not
+    /// `Suppress`. Pre-fix, the dedupe map retained the evicted key and
+    /// the re-send was (wrongly) suppressed.
+    #[tokio::test]
+    async fn test_history_eviction_removes_dedupe_key() {
+        let plugin = make_plugin();
+        let dev = "devabcdef0123456789abcdef01234567";
+        let sig = content_signature("TestApp", "Title", "Body");
+
+        // First MAX_NOTIFICATION_HISTORY notifications, then push more so
+        // the earliest ids are evicted from history.
+        let total = MAX_NOTIFICATION_HISTORY + 50;
+        for i in 0..total {
+            let packet = Packet::new(
+                "kdeconnect.notification".to_string(),
+                serde_json::json!({
+                    "id": format!("notif-{}", i),
+                    "appName": "TestApp",
+                    "title": "Title",
+                    "text": "Body"
+                }),
+            );
+            plugin
+                .handle_packet(dev, packet)
+                .await
+                .expect("Value expected to be present");
+        }
+
+        // The first id was evicted from history (history holds
+        // notif-50..notif-149). Its dedupe entry must be gone too.
+        assert_eq!(
+            plugin.dedupe_track(dev, "notif-0", sig),
+            DesktopAction::Post,
+            "an id evicted from history must not be in the dedupe map"
+        );
+        // A still-present id (within the history window) is still tracked.
+        assert_eq!(
+            plugin.dedupe_track(dev, "notif-149", sig),
+            DesktopAction::Suppress,
+            "a still-present id must still be in the dedupe map"
+        );
+    }
+
+    /// The cancellation path (`dedupe_take`) must continue to drop its
+    /// key. The existing `test_cancel_drops_dedupe_entry` covers the
+    /// behavior; this one also asserts the map shrinks by one.
+    #[tokio::test]
+    async fn test_cancel_removes_dedupe_key_from_map() {
+        let plugin = make_plugin();
+        let dev = "devabcdef0123456789abcdef01234567";
+
+        let packet = Packet::new(
+            "kdeconnect.notification".to_string(),
+            serde_json::json!({
+                "id": "to-cancel",
+                "appName": "Signal",
+                "title": "t",
+                "text": "x"
+            }),
+        );
+        plugin.handle_packet(dev, packet).await.unwrap();
+        assert_eq!(plugin.dedupe_size(), 1, "the post inserted one dedupe key");
+
+        let cancel = Packet::new(
+            "kdeconnect.notification".to_string(),
+            serde_json::json!({ "id": "to-cancel", "isCancel": true }),
+        );
+        plugin.handle_packet(dev, cancel).await.unwrap();
+        assert_eq!(
+            plugin.dedupe_size(),
+            0,
+            "cancellation must drop the dedupe key it names"
         );
     }
 }
