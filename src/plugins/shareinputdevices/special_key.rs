@@ -89,6 +89,13 @@ pub(crate) fn special_key_for_keysym(keysym: xkb::Keysym) -> i32 {
         // (qxkbcommon.cpp :60-61): Sun and X386 SysReq.
         ks::KEY_Sys_Req | SUN_SYS_REQ | X386_SYS_REQ => 15,
         ks::KEY_Scroll_Lock => 16,
+        // Sun keyboards' F36/F37, which Qt's table normalises to
+        // Qt::Key_F11 and Qt::Key_F12 (qxkbcommon.cpp :98-99, labelled
+        // exactly that way in its comments). They sit OUTSIDE the
+        // XKB_KEY_F1..F35 arithmetic run, so the range branch above
+        // never sees them and they need explicit rows.
+        SUN_F36 => 31,
+        SUN_F37 => 32,
         // 17-20 are the four modifier keys, commented out upstream.
         _ => 0,
     }
@@ -99,6 +106,10 @@ pub(crate) fn special_key_for_keysym(keysym: xkb::Keysym) -> i32 {
 const SUN_SYS_REQ: u32 = 0x1005_FF60;
 /// X386 SysReq keysym, hardcoded in Qt's table (qxkbcommon.cpp :61).
 const X386_SYS_REQ: u32 = 0x1007_FF00;
+/// Sun F36, which Qt normalises to `Qt::Key_F11` (qxkbcommon.cpp :98).
+const SUN_F36: u32 = 0x1005_FF10;
+/// Sun F37, which Qt normalises to `Qt::Key_F12` (qxkbcommon.cpp :99).
+const SUN_F37: u32 = 0x1005_FF11;
 
 #[cfg(test)]
 mod tests {
@@ -200,6 +211,29 @@ mod tests {
     fn vendor_sysreq_keysyms_map_to_sysreq() {
         assert_eq!(code(SUN_SYS_REQ), 15);
         assert_eq!(code(X386_SYS_REQ), 15);
+    }
+
+    /// Sun F36/F37 sit outside the XKB_KEY_F1..F35 run, so the
+    /// arithmetic branch cannot reach them — Qt gives them explicit
+    /// KeyTbl rows normalising to Key_F11/Key_F12, and without
+    /// matching rows here a Sun keyboard's F11/F12 would silently
+    /// send nothing. (Caught in review on PR #31: the extraction pass
+    /// that built this table filtered KeyTbl to the non-F-key rows and
+    /// never surfaced these two.)
+    #[test]
+    fn sun_f36_f37_normalise_to_f11_f12() {
+        assert_eq!(code(SUN_F36), 31, "Sun F36 is labelled F11 upstream");
+        assert_eq!(code(SUN_F37), 32, "Sun F37 is labelled F12 upstream");
+        assert_eq!(
+            code(SUN_F36),
+            code(ks::KEY_F11),
+            "Sun F36 must agree with the ordinary F11"
+        );
+        assert_eq!(
+            code(SUN_F37),
+            code(ks::KEY_F12),
+            "Sun F37 must agree with the ordinary F12"
+        );
     }
 
     /// The gaps are upstream's, and must stay gaps: Linefeed (3) and

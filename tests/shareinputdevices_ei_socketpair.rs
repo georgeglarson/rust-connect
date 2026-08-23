@@ -120,6 +120,28 @@ async fn setup() -> (
     Option<tokio::sync::oneshot::Sender<()>>,
     tokio::sync::oneshot::Receiver<BitFlags<DeviceCapability>>,
 ) {
+    setup_staged(None).await
+}
+
+/// `setup()` with the option of staging the activation gate BEFORE
+/// `start()` runs — the populate-before-start shape whose queue
+/// `start()`'s own drain exists to flush. `Some((event, id))` queues
+/// `event` and records `id` as an activation seen while `wire_tx` was
+/// still `None`, exactly as `handle_activated` would have.
+async fn setup_staged(
+    pre_start: Option<(
+        rust_connect::plugins::shareinputdevices::ei::PendingInput,
+        u32,
+    )>,
+) -> (
+    EisConnection,
+    std::sync::Arc<EiReceiver>,
+    tokio::sync::mpsc::UnboundedReceiver<rust_connect::plugins::shareinputdevices::ei::WireBody>,
+    tokio::sync::watch::Receiver<bool>,
+    impl std::future::Future<Output = ()>,
+    Option<tokio::sync::oneshot::Sender<()>>,
+    tokio::sync::oneshot::Receiver<BitFlags<DeviceCapability>>,
+) {
     let (peer_stream, client_stream) = UnixStream::pair().expect("UnixStream::pair");
 
     // The eis drive task owns one end of the socketpair and the
@@ -210,6 +232,14 @@ async fn setup() -> (
 
     let receiver =
         EiReceiver::new(client_stream.into(), "shareinputdevices-test").expect("EiReceiver::new");
+
+    // Stage the gate before `start()` installs `wire_tx`, so the
+    // startup drain has something to flush.
+    if let Some((event, activation_id)) = pre_start {
+        let mut g = receiver.gate_for_test().lock().await;
+        g.queue(event);
+        g.note_activated_retain_pending(activation_id);
+    }
 
     // Kick the receiver off as a spawn_local so it makes progress
     // while we wait for the eis drive to complete the handshake.
@@ -1961,6 +1991,69 @@ fn queued_named_key_replays_with_its_special_key_code() {
             obj.get("key").and_then(|v| v.as_str()),
             Some(""),
             "replayed Escape carries no text; got {json}"
+        );
+
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit");
+    });
+}
+
+/// A named key queued before `start()` installs `wire_tx` must reach
+/// the wire with its `specialKey` code when the startup drain flushes.
+///
+/// `start()` carries a THIRD contentless-body guard, besides the live
+/// dispatch path and the `handle_activated` replay. It is there for
+/// the populate-before-start shape: `handle_activated` saw
+/// `wire_tx = None`, recorded the activation id and retained the
+/// queue for `start()` to flush. That guard tested `text.is_empty()`
+/// alone, so once the specialKey table let named keys through, this
+/// one path would still have dropped them — a queued Escape is all
+/// code and no text. Found in review on PR #31 by both cubic and
+/// sourcery after the other two guards were fixed.
+///
+/// The production pump is the only producer of queued events and does
+/// not run until after `start()` returns, so this queue is empty in
+/// the real wiring today and the drain is defensive. The gate is
+/// staged directly (`gate_for_test`) to pin the behaviour anyway: the
+/// guard must not be the odd one out if the path ever becomes live.
+#[test]
+fn named_key_queued_before_start_survives_the_startup_drain() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        // Escape as it would sit in the queue: no text, code 14.
+        let escape = rust_connect::plugins::shareinputdevices::ei::PendingInput::Key {
+            text: String::new(),
+            special_key: 14,
+            mods: rust_connect::plugins::shareinputdevices::ei::Modifiers::default(),
+        };
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup_staged(Some((escape, 3))).await;
+        let pump = tokio::task::spawn_local(drive);
+
+        // `start()` has already run inside setup_staged, so the drain
+        // has happened: the body must be waiting on the wire.
+        let body = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("queued Escape must survive start()'s startup drain")
+            .expect("wire rx closed");
+        let json = body.into_json();
+        let obj = json.as_object().expect("key body is an object");
+        assert_eq!(
+            obj.get("specialKey").and_then(serde_json::Value::as_i64),
+            Some(14),
+            "drained Escape must keep specialKey 14; got {json}"
+        );
+        assert_eq!(
+            obj.get("key").and_then(|v| v.as_str()),
+            Some(""),
+            "drained Escape carries no text; got {json}"
         );
 
         let _ = eis_done_tx.unwrap().send(());

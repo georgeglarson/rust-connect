@@ -358,6 +358,24 @@ impl EiReceiver {
     ///
     /// The caller can also simply `await` it inline if it wants
     /// pump work and consumer work to share the same task.
+    /// Test-only handle on the activation gate.
+    ///
+    /// `start()`'s startup drain serves the populate-before-start
+    /// shape: `handle_activated` ran while `wire_tx` was still `None`,
+    /// so it recorded the activation id and RETAINED the queue for
+    /// `start()` to flush. In the production wiring the pump is the
+    /// only producer of queued events and it does not run until after
+    /// `start()` returns, so that queue is empty in practice and the
+    /// drain cannot be reached from outside. This accessor lets a test
+    /// stage the shape directly and pin the drain's behaviour.
+    ///
+    /// Zero production overhead: the method does not exist in a normal
+    /// build.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn gate_for_test(&self) -> &Arc<Mutex<ActivationGate>> {
+        &self.gate
+    }
+
     pub async fn start(
         self: &Arc<Self>,
     ) -> Result<
@@ -429,7 +447,14 @@ impl EiReceiver {
                         special_key,
                         mods,
                     } => {
-                        if text.is_empty() {
+                        // Same contentless-body guard as the live
+                        // dispatch and the `handle_activated` replay:
+                        // text AND code, never text alone. A named
+                        // key queued before `start()` installed
+                        // `wire_tx` is all specialKey and no text, so
+                        // a text-only test here would drop it on this
+                        // path while the other two delivered it.
+                        if text.is_empty() && special_key == 0 {
                             continue;
                         }
                         WireBody::Key(plan_key(
