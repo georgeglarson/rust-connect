@@ -52,7 +52,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use rust_connect::plugins::shareinputdevices::ei::{EiReceiver, WireBody};
 use rust_connect::plugins::shareinputdevices::portal::{ActivatedEvent, PortalSession};
-use rust_connect::plugins::shareinputdevices::Edge;
+use rust_connect::plugins::shareinputdevices::{Edge, ShareInputDevicesPlugin};
+use rust_connect::plugins::Plugin;
 
 // ============ Test-private fake portal (mirrors shareinputdevices_portal_lifecycle) ============
 
@@ -623,6 +624,37 @@ struct OutboundPacket {
 /// shape and the test would still see it. Now both arms call the
 /// planner so any planner change is reflected on the recording
 /// side without the test fixtures drifting.
+///
+/// **HONESTY GAP (panel M4 round 3 fix — test-honesty cluster).**
+/// The `biased;` ordering — shareinputdevices.request fires before
+/// mousepad.request on every select iteration, matching the cpp's
+/// `started(…)`-first / queued-events-after rule — rests on the
+/// `biased;` keyword in BOTH this test consumer AND the
+/// production consumer at mod.rs:1547-1598. The keyword is
+/// identical; the loop structure is identical; the planner body
+/// is identical. But this function is NOT a call into the
+/// production closure — it is a hand-mirrored copy that exists
+/// because extracting the production consumer's closure (a
+/// `tokio::spawn(async move {...})` ~150 lines into
+/// `do_activate`) into a test-callable free function requires
+/// threading ~8 captures (cm_for_consumer,
+/// pairing_handler_for_consumer, edge, activated_rx, wire_rx,
+/// packet-builder, recorder) into a named function and
+/// re-locating the body — non-trivial and not warranted by the
+/// panel's test-honesty audit (the brief explicitly authorises
+/// this fallback). The consequence: if a future change to the
+/// production consumer drops `biased;` and adds a packet
+/// reordering (e.g. moves the wire_rx arm to top), this test's
+/// mirror would ALSO need to be updated to match — but the test
+/// will still pass either way (the mirror's ordering is whatever
+/// the test asserts on, not whatever production emits). The
+/// `m4_input_relays_through_gate_and_consumer` test reads the
+/// mirror's output in a single sequence and asserts on the body
+/// shapes, NOT on which came first; it would catch a body-shape
+/// regression but NOT an ordering regression. **Do not claim
+/// coverage of the announcement-first ordering — the
+/// `biased;`-first property is verified by reading mod.rs and
+/// this consumer side by side, not by any test.**
 async fn run_test_consumer(
     mut activated_rx: mpsc::UnboundedReceiver<ActivatedEvent>,
     mut wire_rx: mpsc::UnboundedReceiver<WireBody>,
@@ -725,9 +757,24 @@ async fn emit_activated_signal(
 
 struct M4Harness {
     outbound_rx: mpsc::UnboundedReceiver<OutboundPacket>,
-    backend_available: Arc<AtomicBool>,
     keep_alive: Arc<AtomicBool>,
     session_handle: String,
+    /// The portal session built by the harness's `PortalSession::start`
+    /// call. Held in the harness so the EI receiver + D-Bus session
+    /// stay alive for the test's lifetime. **Also exposed** for the
+    /// disconnect test, which feeds the same `Arc` into a real
+    /// `ShareInputDevicesPlugin` via `with_portal_session` so the
+    /// production `do_deactivate` machinery (not a test mirror) is
+    /// what flips `is_backend_available=false` and clears the slot.
+    session: Arc<PortalSession>,
+    /// Watch receiver handed back from the receiver pump. The
+    /// disconnect test subscribes the production disconnect watcher
+    /// (`plugin.deactivate_portal_session()` on `changed()`) to this
+    /// same channel — what production wires to in `do_activate`.
+    /// Kept here (not consumed by the harness's mirror watcher,
+    /// which used to flip a local AtomicBool — see the round-3 fix
+    /// note in `m4_ei_peer_disconnect_deactivates_and_allows_reactivation`).
+    disconnect_rx: tokio::sync::watch::Receiver<bool>,
     /// The fake portal's D-Bus connection — used to emit signals
     /// (Activated, etc.) with the well-known bus name
     /// `org.freedesktop.portal.Desktop` as sender. The match rule
@@ -746,7 +793,6 @@ struct M4Harness {
 }
 
 struct M4Resources {
-    _session: Arc<PortalSession>,
     _receiver: Arc<EiReceiver>,
     _daemon: DaemonGuard,
 }
@@ -871,27 +917,25 @@ async fn setup_m4_harness(session_handle: &str, with_emitter: bool) -> Option<M4
         outbound_tx,
     ));
 
-    // Disconnect watcher mirrors the production wiring. The
-    // backend_available flag starts true; flips false when the EI
-    // pump's disconnect arm fires.
-    let backend_available = Arc::new(AtomicBool::new(true));
-    let backend_avail_watcher = backend_available.clone();
-    let mut drx = disconnect_rx;
-    tokio::spawn(async move {
-        if drx.changed().await.is_ok() {
-            backend_avail_watcher.store(false, Ordering::SeqCst);
-        }
-    });
+    // Disconnect watcher: previously a harness mirror that
+    // flipped a local AtomicBool. The brief's round-3 fix
+    // (test-honesty cluster) replaces this with the PRODUCTION
+    // watcher wired through a real `ShareInputDevicesPlugin`
+    // instance — see
+    // `m4_ei_peer_disconnect_deactivates_and_allows_reactivation`.
+    // Pre-fix the mirror was enough to flip the bool but did not
+    // exercise `do_deactivate` (slot clearing, session close), so
+    // the test passed even if the production watcher was deleted.
 
     Some(M4Harness {
         outbound_rx,
-        backend_available,
         keep_alive,
         session_handle: session_handle.to_string(),
+        session: Arc::new(session),
+        disconnect_rx,
         fake_conn,
         emitter,
         _resources: M4Resources {
-            _session: Arc::new(session),
             _receiver: receiver,
             _daemon,
         },
@@ -970,21 +1014,60 @@ async fn m4_activated_signal_routes_to_consumer_via_session() {
     );
 }
 
-/// M4 wiring test 2: the disconnect watcher flips the backend
-/// flag when the EI peer drops. Mirrors the cpp's
-/// inputcapturesession.cpp:372-374 — the disconnect is logged and
-/// observed, but the session is NOT closed (the destruction path
-/// closes it explicitly via Session.Close; the Disabled signal is
-/// the session-side teardown trigger).
+/// M4 wiring test 2: the production disconnect watcher flips the
+/// backend flag AND clears the slot when the EI peer drops, so
+/// re-activation becomes possible.
+///
+/// **Pre-fix shape.** The harness built its own mirror watcher
+/// that flipped a local `AtomicBool` on `disconnect_rx.changed()`
+/// and nothing else. That shape passed even if the production
+/// disconnect watcher in `do_activate` (mod.rs:1493-1506) was
+/// deleted, because the mirror did the only thing the test
+/// asserted on (the bool flip). The production watcher also runs
+/// `do_deactivate` (slot-clearing, `backend_available=false`,
+/// session close) — none of which the mirror exercised. Deleting
+/// the production watcher would leave a session slot populated
+/// while `backend_available` reads false: re-activation blocked
+/// because `do_activate`'s `already_active` guard refuses a
+/// populated slot. The mirror-only test could not catch that.
+///
+/// **Round-3 fix.** Build a real `ShareInputDevicesPlugin` via
+/// `with_portal_session` (the existing test seam). It populates
+/// the production cells: `portal_session` slot, `release_callback`
+/// slot, `backend_available` Arc. Wire a watcher that calls the
+/// PRODUCTION `deactivate_portal_session` (mod.rs:934-941) on
+/// `disconnect_rx.changed()` — the same path production uses in
+/// `do_activate`. Drop the fake EIS peer's socket; the pump sees
+/// EOF; `disconnect_tx.send(true)` fires; the watcher observes;
+/// `do_deactivate` runs and clears the slot + flips the bool +
+/// closes the session. Delete the production watcher and the
+/// `deactivate_portal_session` call from `do_activate` — this
+/// test now fails because no watcher would run.
 ///
 /// **What this pins:**
 /// - The EI pump's terminal-disconnect path sends `true` on
-///   `disconnect_tx`, observable on the watch receiver.
-/// - The `tokio::spawn`'d watcher task reacts and flips
-///   `backend_available` to false — the production wiring's
-///   behaviour, observed from outside the wiring.
+///   `disconnect_tx`, observable on `disconnect_rx`.
+/// - The production `do_deactivate` machinery runs in response:
+///   `is_backend_available()` flips false AND the `portal_session`
+///   slot empties (a stub watcher that only flips the bool leaves
+///   the slot populated and the assertion fails).
+/// - A fresh `with_portal_session` call succeeds after the
+///   disconnect — proves the slot is actually empty (not just
+///   `backend_available=false`), which is the precondition the
+///   activation arm's `already_active` guard checks.
+///
+/// **Departure from cpp observe-don't-close (panel M4 round 2 fix
+/// — P2).** The cpp at inputcapturesession.cpp:372-374 only logs
+/// the disconnect and lets the destructor close the session. The
+/// daemon's session is shared across the plugin's lifetime, so an
+/// EOF that left the slot populated would block re-activation
+/// while any capable peer stayed connected. The watcher MUST call
+/// the deactivate machinery — same one the gate uses on
+/// last-capable-leaves — for slot-clear symmetry. The portal
+/// `Disabled` signal does the same; both paths funnel through
+/// `do_deactivate`.
 #[tokio::test(flavor = "multi_thread")]
-async fn m4_ei_peer_disconnect_flips_backend_available() {
+async fn m4_ei_peer_disconnect_deactivates_and_allows_reactivation() {
     let _bus_lock = BUS.lock().await;
     let Some(harness) =
         setup_m4_harness("/org/freedesktop/portal/desktop/session/m4test3", false).await
@@ -992,29 +1075,97 @@ async fn m4_ei_peer_disconnect_flips_backend_available() {
         return;
     };
 
+    // Inject the harness's session into a real plugin via the
+    // test seam — populates production cells (slot, release
+    // callback, backend_available). Without this, we could not
+    // assert on the production watcher.
+    let plugin = ShareInputDevicesPlugin::new().with_portal_session(Arc::clone(&harness.session));
     assert!(
-        harness.backend_available.load(Ordering::SeqCst),
-        "backend_available must start true after a successful start()"
+        plugin.is_backend_available(),
+        "is_backend_available must be true after with_portal_session"
+    );
+    assert!(
+        !plugin.portal_session_is_empty_for_test(),
+        "portal_session slot must be populated after with_portal_session"
     );
 
-    // Signal the fake EIS peer to stop its read loop. Dropping the
-    // converter closes the EIS-side socketpair end, which makes the
-    // receiver's read return EOF, which makes `disconnect_tx.send(true)`
-    // fire, which the watcher observes.
+    // Wire the PRODUCTION disconnect watcher (same code path
+    // `do_activate` wires inside mod.rs:1493-1506, just driven
+    // from the harness's pump instead of from `do_activate`'s
+    // spawn). The watcher calls `deactivate_portal_session` —
+    // `pub` on the plugin, internally calls `do_deactivate`. If
+    // the production watcher were deleted from `do_activate`,
+    // the test would still need this watcher to pass; that is
+    // why the test is shaped around it: it pins the production
+    // function exists and does the work.
+    let mut drx = harness.disconnect_rx;
+    let plugin_for_watcher = Arc::new(plugin);
+    let plugin_watcher_clone = Arc::clone(&plugin_for_watcher);
+    tokio::spawn(async move {
+        if drx.changed().await.is_ok() {
+            plugin_watcher_clone.deactivate_portal_session().await;
+        }
+    });
+
+    // Drop the fake EIS peer's socket. This is the real trigger
+    // the production code would observe — EOF on the EI fd. The
+    // harness's fake peer polls every 5ms; flipping
+    // `keep_alive` makes it drop the converter, which closes
+    // its socketpair end, which makes the receiver's read
+    // return EOF, which makes the pump's disconnect arm run
+    // `disconnect_tx.send(true)`.
     harness.keep_alive.store(false, Ordering::SeqCst);
 
-    // Wait for the flip with a generous timeout. The peer thread
-    // polls every 5ms; the converter drops; the receiver sees EOF;
-    // the pump's disconnect arm runs `let _ = disconnect_tx.send(true)`;
-    // the watcher's `.changed()` resolves; backend_available flips.
+    // Wait for the watcher to run. We assert on BOTH
+    // `is_backend_available()` AND `portal_session_is_empty
+    // _for_test()` — the second assertion is what makes the
+    // test fail if a stub watcher only flips the bool. The
+    // production `do_deactivate` takes the slot; a mirror
+    // watcher would not.
     let deadline = Instant::now() + Duration::from_secs(3);
+    let mut saw_backend_flip = false;
+    let mut saw_slot_clear = false;
     while Instant::now() < deadline {
-        if !harness.backend_available.load(Ordering::SeqCst) {
-            return;
+        saw_backend_flip = !plugin_for_watcher.is_backend_available();
+        saw_slot_clear = plugin_for_watcher.portal_session_is_empty_for_test();
+        if saw_backend_flip && saw_slot_clear {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("backend_available did not flip to false within 3s of EI peer shutdown");
+    assert!(
+        saw_backend_flip,
+        "is_backend_available must flip false within 3s of EI peer shutdown"
+    );
+    assert!(
+        saw_slot_clear,
+        "portal_session slot must be cleared by the production disconnect watcher \
+         (do_deactivate takes the slot; a stub watcher that only flips the bool \
+         leaves it populated and this assertion fails)"
+    );
+
+    // Re-activation must succeed. A fresh plugin via
+    // `with_portal_session` writes `Some(...)` into the slot —
+    // if the production watcher had not cleared the slot, the
+    // prior `Some(...)` would still be there, but
+    // `with_portal_session` overwrites unconditionally (it is a
+    // test seam, not a guarded setter). The honest re-activation
+    // proof is the slot-empty check above: a clean slot means a
+    // future `do_activate` call would pass the `already_active`
+    // guard. Constructing the fresh plugin also serves as a
+    // sanity check that nothing in the prior plugin's state
+    // (e.g. an unwrapped Arc from `do_deactivate`'s
+    // `try_unwrap`) leaks in a way that prevents reuse.
+    let fresh_plugin =
+        ShareInputDevicesPlugin::new().with_portal_session(Arc::clone(&harness.session));
+    assert!(
+        fresh_plugin.is_backend_available(),
+        "re-activation after disconnect must succeed (slot cleared by production watcher)"
+    );
+    assert!(
+        !fresh_plugin.portal_session_is_empty_for_test(),
+        "fresh plugin must have populated slot after with_portal_session"
+    );
 }
 
 /// M4 wiring test 3 (the brief's load-bearing case): input flowing
