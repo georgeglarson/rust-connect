@@ -4,6 +4,7 @@
 
 use super::registry::PluginRegistry;
 use super::{PluginAccess, PluginEventBroadcaster};
+use crate::device::EventBroadcaster;
 use std::sync::Arc;
 
 pub fn load_default_plugins(
@@ -13,6 +14,7 @@ pub fn load_default_plugins(
     pairing_handler: Arc<crate::protocol::pairing::PairingHandler>,
     data_dir: std::path::PathBuf,
     enable_input: bool,
+    device_broadcaster: Arc<EventBroadcaster>,
 ) -> PluginAccess {
     let mousepad = if enable_input {
         super::mousepad::MousepadPlugin::new()
@@ -79,7 +81,7 @@ pub fn load_default_plugins(
         contacts: Arc::new(super::ContactsPlugin::new()),
         runcommand: Arc::new(super::RuncommandPlugin::new()),
         sendnotifications: Arc::new(
-            super::SendNotificationsPlugin::new(plugin_events.clone(), pairing_handler)
+            super::SendNotificationsPlugin::new(plugin_events.clone(), pairing_handler.clone())
                 .with_connection_manager(connection_manager.clone()),
         ),
         remotekeyboard: Arc::new(super::RemoteKeyboardPlugin::new(plugin_events.clone())),
@@ -91,9 +93,24 @@ pub fn load_default_plugins(
         // Session portal backend is enabled only at the production
         // entry point (bootstrap.rs create_state), same gate as
         // clipboard/mpris/screensaver_inhibit/pausemusic/systemvolume.
+        //
+        // The capability gate (Task #1042 fix lane B) needs the
+        // device-event broadcaster — the subscription lives in
+        // `spawn_capability_gate` and reacts to
+        // `StateChanged(Connected/Disconnected)` to activate on the
+        // first capable peer and deactivate on the last one leaving.
+        //
+        // The pairing handler (panel M4 round 3 fix — security
+        // headline) is the predicate that separates an
+        // already-handshaked unpaired LAN peer from a trusted
+        // consumer. The fan-out filter and the activation gate both
+        // read it; without this wire, an unpaired connected-capable
+        // peer is a relay target for captured keystrokes / motion.
         shareinputdevices: Arc::new(
             super::ShareInputDevicesPlugin::new()
-                .with_connection_manager(connection_manager.clone()),
+                .with_connection_manager(connection_manager.clone())
+                .with_pairing_handler(pairing_handler.clone())
+                .with_event_broadcaster(device_broadcaster.clone()),
         ),
     }
 }

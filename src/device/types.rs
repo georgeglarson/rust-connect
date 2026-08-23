@@ -302,6 +302,17 @@ pub enum DeviceEvent {
         device_name: String,
     },
 
+    /// Device unpaired (Task #1042 fix lane E — pairing-event seam).
+    /// Emitted by `PairingHandler::unpair` so capability-gate
+    /// subscribers that gate on `is_paired` (e.g.
+    /// shareinputdevices' M4 pairing-gate lane) can re-evaluate
+    /// eligibility without waiting for a StateChanged. Symmetric
+    /// to `Paired`; the gate's evaluator reads
+    /// `PairingHandler::is_paired` directly, so neither variant
+    /// carries a redundant paired-state payload — the broadcaster
+    /// is a notification, not a duplicate of the canonical store.
+    Unpaired { device_id: DeviceId },
+
     /// A peer asked to pair and is awaiting local acceptance. Carries no
     /// verification key: clients re-read the device over the authenticated
     /// API, which keeps the key on one path.

@@ -16,6 +16,16 @@ use crate::protocol::crypto::CertificateManager;
 use crate::protocol::types::PairingRequest;
 use crate::utils::errors::{Error, Result};
 
+/// Optional broadcaster wired at construction (Task #1042 fix lane E —
+/// pairing-event seam). When set, `accept_pairing` /
+/// `force_accept_pairing` emit `DeviceEvent::Paired` and `unpair`
+/// emits `DeviceEvent::Unpaired`. Capability gates that filter on
+/// `is_paired` (e.g. shareinputdevices' M4 pairing-gate lane) listen
+/// to those events and re-evaluate eligibility. The `Option` keeps
+/// test-only constructions and any future code path that does not
+/// need the broadcaster wiring off the seam.
+pub type PairingBroadcaster = crate::device::EventBroadcaster;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairState {
     NotPaired,
@@ -86,6 +96,15 @@ pub struct PairingHandler {
     /// `ConnectionManager::set_device_identity`. `None` only when a caller
     /// genuinely hasn't wired the identity in yet (e.g. older test setups).
     own_device_id: Arc<RwLock<Option<DeviceId>>>,
+    /// Optional broadcaster (Task #1042 fix lane E — pairing-event
+    /// seam). When `Some`, every successful accept emits
+    /// `DeviceEvent::Paired` and every successful `unpair` emits
+    /// `DeviceEvent::Unpaired` on this bus. `None` for any caller
+    /// that does not need the seam (older test setups; pre-fix
+    /// code paths). The wiring happens at construction via
+    /// `with_broadcaster`; `app.rs` constructs the handler AFTER
+    /// the broadcaster exists and threads it in.
+    broadcaster: Option<Arc<PairingBroadcaster>>,
 }
 
 impl PairingHandler {
@@ -101,12 +120,30 @@ impl PairingHandler {
             max_pending: 10,
             persist_path: None,
             own_device_id: Arc::new(RwLock::new(None)),
+            broadcaster: None,
         }
     }
 
     pub fn with_persistence(mut self, path: PathBuf) -> Self {
         self.persist_path = Some(path);
         self
+    }
+
+    /// Wire the device-event broadcaster so pairing-state changes
+    /// are visible to capability gates that filter on `is_paired`
+    /// (Task #1042 fix lane E). Without this, a connect-then-pair
+    /// flow lands `Connected` BEFORE the device is paired; the
+    /// gate's StateChanged subscription sees the connect, the
+    /// `is_paired` filter rejects, and nothing re-evaluates when
+    /// pairing completes — the peer is a permanent
+    /// "connected-capable but never eligible" record until it
+    /// disconnects and reconnects. The Paired/Unpaired broadcasts
+    /// close that gap.
+    pub fn with_broadcaster(self, broadcaster: Arc<PairingBroadcaster>) -> Self {
+        Self {
+            broadcaster: Some(broadcaster),
+            ..self
+        }
     }
 
     /// Wire in the daemon's own device id at construction time (tests, or
@@ -477,6 +514,28 @@ impl PairingHandler {
             warn!(error = %e, device_id = %device_id, event = "save_after_accept_failed", "Failed to save pairing state after accept");
         }
 
+        // Pairing-event broadcast (Task #1042 fix lane E —
+        // pairing-event seam). Capability gates that filter on
+        // `is_paired` (e.g. shareinputdevices' M4 pairing-gate
+        // lane) re-evaluate eligibility on this event. A
+        // connect-then-pair flow's gate never sees a `Connected`
+        // re-arm trigger once pairing completes — the broadcaster
+        // is the only way the gate learns the device is now
+        // trusted. Best-effort: a closed or full broadcaster is
+        // not a pairing-fatal error (the trusted store is the
+        // canonical state; the broadcast is a notification).
+        if let Some(broadcaster) = &self.broadcaster {
+            // device_name is best-effort here too — we don't
+            // store it on the pairing record. Empty string keeps
+            // the event payload consistent with the existing
+            // Paired variant; consumers that need the name look
+            // it up via the API.
+            broadcaster.broadcast(crate::device::types::DeviceEvent::Paired {
+                device_id: device_id.clone(),
+                device_name: String::new(),
+            });
+        }
+
         Ok(())
     }
 
@@ -508,6 +567,19 @@ impl PairingHandler {
         drop(paired);
         if let Err(e) = self.save_to_disk().await {
             warn!(error = %e, device_id = %device_id, event = "save_after_accept_failed", "Failed to save pairing state after accept");
+        }
+
+        // Same broadcast seam as `accept_pairing` (Task #1042 fix
+        // lane E). The auto-accept path completes without a
+        // pending request, so the gate's prior `Connected`
+        // reaction may have rejected the device as unpaired;
+        // broadcasting Paired here is the only way the gate
+        // re-evaluates against a now-trusted device.
+        if let Some(broadcaster) = &self.broadcaster {
+            broadcaster.broadcast(crate::device::types::DeviceEvent::Paired {
+                device_id: device_id.clone(),
+                device_name: String::new(),
+            });
         }
 
         Ok(())
@@ -562,6 +634,23 @@ impl PairingHandler {
             if let Err(e) = self.save_to_disk().await {
                 warn!(error = %e, device_id = %device_id, event = "save_after_unpair_failed", "Failed to save pairing state after unpair");
             }
+
+            // Pairing-event broadcast (Task #1042 fix lane E —
+            // pairing-event seam, symmetric to Paired). A
+            // currently-active session against an unpairing
+            // device must drop the device from eligibility; if
+            // it was the last capable consumer, the gate's
+            // deactivation arm should also tear down the
+            // session. The gate's existing `Unpaired` arm
+            // handles this via `do_evaluate_after_event(None,
+            // ...)`, which sees the now-empty consumer set
+            // when the unpairing peer was the only one left.
+            if let Some(broadcaster) = &self.broadcaster {
+                broadcaster.broadcast(crate::device::types::DeviceEvent::Unpaired {
+                    device_id: device_id.clone(),
+                });
+            }
+
             Ok(())
         } else {
             Err(Error::DeviceNotPaired(device_id.clone()))
