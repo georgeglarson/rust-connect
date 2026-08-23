@@ -83,6 +83,7 @@ use super::plugin::Plugin;
 pub mod barrier;
 pub mod ei;
 pub mod portal;
+pub mod special_key;
 
 /// Qt::Edge numerics, taken verbatim from the Qt 6 header
 /// /usr/include/qt6/QtCore/qnamespace.h (verified 2026-08-20 against
