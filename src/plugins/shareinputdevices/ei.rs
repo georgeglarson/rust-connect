@@ -75,6 +75,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, warn};
 use xkbcommon::xkb;
 
+use crate::plugins::shareinputdevices::special_key::special_key_for_keysym;
 use crate::plugins::shareinputdevices::{
     plan_button, plan_key, plan_motion, plan_scroll, plan_scroll_discrete, Button, ButtonEdge,
 };
@@ -428,7 +429,14 @@ impl EiReceiver {
                         special_key,
                         mods,
                     } => {
-                        if text.is_empty() {
+                        // Same contentless-body guard as the live
+                        // dispatch and the `handle_activated` replay:
+                        // text AND code, never text alone. A named
+                        // key queued before `start()` installed
+                        // `wire_tx` is all specialKey and no text, so
+                        // a text-only test here would drop it on this
+                        // path while the other two delivered it.
+                        if text.is_empty() && special_key == 0 {
                             continue;
                         }
                         WireBody::Key(plan_key(
@@ -744,40 +752,37 @@ impl EiReceiver {
                     return;
                 }
                 let text = keysym_to_text(keysym);
-                // M4-deferred suppression: until the keysym→Qt::Key
-                // table restores cpp parity (each named key carries
-                // its specialKey code), an empty text + specialKey 0
-                // body has nothing for either phone consumer to act
-                // on — Escape/Backspace/Tab reach the wire as
-                // `{key: "", specialKey: 0, mods…}` and so does every
-                // cursor/function key whose UTF-8 representation is
-                // empty. Drop them at the source, mirroring the
-                // NoSymbol branch above; M4's table is purely
-                // additive.
-                if text.is_empty() {
+                // The cpp's :435 derives a Qt::Key from the keysym and
+                // :109 turns it into the wire's `specialKey` via
+                // `specialKeysMap.value(key)`. `special_key_for_keysym`
+                // folds both steps; see that module for the oracle.
+                let special_key = special_key_for_keysym(keysym);
+                // A body with neither text nor a specialKey has nothing
+                // for either phone consumer to act on. That is now only
+                // true for keys upstream also leaves unmapped (Insert,
+                // Print, Pause, F13+, the bare modifiers) whose UTF-8
+                // is empty or control-only. Named keys no longer land
+                // here: Escape carries 14, Backspace 1, the arrows
+                // 4-7, F1-F12 21-32.
+                //
+                // The cpp does emit the contentless packet in this
+                // case (`Key_unknown` with specialKey 0); dropping it
+                // is the same deliberate divergence as the NoSymbol
+                // branch above, for the same reason.
+                if text.is_empty() && special_key == 0 {
                     return;
                 }
                 let m = Modifiers::from_xkb_state(state);
-                // The cpp's :435 derives a Qt::Key + int code via
-                // `QXkbCommon::keysymToQtKey(sym, modifiers)`; M1's
-                // `plan_key` takes the int directly. The mapping
-                // belongs on the consumer side (or a follow-up that
-                // adds a keysym→int table here). Until then, the
-                // transport emits the text + modifiers and a 0
-                // special_key — the planner still produces the right
-                // shape, and the consumer side of the wire (the
-                // phone) treats `specialKey: 0` as "no special key,
-                // use text".
                 let mut g = gate.lock().await;
                 if g.should_queue() {
                     g.queue(PendingInput::Key {
                         text,
-                        special_key: 0,
+                        special_key,
                         mods: m,
                     });
                 } else {
                     drop(g);
-                    let body = plan_key(&text, 0, m.shift, m.ctrl, m.alt, m.super_key);
+                    let body = plan_key(&text, special_key, m.shift, m.ctrl, m.alt, m.super_key);
                     let _ = wire_tx.send(WireBody::Key(body));
                 }
             }
@@ -792,6 +797,24 @@ impl EiReceiver {
                 // Forward-compat: ignore unknown events.
             }
         }
+    }
+
+    /// Test-only handle on the activation gate.
+    ///
+    /// `start()`'s startup drain serves the populate-before-start
+    /// shape: `handle_activated` ran while `wire_tx` was still `None`,
+    /// so it recorded the activation id and RETAINED the queue for
+    /// `start()` to flush. In the production wiring the pump is the
+    /// only producer of queued events and it does not run until after
+    /// `start()` returns, so that queue is empty in practice and the
+    /// drain cannot be reached from outside. This accessor lets a test
+    /// stage the shape directly and pin the drain's behaviour.
+    ///
+    /// Zero production overhead: the method does not exist in a normal
+    /// build.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn gate_for_test(&self) -> &Arc<Mutex<ActivationGate>> {
+        &self.gate
     }
 
     /// Receive a D-Bus `Activated` activation_id from the
@@ -866,15 +889,15 @@ impl EiReceiver {
                     special_key,
                     mods,
                 } => {
-                    // M4-deferred suppression mirror of the live
-                    // dispatch path — a queued key with empty text
-                    // and specialKey 0 has nothing for the consumer
-                    // to type. The live path drops before queueing
-                    // today, so this branch only fires if a caller
-                    // hand-queues; keep the safety net so the
-                    // replay cannot leak a contentless body to the
-                    // wire.
-                    if text.is_empty() {
+                    // Contentless-body guard, mirroring the live
+                    // dispatch path EXACTLY: a key with no text and
+                    // no specialKey has nothing for the consumer to
+                    // act on. The condition must stay in step with
+                    // the live one — testing `text.is_empty()` alone
+                    // here would drop every queued named key, whose
+                    // whole payload is the specialKey (Escape queued
+                    // behind the gate is `{key:"", specialKey:14}`).
+                    if text.is_empty() && special_key == 0 {
                         continue;
                     }
                     WireBody::Key(plan_key(
@@ -1055,11 +1078,33 @@ fn build_xkb_state(fd: &OwnedFd, size: u32) -> Result<xkb::State, Error> {
 /// codec rejects the whole string in that case.
 fn keysym_to_text(keysym: xkb::Keysym) -> String {
     let raw = xkb::keysym_to_utf8(keysym);
-    if raw.bytes().any(|b| b < 0x20) {
+    if raw.bytes().any(is_control_byte) {
         String::new()
     } else {
         raw
     }
+}
+
+/// C0 controls plus DEL. `< 0x20` alone leaves U+007F through, which
+/// mattered once the specialKey table landed: `XKB_KEY_Delete`'s UTF-8
+/// is exactly U+007F, so Delete would have gone out as
+/// `{key: "\u{7f}", specialKey: 13}` while every other named key went
+/// out with empty text.
+///
+/// A conformant consumer is unharmed either way — `mousepad.rs`'s
+/// `key_actions` gives a valid `specialKey` precedence over `key`,
+/// mirroring x11remoteinput.cpp:160-179 — and upstream's producer does
+/// send both here, since it forwards `lookupStringNoKeysymTransformations`
+/// verbatim. But that same receiving-side doc records the wire
+/// convention: "no real client sends both", and kdeconnect-android
+/// picks one or the other in a single if/else
+/// (KeyListenerView.java:151-163). Emitting the only named key that
+/// carries text would make us the exception, and a less careful
+/// consumer could act on it twice. DEL is a control character; the
+/// filter above says it strips control characters; this makes that
+/// true. (CodeRabbit, PR #31.)
+fn is_control_byte(b: u8) -> bool {
+    b < 0x20 || b == 0x7f
 }
 
 #[cfg(test)]

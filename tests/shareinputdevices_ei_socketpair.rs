@@ -57,6 +57,7 @@ xkb_keycodes {
 	<RIGHT> = 114;
 	<END> = 115;
 	<DOWN> = 116;
+	<DELE> = 119;
 	<CAPS> = 66;
 };
 xkb_types {
@@ -77,6 +78,7 @@ xkb_symbols {
 	key <UP> {	[ Up	]	};
 	key <RIGHT> {	[ Right	]	};
 	key <END> {	[ End	]	};
+	key <DELE> {	[ Delete	]	};
 	key <DOWN> {	[ Down	]	};
 	key <CAPS> {	[ Caps_Lock	]	};
 	key <HKTG> {	[ h	]	};
@@ -85,9 +87,28 @@ xkb_symbols {
 };
 "#;
 
-/// Sets up an `EisConnection` (high-level wrapper) and the
-/// `EiReceiver` end of the socketpair. Returns the wrapped
-/// connection and the receiver's wire mpsc + drive future.
+/// A single boxed pump future. `impl Future` cannot appear in a type
+/// alias on stable, so `Harness` carries the boxed form.
+type Pump = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
+
+/// What the harness hands a test: the EIS end of the socketpair, the
+/// receiver, the wire/disconnect channels, the pump future to spawn,
+/// the EIS shutdown trigger, and the bound-capabilities probe.
+#[allow(clippy::type_complexity)]
+type Harness = (
+    EisConnection,
+    std::sync::Arc<EiReceiver>,
+    tokio::sync::mpsc::UnboundedReceiver<rust_connect::plugins::shareinputdevices::ei::WireBody>,
+    tokio::sync::watch::Receiver<bool>,
+    Pump,
+    Option<tokio::sync::oneshot::Sender<()>>,
+    tokio::sync::oneshot::Receiver<BitFlags<DeviceCapability>>,
+);
+
+/// Bring up an EIS peer over a socketpair and a started `EiReceiver`,
+/// optionally staging the activation gate BEFORE `start()` runs.
+/// Returns the wrapped connection and the receiver's wire mpsc + drive
+/// future.
 ///
 /// **Cooperative handshake.** Both sides are non-blocking. We must
 /// drive the EIS read loop CONCURRENTLY with the receiver's async
@@ -110,16 +131,17 @@ xkb_symbols {
 /// `LocalSet::new()` and `local.block_on(&rt, ...)` — see the test
 /// bodies below). The test body, the eis drive task, and the
 /// `receiver.start()` future all run on the same thread.
-#[allow(clippy::type_complexity)]
-async fn setup() -> (
-    EisConnection,
-    std::sync::Arc<EiReceiver>,
-    tokio::sync::mpsc::UnboundedReceiver<rust_connect::plugins::shareinputdevices::ei::WireBody>,
-    tokio::sync::watch::Receiver<bool>,
-    impl std::future::Future<Output = ()>,
-    Option<tokio::sync::oneshot::Sender<()>>,
-    tokio::sync::oneshot::Receiver<BitFlags<DeviceCapability>>,
-) {
+///
+/// `pre_start: Some((event, id))` queues `event` and records `id` as an
+/// activation seen while `wire_tx` was still `None`, reproducing the
+/// populate-before-start shape whose queue `start()`'s own drain
+/// exists to flush. `None` is the ordinary case.
+async fn setup_staged(
+    pre_start: Option<(
+        rust_connect::plugins::shareinputdevices::ei::PendingInput,
+        u32,
+    )>,
+) -> Harness {
     let (peer_stream, client_stream) = UnixStream::pair().expect("UnixStream::pair");
 
     // The eis drive task owns one end of the socketpair and the
@@ -211,6 +233,14 @@ async fn setup() -> (
     let receiver =
         EiReceiver::new(client_stream.into(), "shareinputdevices-test").expect("EiReceiver::new");
 
+    // Stage the gate before `start()` installs `wire_tx`, so the
+    // startup drain has something to flush.
+    if let Some((event, activation_id)) = pre_start {
+        let mut g = receiver.gate_for_test().lock().await;
+        g.queue(event);
+        g.note_activated_retain_pending(activation_id);
+    }
+
     // Kick the receiver off as a spawn_local so it makes progress
     // while we wait for the eis drive to complete the handshake.
     // We then await both — the receiver's `start()` returns once
@@ -236,10 +266,15 @@ async fn setup() -> (
         receiver,
         wire_rx,
         disconnect_rx,
-        drive,
+        Box::pin(drive),
         Some(eis_done_tx),
         bind_rx,
     )
+}
+
+/// The ordinary harness: no gate staging.
+async fn setup() -> Harness {
+    setup_staged(None).await
 }
 
 /// Send a `pointer_motion` event by reaching into the device's
@@ -1471,24 +1506,20 @@ fn latched_shift_modifier_surfaces_as_shift_on_wire() {
 }
 
 #[test]
-fn control_char_keys_emit_no_body_until_m4_table() {
-    // Red-before-green oracle for the M4-deferred contentless-body
-    // suppression. Pre-suppression the cpp producer at
-    // inputcapturesession.cpp:436 calls
-    // `QXkbCommon::lookupStringNoKeysymTransformations(sym)`, whose
-    // Qt-side equivalent strips chars < 0x20 before emitting —
-    // Escape, Backspace, and Tab all produce empty text on the
-    // wire. Our transport's `keysym_to_text` mirrors the same filter
-    // (all-or-nothing, see the function's doc) so the keysym text is
-    // also empty, AND we do not yet have the cpp's keysym→Qt::Key
-    // table to assign a non-zero specialKey. The M3 fix is to drop
-    // the body entirely at the source — neither phone consumer can
-    // act on `{key: "", specialKey: 0, mods…}` — and let M4's table
-    // restore cpp parity by becoming purely additive (no consumer
-    // code paths need to change).
+fn control_char_keys_emit_their_special_key_code() {
+    // Escape carries no printable text: the cpp gets "\x1b" from
+    // `lookupStringNoKeysymTransformations` (inputcapturesession.cpp
+    // :436) and our `keysym_to_text` filters chars < 0x20 to empty.
+    // Its entire payload is therefore the `specialKey` code, which
+    // `special_key_for_keysym` now supplies (14, per
+    // shareinputdevicesplugin.cpp:44).
     //
-    // We test Escape here (evdev 1 → xkb 9 → XK_Escape → "\x1b" →
-    // filtered to empty text). The body must NEVER reach the wire.
+    // Until the table landed these keys were dropped at the source,
+    // because `{key: "", specialKey: 0}` gives neither phone consumer
+    // anything to act on. This test previously pinned that
+    // suppression; it now pins the parity behaviour that replaced it.
+    // Escape reaching the wire as `{key: "", specialKey: 14}` is the
+    // whole point of the table.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1527,21 +1558,29 @@ fn control_char_keys_emit_no_body_until_m4_table() {
         // Arm-then-clear the activation gate.
         _receiver.handle_activated(1).await;
 
-        // Press KEY_ESCAPE (evdev 1) → xkb 9 → XK_Escape. The
-        // M4-deferred suppression drops the body at the source.
+        // Press KEY_ESCAPE (evdev 1) → xkb 9 → XK_Escape.
         key_event(&connection, &device, 1, true);
 
-        let spurious = timeout(Duration::from_millis(300), wire_rx.recv()).await;
-        assert!(
-            spurious.is_err(),
-            "Escape must NOT produce a wire body (M4-deferred contentless suppression); \
-             got {:?}",
-            spurious.ok().flatten().map(|b| b.into_json())
+        let body = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("Escape must reach the wire once the table supplies its code")
+            .expect("wire rx closed");
+        let json = body.into_json();
+        let obj = json.as_object().expect("key body is an object");
+        assert_eq!(
+            obj.get("specialKey").and_then(serde_json::Value::as_i64),
+            Some(14),
+            "Escape must carry specialKey 14 (shareinputdevicesplugin.cpp:44); got {json}"
+        );
+        assert_eq!(
+            obj.get("key").and_then(|v| v.as_str()),
+            Some(""),
+            "Escape carries no printable text — the specialKey is the payload; got {json}"
         );
 
         // The pump must still be alive — a subsequent mapped key
         // (KEY_H=35 → xkb 43 → XK_h) must produce a body, proving
-        // the suppression did not break the dispatch loop.
+        // the special-key path did not break the dispatch loop.
         key_event(&connection, &device, 35, true);
         let body = timeout(Duration::from_secs(2), wire_rx.recv())
             .await
@@ -1565,23 +1604,19 @@ fn control_char_keys_emit_no_body_until_m4_table() {
 }
 
 #[test]
-fn cursor_keys_emit_no_body_until_m4_table() {
-    // Red-before-green oracle for cursor keys (Up/Down/Home/End):
-    // the brief's claimed mechanism — that cursor keysyms emit CSI
-    // escape sequences like "\x1b[D" from `xkb_keysym_to_utf8` —
-    // was empirically disproved: an integrator probe on this
-    // libxkbcommon showed n=0 (empty string) for Left/Home/F1, and
-    // raw control bytes only for Escape ("\x1b") and Tab ("\t").
-    // See FINDINGS.md § Fix 1 — the suppression still applies
-    // because the resulting text is empty, so cursor keys reach the
-    // same `{key: "", specialKey: 0}` body and the M4-deferred drop
-    // catches them at the source.
+fn cursor_keys_emit_their_special_key_codes() {
+    // Cursor keys produce EMPTY text, not CSI escape sequences: the
+    // brief's claimed mechanism ("\x1b[D" out of `xkb_keysym_to_utf8`)
+    // was empirically disproved — an integrator probe showed n=0 for
+    // Left/Home/F1, with raw control bytes only for Escape and Tab.
+    // So their entire payload is the `specialKey` code, and before
+    // the table existed they were dropped at the source.
     //
     // Each cursor key has a TEST_KEYMAP binding (<HOME>=110,
-    // <UP>=111, <RIGHT>=114, <END>=115, <DOWN>=116) so the
-    // keymap's `key_get_one_sym` lookup hits a real keysym rather
-    // than NoSymbol. The test then asserts none of them produces
-    // a wire body.
+    // <UP>=111, <RIGHT>=114, <END>=115, <DOWN>=116) so
+    // `key_get_one_sym` hits a real keysym rather than NoSymbol.
+    // Every one must now reach the wire carrying the code
+    // shareinputdevicesplugin.cpp:33-40 assigns it.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1624,14 +1659,30 @@ fn cursor_keys_emit_no_body_until_m4_table() {
         // <HOME>=110, <UP>=111, <RIGHT>=114, <END>=115, <DOWN>=116;
         // evdev keycode is xkb - XKB_KEYCODE_OFFSET (8) → 102, 103,
         // 106, 107, 108 respectively.
-        for evdev in [102u32, 103, 106, 107, 108] {
+        // Expected codes: Home=10, Up=5, Right=6, End=11, Down=7.
+        for (evdev, want_code, name) in [
+            (102u32, 10i64, "Home"),
+            (103, 5, "Up"),
+            (106, 6, "Right"),
+            (107, 11, "End"),
+            (108, 7, "Down"),
+        ] {
             key_event(&connection, &device, evdev, true);
-            let spurious = timeout(Duration::from_millis(150), wire_rx.recv()).await;
-            assert!(
-                spurious.is_err(),
-                "cursor key evdev={evdev} must NOT produce a wire body \
-                 (M4-deferred contentless suppression); got {:?}",
-                spurious.ok().flatten().map(|b| b.into_json())
+            let body = timeout(Duration::from_secs(2), wire_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{name} (evdev={evdev}) must reach the wire"))
+                .expect("wire rx closed");
+            let json = body.into_json();
+            let obj = json.as_object().expect("key body is an object");
+            assert_eq!(
+                obj.get("specialKey").and_then(serde_json::Value::as_i64),
+                Some(want_code),
+                "{name} (evdev={evdev}) must carry specialKey {want_code}; got {json}"
+            );
+            assert_eq!(
+                obj.get("key").and_then(|v| v.as_str()),
+                Some(""),
+                "{name} carries no printable text; got {json}"
             );
         }
 
@@ -1861,4 +1912,243 @@ fn memfd_create() -> std::io::Result<std::fs::File> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// A named key pressed while the activation gate is armed must
+/// survive the replay carrying its `specialKey` code.
+///
+/// The replay path has its own contentless-body guard, mirroring the
+/// live dispatch path. That guard tested `text.is_empty()` alone
+/// while the live path dropped every empty-text key anyway, so the
+/// two agreed. Once `special_key_for_keysym` let named keys through,
+/// a guard testing text alone would drop exactly the keys the table
+/// exists to deliver — Escape queued behind the gate is
+/// `{key: "", specialKey: 14}`, all payload and no text.
+///
+/// Nothing else covers the queued-named-key case: the gate tests use
+/// pointer motion (which carries coordinates) and the special-key
+/// tests fire after the gate is already clear. This is the crossing
+/// point of the two.
+#[test]
+fn queued_named_key_replays_with_its_special_key_code() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        let seat = connection.add_seat(
+            Some("test"),
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
+        );
+        let keymap_text = TEST_KEYMAP.to_string();
+        let device = seat.add_device(
+            Some("test-kb"),
+            DeviceType::Virtual,
+            DeviceCapability::Keyboard.into(),
+            move |device| {
+                let kb: eis::Keyboard = device
+                    .interface()
+                    .expect("keyboard interface available pre-done");
+                let (memfd, size) = keymap_fd(&keymap_text);
+                kb.keymap(EisKeymapType::Xkb, size, memfd.as_fd());
+            },
+        );
+        device.resumed();
+        // start_emulating(9) with no matching handle_activated leaves
+        // the gate ARMED, so the press below is queued, not sent.
+        device.start_emulating(9);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Press KEY_ESCAPE (evdev 1 → xkb 9 → XK_Escape).
+        key_event(&connection, &device, 1, true);
+
+        let premature = timeout(Duration::from_millis(200), wire_rx.recv()).await;
+        assert!(
+            premature.is_err(),
+            "Escape must stay queued while the gate is armed; got {:?}",
+            premature.ok().flatten().map(|b| b.into_json())
+        );
+
+        // The activation id arrives — the queue drains.
+        receiver.handle_activated(9).await;
+
+        let body = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("queued Escape must replay, not be dropped by the contentless guard")
+            .expect("wire rx closed");
+        let json = body.into_json();
+        let obj = json.as_object().expect("key body is an object");
+        assert_eq!(
+            obj.get("specialKey").and_then(serde_json::Value::as_i64),
+            Some(14),
+            "replayed Escape must carry specialKey 14; got {json}"
+        );
+        assert_eq!(
+            obj.get("key").and_then(|v| v.as_str()),
+            Some(""),
+            "replayed Escape carries no text; got {json}"
+        );
+
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit");
+    });
+}
+
+/// A named key queued before `start()` installs `wire_tx` must reach
+/// the wire with its `specialKey` code when the startup drain flushes.
+///
+/// `start()` carries a THIRD contentless-body guard, besides the live
+/// dispatch path and the `handle_activated` replay. It is there for
+/// the populate-before-start shape: `handle_activated` saw
+/// `wire_tx = None`, recorded the activation id and retained the
+/// queue for `start()` to flush. That guard tested `text.is_empty()`
+/// alone, so once the specialKey table let named keys through, this
+/// one path would still have dropped them — a queued Escape is all
+/// code and no text. Found in review on PR #31 by both cubic and
+/// sourcery after the other two guards were fixed.
+///
+/// The production pump is the only producer of queued events and does
+/// not run until after `start()` returns, so this queue is empty in
+/// the real wiring today and the drain is defensive. The gate is
+/// staged directly (`gate_for_test`) to pin the behaviour anyway: the
+/// guard must not be the odd one out if the path ever becomes live.
+#[test]
+fn named_key_queued_before_start_survives_the_startup_drain() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        // Escape as it would sit in the queue: no text, code 14.
+        let escape = rust_connect::plugins::shareinputdevices::ei::PendingInput::Key {
+            text: String::new(),
+            special_key: 14,
+            mods: rust_connect::plugins::shareinputdevices::ei::Modifiers::default(),
+        };
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup_staged(Some((escape, 3))).await;
+        let pump = tokio::task::spawn_local(drive);
+
+        // `start()` has already run inside setup_staged, so the drain
+        // has happened: the body must be waiting on the wire.
+        let body = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("queued Escape must survive start()'s startup drain")
+            .expect("wire rx closed");
+        let json = body.into_json();
+        let obj = json.as_object().expect("key body is an object");
+        assert_eq!(
+            obj.get("specialKey").and_then(serde_json::Value::as_i64),
+            Some(14),
+            "drained Escape must keep specialKey 14; got {json}"
+        );
+        assert_eq!(
+            obj.get("key").and_then(|v| v.as_str()),
+            Some(""),
+            "drained Escape carries no text; got {json}"
+        );
+
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit");
+    });
+}
+
+/// Delete must reach the wire as its `specialKey` alone, with NO text.
+///
+/// `XKB_KEY_Delete`'s UTF-8 is exactly U+007F, which the original
+/// `< 0x20` text filter let through — so Delete would have been the
+/// one named key carrying both a code and a text byte, while Escape,
+/// Backspace and the arrows all went out with empty text.
+///
+/// A conformant consumer survives either shape: `mousepad.rs`'s
+/// `key_actions` gives a valid `specialKey` precedence over `key`,
+/// mirroring x11remoteinput.cpp:160-179. But that same doc records the
+/// convention — "no real client sends both" — and kdeconnect-android
+/// picks one or the other in a single if/else. DEL is a control
+/// character and the filter claims to strip control characters, so it
+/// now does. (CodeRabbit, PR #31.)
+#[test]
+fn delete_emits_special_key_without_the_del_control_char() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        let seat = connection.add_seat(
+            Some("test"),
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
+        );
+        let keymap_text = TEST_KEYMAP.to_string();
+        let device = seat.add_device(
+            Some("test-kb"),
+            DeviceType::Virtual,
+            DeviceCapability::Keyboard.into(),
+            move |device| {
+                let kb: eis::Keyboard = device
+                    .interface()
+                    .expect("keyboard interface available pre-done");
+                let (memfd, size) = keymap_fd(&keymap_text);
+                kb.keymap(EisKeymapType::Xkb, size, memfd.as_fd());
+            },
+        );
+        device.resumed();
+        device.start_emulating(1);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        _receiver.handle_activated(1).await;
+
+        // TEST_KEYMAP binds <DELE> = 119 → evdev 111.
+        key_event(&connection, &device, 111, true);
+
+        let body = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("Delete must reach the wire")
+            .expect("wire rx closed");
+        let json = body.into_json();
+        let obj = json.as_object().expect("key body is an object");
+        assert_eq!(
+            obj.get("specialKey").and_then(serde_json::Value::as_i64),
+            Some(13),
+            "Delete must carry specialKey 13; got {json}"
+        );
+        assert_eq!(
+            obj.get("key").and_then(|v| v.as_str()),
+            Some(""),
+            // Debug-format the field: a raw U+007F prints as an
+            // invisible byte, so `{json}` alone shows an apparently
+            // EMPTY key on failure and hides the whole defect.
+            "Delete must NOT carry the U+007F control char as text; got key={:?} in {json}",
+            obj.get("key")
+        );
+
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit");
+    });
 }
