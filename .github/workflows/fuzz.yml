@@ -35,6 +35,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e # v2.9.0
 
+      - name: Install system dependencies
+        # The fuzz targets link the full crate; the xkbcommon crate is
+        # raw FFI (#[link(name = "xkbcommon")], no pkg-config), so the
+        # link step needs libxkbcommon-dev. Broken since M3 added the
+        # xkbcommon dependency (same class as the linux-ci fix).
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev
+
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
