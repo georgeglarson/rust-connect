@@ -54,7 +54,32 @@ use rust_connect::device::EventBroadcaster;
 use rust_connect::protocol::pairing::PairingHandler;
 use rust_connect::protocol::CertificateManager;
 
-const PEER: &str = "test-peer-round4";
+const PEER: &str = "test-peer-round4aaaaaaaaaaaaaaaa";
+
+/// Stage a fake peer certificate so the cert-anchor gate added by PR #28
+/// (accept/force-accept refuse without a pending cert or pinned
+/// fingerprint) lets the accept through. Mirrors the orchestrator's
+/// `make_external_cert_der` shape: generate in a throwaway cert dir,
+/// convert PEM → DER, stage under the peer's device id.
+async fn stage_peer_cert(pairing: &PairingHandler, device_id: &str) {
+    const MIN_DEVICE_ID_LEN: usize = 32;
+    let mut valid_id = String::from(device_id);
+    while valid_id.len() < MIN_DEVICE_ID_LEN {
+        valid_id.push('a');
+    }
+    let cert_dir = tempfile::tempdir().expect("cert tempdir");
+    let cm_for_cert = Arc::new(CertificateManager::new(cert_dir.path().to_path_buf()));
+    let (cert_pem, _) = cm_for_cert
+        .generate_certificate(&valid_id, "Peer")
+        .expect("cert generation must succeed");
+    let cert_der = openssl::x509::X509::from_pem(&cert_pem)
+        .expect("PEM must parse")
+        .to_der()
+        .expect("DER conversion must succeed");
+    pairing
+        .set_pending_peer_cert(&device_id.to_string(), cert_der)
+        .await;
+}
 
 fn build_pairing_with_broadcaster() -> (
     Arc<PairingHandler>,
@@ -113,6 +138,9 @@ async fn accept_pairing_emits_paired_event() {
         .await
         .expect("receive_pair_request must succeed");
 
+    // PR #28's cert-anchor gate: accept refuses without a pending cert.
+    stage_peer_cert(&pairing, PEER).await;
+
     pairing
         .accept_pairing(&PEER.to_string())
         .await
@@ -148,6 +176,9 @@ async fn accept_pairing_emits_paired_event() {
 async fn force_accept_pairing_emits_paired_event() {
     let (pairing, mut rx) = build_pairing_with_broadcaster();
 
+    // PR #28's cert-anchor gate: force-accept refuses without a cert.
+    stage_peer_cert(&pairing, PEER).await;
+
     pairing
         .force_accept_pairing(&PEER.to_string())
         .await
@@ -181,6 +212,8 @@ async fn unpair_emits_unpaired_event() {
     let (pairing, mut rx) = build_pairing_with_broadcaster();
 
     // Get the device paired first so unpair has something to do.
+    // PR #28's cert-anchor gate: force-accept refuses without a cert.
+    stage_peer_cert(&pairing, PEER).await;
     pairing
         .force_accept_pairing(&PEER.to_string())
         .await
@@ -236,6 +269,8 @@ async fn pairing_handler_without_broadcaster_still_lifecycle_correctly() {
         .receive_pair_request(&PEER.to_string(), None)
         .await
         .expect("receive_pair_request must succeed even without broadcaster");
+    // PR #28's cert-anchor gate: accept refuses without a pending cert.
+    stage_peer_cert(&pairing, PEER).await;
     pairing
         .accept_pairing(&PEER.to_string())
         .await

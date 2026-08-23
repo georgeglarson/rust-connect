@@ -73,11 +73,36 @@ async fn record_only_mousepad_cap(cm: &ConnectionManager, device_id: &str) {
     cm.mark_fake_connected_for_test(device_id);
 }
 
+/// Stage a fake peer certificate so the cert-anchor gate added by PR #28
+/// (accept refuses without a pending cert or pinned fingerprint) lets
+/// the accept through. Mirrors the orchestrator's `make_external_cert_der`.
+async fn stage_peer_cert(pairing: &PairingHandler, device_id: &str) {
+    const MIN_DEVICE_ID_LEN: usize = 32;
+    let mut valid_id = String::from(device_id);
+    while valid_id.len() < MIN_DEVICE_ID_LEN {
+        valid_id.push('a');
+    }
+    let cert_dir = tempfile::tempdir().expect("cert tempdir");
+    let cm_for_cert = Arc::new(CertificateManager::new(cert_dir.path().to_path_buf()));
+    let (cert_pem, _) = cm_for_cert
+        .generate_certificate(&valid_id, "Peer")
+        .expect("cert generation must succeed");
+    let cert_der = openssl::x509::X509::from_pem(&cert_pem)
+        .expect("PEM must parse")
+        .to_der()
+        .expect("DER conversion must succeed");
+    pairing
+        .set_pending_peer_cert(&device_id.to_string(), cert_der)
+        .await;
+}
+
 async fn fake_pair(pairing: &PairingHandler, device_id: &str) {
     pairing
         .initiate_pairing(&device_id.to_string())
         .await
         .expect("initiate_pairing must succeed");
+    // PR #28's cert-anchor gate: accept refuses without a pending cert.
+    stage_peer_cert(pairing, device_id).await;
     pairing
         .accept_pairing(&device_id.to_string())
         .await
@@ -94,7 +119,7 @@ async fn fake_pair(pairing: &PairingHandler, device_id: &str) {
 async fn wrapper_includes_paired_peer_with_both_caps() {
     let (cm, pairing) = build_cm_and_pairing().await;
 
-    let peer = "peer-both-caps-paired";
+    let peer = "peer-both-caps-pairedaaaaaaaaaaa";
     record_full_consumer_caps(&cm, peer).await;
     fake_pair(&pairing, peer).await;
 
@@ -117,7 +142,7 @@ async fn wrapper_includes_paired_peer_with_both_caps() {
 async fn wrapper_excludes_unpaired_peer_with_both_caps() {
     let (cm, pairing) = build_cm_and_pairing().await;
 
-    let peer = "peer-both-caps-unpaired";
+    let peer = "peer-both-caps-unpairedaaaaaaaaa";
     record_full_consumer_caps(&cm, peer).await;
     // Deliberately no `fake_pair` — the security case under test.
 
@@ -143,7 +168,7 @@ async fn wrapper_excludes_unpaired_peer_with_both_caps() {
 async fn wrapper_excludes_paired_peer_with_single_cap() {
     let (cm, pairing) = build_cm_and_pairing().await;
 
-    let only_share = "peer-only-shareinputdevices";
+    let only_share = "peer-only-shareinputdevicesaaaaa";
     record_only_shareinputdevices_cap(&cm, only_share).await;
     fake_pair(&pairing, only_share).await;
 
@@ -155,7 +180,7 @@ async fn wrapper_excludes_paired_peer_with_single_cap() {
         result
     );
 
-    let only_mouse = "peer-only-mousepad";
+    let only_mouse = "peer-only-mousepadaaaaaaaaaaaaaa";
     record_only_mousepad_cap(&cm, only_mouse).await;
     fake_pair(&pairing, only_mouse).await;
 
@@ -176,9 +201,9 @@ async fn wrapper_excludes_paired_peer_with_single_cap() {
 async fn wrapper_handles_mixed_peer_state() {
     let (cm, pairing) = build_cm_and_pairing().await;
 
-    let paired = "peer-mixed-paired";
-    let unpaired = "peer-mixed-unpaired";
-    let single_cap = "peer-mixed-single-cap";
+    let paired = "peer-mixed-pairedaaaaaaaaaaaaaaa";
+    let unpaired = "peer-mixed-unpairedaaaaaaaaaaaaa";
+    let single_cap = "peer-mixed-single-capaaaaaaaaaaa";
 
     record_full_consumer_caps(&cm, paired).await;
     fake_pair(&pairing, paired).await;
