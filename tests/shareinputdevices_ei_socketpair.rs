@@ -57,6 +57,7 @@ xkb_keycodes {
 	<RIGHT> = 114;
 	<END> = 115;
 	<DOWN> = 116;
+	<DELE> = 119;
 	<CAPS> = 66;
 };
 xkb_types {
@@ -77,6 +78,7 @@ xkb_symbols {
 	key <UP> {	[ Up	]	};
 	key <RIGHT> {	[ Right	]	};
 	key <END> {	[ End	]	};
+	key <DELE> {	[ Delete	]	};
 	key <DOWN> {	[ Down	]	};
 	key <CAPS> {	[ Caps_Lock	]	};
 	key <HKTG> {	[ h	]	};
@@ -111,37 +113,39 @@ xkb_symbols {
 /// bodies below). The test body, the eis drive task, and the
 /// `receiver.start()` future all run on the same thread.
 #[allow(clippy::type_complexity)]
-async fn setup() -> (
+/// What the harness hands a test: the EIS end of the socketpair, the
+/// receiver, the wire/disconnect channels, the pump future to spawn,
+/// the EIS shutdown trigger, and the bound-capabilities probe.
+type Pump = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
+
+type Harness = (
     EisConnection,
     std::sync::Arc<EiReceiver>,
     tokio::sync::mpsc::UnboundedReceiver<rust_connect::plugins::shareinputdevices::ei::WireBody>,
     tokio::sync::watch::Receiver<bool>,
-    impl std::future::Future<Output = ()>,
+    Pump,
     Option<tokio::sync::oneshot::Sender<()>>,
     tokio::sync::oneshot::Receiver<BitFlags<DeviceCapability>>,
-) {
-    setup_staged(None).await
-}
+);
 
-/// `setup()` with the option of staging the activation gate BEFORE
-/// `start()` runs — the populate-before-start shape whose queue
-/// `start()`'s own drain exists to flush. `Some((event, id))` queues
-/// `event` and records `id` as an activation seen while `wire_tx` was
-/// still `None`, exactly as `handle_activated` would have.
+/// Bring up an EIS peer over a socketpair and a started `EiReceiver`,
+/// optionally staging the activation gate BEFORE `start()` runs.
+///
+/// The eis drive task owns one end of the socketpair and the EIS
+/// handshake state; the receiver is created and started on the
+/// caller's LocalSet task, and the two make progress cooperatively.
+/// Order matters — see the comments inside.
+///
+/// `pre_start: Some((event, id))` queues `event` and records `id` as an
+/// activation seen while `wire_tx` was still `None`, reproducing the
+/// populate-before-start shape whose queue `start()`'s own drain
+/// exists to flush. `None` is the ordinary case.
 async fn setup_staged(
     pre_start: Option<(
         rust_connect::plugins::shareinputdevices::ei::PendingInput,
         u32,
     )>,
-) -> (
-    EisConnection,
-    std::sync::Arc<EiReceiver>,
-    tokio::sync::mpsc::UnboundedReceiver<rust_connect::plugins::shareinputdevices::ei::WireBody>,
-    tokio::sync::watch::Receiver<bool>,
-    impl std::future::Future<Output = ()>,
-    Option<tokio::sync::oneshot::Sender<()>>,
-    tokio::sync::oneshot::Receiver<BitFlags<DeviceCapability>>,
-) {
+) -> Harness {
     let (peer_stream, client_stream) = UnixStream::pair().expect("UnixStream::pair");
 
     // The eis drive task owns one end of the socketpair and the
@@ -266,10 +270,15 @@ async fn setup_staged(
         receiver,
         wire_rx,
         disconnect_rx,
-        drive,
+        Box::pin(drive),
         Some(eis_done_tx),
         bind_rx,
     )
+}
+
+/// The ordinary harness: no gate staging.
+async fn setup() -> Harness {
+    setup_staged(None).await
 }
 
 /// Send a `pointer_motion` event by reaching into the device's
@@ -2054,6 +2063,90 @@ fn named_key_queued_before_start_survives_the_startup_drain() {
             obj.get("key").and_then(|v| v.as_str()),
             Some(""),
             "drained Escape carries no text; got {json}"
+        );
+
+        let _ = eis_done_tx.unwrap().send(());
+        drop(connection);
+        let _ = timeout(Duration::from_secs(2), pump)
+            .await
+            .expect("pump did not exit");
+    });
+}
+
+/// Delete must reach the wire as its `specialKey` alone, with NO text.
+///
+/// `XKB_KEY_Delete`'s UTF-8 is exactly U+007F, which the original
+/// `< 0x20` text filter let through — so Delete would have been the
+/// one named key carrying both a code and a text byte, while Escape,
+/// Backspace and the arrows all went out with empty text.
+///
+/// A conformant consumer survives either shape: `mousepad.rs`'s
+/// `key_actions` gives a valid `specialKey` precedence over `key`,
+/// mirroring x11remoteinput.cpp:160-179. But that same doc records the
+/// convention — "no real client sends both" — and kdeconnect-android
+/// picks one or the other in a single if/else. DEL is a control
+/// character and the filter claims to strip control characters, so it
+/// now does. (CodeRabbit, PR #31.)
+#[test]
+fn delete_emits_special_key_without_the_del_control_char() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let (connection, _receiver, mut wire_rx, _disconnect, drive, eis_done_tx, _bind_rx) =
+            setup().await;
+        let pump = tokio::task::spawn_local(drive);
+
+        let seat = connection.add_seat(
+            Some("test"),
+            DeviceCapability::Keyboard
+                | DeviceCapability::Pointer
+                | DeviceCapability::Button
+                | DeviceCapability::Scroll,
+        );
+        let keymap_text = TEST_KEYMAP.to_string();
+        let device = seat.add_device(
+            Some("test-kb"),
+            DeviceType::Virtual,
+            DeviceCapability::Keyboard.into(),
+            move |device| {
+                let kb: eis::Keyboard = device
+                    .interface()
+                    .expect("keyboard interface available pre-done");
+                let (memfd, size) = keymap_fd(&keymap_text);
+                kb.keymap(EisKeymapType::Xkb, size, memfd.as_fd());
+            },
+        );
+        device.resumed();
+        device.start_emulating(1);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        _receiver.handle_activated(1).await;
+
+        // TEST_KEYMAP binds <DELE> = 119 → evdev 111.
+        key_event(&connection, &device, 111, true);
+
+        let body = timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("Delete must reach the wire")
+            .expect("wire rx closed");
+        let json = body.into_json();
+        let obj = json.as_object().expect("key body is an object");
+        assert_eq!(
+            obj.get("specialKey").and_then(serde_json::Value::as_i64),
+            Some(13),
+            "Delete must carry specialKey 13; got {json}"
+        );
+        assert_eq!(
+            obj.get("key").and_then(|v| v.as_str()),
+            Some(""),
+            // Debug-format the field: a raw U+007F prints as an
+            // invisible byte, so `{json}` alone shows an apparently
+            // EMPTY key on failure and hides the whole defect.
+            "Delete must NOT carry the U+007F control char as text; got key={:?} in {json}",
+            obj.get("key")
         );
 
         let _ = eis_done_tx.unwrap().send(());

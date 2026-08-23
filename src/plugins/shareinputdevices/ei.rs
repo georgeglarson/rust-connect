@@ -358,24 +358,6 @@ impl EiReceiver {
     ///
     /// The caller can also simply `await` it inline if it wants
     /// pump work and consumer work to share the same task.
-    /// Test-only handle on the activation gate.
-    ///
-    /// `start()`'s startup drain serves the populate-before-start
-    /// shape: `handle_activated` ran while `wire_tx` was still `None`,
-    /// so it recorded the activation id and RETAINED the queue for
-    /// `start()` to flush. In the production wiring the pump is the
-    /// only producer of queued events and it does not run until after
-    /// `start()` returns, so that queue is empty in practice and the
-    /// drain cannot be reached from outside. This accessor lets a test
-    /// stage the shape directly and pin the drain's behaviour.
-    ///
-    /// Zero production overhead: the method does not exist in a normal
-    /// build.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub fn gate_for_test(&self) -> &Arc<Mutex<ActivationGate>> {
-        &self.gate
-    }
-
     pub async fn start(
         self: &Arc<Self>,
     ) -> Result<
@@ -817,6 +799,24 @@ impl EiReceiver {
         }
     }
 
+    /// Test-only handle on the activation gate.
+    ///
+    /// `start()`'s startup drain serves the populate-before-start
+    /// shape: `handle_activated` ran while `wire_tx` was still `None`,
+    /// so it recorded the activation id and RETAINED the queue for
+    /// `start()` to flush. In the production wiring the pump is the
+    /// only producer of queued events and it does not run until after
+    /// `start()` returns, so that queue is empty in practice and the
+    /// drain cannot be reached from outside. This accessor lets a test
+    /// stage the shape directly and pin the drain's behaviour.
+    ///
+    /// Zero production overhead: the method does not exist in a normal
+    /// build.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn gate_for_test(&self) -> &Arc<Mutex<ActivationGate>> {
+        &self.gate
+    }
+
     /// Receive a D-Bus `Activated` activation_id from the
     /// `PortalSession` signal handler. Updates the gate and replays
     /// any queued events in arrival order. Mirrors
@@ -1078,11 +1078,33 @@ fn build_xkb_state(fd: &OwnedFd, size: u32) -> Result<xkb::State, Error> {
 /// codec rejects the whole string in that case.
 fn keysym_to_text(keysym: xkb::Keysym) -> String {
     let raw = xkb::keysym_to_utf8(keysym);
-    if raw.bytes().any(|b| b < 0x20) {
+    if raw.bytes().any(is_control_byte) {
         String::new()
     } else {
         raw
     }
+}
+
+/// C0 controls plus DEL. `< 0x20` alone leaves U+007F through, which
+/// mattered once the specialKey table landed: `XKB_KEY_Delete`'s UTF-8
+/// is exactly U+007F, so Delete would have gone out as
+/// `{key: "\u{7f}", specialKey: 13}` while every other named key went
+/// out with empty text.
+///
+/// A conformant consumer is unharmed either way — `mousepad.rs`'s
+/// `key_actions` gives a valid `specialKey` precedence over `key`,
+/// mirroring x11remoteinput.cpp:160-179 — and upstream's producer does
+/// send both here, since it forwards `lookupStringNoKeysymTransformations`
+/// verbatim. But that same receiving-side doc records the wire
+/// convention: "no real client sends both", and kdeconnect-android
+/// picks one or the other in a single if/else
+/// (KeyListenerView.java:151-163). Emitting the only named key that
+/// carries text would make us the exception, and a less careful
+/// consumer could act on it twice. DEL is a control character; the
+/// filter above says it strips control characters; this makes that
+/// true. (CodeRabbit, PR #31.)
+fn is_control_byte(b: u8) -> bool {
+    b < 0x20 || b == 0x7f
 }
 
 #[cfg(test)]
