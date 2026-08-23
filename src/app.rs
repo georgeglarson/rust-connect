@@ -53,8 +53,18 @@ impl AppState {
         // phone's fresh request was mis-classified as the accept of our
         // expired one, we answered with plugin traffic instead of pair=true,
         // and the unpaired phone correctly rejected with pair=false.
-        let pairing_handler =
-            Arc::new(PairingHandler::new(cert_manager.clone()).with_persistence(pairing_path));
+        //
+        // The pairing handler is built first, then we extract its
+        // inner paired-ids handle for the device registry (finding
+        // L2-1, Sprint 2 security audit — registry must tell
+        // truly-paired devices from pre-auth ones that merely
+        // reached Connected), then wire the broadcaster in (Task
+        // #1042 fix lane E — pairing-event seam) so accept /
+        // force-accept emit `DeviceEvent::Paired` and `unpair`
+        // emits `DeviceEvent::Unpaired`. Capability gates that
+        // filter on `is_paired` (e.g. shareinputdevices' M4
+        // pairing-gate lane) re-evaluate on those events.
+        let pairing_handler = Arc::new(PairingHandler::new(cert_manager.clone()));
 
         // Built before the registry so its shared paired-ids handle
         // (finding L2-1, Sprint 2 security audit) can be wired in at
@@ -66,6 +76,18 @@ impl AppState {
                 .with_paired_source(pairing_handler.paired_handle()),
         );
         let broadcaster = Arc::new(EventBroadcaster::new(256, "device"));
+        // Wire persistence + broadcaster into the pairing handler
+        // (Task #1042 fix lane E — pairing-event seam). The
+        // builder consumes the `PairingHandler` value (not the
+        // outer Arc) and returns a fresh one; the registry
+        // already holds the inner paired-ids `Arc` clone, so it
+        // observes the new broadcaster-wired state via that
+        // shared inner handle — no extra wiring needed.
+        let pairing_handler = Arc::new(
+            PairingHandler::new(cert_manager.clone())
+                .with_persistence(pairing_path)
+                .with_broadcaster(broadcaster.clone()),
+        );
         let lifecycle = Arc::new(LifecycleManager::new(registry.clone(), broadcaster.clone()));
 
         let connection_manager = Arc::new(ConnectionManager::new(cert_manager.clone())?);
