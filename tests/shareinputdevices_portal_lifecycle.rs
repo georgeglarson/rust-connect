@@ -102,6 +102,15 @@ enum Call {
     Enable {
         session_handle: String,
     },
+    /// `cursor_position` decoded STRICTLY as `(dd)` — `None` when the
+    /// value arrived as anything else (notably the `(vv)` a
+    /// StructureBuilder produces). A real portal decodes this field
+    /// as a `(dd)` and rejects other shapes, so the strict decode is
+    /// the oracle, not a convenience.
+    Release {
+        session_handle: String,
+        cursor_position: Option<(f64, f64)>,
+    },
     SessionClose,
 }
 
@@ -267,6 +276,33 @@ impl FakePortal {
         Ok(zbus::zvariant::OwnedObjectPath::from(
             zbus::zvariant::ObjectPath::from_string_unchecked(request_path),
         ))
+    }
+
+    /// `Release(session_handle: o, options: a{sv})` — no Request
+    /// path, no Response (spec InputCapture.xml:337-345).
+    ///
+    /// `cursor_position` is decoded with the SAME strict `(dd)`
+    /// conversion the production inbound path uses on Activated
+    /// (portal.rs:1436) and that a real portal applies. A value
+    /// carrying variant-wrapped fields — `(vv)`, which
+    /// `StructureBuilder::add_field(Value::F64(..))` produces —
+    /// fails this conversion and records `None`, exactly as the
+    /// real portal would reject it. This is the same class of trap
+    /// the barrier `position` field hit (`(vvvv)` instead of `ai`).
+    #[zbus(name = "Release")]
+    async fn release(
+        &self,
+        session_handle: zbus::zvariant::OwnedObjectPath,
+        options: HashMap<String, OwnedValue>,
+    ) -> zbus::fdo::Result<()> {
+        let cursor_position = options
+            .get("cursor_position")
+            .and_then(|v| <(f64, f64)>::try_from(v.clone()).ok());
+        self.state.lock().unwrap().calls.push(Call::Release {
+            session_handle: session_handle.as_str().to_string(),
+            cursor_position,
+        });
+        Ok(())
     }
 
     #[zbus(name = "SetPointerBarriers")]
@@ -569,6 +605,7 @@ async fn v1_session_records_call_sequence_in_spec_order() {
             Call::GetZones { .. } => "GetZones",
             Call::SetPointerBarriers { .. } => "SetPointerBarriers",
             Call::Enable { .. } => "Enable",
+            Call::Release { .. } => "Release",
             Call::SessionClose => "SessionClose",
         })
         .collect();
@@ -695,6 +732,7 @@ async fn v1_session_aborts_on_empty_zones() {
             Call::GetZones { .. } => "GetZones",
             Call::SetPointerBarriers { .. } => "SetPointerBarriers",
             Call::Enable { .. } => "Enable",
+            Call::Release { .. } => "Release",
             Call::SessionClose => "SessionClose",
         })
         .collect();
@@ -703,4 +741,110 @@ async fn v1_session_aborts_on_empty_zones() {
         vec!["CreateSession", "ConnectToEIS", "GetZones"],
         "empty zones must abort after GetZones — SetPointerBarriers/Enable unreachable"
     );
+}
+
+/// The Release wire shape: `cursor_position` must go out as a D-Bus
+/// `(dd)`, and must carry `barrier.p1() + release_delta` (absolute),
+/// not the peer's relative delta.
+///
+/// Both halves have real failure modes. The shape half:
+/// `StructureBuilder::add_field(Value::F64(..))` wraps each field in
+/// a variant, putting `(vv)` on the wire where the spec says `(dd)`
+/// (InputCapture.xml:337-345, cpp :278 `QPointF`) — the identical
+/// trap the barrier `position` field hit as `(vvvv)` instead of `ai`.
+/// A real portal decodes `cursor_position` as `(dd)` and rejects the
+/// variant-wrapped form, so every Release would fail against a live
+/// compositor while every existing test stayed green: nothing
+/// decoded a Release body until this test.
+///
+/// The arithmetic half: the zone here sits at (100, 200), so the
+/// Left-edge barrier origin is (100, 200) and a (50, 100) delta must
+/// surface as (150.0, 300.0). Sending the delta raw would release
+/// the cursor at (50, 100) — wrong on any barrier away from the
+/// origin (cpp :275-279).
+#[tokio::test(flavor = "multi_thread")]
+async fn release_sends_cursor_position_as_dd_offset_from_barrier_origin() {
+    let _bus_lock = BUS.lock().await;
+    let state = Arc::new(Mutex::new(FakePortalState {
+        version: 1,
+        supported_caps: 3,
+        session_handle: "/org/freedesktop/portal/desktop/session/release1".to_string(),
+        // Deliberately NOT at the origin: (width, height, x, y).
+        zones: vec![(1920, 1080, 100, 200)],
+        ..Default::default()
+    }));
+    let Some(_daemon) = setup(state.clone()).await else {
+        return;
+    };
+
+    let fake_conn = state
+        .lock()
+        .unwrap()
+        .conn
+        .clone()
+        .expect("setup() stores the fake's connection");
+    let session_path = zbus::zvariant::ObjectPath::from_string_unchecked(
+        state.lock().unwrap().session_handle.clone(),
+    );
+    assert!(
+        fake_conn
+            .object_server()
+            .at(
+                session_path,
+                FakeSession {
+                    state: state.clone()
+                }
+            )
+            .await
+            .expect("session object registration must not error"),
+        "fake session object must register at the session_handle path"
+    );
+
+    let conn = zbus::Connection::session().await.unwrap();
+    let (activated_tx, _activated_rx) = tokio::sync::mpsc::unbounded_channel::<
+        rust_connect::plugins::shareinputdevices::portal::ActivatedEvent,
+    >();
+
+    let session = tokio::time::timeout(
+        Duration::from_secs(5),
+        rust_connect::plugins::shareinputdevices::portal::PortalSession::start(
+            conn,
+            rust_connect::plugins::shareinputdevices::Edge::Left,
+            activated_tx,
+        ),
+    )
+    .await
+    .expect("PortalSession::start must complete well under the timeout")
+    .expect("PortalSession::start must succeed with one real zone");
+
+    session
+        .release(50, 100)
+        .await
+        .expect("release must succeed against the fake portal");
+
+    let calls = state.lock().unwrap().calls.clone();
+    let release = calls
+        .iter()
+        .find_map(|c| match c {
+            Call::Release {
+                session_handle,
+                cursor_position,
+            } => Some((session_handle.clone(), *cursor_position)),
+            _ => None,
+        })
+        .expect("release() must land a Release call on the portal interface");
+
+    assert_eq!(
+        release.0, "/org/freedesktop/portal/desktop/session/release1",
+        "Release must carry the session_handle CreateSession returned"
+    );
+    assert_eq!(
+        release.1,
+        Some((150.0, 300.0)),
+        "cursor_position must decode as a (dd) carrying barrier.p1() + delta \
+         = (100+50, 200+100); None means the value did not arrive as (dd) at \
+         all — the (vv) StructureBuilder trap a real portal rejects"
+    );
+
+    session.close().await.expect("explicit close must succeed");
 }

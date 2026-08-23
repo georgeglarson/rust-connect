@@ -263,18 +263,18 @@ impl Options {
         self.pairs.push((key.to_string(), Value::U32(value)));
         self
     }
-    /// `(dd)` shape — a tuple of two f64s, encoded as a Structure.
-    /// The portal's `cursor_position` is exactly this (spec
+    /// `(dd)` shape — a tuple of two f64s. The portal's
+    /// `cursor_position` is exactly this (spec
     /// InputCapture.xml:337-345, cpp :278 with `QPointF`).
+    ///
+    /// Built from the Rust tuple, NOT via `StructureBuilder`: that
+    /// route wraps each field in a variant and puts `(vv)` on the
+    /// wire, which a real portal rejects when it decodes the field
+    /// as a `(dd)`. Identical trap to the barrier `position` field,
+    /// which went out as `(vvvv)` instead of `ai` — see
+    /// `barrier_position`.
     pub fn insert_doubles(mut self, key: &str, x: f64, y: f64) -> Self {
-        let tuple = Value::Structure(
-            zbus::zvariant::StructureBuilder::new()
-                .add_field(Value::F64(x))
-                .add_field(Value::F64(y))
-                .build()
-                .expect("static (f64, f64) tuple cannot fail to build"),
-        );
-        self.pairs.push((key.to_string(), tuple));
+        self.pairs.push((key.to_string(), Value::from((x, y))));
         self
     }
     pub(crate) fn into_body(self) -> HashMap<String, Value<'static>> {
