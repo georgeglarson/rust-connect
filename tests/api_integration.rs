@@ -32,6 +32,35 @@ async fn create_test_app_with_keys(keys: Vec<String>) -> (Arc<AppState>, tempfil
     (state, temp_dir)
 }
 
+/// Stage a synthetic peer cert and accept a pairing. Mirrors the
+/// production flow that drives `accept_pairing` via the cert-anchor
+/// gate (vk #1056): the cert is staged in the handler's pending_certs
+/// map so the accept call sees either a pending or a pinned cert.
+async fn receive_and_accept_with_cert(state: &AppState, device_id: &str) {
+    use rust_connect::protocol::crypto::CertificateManager;
+    let cert_dir = tempfile::TempDir::new().unwrap();
+    let cm_for_cert = std::sync::Arc::new(CertificateManager::new(cert_dir.path().to_path_buf()));
+    let (cert_pem, _) = cm_for_cert.generate_certificate(device_id, "Peer").unwrap();
+    let cert_der = openssl::x509::X509::from_pem(&cert_pem)
+        .unwrap()
+        .to_der()
+        .unwrap();
+    state
+        .pairing_handler
+        .receive_pair_request(&device_id.to_string(), Some(1_700_000_000))
+        .await
+        .unwrap();
+    state
+        .pairing_handler
+        .set_pending_peer_cert(&device_id.to_string(), cert_der)
+        .await;
+    state
+        .pairing_handler
+        .accept_pairing(&device_id.to_string())
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn test_list_devices_empty() {
     let (state, _temp, api_key) = create_test_app().await;
@@ -492,19 +521,7 @@ async fn test_pair_device_invalid_id() {
 async fn test_unpair_device() {
     let (state, _temp, api_key) = create_test_app().await;
 
-    state
-        .pairing_handler
-        .receive_pair_request(
-            &"unpair-meaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            Some(1_700_000_000),
-        )
-        .await
-        .unwrap();
-    state
-        .pairing_handler
-        .accept_pairing(&"unpair-meaaaaaaaaaaaaaaaaaaaaaaa".to_string())
-        .await
-        .unwrap();
+    receive_and_accept_with_cert(&state, "unpair-meaaaaaaaaaaaaaaaaaaaaaaa").await;
     assert!(
         state
             .pairing_handler
@@ -552,16 +569,7 @@ async fn test_unpair_drops_sftp_credentials() {
 
     // Plant pairing + SFTP creds as if the device had connected and
     // sent an sftp packet.
-    state
-        .pairing_handler
-        .receive_pair_request(&device_id.to_string(), Some(1_700_000_000))
-        .await
-        .unwrap();
-    state
-        .pairing_handler
-        .accept_pairing(&device_id.to_string())
-        .await
-        .unwrap();
+    receive_and_accept_with_cert(&state, device_id).await;
     let pkt = rust_connect::protocol::types::Packet::new(
         "kdeconnect.sftp".to_string(),
         serde_json::json!({

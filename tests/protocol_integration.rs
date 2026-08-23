@@ -19,6 +19,45 @@ fn create_test_state() -> (Arc<AppState>, tempfile::TempDir) {
     (state, temp_dir)
 }
 
+/// Stage a synthetic peer cert. The cert-anchor gate (vk #1056)
+/// requires either a pending or pinned cert before accept or
+/// force_accept will complete; production code paths stage via
+/// `receive_pair_request_with_cert`. Tests that go through
+/// `receive_pair_request` + `accept_pairing` (or call `force_accept`
+/// directly) need to seed a cert the same way.
+async fn stage_test_peer_cert(state: &AppState, device_id: &str) {
+    let cert_dir = tempfile::TempDir::new().unwrap();
+    let cm_for_cert = Arc::new(CertificateManager::new(cert_dir.path().to_path_buf()));
+    let (cert_pem, _) = cm_for_cert.generate_certificate(device_id, "Peer").unwrap();
+    let cert_der = openssl::x509::X509::from_pem(&cert_pem)
+        .unwrap()
+        .to_der()
+        .unwrap();
+    state
+        .pairing_handler
+        .set_pending_peer_cert(&device_id.to_string(), cert_der)
+        .await;
+}
+
+/// Stage the peer's REAL certificate, read from the live connection
+/// set up by `setup_peer_pair` — the same staging source production
+/// uses (`pair_device` at api/handlers/device.rs). The fingerprint
+/// stored at accept then matches the cert the peer actually presents
+/// on later handshakes, so the trust store stays internally
+/// consistent and no pin-stripping test seam is needed. Call AFTER
+/// `setup_peer_pair`; pair programmatically after that.
+async fn stage_real_peer_cert(state: &AppState, device_id: &str) {
+    let cert_der = state
+        .connection_manager
+        .get_peer_certificate(&device_id.to_string())
+        .await
+        .expect("peer cert must be readable from the live connection");
+    state
+        .pairing_handler
+        .set_pending_peer_cert(&device_id.to_string(), cert_der)
+        .await;
+}
+
 #[tokio::test]
 async fn test_full_app_initialization() {
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -521,7 +560,7 @@ async fn test_full_lifecycle_discover_pair_connect_disconnect() {
 async fn test_pairing_flow_via_state() {
     let (state, _temp) = create_test_state();
 
-    let device_id = "pair-test-device".to_string();
+    let device_id = "pair-test-device-aaaaaaaaaaaaaaa".to_string();
     let device = Device::new(
         device_id.clone(),
         "Pair Test".to_string(),
@@ -537,6 +576,7 @@ async fn test_pairing_flow_via_state() {
         .unwrap();
     assert!(state.pairing_handler.has_pending_request(&device_id).await);
 
+    stage_test_peer_cert(&state, &device_id).await;
     state
         .pairing_handler
         .accept_pairing(&device_id)
@@ -972,6 +1012,9 @@ async fn test_connection_loop_stale_pair_false_still_unpairs() {
         .receive_pair_request(&device_id, Some(1_700_000_000))
         .await
         .unwrap();
+
+    let (peer_cm, server_handle, generation) = setup_peer_pair(&state).await;
+    stage_real_peer_cert(&state, &device_id).await;
     state
         .pairing_handler
         .accept_pairing(&device_id)
@@ -979,7 +1022,6 @@ async fn test_connection_loop_stale_pair_false_still_unpairs() {
         .unwrap();
     assert!(state.pairing_handler.is_paired(&device_id).await);
 
-    let (peer_cm, server_handle, generation) = setup_peer_pair(&state).await;
     let (cancel, loop_handle) = spawn_real_packet_loop(&state, &device_id, generation);
 
     // pair=false dated an hour ago: outside the window, but the window must
@@ -1082,6 +1124,9 @@ async fn test_connection_loop_pair_while_paired_unpairs_and_starts_over() {
         .receive_pair_request(&device_id, Some(1_700_000_000))
         .await
         .unwrap();
+
+    let (peer_cm, server_handle, generation) = setup_peer_pair(&state).await;
+    stage_real_peer_cert(&state, &device_id).await;
     state
         .pairing_handler
         .accept_pairing(&device_id)
@@ -1090,7 +1135,6 @@ async fn test_connection_loop_pair_while_paired_unpairs_and_starts_over() {
 
     assert!(state.pairing_handler.is_paired(&device_id).await);
 
-    let (peer_cm, server_handle, generation) = setup_peer_pair(&state).await;
     let (cancel, _loop_handle) = spawn_real_packet_loop(&state, &device_id, generation);
 
     let pair_resp = Packet::pair_response(true);
@@ -1417,13 +1461,14 @@ async fn test_connection_loop_survives_panicking_plugin() {
 
     let device_id = "peeraaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
     // Non-pair packets from an unpaired peer are dropped before routing.
+    let (peer_cm, server_handle, generation) = setup_peer_pair(&state).await;
+    stage_real_peer_cert(&state, &device_id).await;
     state
         .pairing_handler
         .force_accept_pairing(&device_id)
         .await
         .unwrap();
 
-    let (peer_cm, server_handle, generation) = setup_peer_pair(&state).await;
     let (cancel, loop_handle) = spawn_real_packet_loop(&state, &device_id, generation);
 
     peer_cm
@@ -1742,14 +1787,15 @@ async fn test_identity_exchange_no_pair_request_for_paired() {
         .receive_pair_request(&device_id, Some(1_700_000_000))
         .await
         .unwrap();
+
+    let (peer_cm, server_handle, _generation) = setup_peer_pair(&state).await;
+    stage_real_peer_cert(&state, &device_id).await;
     state
         .pairing_handler
         .accept_pairing(&device_id)
         .await
         .unwrap();
     assert!(state.pairing_handler.is_paired(&device_id).await);
-
-    let (peer_cm, server_handle, _generation) = setup_peer_pair(&state).await;
 
     let identity = make_identity("peeraaaaaaaaaaaaaaaaaaaaaaaaaaaa", "Test Peer");
     peer_cm
