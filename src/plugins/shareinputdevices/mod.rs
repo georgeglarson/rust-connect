@@ -190,13 +190,14 @@ pub async fn capable_consumer_ids(
     // AND post-filter: keep only peers advertising EVERY entry.
     let wanted: std::collections::HashSet<&str> = CONSUMER_INCOMING_CAPS.iter().copied().collect();
     // Track unpaired-capable peers we've already logged (panel M4
-    // round 3 fix — auditable, not per-packet noise). The log fires
-    // once per device per process lifetime; subsequent evaluations
-    // of the same unpaired device stay silent. The set is leaked
-    // (process-lifetime) — at most one entry per device id ever
-    // gets through; bounded by the number of devices the LAN has
-    // seen.
-    let mut seen_unpaired: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // round 3 fix — auditable, not per-packet noise). The set is
+    // process-lifetime (static): the log fires once per device id,
+    // and later evaluations of the same unpaired device stay silent
+    // even though this function re-runs on every gate event and every
+    // relay snapshot. Bounded by the number of devices the LAN has
+    // ever seen.
+    static SEEN_UNPAIRED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     let mut out = Vec::with_capacity(any_match.len());
     for device_id in any_match {
         let Some(incoming) = cm.peer_incoming_capabilities(&device_id).await else {
@@ -214,7 +215,11 @@ pub async fn capable_consumer_ids(
         // user has never paired with.
         if let Some(ph) = pairing_handler {
             if !ph.is_paired(&device_id).await {
-                if seen_unpaired.insert(device_id.clone()) {
+                let first_sighting = SEEN_UNPAIRED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(device_id.clone());
+                if first_sighting {
                     warn!(
                         device_id = %device_id,
                         event = "shareinputdevices_unpaired_capable_peer_excluded",
