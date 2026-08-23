@@ -982,14 +982,29 @@ impl PortalSession {
     /// they don't exercise the cross-module deactivate path.
     /// See panel M4 round 2 fix — P2 part 2.
     ///
-    /// **Pending-disabled latch (panel M4 round 3 fix — P2).** If
-    /// `Disabled` arrived between `start`'s `Enable` and this
-    /// install, the latch was set by the signal handler; on
-    /// install we consume it and immediately invoke the callback
-    /// so the deactivate machinery runs and the session is
-    /// torn down before `backend_available` is flipped. After
-    /// consumption the latch stays clear so a SECOND `Disabled`
-    /// after install doesn't double-fire the callback.
+    /// **Pending-disabled latch (panel M4 round 3 fix — P2;
+    /// refined by Task #1042 fix lane E).** If `Disabled`
+    /// arrived between `start`'s `Enable` and this install, the
+    /// latch was set by the signal handler; on install we
+    /// consume it and immediately invoke the callback.
+    ///
+    /// **What the latch actually closes (post-fix).** The
+    /// pre-fix shape deferred the entire teardown to a
+    /// `tokio::spawn` inside the callback. The latch fired
+    /// synchronously, but the spawned task had not run before
+    /// `do_activate` stored the session in the slot and flipped
+    /// `backend_available=true` — a live-flagged dead session.
+    /// The fix (mod.rs::do_activate) reorders to: store the
+    /// session FIRST, install the callback SECOND. The callback
+    /// now does the slot-take + flag-flip synchronously, so by
+    /// the time `set_on_disabled` returns the slot is empty if
+    /// the latch fired. `do_activate`'s post-`set_on_disabled`
+    /// re-check sees the empty slot and aborts the rest of
+    /// activation. The window is closed by the synchronous
+    /// slot-take inside the callback, not by the latch alone.
+    /// After consumption the latch stays clear so a SECOND
+    /// `Disabled` after install doesn't double-fire the
+    /// callback.
     pub fn set_on_disabled(&self, cb: Arc<dyn Fn() + Send + Sync>) {
         let mut slot = self.on_disabled.lock().unwrap_or_else(|e| e.into_inner());
         *slot = Some(cb.clone());

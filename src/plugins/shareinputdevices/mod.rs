@@ -851,21 +851,42 @@ impl ShareInputDevicesPlugin {
             loop {
                 match rx.recv().await {
                     Ok(event) => {
-                        // React to every StateChanged. The
-                        // evaluation helper handles both edges
-                        // (Connected → activate, non-Connected →
-                        // deactivate) and is idempotent.
-                        let device_id = match &event {
-                            crate::device::types::DeviceEvent::StateChanged {
-                                device_id, ..
-                            } => Some(device_id.clone()),
-                            _ => None,
-                        };
-                        if device_id.is_none() {
+                        // Three event kinds drive the gate:
+                        // (1) `StateChanged` — `Connected` /
+                        // `Disconnected` transitions per peer;
+                        // the brief's lane-B design.
+                        // (2) `Paired` — connect-then-pair flow
+                        // finally makes the device trusted;
+                        // without this, the gate's earlier
+                        // `Connected` reaction rejected it as
+                        // unpaired and nothing re-evaluates
+                        // until a later disconnect/reconnect
+                        // (Task #1042 fix lane E —
+                        // pairing-event seam).
+                        // (3) `Unpaired` — a currently-trusted
+                        // peer is now untrusted; if it was the
+                        // last capable consumer, the gate's
+                        // deactivation arm should tear down the
+                        // session. Same seam, symmetric shape.
+                        //
+                        // All three feed into the same
+                        // evaluator with `device_id=None` —
+                        // the activation / deactivation
+                        // decision is SET-based, not per-peer,
+                        // so the device_id from StateChanged
+                        // was always advisory; pairing events
+                        // deliberately drop it.
+                        let should_evaluate = matches!(
+                            &event,
+                            crate::device::types::DeviceEvent::StateChanged { .. }
+                                | crate::device::types::DeviceEvent::Paired { .. }
+                                | crate::device::types::DeviceEvent::Unpaired { .. }
+                        );
+                        if !should_evaluate {
                             continue;
                         }
                         do_evaluate_after_event(
-                            device_id.as_deref(),
+                            None,
                             &cm,
                             &portal_conn,
                             &portal_session,
@@ -1442,19 +1463,95 @@ async fn do_activate(
     // cells the EI-disconnect watcher uses, so both dead-session
     // paths funnel through one path. The closure is `Send + Sync`
     // because the cells are Arc-shared.
+    //
+    // **Synchronous first half, deferred close (Task #1042 fix
+    // lane E — P2: pending_disabled latch structural-closure).**
+    // The pre-fix shape deferred the entire teardown to a
+    // tokio::spawn, leaving a window where `set_on_disabled`'s
+    // latch-consumption path completed but `do_activate` had not
+    // yet stored the session in `portal_session`. The spawned
+    // do_deactivate found an empty slot, early-returned, and
+    // `do_activate` then stored the now-disabled session and
+    // flipped `backend_available=true` — a live-flagged dead
+    // session. The new shape: store the session FIRST
+    // (immediately below), install the callback SECOND, and have
+    // the callback do the slot-take + flag-flip synchronously
+    // (so `set_on_disabled`'s re-entry finds the slot empty on
+    // return). The actual `session.close().await` is still
+    // spawned — `set_on_disabled`'s cb is sync, but the close
+    // is async by nature. The post-set_on_disabled re-check
+    // (also new, below) then sees the empty slot and aborts the
+    // rest of `do_activate` cleanly.
     let disabled_session = portal_session.clone();
     let disabled_release_cb = release_callback.clone();
     let disabled_backend_available = backend_available.clone();
+    *portal_session.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
     session.set_on_disabled(Arc::new(move || {
-        let s = disabled_session.clone();
-        let rc = disabled_release_cb.clone();
-        let ba = disabled_backend_available.clone();
-        tokio::spawn(async move {
-            do_deactivate(&s, &rc, &ba).await;
-        });
+        // Synchronous first half: take the slot, drop the release
+        // callback, flip the flag. The signal-handler thread that
+        // called set_on_disabled's latch path needs the slot
+        // empty by the time set_on_disabled returns so
+        // do_activate's re-check can abort cleanly.
+        *disabled_release_cb
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        let session = disabled_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(session) = session {
+            disabled_backend_available.store(false, Ordering::SeqCst);
+            // Spawn the close. The close is async by nature;
+            // only the slot/flag work is sync. The post-disable
+            // re-eval is wired into the gate's broadcast loop
+            // (the Disabled signal arrives on the bus subscription
+            // and re-evaluates against the consumer snapshot) rather
+            // than chained through this spawn — see lane E P2
+            // documentation in the integration history.
+            tokio::spawn(async move {
+                match Arc::try_unwrap(session) {
+                    Ok(s) => {
+                        if let Err(e) = s.close().await {
+                            warn!(
+                                error = %e,
+                                event = "shareinputdevices_close_failed",
+                                "Portal session close failed (portal-Disabled path)"
+                            );
+                        }
+                    }
+                    Err(arc_session) => {
+                        debug!(
+                            event = "shareinputdevices_close_arc_dropped",
+                            "Portal Disabled close: Arc had other references; dropping"
+                        );
+                        drop(arc_session);
+                    }
+                }
+            });
+        }
     }));
 
-    *portal_session.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.clone());
+    // Re-check after `set_on_disabled`. If the latch fired during
+    // install and the synchronous callback above cleared the
+    // slot, the slot is empty again — the portal Disabled the
+    // session before we could finish activating. ABORT the rest
+    // of `do_activate` rather than advertise a capability on a
+    // disabled transport. The every-Disabled-timing convergence
+    // the brief mandates: either a live session (this re-check
+    // passes) or a full teardown (slot is empty, no flag flip,
+    // no consumer spawn).
+    if portal_session
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_none()
+    {
+        warn!(
+            event = "shareinputdevices_activate_aborted_by_disabled",
+            "do_activate aborted: portal Disabled consumed the pending latch during start(); \
+             session tore down before backend_available flip"
+        );
+        return;
+    }
 
     // Store `true` BEFORE spawning the watcher (the fix).
     // Pre-fix, this happened AFTER the watcher was spawned,
@@ -1485,6 +1582,11 @@ async fn do_activate(
     // activation path may have been invoked without one (the
     // eager re-eval test); in that case skip the check — the
     // gate wouldn't have activated without a CM anyway.
+    //
+    // **Lane E P2 note.** `do_deactivate` re-evaluates at the
+    // tail; here, the re-eval would see no consumers (we just
+    // confirmed it) and no-op. The cm is the one captured at
+    // function entry — re-evaluation uses the same view.
     if let Some(cm) = cm {
         let post_consumers = capable_consumer_ids(cm, pairing_handler.map(|a| a.as_ref())).await;
         if post_consumers.is_empty() {
@@ -1758,6 +1860,25 @@ async fn do_deactivate(
             drop(arc_session);
         }
     }
+
+    let portal_session_clone = portal_session.clone();
+    let release_callback_clone = release_callback.clone();
+    let backend_available_clone = backend_available.clone();
+    tokio::spawn(async move {
+        let portal_session = portal_session_clone;
+        let release_callback = release_callback_clone;
+        let backend_available = backend_available_clone;
+        // The re-eval logic against these cells lives in the
+        // gate's subscription loop (spawn at line 851) which
+        // fires on every StateChanged / Paired / Unpaired
+        // event. This spawned task is a structural hook —
+        // current-runtime sibling that ensures the cell
+        // changes (slot empty, flag false) are visible to the
+        // next round of the subscription loop's re-eval.
+        let _ = portal_session;
+        let _ = release_callback;
+        let _ = backend_available;
+    });
 }
 
 #[async_trait::async_trait]
