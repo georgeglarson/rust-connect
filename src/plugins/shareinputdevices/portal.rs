@@ -505,6 +505,18 @@ pub struct PortalSession {
     /// Production wires `mod.rs::do_deactivate`'s path here after
     /// `start` returns; tests leave it `None`.
     on_disabled: DisabledCallbackSlot,
+    /// Pending-disabled latch (panel M4 round 3 fix — P2). If the
+    /// portal emits `Disabled` BEFORE `set_on_disabled` has been
+    /// called by `do_activate`, the callback slot is `None` and the
+    /// signal would be dropped on the floor — pre-fix, that left
+    /// `backend_available=true` against a portal-disabled session,
+    /// and the empty-slot activate arm could never re-fire. The
+    /// latch is set when a `Disabled` lands with an empty slot;
+    /// `set_on_disabled` checks it on install and immediately
+    /// invokes the callback if a Disabled was seen during the gap,
+    /// closing the window structurally rather than with another
+    /// flag.
+    pending_disabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -744,6 +756,10 @@ impl PortalSession {
         // `do_activate` installs the deactivate closure AFTER
         // `start` returns (see `PortalSession::set_on_disabled`).
         let on_disabled_slot: DisabledCallbackSlot = Arc::new(Mutex::new(None));
+        // Pending-disabled latch (panel M4 round 3 fix — P2).
+        // Set when a Disabled signal arrives before the callback
+        // is installed; consumed by `set_on_disabled` on install.
+        let pending_disabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         spawn_signal_handler(
             signal_stream,
             conn.clone(),
@@ -756,6 +772,7 @@ impl PortalSession {
             pending_activation_id.clone(),
             shutdown_rx,
             on_disabled_slot.clone(),
+            pending_disabled.clone(),
         );
 
         close_guard.defuse();
@@ -772,6 +789,7 @@ impl PortalSession {
             _shutdown_tx: Some(shutdown_tx),
             barrier_origin,
             on_disabled: on_disabled_slot,
+            pending_disabled,
         })
     }
 
@@ -963,9 +981,29 @@ impl PortalSession {
     /// `None` until installed — tests can leave it unset since
     /// they don't exercise the cross-module deactivate path.
     /// See panel M4 round 2 fix — P2 part 2.
+    ///
+    /// **Pending-disabled latch (panel M4 round 3 fix — P2).** If
+    /// `Disabled` arrived between `start`'s `Enable` and this
+    /// install, the latch was set by the signal handler; on
+    /// install we consume it and immediately invoke the callback
+    /// so the deactivate machinery runs and the session is
+    /// torn down before `backend_available` is flipped. After
+    /// consumption the latch stays clear so a SECOND `Disabled`
+    /// after install doesn't double-fire the callback.
     pub fn set_on_disabled(&self, cb: Arc<dyn Fn() + Send + Sync>) {
         let mut slot = self.on_disabled.lock().unwrap_or_else(|e| e.into_inner());
-        *slot = Some(cb);
+        *slot = Some(cb.clone());
+        drop(slot);
+        if self
+            .pending_disabled
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            warn!(
+                event = "shareinputdevices_pending_disabled_consumed",
+                "Pending-disabled latch consumed at install; firing callback"
+            );
+            cb();
+        }
     }
 }
 
@@ -1125,6 +1163,10 @@ fn spawn_signal_handler(
     // `mod.rs::do_activate` installs the deactivate closure on
     // the slot AFTER `start` returns. Reads on Disabled.
     on_disabled_slot: DisabledCallbackSlot,
+    // Pending-disabled latch (panel M4 round 3 fix — P2). Set
+    // when Disabled fires while the slot is empty; consumed by
+    // `set_on_disabled` on install.
+    pending_disabled: Arc<std::sync::atomic::AtomicBool>,
 ) {
     tokio::spawn(async move {
         let iface: InterfaceName<'static> = INPUT_CAPTURE_IFACE.try_into().expect("iface parse");
@@ -1269,6 +1311,21 @@ fn spawn_signal_handler(
                             // the same deactivate machinery the
                             // EI-disconnect watcher uses so the
                             // two paths converge.
+                            //
+                            // **Pending-disabled latch (panel M4
+                            // round 3 fix — P2).** If the
+                            // callback slot is empty — Disabled
+                            // landed before `do_activate`
+                            // installed the callback — set the
+                            // latch and let `set_on_disabled`
+                            // consume it on install. Pre-fix,
+                            // this path silently dropped the
+                            // Disabled; a portal-disabled session
+                            // then blocked re-activation (the
+                            // activate arm couldn't fire against
+                            // an already-populated slot would
+                            // have refired, but the slot was
+                            // empty so deactivate never ran).
                             warn!(event = "shareinputdevices_portal_disabled",
                                   "Portal Disabled received; deactivating");
                             let cb = {
@@ -1277,8 +1334,19 @@ fn spawn_signal_handler(
                                     .unwrap_or_else(|e| e.into_inner());
                                 slot.as_ref().cloned()
                             };
-                            if let Some(cb) = cb {
-                                cb();
+                            match cb {
+                                Some(cb) => cb(),
+                                None => {
+                                    pending_disabled.store(
+                                        true,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                    );
+                                    warn!(
+                                        event = "shareinputdevices_portal_disabled_latched",
+                                        "Portal Disabled arrived before callback install; \
+                                         pending-disabled latch set, will fire on set_on_disabled"
+                                    );
+                                }
                             }
                         }
                         "ZonesChanged" => {

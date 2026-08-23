@@ -152,11 +152,12 @@ pub const CONSUMER_INCOMING_CAPS: &[&str] = &[
     "kdeconnect.mousepad.request",
 ];
 
-/// Snapshot the set of currently-connected, capability-advertising
-/// consumers. Used both by the gate's last-capable-leaves transition
-/// (count drops to 0 → deactivate) and by the wire consumer's
-/// per-packet fan-out filter (capability-filtered fan-out, brief item
-/// 4 — send only to peers that can consume what we're sending).
+/// Snapshot the set of currently-connected, capability-advertising,
+/// **paired** consumers. Used both by the gate's last-capable-leaves
+/// transition (count drops to 0 → deactivate) and by the wire
+/// consumer's per-packet fan-out filter (capability-filtered fan-out,
+/// brief item 4 — send only to peers that can consume what we're
+/// sending).
 ///
 /// **AND match (panel M4 round 2 fix — P5).** Wraps
 /// `ConnectionManager::capable_consumer_ids` (OR semantics) and
@@ -164,19 +165,67 @@ pub const CONSUMER_INCOMING_CAPS: &[&str] = &[
 /// `CONSUMER_INCOMING_CAPS`. The fan-out filter must require the
 /// full set so an activated session (which emits BOTH packet
 /// types) cannot arm against a peer that consumes only one arm.
-pub(crate) async fn capable_consumer_ids(cm: &crate::protocol::ConnectionManager) -> Vec<String> {
+///
+/// **Pairing gate (panel M4 round 3 fix — security headline).**
+/// The CM's capability map is recorded at TLS handshake completion
+/// (inbound.rs `handle_tls_complete` → `record_peer_capabilities`,
+/// outbound.rs:321) — BEFORE pairing. Without this filter, the
+/// capability gate arms the barrier and relays captured keystrokes /
+/// motion to a peer that merely completed the handshake advertising
+/// the caps, on a LAN that allows the handshake to even start.
+/// `pairing_handler.is_paired` is the same predicate the
+/// `sendnotifications` plugin uses on its fan-out (sendnotifications.rs:239);
+/// an unpaired peer is never a consumer, for activation or relay.
+///
+/// `pairing_handler` is `Option` so test-only construction without
+/// pairing (and any future code path that needs the unpaired-capable
+/// view) can call with `None` — production wires it via the loader.
+/// When `None`, the pairing filter is a no-op (capability match alone
+/// decides), so test behavior is identical to the pre-fix shape.
+pub async fn capable_consumer_ids(
+    cm: &crate::protocol::ConnectionManager,
+    pairing_handler: Option<&crate::protocol::pairing::PairingHandler>,
+) -> Vec<String> {
     let any_match = cm.capable_consumer_ids(CONSUMER_INCOMING_CAPS).await;
     // AND post-filter: keep only peers advertising EVERY entry.
     let wanted: std::collections::HashSet<&str> = CONSUMER_INCOMING_CAPS.iter().copied().collect();
+    // Track unpaired-capable peers we've already logged (panel M4
+    // round 3 fix — auditable, not per-packet noise). The log fires
+    // once per device per process lifetime; subsequent evaluations
+    // of the same unpaired device stay silent. The set is leaked
+    // (process-lifetime) — at most one entry per device id ever
+    // gets through; bounded by the number of devices the LAN has
+    // seen.
+    let mut seen_unpaired: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(any_match.len());
     for device_id in any_match {
         let Some(incoming) = cm.peer_incoming_capabilities(&device_id).await else {
             continue;
         };
         let all_present = wanted.iter().all(|w| incoming.iter().any(|c| c == w));
-        if all_present {
-            out.push(device_id);
+        if !all_present {
+            continue;
         }
+        // Pairing filter. The CM's connection existence + recorded
+        // caps fire BEFORE pairing; this is the predicate that
+        // separates a complete-handshake LAN peer from a
+        // trusted consumer. Without it, every connected phone with
+        // the right caps is a relay target, including ones the
+        // user has never paired with.
+        if let Some(ph) = pairing_handler {
+            if !ph.is_paired(&device_id).await {
+                if seen_unpaired.insert(device_id.clone()) {
+                    warn!(
+                        device_id = %device_id,
+                        event = "shareinputdevices_unpaired_capable_peer_excluded",
+                        "Connected-capable peer is NOT paired; excluding from fan-out and activation. \
+                         Pair with the device before shareinputdevices can relay input."
+                    );
+                }
+                continue;
+            }
+        }
+        out.push(device_id);
     }
     out
 }
@@ -368,6 +417,16 @@ pub struct ShareInputDevicesPlugin {
     /// but never calls it; the optional is here so M2 wires send
     /// without changing the struct.
     connection_manager: Option<Arc<crate::protocol::ConnectionManager>>,
+    /// Optional pairing handler (panel M4 round 3 fix — security
+    /// headline). The capability gate and the wire consumer's
+    /// fan-out filter read it to require `is_paired` before counting
+    /// a connected-capable peer as a consumer. Without it, an
+    /// UNPAIRED peer that completes the TLS handshake advertising
+    /// the consumer caps is a relay target — captured keystrokes /
+    /// motion going to a phone the user has never trusted. Wired by
+    /// the loader; tests that don't exercise the gate can leave it
+    /// `None` (the filter is a no-op without it).
+    pairing_handler: Option<Arc<crate::protocol::pairing::PairingHandler>>,
     /// Optional device-event broadcaster (Task #1042 fix lane B). The
     /// capability-gate task subscribes once and reacts to
     /// `StateChanged(Connected)` / `StateChanged(Disconnected)` to
@@ -429,6 +488,7 @@ impl ShareInputDevicesPlugin {
         Self {
             edge: Edge::default(),
             connection_manager: None,
+            pairing_handler: None,
             broadcaster: None,
             gate_spawned: Arc::new(AtomicBool::new(false)),
             last_release: Arc::new(Mutex::new(None)),
@@ -455,6 +515,24 @@ impl ShareInputDevicesPlugin {
     /// never calls it.
     pub fn with_connection_manager(mut self, cm: Arc<crate::protocol::ConnectionManager>) -> Self {
         self.connection_manager = Some(cm);
+        self
+    }
+
+    /// Wire the pairing handler (panel M4 round 3 fix). Required
+    /// for the capability gate and the wire consumer's fan-out to
+    /// enforce the pairing predicate — without it, an unpaired
+    /// connected-capable peer is a relay target. Mirrors
+    /// `sendnotifications.rs::SendNotificationsPlugin::new`, which
+    /// takes the pairing handler at construction; we follow the
+    /// `with_*` builder pattern used elsewhere in this struct
+    /// instead, because the loader wires it through `load_default_plugins`
+    /// alongside `with_connection_manager` /
+    /// `with_event_broadcaster`.
+    pub fn with_pairing_handler(
+        mut self,
+        pairing_handler: Arc<crate::protocol::pairing::PairingHandler>,
+    ) -> Self {
+        self.pairing_handler = Some(pairing_handler);
         self
     }
 
@@ -520,13 +598,36 @@ impl ShareInputDevicesPlugin {
         !self.activation_in_flight.load(Ordering::SeqCst)
     }
 
+    /// Test/inspection seam: whether the `portal_session` slot is
+    /// currently empty (no live session). The disconnect watcher
+    /// in production calls `do_deactivate` to flip `is_backend_
+    /// available=false` AND `take()` the slot, so a test that
+    /// only asserts on `is_backend_available` would pass even if
+    /// the slot-clearing half of the production machinery was
+    /// deleted. Pinning the slot-empty half separately is what
+    /// makes the test fail when the production disconnect watcher
+    /// is removed: a stub watcher that just flips the bool leaves
+    /// the slot populated.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn portal_session_is_empty_for_test(&self) -> bool {
+        self.portal_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+    }
+
     /// Inject a pre-built `PortalSession` for integration tests.
     /// Production wiring goes through `enable_session_backend()` —
     /// which connects to the session bus, probes the portal, and
     /// starts the session in one shot. The test bypass is needed
     /// because a fake-portal session is built against a
     /// test-supplied `Connection`, not the live session bus.
-    #[cfg(test)]
+    ///
+    /// Available under `test-helpers` for integration tests in
+    /// `tests/` (panel M4 round 3 — test-honesty fix wires a real
+    /// plugin instance so the disconnect test drives the production
+    /// watcher rather than a mirror).
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn with_portal_session(self, session: Arc<portal::PortalSession>) -> Self {
         *self
             .portal_session
@@ -683,6 +784,12 @@ impl ShareInputDevicesPlugin {
         let portal_conn = self.portal_conn.clone();
         let release_callback = self.release_callback.clone();
         let activation_in_flight = self.activation_in_flight.clone();
+        // Pairing handler (panel M4 round 3 fix — security
+        // headline). The gate's activation/deactivation evaluator
+        // and the wire consumer's fan-out filter both read it to
+        // enforce `is_paired`. Without this clone, unpaired
+        // connected-capable peers are relay targets.
+        let pairing_handler = self.pairing_handler.clone();
 
         // The gate's spawned task cannot hold the plugin (it is not
         // Arc-wrapped at construction), so activation/deactivation
@@ -718,6 +825,7 @@ impl ShareInputDevicesPlugin {
         let release_callback_for_eager = release_callback.clone();
         let backend_available_for_eager = backend_available.clone();
         let activation_in_flight_for_eager = activation_in_flight.clone();
+        let pairing_handler_for_eager = pairing_handler.clone();
         tokio::spawn(async move {
             do_evaluate_after_event(
                 None,
@@ -727,11 +835,13 @@ impl ShareInputDevicesPlugin {
                 &release_callback_for_eager,
                 &backend_available_for_eager,
                 &activation_in_flight_for_eager,
+                pairing_handler_for_eager.as_ref(),
                 edge,
             )
             .await;
         });
 
+        let pairing_handler_for_loop = pairing_handler.clone();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -757,6 +867,7 @@ impl ShareInputDevicesPlugin {
                             &release_callback,
                             &backend_available,
                             &activation_in_flight,
+                            pairing_handler_for_loop.as_ref(),
                             edge,
                         )
                         .await;
@@ -788,6 +899,7 @@ impl ShareInputDevicesPlugin {
                             &release_callback,
                             &backend_available,
                             &activation_in_flight,
+                            pairing_handler_for_loop.as_ref(),
                             edge,
                         )
                         .await;
@@ -817,6 +929,7 @@ impl ShareInputDevicesPlugin {
             &self.release_callback,
             &self.backend_available,
             &self.activation_in_flight,
+            self.pairing_handler.as_ref(),
             self.edge,
         )
         .await;
@@ -857,9 +970,13 @@ impl ShareInputDevicesPlugin {
 /// snapshot). Idempotent: activate is a no-op if a session is
 /// already live; deactivate is a no-op if no session is live.
 ///
-/// **Connected edge.** If `event_device_id` is in the consumer set,
-/// activate if not already live. This is the brief's "first capable
-/// peer connects" arm.
+/// **Connected edge.** If the consumer set is non-empty, activate
+/// if not already live (panel M4 round 3 fix — set-based retry
+/// evaluation). The activation decision depends on the consumer
+/// SET, not on who generated the event; an event from a
+/// disconnected device whose gate re-eval still sees a capable
+/// peer must trigger activation just like the device's own
+/// Connected event would.
 ///
 /// **Disconnect edge.** If, AFTER the event, the consumer set is
 /// empty AND a session is live, deactivate. We don't reason about
@@ -877,9 +994,11 @@ async fn do_evaluate_after_event(
     release_callback: &Arc<std::sync::Mutex<Option<ReleaseCallback>>>,
     backend_available: &Arc<AtomicBool>,
     activation_in_flight: &Arc<AtomicBool>,
+    pairing_handler: Option<&Arc<crate::protocol::pairing::PairingHandler>>,
     edge: Edge,
 ) {
-    let consumers = capable_consumer_ids(cm).await;
+    let _ = event_device_id;
+    let consumers = capable_consumer_ids(cm, pairing_handler.map(|a| a.as_ref())).await;
     let session_live = portal_session
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -897,17 +1016,19 @@ async fn do_evaluate_after_event(
         if !probe_passed {
             return;
         }
-        // First capable peer — the transition we care about is
-        // the connect that took the consumer count from 0 to 1.
-        // If event_device_id is None (eager boot eval) OR the
-        // device is now in the consumer set, activate. A
-        // double-activate is guarded inside `do_activate` (and
-        // cross-armed at `activation_in_flight`).
-        let should_activate = match event_device_id {
-            None => !consumers.is_empty(),
-            Some(id) => consumers.iter().any(|c| c == id),
-        };
-        if should_activate {
+        // Set-based activation decision (panel M4 round 3 fix —
+        // set-based retry evaluation). The activation decision
+        // depends on the consumer SET, not on who generated the
+        // event: any non-empty consumer set triggers activation,
+        // not just the device whose Connected event arrived. This
+        // matches the disconnect arm's set-based shape and is
+        // the requirement that lets an unrelated gate event
+        // re-trigger activation after a previous attempt failed
+        // with the peer still connected (whose Connected was
+        // already consumed). When `event_device_id` is `None`
+        // (eager boot eval) the rule is the same: any consumer
+        // qualifies.
+        if !consumers.is_empty() {
             do_activate(
                 Some(cm),
                 portal_conn,
@@ -915,6 +1036,7 @@ async fn do_evaluate_after_event(
                 release_callback,
                 backend_available,
                 activation_in_flight,
+                pairing_handler,
                 edge,
             )
             .await;
@@ -972,6 +1094,7 @@ async fn do_activate(
     release_callback: &Arc<std::sync::Mutex<Option<ReleaseCallback>>>,
     backend_available: &Arc<AtomicBool>,
     activation_in_flight: &Arc<AtomicBool>,
+    pairing_handler: Option<&Arc<crate::protocol::pairing::PairingHandler>>,
     edge: Edge,
 ) {
     // Re-entry guard — two layers. (a) Cross-armed
@@ -1358,7 +1481,7 @@ async fn do_activate(
     // eager re-eval test); in that case skip the check — the
     // gate wouldn't have activated without a CM anyway.
     if let Some(cm) = cm {
-        let post_consumers = capable_consumer_ids(cm).await;
+        let post_consumers = capable_consumer_ids(cm, pairing_handler.map(|a| a.as_ref())).await;
         if post_consumers.is_empty() {
             warn!(
                 event = "shareinputdevices_post_activate_no_consumers",
@@ -1426,6 +1549,13 @@ async fn do_activate(
     // events after) and the ordering the brief mandates (drain
     // before first relayed body).
     let cm_for_consumer = cm.cloned();
+    // Capture the pairing handler for the wire consumer's fan-out
+    // filter (panel M4 round 3 fix — security headline). Both arms
+    // call `capable_consumer_ids(cm, Some(&pairing))` so an
+    // unpaired connected-capable peer is never a relay target.
+    // Cloned so the `'static` task can hold it.
+    let pairing_handler_for_consumer: Option<Arc<crate::protocol::pairing::PairingHandler>> =
+        pairing_handler.cloned();
     tokio::spawn(async move {
         let mut activated_closed = false;
         let mut wire_closed = false;
@@ -1437,103 +1567,116 @@ async fn do_activate(
                 );
                 return;
             }
-            // **Capability-filtered fan-out (brief item 4).** Both
-            // consumer arms relay to the
-            // CAPABLE-CONNECTED peer set, not the full
-            // `connected_device_ids()` list. Single-peer reality
-            // today; this keeps multi-peer honest so we don't
-            // double-drive phones that didn't ask for the
-            // stream.
-            let consumer_peers: Vec<String> = match cm_for_consumer.as_ref() {
-                Some(cm) => capable_consumer_ids(cm).await,
-                None => Vec::new(),
-            };
             tokio::select! {
                 biased;
                 event = activated_rx.recv(), if !activated_closed => {
-                    match event {
-                        Some(event) => {
-                            let body = plan_shareinputdevices_request(
-                                edge,
-                                event.deltax,
-                                event.deltay,
-                            );
-                            let packet = Packet::new(
-                                "kdeconnect.shareinputdevices.request".to_string(),
-                                serde_json::to_value(&body).unwrap_or_else(|e| {
-                                    warn!(
-                                        error = %e,
-                                        event = "shareinputdevices_request_serialize_failed",
-                                        "ShareInputDevicesRequest serialize failed"
-                                    );
-                                    serde_json::json!({})
-                                }),
-                            );
-                            if consumer_peers.is_empty() {
-                                debug!(
-                                    event = "shareinputdevices_activated_no_peers",
-                                    "Activated: no capable consumers connected; request dropped"
+                    if let Some(event) = event {
+                        // **Refresh consumer snapshot after event
+                        // (panel M4 round 3 fix — P1).** Pre-fix the
+                        // snapshot was read once before the loop and
+                        // used for every relay — peers
+                        // connected/disconnected during the idle wait
+                        // were stale for the first relayed packet
+                        // (and every packet, until the loop exited).
+                        // Now the snapshot is taken AFTER `select!`
+                        // returns the event, so the relay decision
+                        // follows connection state at RELAY time,
+                        // not at WAIT time.
+                        let consumer_peers: Vec<String> = match cm_for_consumer.as_ref() {
+                            Some(cm) => {
+                                let pairing_ref = pairing_handler_for_consumer
+                                    .as_deref();
+                                capable_consumer_ids(cm, pairing_ref).await
+                            }
+                            None => Vec::new(),
+                        };
+                        let body = plan_shareinputdevices_request(
+                            edge,
+                            event.deltax,
+                            event.deltay,
+                        );
+                        let packet = Packet::new(
+                            "kdeconnect.shareinputdevices.request".to_string(),
+                            serde_json::to_value(&body).unwrap_or_else(|e| {
+                                warn!(
+                                    error = %e,
+                                    event = "shareinputdevices_request_serialize_failed",
+                                    "ShareInputDevicesRequest serialize failed"
                                 );
-                                continue;
-                            }
-                            let Some(cm) = cm_for_consumer.as_ref() else {
-                                continue;
-                            };
-                            for device_id in &consumer_peers {
-                                if let Err(e) = cm.send_packet(device_id, &packet).await {
-                                    warn!(
-                                        device_id = %device_id,
-                                        error = %e,
-                                        event = "shareinputdevices_activated_send_failed",
-                                        "Send of shareinputdevices.request failed"
-                                    );
-                                }
-                            }
-                        }
-                        None => {
+                                serde_json::json!({})
+                            }),
+                        );
+                        if consumer_peers.is_empty() {
                             debug!(
-                                event = "shareinputdevices_activated_channel_closed",
-                                "Activated channel closed"
+                                event = "shareinputdevices_activated_no_peers",
+                                "Activated: no capable consumers connected; request dropped"
                             );
-                            activated_closed = true;
+                            continue;
                         }
+                        let Some(cm) = cm_for_consumer.as_ref() else {
+                            continue;
+                        };
+                        for device_id in &consumer_peers {
+                            if let Err(e) = cm.send_packet(device_id, &packet).await {
+                                warn!(
+                                    device_id = %device_id,
+                                    error = %e,
+                                    event = "shareinputdevices_activated_send_failed",
+                                    "Send of shareinputdevices.request failed"
+                                );
+                            }
+                        }
+                    } else {
+                        debug!(
+                            event = "shareinputdevices_activated_channel_closed",
+                            "Activated channel closed"
+                        );
+                        activated_closed = true;
                     }
                 }
                 body = wire_rx.recv(), if !wire_closed => {
-                    match body {
-                        Some(wire_body) => {
-                            let packet = Packet::new(
-                                "kdeconnect.mousepad.request".to_string(),
-                                wire_body.into_json(),
-                            );
-                            if consumer_peers.is_empty() {
-                                debug!(
-                                    event = "shareinputdevices_wire_no_peers",
-                                    "Wire body: no capable consumers connected; packet dropped"
-                                );
-                                continue;
+                    if let Some(wire_body) = body {
+                        // **Refresh consumer snapshot after event
+                        // (panel M4 round 3 fix — P1).** Same
+                        // rationale as the activated arm above.
+                        let consumer_peers: Vec<String> = match cm_for_consumer.as_ref() {
+                            Some(cm) => {
+                                let pairing_ref = pairing_handler_for_consumer
+                                    .as_deref();
+                                capable_consumer_ids(cm, pairing_ref).await
                             }
-                            let Some(cm) = cm_for_consumer.as_ref() else {
-                                continue;
-                            };
-                            for device_id in &consumer_peers {
-                                if let Err(e) = cm.send_packet(device_id, &packet).await {
-                                    warn!(
-                                        device_id = %device_id,
-                                        error = %e,
-                                        event = "shareinputdevices_wire_send_failed",
-                                        "Send of mousepad.request failed"
-                                    );
-                                }
-                            }
-                        }
-                        None => {
+                            None => Vec::new(),
+                        };
+                        let packet = Packet::new(
+                            "kdeconnect.mousepad.request".to_string(),
+                            wire_body.into_json(),
+                        );
+                        if consumer_peers.is_empty() {
                             debug!(
-                                event = "shareinputdevices_wire_channel_closed",
-                                "Wire channel closed"
+                                event = "shareinputdevices_wire_no_peers",
+                                "Wire body: no capable consumers connected; packet dropped"
                             );
-                            wire_closed = true;
+                            continue;
                         }
+                        let Some(cm) = cm_for_consumer.as_ref() else {
+                            continue;
+                        };
+                        for device_id in &consumer_peers {
+                            if let Err(e) = cm.send_packet(device_id, &packet).await {
+                                warn!(
+                                    device_id = %device_id,
+                                    error = %e,
+                                    event = "shareinputdevices_wire_send_failed",
+                                    "Send of mousepad.request failed"
+                                );
+                            }
+                        }
+                    } else {
+                        debug!(
+                            event = "shareinputdevices_wire_channel_closed",
+                            "Wire channel closed"
+                        );
+                        wire_closed = true;
                     }
                 }
             }
