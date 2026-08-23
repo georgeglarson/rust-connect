@@ -87,9 +87,28 @@ xkb_symbols {
 };
 "#;
 
-/// Sets up an `EisConnection` (high-level wrapper) and the
-/// `EiReceiver` end of the socketpair. Returns the wrapped
-/// connection and the receiver's wire mpsc + drive future.
+/// A single boxed pump future. `impl Future` cannot appear in a type
+/// alias on stable, so `Harness` carries the boxed form.
+type Pump = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
+
+/// What the harness hands a test: the EIS end of the socketpair, the
+/// receiver, the wire/disconnect channels, the pump future to spawn,
+/// the EIS shutdown trigger, and the bound-capabilities probe.
+#[allow(clippy::type_complexity)]
+type Harness = (
+    EisConnection,
+    std::sync::Arc<EiReceiver>,
+    tokio::sync::mpsc::UnboundedReceiver<rust_connect::plugins::shareinputdevices::ei::WireBody>,
+    tokio::sync::watch::Receiver<bool>,
+    Pump,
+    Option<tokio::sync::oneshot::Sender<()>>,
+    tokio::sync::oneshot::Receiver<BitFlags<DeviceCapability>>,
+);
+
+/// Bring up an EIS peer over a socketpair and a started `EiReceiver`,
+/// optionally staging the activation gate BEFORE `start()` runs.
+/// Returns the wrapped connection and the receiver's wire mpsc + drive
+/// future.
 ///
 /// **Cooperative handshake.** Both sides are non-blocking. We must
 /// drive the EIS read loop CONCURRENTLY with the receiver's async
@@ -112,29 +131,6 @@ xkb_symbols {
 /// `LocalSet::new()` and `local.block_on(&rt, ...)` — see the test
 /// bodies below). The test body, the eis drive task, and the
 /// `receiver.start()` future all run on the same thread.
-#[allow(clippy::type_complexity)]
-/// What the harness hands a test: the EIS end of the socketpair, the
-/// receiver, the wire/disconnect channels, the pump future to spawn,
-/// the EIS shutdown trigger, and the bound-capabilities probe.
-type Pump = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
-
-type Harness = (
-    EisConnection,
-    std::sync::Arc<EiReceiver>,
-    tokio::sync::mpsc::UnboundedReceiver<rust_connect::plugins::shareinputdevices::ei::WireBody>,
-    tokio::sync::watch::Receiver<bool>,
-    Pump,
-    Option<tokio::sync::oneshot::Sender<()>>,
-    tokio::sync::oneshot::Receiver<BitFlags<DeviceCapability>>,
-);
-
-/// Bring up an EIS peer over a socketpair and a started `EiReceiver`,
-/// optionally staging the activation gate BEFORE `start()` runs.
-///
-/// The eis drive task owns one end of the socketpair and the EIS
-/// handshake state; the receiver is created and started on the
-/// caller's LocalSet task, and the two make progress cooperatively.
-/// Order matters — see the comments inside.
 ///
 /// `pre_start: Some((event, id))` queues `event` and records `id` as an
 /// activation seen while `wire_tx` was still `None`, reproducing the
