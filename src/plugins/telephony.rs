@@ -82,6 +82,28 @@ impl TelephonyPlugin {
     }
 }
 
+/// Desktop -> phone "mute the ringing call".
+///
+/// kdeconnect-kde sends this from a "Mute Call" action it attaches to the
+/// ringing notification (`plugins/telephony/telephonyplugin.cpp:66,87-91`);
+/// all three upstreams declare it outgoing
+/// (`tests/fixtures/upstream-capabilities/*.yaml`).
+pub const MUTE_REQUEST_PACKET_TYPE: &str = "kdeconnect.telephony.request_mute";
+
+impl TelephonyPlugin {
+    /// The mute-request packet, exactly as kdeconnect-kde builds it.
+    ///
+    /// The body is NOT empty: upstream sends `{"action": "mute"}`
+    /// (`telephonyplugin.cpp:89`). Pure so the wire shape is pinned by a unit
+    /// test with no device, no socket and no connection manager.
+    pub fn mute_request_packet() -> Packet {
+        Packet::new(
+            MUTE_REQUEST_PACKET_TYPE.to_string(),
+            serde_json::json!({ "action": "mute" }),
+        )
+    }
+}
+
 #[async_trait::async_trait]
 impl Plugin for TelephonyPlugin {
     fn name(&self) -> &str {
@@ -93,7 +115,7 @@ impl Plugin for TelephonyPlugin {
     }
 
     fn outgoing_capabilities(&self) -> Vec<String> {
-        vec![]
+        vec![MUTE_REQUEST_PACKET_TYPE.to_string()]
     }
 
     fn on_disconnected(&self, device_id: &str) {
@@ -163,6 +185,47 @@ mod tests {
         Packet::new("kdeconnect.telephony".to_string(), body)
     }
 
+    #[test]
+    fn test_mute_request_wire_shape_matches_upstream() {
+        // kdeconnect-kde plugins/telephony/telephonyplugin.cpp:89 —
+        //   NetworkPacket(PACKET_TYPE_TELEPHONY_REQUEST_MUTE,
+        //                 {{"action", "mute"}})
+        // The body is NOT empty. The lane brief said "likely empty-body,
+        // verify, don't assume", and the assumption would have been wrong.
+        let packet = TelephonyPlugin::mute_request_packet();
+        assert_eq!(packet.packet_type, MUTE_REQUEST_PACKET_TYPE);
+        assert_eq!(
+            packet.body,
+            serde_json::json!({ "action": "mute" }),
+            "body must match telephonyplugin.cpp:89 exactly"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mute_request_is_advertised_as_outgoing() {
+        // All three upstreams declare it outgoing
+        // (tests/fixtures/upstream-capabilities/*.yaml). Advertising it is
+        // what tells the phone we can send it.
+        let (plugin, _) = setup();
+        assert!(
+            plugin
+                .outgoing_capabilities()
+                .contains(&MUTE_REQUEST_PACKET_TYPE.to_string()),
+            "outgoing was {:?}",
+            plugin.outgoing_capabilities()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mute_request_is_not_claimed_as_incoming() {
+        // We SEND request_mute; the phone consumes it. Claiming it incoming
+        // would advertise a handler that does not exist.
+        let (plugin, _) = setup();
+        assert!(!plugin
+            .incoming_capabilities()
+            .contains(&MUTE_REQUEST_PACKET_TYPE.to_string()));
+    }
+
     #[tokio::test]
     async fn test_telephony_plugin_name_and_capabilities() {
         let (plugin, _) = setup();
@@ -170,7 +233,13 @@ mod tests {
         assert!(plugin
             .incoming_capabilities()
             .contains(&"kdeconnect.telephony".to_string()));
-        assert!(plugin.outgoing_capabilities().is_empty());
+        // Was `is_empty()` while the plugin was receive-only. The mute leg
+        // (vk #1043) makes request_mute the ONE outgoing capability, so pin
+        // the exact set rather than loosening the assertion to nothing.
+        assert_eq!(
+            plugin.outgoing_capabilities(),
+            vec![MUTE_REQUEST_PACKET_TYPE.to_string()]
+        );
     }
 
     /// EXACT body Android sends on an incoming call with contacts permission
