@@ -292,6 +292,7 @@ pub async fn pair_device(
         (status = 200, description = "Device unpaired", body = PairResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
+        (status = 409, description = "Device is not paired (DEVICE_NOT_PAIRED)", body = ApiError),
         (status = 500, description = "Internal error", body = ApiError),
     ),
     security(("api_key" = []))
