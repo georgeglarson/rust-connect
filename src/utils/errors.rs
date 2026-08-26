@@ -269,6 +269,13 @@ impl ErrorCode {
             | Self::InvalidConfigValue
             | Self::CapabilityNotSupported => 400,
             Self::DeviceAlreadyExists => 409,
+            // Unpairing something not paired is a benign client-state
+            // condition, not a server fault (audit F-M1). 500 here misled
+            // monitoring into reading a client mistake as a crash, and the
+            // error CODE already said client-error while the status said
+            // server-error. Same class as DeviceAlreadyExists: a conflict
+            // with current state.
+            Self::DeviceNotPaired => 409,
             // Deliberate policy refusal (e.g. the #1056 cert-anchor gate):
             // a conflict with the current state, not an internal fault.
             Self::PairingRejected => 409,

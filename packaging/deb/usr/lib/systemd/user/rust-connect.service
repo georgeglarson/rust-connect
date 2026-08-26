@@ -1,0 +1,81 @@
+[Unit]
+Description=Rust Connect - KDE Connect compatible daemon
+Documentation=https://github.com/georgeglarson/rust-connect
+After=graphical-session.target network-online.target
+Wants=network-online.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rust-connect
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rust-connect
+
+# Security hardening, session-compatible.
+#
+# This is a USER unit (systemd --user), not a system unit. It must be, because
+# three things the daemon does are only reachable from inside the desktop
+# session:
+#   - plugins/notification.rs gates the desktop popup on DISPLAY/WAYLAND_DISPLAY
+#     and raises it through notify-rust, which needs the session DBus.
+#   - config/settings.rs resolves the data dir to ~/.local/share/rust-connect,
+#     holding own.crt, own.key, device_id and paired.json. Losing sight of it
+#     means minting a fresh identity on every boot and dropping every pairing.
+#   - plugins/share.rs writes received files to dirs::download_dir(), ~/Downloads.
+#
+# ProtectHome is therefore deliberately ABSENT. Do not add it back: it would
+# hide the identity and the download dir, and the daemon would silently
+# re-pair from scratch on every start.
+# NoNewPrivileges / RestrictSUIDSGID are deliberately OFF for the SFTP
+# browsing feature: unprivileged users cannot mount() directly (needs
+# CAP_SYS_ADMIN), so sshfs must delegate to the setuid fusermount3 helper,
+# which requires privilege elevation to work. With either flag on,
+# fusermount3 core-dumps in drop_privs (observed live 2026-08-06). The
+# daemon itself stays unprivileged; only setuid helpers it spawns can
+# elevate. See the SystemCallFilter note below — keep in sync with the
+# sftp-fuse drop-in documented in docs/live-validation.md.
+NoNewPrivileges=no
+PrivateTmp=yes
+ProtectSystem=strict
+# Both ReadWritePaths targets must exist BEFORE the mount namespace is set
+# up, or the unit dies with status=226/NAMESPACE — on a fresh install the
+# data dir doesn't exist yet, and ProtectSystem=strict stops the daemon from
+# creating it. The "+" prefix runs this one command outside the sandbox (as
+# the same user) so the paths exist by the time ExecStart's namespace forms.
+# Found live on the first clean .deb install, 2026-08-05.
+ExecStartPre=+/usr/bin/mkdir -p %h/.local/share/rust-connect %h/Downloads
+ReadWritePaths=%h/.local/share/rust-connect %h/Downloads
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# OFF for the same fusermount3 reason as NoNewPrivileges above.
+RestrictSUIDSGID=no
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+# SFTP browsing carve-out: mount()/umount2() are not in @system-service, and
+# fusermount3's privilege drop needs the uid/gid-management syscalls, which
+# are @privileged members. A blanket "~@privileged" deny would cancel both,
+# so the deny below is the @privileged group MINUS those calls (enumerated
+# via `systemd-analyze syscall-filter @privileged` on systemd 258). After a
+# systemd upgrade, re-diff that list against this line — drift silently
+# breaks SFTP mounts (EPERM/SIGSYS) or widens the sandbox.
+SystemCallFilter=@system-service mount umount2 setuid setuid32 setreuid setreuid32 setresuid setresuid32 setfsuid setfsuid32 setgroups setgroups32 capset
+SystemCallFilter=~@chown @clock @module @raw-io @reboot @swap _sysctl acct bpf chroot fanotify_init fanotify_mark nfsservctl open_by_handle_at pivot_root quotactl quotactl_fd setdomainname sethostname vhangup @resources
+# The mousepad plugin injects input through /dev/uinput (evdev). This permits
+# the device under systemd's policy; the user still needs filesystem access to
+# it (input group or a udev rule) or the plugin fails to open it at runtime.
+DeviceAllow=/dev/uinput rw
+# sshfs/fusermount3 need the FUSE device for SFTP browsing.
+DeviceAllow=/dev/fuse rw
+
+[Install]
+WantedBy=default.target
