@@ -131,6 +131,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(handlers::send_remotekeyboard_keypress),
         )
         .route(
+            "/api/v1/devices/:device_id/remotecontrol/pointer",
+            post(handlers::send_remotecontrol_pointer),
+        )
+        .route(
             "/api/v1/devices/:device_id/mpris/:player/action",
             post(handlers::mpris_action),
         )

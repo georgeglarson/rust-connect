@@ -890,7 +890,7 @@ feature_ledger:
     environment: UNVERIFIED
     status: UNVERIFIED
     cite:
-    reason: "PARTIAL coverage: kde's remotecontrol is a D-Bus adaptor PRODUCING kdeconnect.mousepad.request (remotecontrolplugin.cpp:21-33 — moveCursor sends dx/dy). Rust's producer (`remotekeyboard`, out mousepad.request) only emits keyboard fields, never dx/dy/x/y/click/scroll. Implementation task (S): extend the producer REST surface to emit pointer fields (dx/dy, absolute x/y, click/hold/release/scroll) per Android MouseReceiverPlugin.kt:51-65's parse set. No capability-negotiation change needed."
+    reason: "Producer leg LANDED 2026-08-26 (vk #1040). kde's remotecontrol is a D-Bus adaptor PRODUCING kdeconnect.mousepad.request (remotecontrolplugin.cpp:21-33 — moveCursor sends dx/dy); rust previously emitted only keyboard fields via `remotekeyboard`. Now MousepadRequest carries pure constructors for relative {dx,dy}, absolute {x,y}, the six click booleans, and scroll, exposed at POST /api/v1/devices/{id}/remotecontrol/pointer. Built by SERIALIZING the same struct the consume side deserializes, so producer and parser cannot drift — a round-trip test feeds produced bodies back through plan_actions. Serialization skips defaults so bodies match upstream's minimal shape rather than carrying every false boolean. No capability change: remotekeyboard already advertises outgoing kdeconnect.mousepad.request and a test asserts mousepad does NOT double-declare it. Absolute {x,y} is worth noting — upstream never puts it on the wire (kde's shareinputdevicesremote hands it to a local plugin in-process), so ours is the first wire producer of that shape."
     owner: "vk #1040"
 
   - feature: kdeconnect-kde/remotekeyboard

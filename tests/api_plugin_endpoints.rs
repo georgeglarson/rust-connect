@@ -40,6 +40,44 @@ async fn create_test_app() -> (Arc<AppState>, tempfile::TempDir, String) {
 }
 
 #[tokio::test]
+async fn test_remotecontrol_pointer_route_exists() {
+    // vk #1040. A compiled handler is not a reachable one.
+    let (state, _temp, api_key) = create_test_app().await;
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/devices/test-phoneaaaaaaaaaaaaaaaaaaaaaa/remotecontrol/pointer")
+                .header("X-API-Key", &api_key)
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"action":"move","dx":1.0,"dy":1.0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // The handler answers an unconnected device with DEVICE_NOT_FOUND (404),
+    // same as the remotekeyboard template, so a bare status check cannot tell
+    // "routed but no device" from "not routed at all". Read the envelope: an
+    // unrouted path produces axum's empty 404, not our error body.
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        !bytes.is_empty(),
+        "unrouted: axum returned a bare {status} with no error envelope"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["error"]["code"], "DEVICE_NOT_FOUND",
+        "expected our handler's envelope, got {body}"
+    );
+}
+
+#[tokio::test]
 async fn test_telephony_mute_route_exists() {
     // vk #1043. Compiling a handler is not the same as reaching it — the route
     // has to be wired into build_router. A 404 here would mean it is not.
@@ -58,10 +96,15 @@ async fn test_telephony_mute_route_exists() {
         .await
         .unwrap();
 
-    assert_ne!(
-        response.status(),
-        StatusCode::NOT_FOUND,
-        "POST .../telephony/mute is not routed"
+    // Same caveat as the pointer route above: a bare status check cannot tell
+    // a handler 404 from an unrouted 404. Assert the envelope exists.
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        !bytes.is_empty(),
+        "unrouted: axum returned a bare {status} with no error envelope"
     );
 }
 
