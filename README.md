@@ -16,7 +16,11 @@ user service, not a system one). The second command starts it for your user
 right away; for other users it starts at their next login.
 
 No Debian-based distro? Grab the `rust-connect` binary from the same release
-(x86-64 Linux, glibc 2.17+), or build from source:
+(x86-64 Linux, glibc 2.17+), or build from source. The binary also links
+**libxkbcommon** at load time, which the `.deb` pulls in for you but a bare
+binary does not — install it first if your system is minimal (Fedora:
+`dnf install libxkbcommon`; Arch: `pacman -S libxkbcommon`). Without it the
+binary exits with `error while loading shared libraries: libxkbcommon.so.0`.
 
 ```bash
 cargo run
