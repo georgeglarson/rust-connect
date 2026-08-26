@@ -411,8 +411,8 @@ fixtures:
     source_file: plugins/lockdevice/lockdeviceplugin.cpp
     source_lines: "122"
     extraction_date: "2026-08-06"
-    note: "Upstream truth: kdeconnect-kde's lockdevice `connected()` sends `kdeconnect.lock.request` with `{\"requestLocked\": null}`. The rust plugin answers any lock.request body regardless of fields (matching kde's query->sendState flow), so the fixture's field is not read today; the reply-side field divergence is the defect, pinned by test_lock_request_reply_diverges_from_upstream_field (ledger lock row FAIL, vk #1018)."
-    used_by: "src/plugins/lock.rs::test_lock_request_reply_diverges_from_upstream_field"
+    note: "Upstream truth: kdeconnect-kde's lockdevice `connected()` sends `kdeconnect.lock.request` with `{\"requestLocked\": null}`. The rust plugin answers any lock.request body regardless of fields (matching kde's query->sendState flow), so the fixture's field is not read today; the reply-side field divergence WAS the defect, fixed 2026-08-25 and now pinned green by test_lock_request_reply_uses_the_upstream_field (ledger lock row was FAIL; vk #1018 landed)."
+    used_by: "src/plugins/lock.rs::test_lock_request_reply_uses_the_upstream_field"
 
   - file: lock/lock_state.json
     kind: upstream-derived
@@ -421,8 +421,8 @@ fixtures:
     source_file: plugins/lockdevice/lockdeviceplugin.cpp
     source_lines: "104,116"
     extraction_date: "2026-08-06"
-    note: "Upstream truth: kdeconnect-kde's lockdevice emits `lockResult: <bool>` (setLocked reply, :104) or `isLocked: <bool>` (sendState, :116) on `kdeconnect.lock`. The rust plugin reads and emits `locked` instead — no upstream field matches. This was NOT a deliberate decision (integrator review 2026-08-06): the plugin predates upstream verification. Ledger lock row is FAIL, owner vk #1018 (rewrite to the kde contract; validate via Task 3.2 kdeconnectd harness). No Android implementation of lock exists, so phones are unaffected. Defect pinned by test_upstream_lock_state_shape_currently_misparsed."
-    used_by: "src/plugins/lock.rs::test_upstream_lock_state_shape_currently_misparsed"
+    note: "Upstream truth: kdeconnect-kde's lockdevice emits `lockResult: <bool>` (setLocked reply, :104) or `isLocked: <bool>` (sendState, :116) on `kdeconnect.lock`. The rust plugin read and emitted `locked` instead — no upstream field matched. FIXED 2026-08-25 (vk #1018): it now reads and emits `isLocked`, accepts `lockResult` terminally, and answers `setLocked` with an honest lockResult=false plus state. This was NOT a deliberate decision (integrator review 2026-08-06): the plugin predates upstream verification. Ledger lock row moves FAIL -> UNVERIFIED: the contract is aligned, but the D3 rollup holds the row at its weakest cell until Task 3.2's kdeconnectd harness closes desktop_effect/api_surface/lifecycle/environment. No Android implementation of lock exists, so phones are unaffected. Formerly pinned as a defect by this test; the test was inverted rather than deleted when the fix landed."
+    used_by: "src/plugins/lock.rs::test_upstream_lock_state_shape_parses"
 
   - file: findthisdevice/ring_request.json
     kind: upstream-derived
