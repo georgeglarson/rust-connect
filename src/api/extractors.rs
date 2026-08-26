@@ -100,7 +100,10 @@ mod tests {
         // Removing the wrapper must not cost the caller the useful part.
         let err = validate_device_id("aaaa").expect_err("4 chars must be rejected");
         let message = err.to_string();
-        assert!(message.contains("device_id"), "lost the field name: {message}");
+        assert!(
+            message.contains("device_id"),
+            "lost the field name: {message}"
+        );
         let (status, _) = api_err(err);
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
