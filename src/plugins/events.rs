@@ -277,6 +277,8 @@ mod tests {
             can_seek: Some(true),
             loop_status: None,
             shuffle: None,
+            album_art_url: None,
+            transferring_album_art: false,
         };
 
         broadcaster.broadcast(PluginEvent::MprisUpdate {

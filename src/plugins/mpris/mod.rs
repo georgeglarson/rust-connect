@@ -161,6 +161,25 @@ pub struct MprisInfo {
     pub loop_status: Option<String>,
     #[serde(default)]
     pub shuffle: Option<bool>,
+    /// Art location as the PHONE reports it (kdeconnect-android
+    /// MprisPlugin sends `albumArtUrl` alongside the rest of the player
+    /// state; kdeconnect-kde's remote role reads it at
+    /// `plugins/mprisremote/mprisremoteplayer.cpp:63`).
+    ///
+    /// Parsing it is the prerequisite for fetching the bytes: kde asks the
+    /// peer with `{player, albumArtUrl}` on `kdeconnect.mpris.request`
+    /// (`mprisremoteplugin.cpp:106`) and caches the payload
+    /// (`plugins/mprisremote/albumart_cache.cpp`). rust-connect does not
+    /// request or cache yet — vk #1009 — so this field is currently
+    /// surfaced, not consumed. Storing a URL we can show beats dropping it.
+    #[serde(default)]
+    pub album_art_url: Option<String>,
+    /// Set by a peer that is about to send art bytes in the payload slot
+    /// (`mpriscontrolplugin.cpp:246-251`). Parsed so such a packet is not
+    /// mistaken for an ordinary state update; the payload itself is not yet
+    /// collected (vk #1009).
+    #[serde(default)]
+    pub transferring_album_art: bool,
 }
 
 // =====================================================================
@@ -1217,6 +1236,51 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
     use super::*;
+
+    // ---- vk #1009: remote-role album art ----
+
+    #[test]
+    fn test_remote_update_parses_the_phones_album_art_url() {
+        // kdeconnect-android sends albumArtUrl in the player state;
+        // kde's remote role reads it (mprisremoteplayer.cpp:63). We dropped
+        // it silently before, so a UI could never show phone album art.
+        let info: MprisInfo = serde_json::from_value(serde_json::json!({
+            "player": "Spotify",
+            "title": "Song",
+            "albumArtUrl": "file:///tmp/art.png",
+        }))
+        .expect("parses");
+        assert_eq!(info.album_art_url.as_deref(), Some("file:///tmp/art.png"));
+    }
+
+    #[test]
+    fn test_transferring_album_art_is_distinguishable_from_a_state_update() {
+        // A peer announcing bytes (mpriscontrolplugin.cpp:246-251) must not
+        // read as an ordinary update — that is what would make us treat an
+        // art envelope as a now-playing change.
+        let envelope: MprisInfo = serde_json::from_value(serde_json::json!({
+            "player": "Spotify",
+            "transferringAlbumArt": true,
+            "albumArtUrl": "file:///tmp/art.png",
+        }))
+        .expect("parses");
+        assert!(envelope.transferring_album_art);
+
+        let ordinary: MprisInfo = serde_json::from_value(serde_json::json!({
+            "player": "Spotify", "title": "Song"
+        }))
+        .expect("parses");
+        assert!(!ordinary.transferring_album_art);
+    }
+
+    #[test]
+    fn test_album_art_fields_are_optional_on_the_wire() {
+        // Every existing peer omits them; parsing must not regress.
+        let info: MprisInfo =
+            serde_json::from_value(serde_json::json!({"player": "X"})).expect("parses");
+        assert_eq!(info.album_art_url, None);
+        assert!(!info.transferring_album_art);
+    }
     use std::sync::Mutex;
 
     fn setup() -> (MprisPlugin, Arc<PluginEventBroadcaster>) {
