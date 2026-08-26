@@ -27,6 +27,7 @@ use crate::device::types::{Device, DeviceState, DeviceType};
         handlers::list_tools,
         handlers::get_device_battery,
         handlers::request_device_battery,
+        handlers::mute_device_call,
         handlers::get_sms_threads,
         handlers::get_sms_thread,
         handlers::request_sms_threads,

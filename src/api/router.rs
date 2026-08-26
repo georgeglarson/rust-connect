@@ -139,6 +139,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(handlers::get_device_telephony),
         )
         .route(
+            "/api/v1/devices/:device_id/telephony/mute",
+            post(handlers::mute_device_call),
+        )
+        .route(
             "/api/v1/devices/:device_id/lock",
             post(handlers::lock_device),
         )

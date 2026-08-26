@@ -40,6 +40,51 @@ async fn create_test_app() -> (Arc<AppState>, tempfile::TempDir, String) {
 }
 
 #[tokio::test]
+async fn test_telephony_mute_route_exists() {
+    // vk #1043. Compiling a handler is not the same as reaching it — the route
+    // has to be wired into build_router. A 404 here would mean it is not.
+    let (state, _temp, api_key) = create_test_app().await;
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/devices/test-phoneaaaaaaaaaaaaaaaaaaaaaa/telephony/mute")
+                .header("X-API-Key", &api_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "POST .../telephony/mute is not routed"
+    );
+}
+
+#[tokio::test]
+async fn test_telephony_mute_requires_auth() {
+    let (state, _temp, _api_key) = create_test_app().await;
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/devices/test-phoneaaaaaaaaaaaaaaaaaaaaaa/telephony/mute")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn test_findmyphone_route_exists() {
     let (state, _temp, api_key) = create_test_app().await;
     let app = build_router(state);
