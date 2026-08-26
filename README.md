@@ -239,8 +239,9 @@ restart the daemon.
 
 ### Fuzzing
 
-The wire parser (`PacketSerializer::deserialize`) and the UDP identity
-decode path are fuzzed with cargo-fuzz (libFuzzer). The fuzz crate lives in
+The wire parser (`PacketSerializer::deserialize`), the UDP identity
+decode path, and the multipart share upload path are fuzzed with
+cargo-fuzz (libFuzzer). The fuzz crate lives in
 `fuzz/` (requires nightly, pinned there via `rust-toolchain.toml`):
 
 ```
@@ -248,6 +249,7 @@ cargo install cargo-fuzz
 cd fuzz
 cargo fuzz run packet_deserialize   # raw bytes -> deserialize (+ round-trip)
 cargo fuzz run identity_packet      # discovery identity-packet decode path
+cargo fuzz run share_multipart      # multipart share upload parsing
 ```
 
 Seed inputs (valid identity/pair/ping/share packets plus boundary cases:

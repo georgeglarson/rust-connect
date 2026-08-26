@@ -69,8 +69,11 @@ documented here so reviewers do not file them as bugs. See
   certificate verifiers (not after the fact).
 - Unpaired peers can only send pair/unpair packets; all other packet
   types are dropped.
-- SAS pairing with a 1800-second freshness window, matching Android's
-  `PairingHandler`.
+- SAS pairing request lifetimes match Android's `PairingHandler`: the
+  requester waits 30s for an accept (`PairingHandler.kt:151`) and the
+  accepter holds a pending request 25s (`PairingHandler.kt:88`), so the
+  accepter always gives up first. Separately, an incoming pair packet is
+  rejected unless its timestamp is within a 1800-second freshness window.
 - Received-file size caps on share transfers (default 100 MiB), pairing
   rate limits (max 10 concurrent pending), and packet size caps: 512 KiB
   for pre-auth identity reads (mirroring Android's `LanLinkProvider`) and
