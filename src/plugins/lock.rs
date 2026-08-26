@@ -32,6 +32,20 @@ impl LockPlugin {
     }
 
     /// Last known lock state for a device, if any.
+    /// Our own lock state, as `kdeconnect.lock` carries it.
+    ///
+    /// Upstream's `sendState` sends `m_localLocked` (lockdeviceplugin.cpp:116).
+    /// rust-connect has no session-lock backend, so our local state is
+    /// definitively "not locked" — reporting anything else would be a claim we
+    /// cannot back.
+    fn state_packet(&self) -> Packet {
+        Packet::new(
+            "kdeconnect.lock".to_string(),
+            serde_json::json!({ "isLocked": false }),
+        )
+    }
+
+    /// The PEER's last reported lock state (not ours).
     pub async fn is_locked(&self, device_id: &str) -> Option<bool> {
         self.states.read().await.get(device_id).copied()
     }
@@ -58,45 +72,78 @@ impl Plugin for LockPlugin {
     }
 
     async fn handle_packet(&self, device_id: &str, packet: Packet) -> Result<Option<Vec<Packet>>> {
+        // kdeconnect-kde's lockdevice plugin is permissive about WHICH of its
+        // two packet types carries which field — receivePacket() tests for
+        // requestLocked / lockResult / setLocked on both
+        // (lockdeviceplugin.cpp:77-111). Mirror that rather than binding a
+        // field to one carrier and misparsing a peer that chose the other.
         match packet.packet_type.as_str() {
-            "kdeconnect.lock" => {
-                let is_locked = packet
-                    .body
-                    .get("locked")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-
-                self.states
-                    .write()
-                    .await
-                    .insert(device_id.to_string(), is_locked);
-
-                tracing::info!(
-                    device_id = %device_id,
-                    is_locked = is_locked,
-                    event = "lock_update",
-                    "Received lock state update"
-                );
-
-                Ok(None)
-            }
-            "kdeconnect.lock.request" => {
-                // The peer asks for our last known lock state — answer with a
-                // kdeconnect.lock packet (protocol: request/response pair).
-                let is_locked = self.is_locked(device_id).await.unwrap_or(false);
-                tracing::debug!(
-                    device_id = %device_id,
-                    is_locked = is_locked,
-                    event = "lock_state_requested",
-                    "Answering lock state request"
-                );
-                Ok(Some(vec![Packet::new(
-                    "kdeconnect.lock".to_string(),
-                    serde_json::json!({ "locked": is_locked }),
-                )]))
-            }
-            _ => Ok(None),
+            "kdeconnect.lock" | "kdeconnect.lock.request" => {}
+            _ => return Ok(None),
         }
+
+        let mut replies = Vec::new();
+
+        // Peer reporting ITS lock state. Upstream field is `isLocked`
+        // (lockdeviceplugin.cpp:116, sendState). The old code read `locked`,
+        // which no upstream emits, so every upstream packet parsed as false.
+        if let Some(is_locked) = packet.body.get("isLocked").and_then(|v| v.as_bool()) {
+            self.states
+                .write()
+                .await
+                .insert(device_id.to_string(), is_locked);
+            tracing::info!(
+                device_id = %device_id, is_locked = is_locked,
+                event = "lock_update", "Received lock state update"
+            );
+        }
+
+        // Result of a setLocked WE sent (lockdeviceplugin.cpp:82-95). Upstream
+        // raises a desktop notification; we have no notification surface for
+        // it, so log at the level that makes a failed remote lock findable.
+        if let Some(ok) = packet.body.get("lockResult").and_then(|v| v.as_bool()) {
+            if ok {
+                tracing::info!(device_id = %device_id, event = "remote_lock_result",
+                               "Remote lock succeeded");
+            } else {
+                tracing::warn!(device_id = %device_id, event = "remote_lock_result",
+                               "Remote lock FAILED on the peer");
+            }
+        }
+
+        // Peer commanding US to lock/unlock (lockdeviceplugin.cpp:98-110).
+        // rust-connect has no session-lock backend, so this cannot be honoured.
+        // Upstream answers a lock attempt with lockResult; answering `false` is
+        // both contract-faithful and true. Silence would leave the peer
+        // waiting on a reply its own code expects.
+        if let Some(set_locked) = packet.body.get("setLocked").and_then(|v| v.as_bool()) {
+            if set_locked {
+                tracing::warn!(
+                    device_id = %device_id, event = "lock_unsupported",
+                    "Peer asked us to lock; no session-lock backend, replying lockResult=false"
+                );
+                replies.push(Packet::new(
+                    "kdeconnect.lock".to_string(),
+                    serde_json::json!({ "lockResult": false }),
+                ));
+            }
+            replies.push(self.state_packet());
+        }
+
+        // Peer asking for OUR state (lockdeviceplugin.cpp:77-79 -> sendState).
+        // The old code answered with the PEER's last reported state, i.e. it
+        // echoed their own value back at them. sendState sends m_localLocked.
+        if packet.body.get("requestLocked").is_some() {
+            tracing::debug!(device_id = %device_id, event = "lock_state_requested",
+                            "Answering lock state request");
+            replies.push(self.state_packet());
+        }
+
+        Ok(if replies.is_empty() {
+            None
+        } else {
+            Some(replies)
+        })
     }
 }
 
@@ -126,16 +173,91 @@ mod tests {
             .contains(&"kdeconnect.lock".to_string()));
     }
 
-    /// DEFECT PIN (feature ledger `lock` row = FAIL, vk #1018): kdeconnect-kde
-    /// sends lock state as `{"isLocked": <bool>}` on `kdeconnect.lock`
-    /// (lockdeviceplugin.cpp:116, `sendState`). This plugin reads a `locked`
-    /// field that no upstream implementation emits, so the upstream shape
-    /// parses as `false`. When lock.rs is rewritten to the kde contract
-    /// (isLocked/lockResult/setLocked/requestLocked), invert this test to
-    /// expect `Some(true)`. No Android peer implements lock, so the defect
-    /// is desktop-peer-direction only (Task 3.2 harness will exercise it).
     #[tokio::test]
-    async fn test_upstream_lock_state_shape_currently_misparsed() {
+    async fn test_request_answers_with_our_state_not_the_peers_echo() {
+        // The subtler half of vk #1018. sendState sends m_localLocked
+        // (lockdeviceplugin.cpp:116) — OUR state. The old reply used the
+        // peer's last reported value, echoing their own number back at them,
+        // which reads as correct in a one-device test and is wrong on the wire.
+        let plugin = LockPlugin::new();
+        plugin
+            .handle_packet(
+                "device1",
+                Packet::new(
+                    "kdeconnect.lock".to_string(),
+                    serde_json::json!({"isLocked": true}),
+                ),
+            )
+            .await
+            .expect("handle");
+        assert_eq!(
+            plugin.is_locked("device1").await,
+            Some(true),
+            "peer state stored"
+        );
+
+        let reply = plugin
+            .handle_packet(
+                "device1",
+                Packet::new(
+                    "kdeconnect.lock.request".to_string(),
+                    serde_json::json!({"requestLocked": serde_json::Value::Null}),
+                ),
+            )
+            .await
+            .expect("handle")
+            .expect("a requestLocked must be answered");
+        assert_eq!(
+            reply[0].body["isLocked"], false,
+            "must report OUR state (no lock backend => false), not the peer's true"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_locked_is_answered_honestly_not_silently() {
+        // We have no session-lock backend. Upstream's setLocked path expects a
+        // lockResult (lockdeviceplugin.cpp:98-107); silence would leave the
+        // peer waiting on a reply its own code handles.
+        let plugin = LockPlugin::new();
+        let reply = plugin
+            .handle_packet(
+                "device1",
+                Packet::new(
+                    "kdeconnect.lock.request".to_string(),
+                    serde_json::json!({"setLocked": true}),
+                ),
+            )
+            .await
+            .expect("handle")
+            .expect("setLocked must be answered");
+        assert_eq!(reply[0].body["lockResult"], false, "we cannot lock; say so");
+        assert_eq!(
+            reply[1].body["isLocked"], false,
+            "and follow with state, as kde does"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lock_result_from_peer_is_accepted_without_a_reply() {
+        let plugin = LockPlugin::new();
+        let out = plugin
+            .handle_packet(
+                "device1",
+                Packet::new(
+                    "kdeconnect.lock".to_string(),
+                    serde_json::json!({"lockResult": true}),
+                ),
+            )
+            .await
+            .expect("handle");
+        assert!(out.is_none(), "a result is terminal, not a question");
+    }
+
+    /// Was a DEFECT PIN (vk #1018): this plugin read a `locked` field no
+    /// upstream emits, so the upstream shape parsed as `false`. Inverted on
+    /// 2026-08-25 when the contract rewrite landed, exactly as the pin said to.
+    #[tokio::test]
+    async fn test_upstream_lock_state_shape_parses() {
         let plugin = LockPlugin::new();
         assert_eq!(plugin.is_locked("device1").await, None);
 
@@ -155,20 +277,14 @@ mod tests {
             .handle_packet("device1", packet)
             .await
             .expect("handle");
-        // Upstream said locked=true; we read the wrong field and stored false.
-        assert_eq!(plugin.is_locked("device1").await, Some(false));
+        // Upstream said isLocked=true, and we now read it.
+        assert_eq!(plugin.is_locked("device1").await, Some(true));
     }
 
-    /// DEFECT PIN (feature ledger `lock` row = FAIL, vk #1018): the reply
-    /// carrier `kdeconnect.lock` matches kde's `sendState` carrier, and
-    /// answering a `lock.request` matches kde's connected()-query flow —
-    /// but the reply body field is ours (`locked`), not upstream's
-    /// `isLocked` (lockdeviceplugin.cpp:116). The request fixture is the
-    /// upstream connected() query `{"requestLocked": null}`
-    /// (lockdeviceplugin.cpp:122). Invert the field assertions when the
-    /// contract rewrite lands.
+    /// Was a DEFECT PIN (vk #1018): the reply body field was ours (`locked`),
+    /// not upstream's `isLocked`. Inverted on 2026-08-25 with the rewrite.
     #[tokio::test]
-    async fn test_lock_request_reply_diverges_from_upstream_field() {
+    async fn test_lock_request_reply_uses_the_upstream_field() {
         let plugin = LockPlugin::new();
 
         let request_body: serde_json::Value = serde_json::from_str(
@@ -193,11 +309,11 @@ mod tests {
         assert_eq!(reply.len(), 1);
         assert_eq!(reply[0].packet_type, "kdeconnect.lock");
         let body = reply[0].body.as_object().expect("reply body is an object");
-        assert!(body.contains_key("locked"), "our (divergent) field");
         assert!(
-            !body.contains_key("isLocked"),
-            "upstream field absent until vk #1018 lands"
+            body.contains_key("isLocked"),
+            "reply must use upstream's field (lockdeviceplugin.cpp:116)"
         );
+        assert!(!body.contains_key("locked"), "the divergent field is gone");
     }
 
     #[tokio::test]

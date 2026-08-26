@@ -63,7 +63,9 @@ impl Plugin for BatteryPlugin {
     fn on_connected(&self, _device_id: &str) -> Vec<Packet> {
         vec![Packet::new(
             "kdeconnect.battery.request".to_string(),
-            serde_json::json!({}),
+            // GSConnect battery.js:364-368 `_requestState` sends
+            // {"request": true}. We sent an empty body (vk #1018).
+            serde_json::json!({ "request": true }),
         )]
     }
 
@@ -182,14 +184,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_on_connected_requests_battery() {
-        // DIVERGENCE PIN (vk #1018): upstream GSConnect sends
-        // `{"request": true}` (gsconnect battery.js:364-368 `_requestState`);
-        // the fixture holds that upstream shape. The rust plugin sends an
-        // empty body. The divergence is behaviorally inert today — Android's
-        // BatteryPlugin does not implement `kdeconnect.battery.request` at
-        // all (supportedPacketTypes = [kdeconnect.battery] only) and no
-        // implementation reads the field — but vk #1018 aligns the body.
-        // Invert to `assert_eq!` when it lands.
+        // Was a DIVERGENCE PIN (vk #1018): we sent an empty body where
+        // GSConnect sends {"request": true} (battery.js:364-368
+        // `_requestState`). Aligned 2026-08-25; the pin said to invert to
+        // assert_eq! when it landed, so this now asserts equality with the
+        // upstream fixture rather than difference from it.
         let plugin = make_plugin();
         let packets = plugin.on_connected("test-device");
         assert_eq!(packets.len(), 1);
@@ -206,8 +205,10 @@ mod tests {
             upstream_body["request"], true,
             "fixture is the upstream shape"
         );
-        assert_eq!(packets[0].body, serde_json::json!({}));
-        assert_ne!(packets[0].body, upstream_body);
+        assert_eq!(
+            packets[0].body, upstream_body,
+            "on_connected must send the upstream request shape verbatim"
+        );
     }
 
     #[tokio::test]
