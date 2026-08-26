@@ -24,23 +24,28 @@ use super::plugin::Plugin;
 /// waylandremoteinput.cpp:442-456) and kdeconnect-android's senders
 /// (plugins/mousepad/MousePadPlugin.kt:77-186 and
 /// KeyListenerView.java:129-165).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+// Serialization skips defaults so a produced packet carries only the fields it
+// is about, matching upstream's minimal bodies (remotecontrolplugin.cpp:23
+// sends {dx,dy}; kdeconnect-android sends one field set per packet,
+// MousePadPlugin.kt:77-186). Deserialization is unaffected: every field is
+// already `#[serde(default)]`, so a peer omitting them reads identically.
 pub struct MousepadRequest {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     /// Android always sends this as an INTEGER code, never a string —
     /// every set site goes through SpecialKeysMap.get() which returns int
     /// (kdeconnect-android KeyListenerView.java:151-154,
     /// MousePadPlugin.kt:132-180). kdeconnect-kde reads it with
     /// np.get<int> (plugins/mousepad/x11remoteinput.cpp:105).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub special_key: Option<i32>,
     /// Relative pointer delta (kdeconnect-android MousePadPlugin.kt:77-82).
     /// When `scroll` is set these are wheel deltas instead (:124-130).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dx: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dy: Option<f64>,
     /// Absolute pointer position. Only kdeconnect-kde's
     /// shareinputdevicesremote plugin ever produces these
@@ -50,45 +55,124 @@ pub struct MousepadRequest {
     /// See `absolute_position` for the decision and `scale_abs_coord` for
     /// how the values are mapped onto our synthetic absolute-pointer
     /// device.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub y: Option<f64>,
     /// The six click booleans, all lowercase on the wire with no camel
     /// humps. kdeconnect-kde reads them at x11remoteinput.cpp:97-102;
     /// kdeconnect-android sends one per packet
     /// (MousePadPlugin.kt:88-122).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub singleclick: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub doubleclick: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub middleclick: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rightclick: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub singlehold: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub singlerelease: bool,
     /// Reinterprets dx/dy as wheel deltas
     /// (x11remoteinput.cpp:103, :137-144;
     /// kdeconnect-android MousePadPlugin.kt:124-130).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scroll: bool,
     /// Four INDEPENDENT modifier booleans, not one string
     /// (x11remoteinput.cpp:146-149; KeyListenerView.java:132-149).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ctrl: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub alt: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shift: bool,
     /// `super` is a Rust keyword, so the wire name is set explicitly.
     /// An explicit `rename` overrides the container's `rename_all`.
-    #[serde(default, rename = "super")]
+    #[serde(default, rename = "super", skip_serializing_if = "std::ops::Not::not")]
     pub super_key: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_ack: bool,
+}
+
+/// Which mouse button a produced click packet names.
+///
+/// The wire carries one boolean per button, all lowercase with no camel humps
+/// (x11remoteinput.cpp:97-102). kdeconnect-android sends exactly one per packet
+/// (MousePadPlugin.kt:88-122).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerClick {
+    Single,
+    Double,
+    Middle,
+    Right,
+    /// Drag start: press without release (x11remoteinput.cpp:132-134).
+    Hold,
+    /// Drag end (x11remoteinput.cpp:135-136).
+    Release,
+}
+
+impl MousepadRequest {
+    /// Relative pointer motion. kde's remotecontrol sends exactly `{dx, dy}`
+    /// (remotecontrolplugin.cpp:23, from a QPoint).
+    pub fn move_relative(dx: f64, dy: f64) -> Self {
+        Self {
+            dx: Some(dx),
+            dy: Some(dy),
+            ..Default::default()
+        }
+    }
+
+    /// Absolute pointer position. Note the consume side's own warning: only
+    /// kde's shareinputdevicesremote produces these, and it hands the packet to
+    /// its local mousepad in-process rather than transmitting it, so no wire
+    /// producer exercises this path upstream. Ours is the first.
+    pub fn move_absolute(x: f64, y: f64) -> Self {
+        Self {
+            x: Some(x),
+            y: Some(y),
+            ..Default::default()
+        }
+    }
+
+    /// One click/hold/release. Exactly one boolean is set, as upstream sends.
+    pub fn click(which: PointerClick) -> Self {
+        let mut req = Self::default();
+        match which {
+            PointerClick::Single => req.singleclick = true,
+            PointerClick::Double => req.doubleclick = true,
+            PointerClick::Middle => req.middleclick = true,
+            PointerClick::Right => req.rightclick = true,
+            PointerClick::Hold => req.singlehold = true,
+            PointerClick::Release => req.singlerelease = true,
+        }
+        req
+    }
+
+    /// Scroll. `scroll` reinterprets dx/dy as WHEEL deltas rather than pointer
+    /// motion (x11remoteinput.cpp:103,:137-144; MousePadPlugin.kt:124-130), so
+    /// the same two fields mean something different here.
+    pub fn scroll(dx: f64, dy: f64) -> Self {
+        Self {
+            scroll: true,
+            dx: Some(dx),
+            dy: Some(dy),
+            ..Default::default()
+        }
+    }
+
+    /// The packet this request produces.
+    ///
+    /// Built by serializing the SAME struct the consume side deserializes, so
+    /// the producer cannot drift from the parser: a field renamed on one side
+    /// moves on both.
+    pub fn into_packet(self) -> Result<Packet> {
+        Ok(Packet::new(
+            "kdeconnect.mousepad.request".to_string(),
+            serde_json::to_value(self)?,
+        ))
+    }
 }
 
 /// Modifier keys held around a key press.
@@ -885,6 +969,88 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
     use super::*;
+
+    // ---- vk #1040: pointer producer wire shapes ----
+
+    fn body(req: MousepadRequest) -> serde_json::Value {
+        req.into_packet().expect("serializes").body
+    }
+
+    #[test]
+    fn test_relative_motion_is_exactly_dx_dy() {
+        // kde remotecontrolplugin.cpp:23 sends {dx, dy} and nothing else.
+        // Producing every default boolean alongside would be noise no upstream
+        // emits, which is why the struct skips defaults on serialize.
+        assert_eq!(
+            body(MousepadRequest::move_relative(3.0, -4.0)),
+            serde_json::json!({"dx": 3.0, "dy": -4.0})
+        );
+    }
+
+    #[test]
+    fn test_absolute_motion_is_exactly_x_y() {
+        assert_eq!(
+            body(MousepadRequest::move_absolute(10.5, 20.25)),
+            serde_json::json!({"x": 10.5, "y": 20.25})
+        );
+    }
+
+    #[test]
+    fn test_each_click_sets_exactly_one_boolean() {
+        for (which, field) in [
+            (PointerClick::Single, "singleclick"),
+            (PointerClick::Double, "doubleclick"),
+            (PointerClick::Middle, "middleclick"),
+            (PointerClick::Right, "rightclick"),
+            (PointerClick::Hold, "singlehold"),
+            (PointerClick::Release, "singlerelease"),
+        ] {
+            let b = body(MousepadRequest::click(which));
+            assert_eq!(
+                b,
+                serde_json::json!({ field: true }),
+                "{field} packet must carry only its own flag"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scroll_carries_the_flag_and_reuses_dx_dy() {
+        // scroll REINTERPRETS dx/dy as wheel deltas (x11remoteinput.cpp:103).
+        assert_eq!(
+            body(MousepadRequest::scroll(0.0, -1.0)),
+            serde_json::json!({"scroll": true, "dx": 0.0, "dy": -1.0})
+        );
+    }
+
+    #[test]
+    fn test_produced_packets_round_trip_through_the_consume_side() {
+        // The point of building from the shared struct: what we emit is what
+        // the parser reads. Round-trip through plan_actions, the real consumer.
+        let moved = body(MousepadRequest::move_relative(7.0, 9.0));
+        let parsed: MousepadRequest = serde_json::from_value(moved).expect("parses");
+        assert_eq!(
+            plan_actions(&parsed),
+            vec![InputAction::Move { dx: 7, dy: 9 }]
+        );
+
+        let clicked = body(MousepadRequest::click(PointerClick::Right));
+        let parsed: MousepadRequest = serde_json::from_value(clicked).expect("parses");
+        assert_eq!(
+            plan_actions(&parsed),
+            vec![InputAction::Click(KeyCode::BTN_RIGHT)]
+        );
+    }
+
+    #[test]
+    fn test_producer_adds_no_new_capability() {
+        // remotekeyboard already advertises outgoing kdeconnect.mousepad.request
+        // and the registry dedups; double-declaring would be the bug.
+        let plugin = MousepadPlugin::new();
+        assert!(!plugin
+            .outgoing_capabilities()
+            .contains(&"kdeconnect.mousepad.request".to_string()));
+    }
 
     #[tokio::test]
     async fn test_mousepad_plugin_name() {
