@@ -1054,19 +1054,19 @@ feature_ledger:
     owner: "Task 3.1 (classified 2026-08-14)"
 
   - feature: kdeconnect-kde/telephony
-    rust_impl: false
+    rust_impl: true
     upstream: kdeconnect-kde
     upstream_ref: "kdeconnect-kde plugins/telephony/kdeconnect_telephony.json"
     desktop_effect: NOT-APPLICABLE
-    api_surface: NOT-APPLICABLE
+    api_surface: PASS
     lifecycle: NOT-APPLICABLE
     hostile_input: NOT-APPLICABLE
-    fixture_provenance: NOT-APPLICABLE
-    live_device: NOT-APPLICABLE
+    fixture_provenance: PASS
+    live_device: UNVERIFIED
     environment: NOT-APPLICABLE
     status: UNVERIFIED
-    cite: "row partially satisfied by the rust plugin `telephony` (kdeconnect.telephony consume side)"
-    reason: "rolled-up to rust plugin `telephony` EXCEPT a missing desktop→phone request_mute leg (mute ringing phone): kde's telephony SENDS kdeconnect.telephony.request_mute (telephonyplugin.cpp:89-90; Android consumes it) and rust never sends or consumes request_mute anywhere (zero hits in src/); small implementation task filed 2026-08-14"
+    cite: "src/plugins/telephony.rs (kdeconnect.telephony consume side plus request_mute packet builder and outgoing capability); src/api/handlers/plugins/telephony.rs (POST /api/v1/devices/{device_id}/telephony/mute); tests/api_plugin_endpoints.rs; tests/fixtures/rust-capabilities.yaml"
+    reason: "vk #1043 implemented the missing desktop→phone request_mute leg using kdeconnect-kde's exact {action: mute} wire shape and exposed it through the device telephony API. Unit and API tests cover construction and dispatch; a paired-phone call remains unverified, so the row stays UNVERIFIED."
     owner: "vk #1043"
 
   - feature: kdeconnect-kde/virtualmonitor
@@ -2059,4 +2059,3 @@ ledger row that resolves it:
 
 Any new intentional divergence added to the ledger must carry a `reason`
 and an `owner` task reference per the schema-lint test.
-

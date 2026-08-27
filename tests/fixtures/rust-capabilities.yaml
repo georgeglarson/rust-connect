@@ -144,4 +144,4 @@ plugins:
     incoming_capabilities:
       - kdeconnect.telephony
     outgoing_capabilities:
-      []
+      - kdeconnect.telephony.request_mute
