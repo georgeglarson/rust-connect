@@ -29,6 +29,9 @@ config.toml
 # Build artifacts
 /dist/
 /build/
+# build-deb.sh staging + output (never commit a built binary or package)
+/packaging/deb/usr/
+/packaging/*.deb
 
 # Test artifacts
 /coverage/
