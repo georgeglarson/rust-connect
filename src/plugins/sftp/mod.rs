@@ -369,8 +369,18 @@ impl SftpPlugin {
         // mount either precedes it (and the cleanup sees the live
         // connection and stands down) or follows it (and mounts a clean
         // path) — it never overlaps the unmount (PR #40 review).
-        let mount_lock = self.mount_lock_for(device_id);
-        let mount_guard = mount_lock.lock_owned().await;
+        let mount_guard = match self.acquire_mount_lock(device_id).await {
+            Ok(guard) => guard,
+            Err(msg) => {
+                let state = MountState::Failed(msg);
+                self.set_mount_state(device_id, state.clone());
+                self.broadcast_update(device_id, info, &state, None);
+                return Ok(MountStatus {
+                    state,
+                    mount_point: None,
+                });
+            }
+        };
         let (status, leftover) = self.mount_device_locked(device_id, info).await;
         Self::hand_lock_to_leftover_task(mount_guard, leftover);
         status
@@ -405,7 +415,14 @@ impl SftpPlugin {
             .await;
         let outcome = match outcome {
             Ok(outcome) => outcome,
-            Err(e) => return (Err(e), leftover),
+            Err(e) => {
+                // Don't leave the device stuck in Mounting without an
+                // event (PR #40 review round 3, coderabbit).
+                let state = MountState::Failed(format!("mount task failed: {e}"));
+                self.set_mount_state(device_id, state.clone());
+                self.broadcast_update(device_id, info, &state, Some(mp.as_path()));
+                return (Err(e), leftover);
+            }
         };
         let final_state = match outcome {
             MountOutcome::Mounted => MountState::Mounted,
@@ -427,8 +444,20 @@ impl SftpPlugin {
         let mp = self.mount_point(device_id);
         // Serialize with a mount or disconnect cleanup racing for the
         // same path (PR #40 review round 2).
-        let unmount_lock = self.mount_lock_for(device_id);
-        let unmount_guard = unmount_lock.lock_owned().await;
+        let unmount_guard = match self.acquire_mount_lock(device_id).await {
+            Ok(guard) => guard,
+            Err(msg) => {
+                let state = MountState::Failed(msg);
+                self.set_mount_state(device_id, state.clone());
+                if let Some(info) = self.get_connection(device_id) {
+                    self.broadcast_update(device_id, &info, &state, None);
+                }
+                return Ok(MountStatus {
+                    state,
+                    mount_point: None,
+                });
+            }
+        };
         let (outcome, leftover) = self.unmount_via_mounter_tracked(mp.clone()).await;
         let outcome = match outcome {
             Ok(outcome) => outcome,
@@ -467,20 +496,34 @@ impl SftpPlugin {
         let mp = self.mount_point(device_id);
         // Serialize with a mount or disconnect cleanup racing for the
         // same path (PR #40 review round 2).
-        let cleanup_lock = self.mount_lock_for(device_id);
-        let cleanup_guard = cleanup_lock.lock_owned().await;
-        let leftover = if mp.exists() {
-            let (outcome, leftover) = self.unmount_via_mounter_tracked(mp).await;
-            let _ = outcome;
-            leftover
-        } else {
-            None
-        };
+        match self.acquire_mount_lock(device_id).await {
+            Ok(guard) => {
+                let leftover = if mp.exists() {
+                    let (outcome, leftover) = self.unmount_via_mounter_tracked(mp).await;
+                    let _ = outcome;
+                    leftover
+                } else {
+                    None
+                };
+                Self::hand_lock_to_leftover_task(guard, leftover);
+            }
+            Err(msg) => {
+                // An in-flight operation holds the path (usually the
+                // orphaned unmount draining); the tables still get
+                // cleaned below — the bounded wait must not stall
+                // unpair/delete/shutdown (PR #40 review round 3).
+                warn!(
+                    device_id = %device_id,
+                    error = %msg,
+                    event = "sftp_cleanup_lock_busy",
+                    "Skipping unmount during device cleanup"
+                );
+            }
+        }
         self.set_mount_state(device_id, MountState::Unmounted);
         if let Ok(mut connections) = self.connections.write() {
             connections.remove(device_id);
         }
-        Self::hand_lock_to_leftover_task(cleanup_guard, leftover);
     }
 
     /// Daemon-shutdown cleanup: unmount every active mount, drop every
@@ -567,8 +610,16 @@ impl SftpPlugin {
         // deliberately ignore its outcome (it may be in a half-torn-down
         // state from the phone's side) and let the new mount attempt
         // speak for itself.
-        let remount_lock = self.mount_lock_for(device_id);
-        let remount_guard = remount_lock.lock_owned().await;
+        let remount_guard = match self.acquire_mount_lock(device_id).await {
+            Ok(guard) => guard,
+            Err(msg) => {
+                self.set_mount_state(device_id, MountState::Failed(msg.clone()));
+                return Ok(MountStatus {
+                    state: MountState::Failed(msg),
+                    mount_point: None,
+                });
+            }
+        };
         let (unmount_outcome, leftover) = self
             .unmount_via_mounter_tracked(self.mount_point(device_id))
             .await;
@@ -614,10 +665,44 @@ impl SftpPlugin {
             .clone()
     }
 
+    /// Acquire the device's mount lock, bounded by `mount_timeout`. A
+    /// previous operation — usually an orphaned fusermount/sshfs still
+    /// draining after a timeout (see `hand_lock_to_leftover_task`) — can
+    /// hold the lock for a long time, and waiting it out indefinitely
+    /// would reintroduce the unbounded wait this audit removed. Callers
+    /// fail retryable instead of blocking (PR #40 review round 3,
+    /// coderabbit).
+    async fn acquire_mount_lock(
+        &self,
+        device_id: &str,
+    ) -> std::result::Result<tokio::sync::OwnedMutexGuard<()>, String> {
+        let lock = self.mount_lock_for(device_id);
+        match tokio::time::timeout(self.mount_timeout, lock.lock_owned()).await {
+            Ok(guard) => Ok(guard),
+            Err(_) => Err(format!(
+                "previous mount operation for {device_id} still draining after {}s",
+                self.mount_timeout.as_secs_f64()
+            )),
+        }
+    }
+
     async fn cleanup_mount_on_disconnect(&self, device_id: &str, live_mount: bool) {
         let mp = mount_point_for(&self.data_dir, device_id);
-        let cleanup_lock = self.mount_lock_for(device_id);
-        let cleanup_guard = cleanup_lock.lock_owned().await;
+        let cleanup_guard = match self.acquire_mount_lock(device_id).await {
+            Ok(guard) => guard,
+            Err(msg) => {
+                // The lock is held by an in-flight operation on the same
+                // path; that operation owns the outcome. Stay bounded
+                // instead of waiting it out (PR #40 review round 3).
+                warn!(
+                    device_id = %device_id,
+                    error = %msg,
+                    event = "sftp_disconnect_cleanup_lock_busy",
+                    "Disconnect cleanup skipped: mount lock busy"
+                );
+                return;
+            }
+        };
         // The registry awaits plugins sequentially, so this cleanup can be
         // delayed behind other plugins' handlers — long enough for the
         // device to reconnect and even re-mount. If a live connection
@@ -1961,6 +2046,35 @@ mod tests {
             mount_start > unmount_end,
             "replacement mount started before the in-flight unmount finished: {ev:?}"
         );
+    }
+
+    /// PR #40 review round 3 (coderabbit): a previous operation draining
+    /// under the device lock must not block the next caller indefinitely;
+    /// acquisition is bounded by `mount_timeout` and fails retryable.
+    #[tokio::test]
+    async fn mount_lock_acquisition_times_out_instead_of_blocking_indefinitely() {
+        let (plugin, _d) = test_plugin_with_runner(ScriptedRunner::always_succeed());
+        let plugin = plugin.with_mount_timeout(std::time::Duration::from_millis(50));
+        // Hold the device's lock like an orphaned operation still draining.
+        let busy = plugin.mount_lock_for("dev1").lock_owned().await;
+        let info = sample_info();
+        let started = std::time::Instant::now();
+        let call = plugin.mount_device("dev1", &info);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), call).await;
+        let status = result
+            .expect("mount_device must not wait out a draining lock")
+            .expect("status");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        let failed_draining = match &status.state {
+            MountState::Failed(msg) => msg.contains("still draining"),
+            _ => false,
+        };
+        assert!(
+            failed_draining,
+            "expected a retryable 'still draining' failure, got {:?}",
+            status.state
+        );
+        drop(busy);
     }
 
     /// PR #40 review round 2 (cubic-dev P2): device ids arrive from the
