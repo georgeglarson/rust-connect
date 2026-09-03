@@ -24,6 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   borrowed its paired-ids handle from a pairing handler that was then
   discarded, so no device ever counted as paired for persistence or for the
   unpaired-eviction cap. Device records now survive a restart.
+- SFTP mounts target the address of the authenticated link, never the `ip`
+  the packet claims, and the `user`/`path` fields are validated before they
+  become sshfs arguments (a `user` beginning `-oProxyCommand=` was command
+  execution from a paired peer).
+- A send that fails or times out now tears the link down instead of leaving
+  a half-written packet queued ahead of the next one, which the peer then
+  dropped along with it.
+- `cargo test` no longer announces fixture identities to real KDE Connect
+  peers on the LAN: test builds use a test-only mDNS service type.
 
 First public release. Everything below is the initial feature set rather
 than a delta against a previous version.
