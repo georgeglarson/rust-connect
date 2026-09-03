@@ -14,7 +14,7 @@ use crate::app::AppState;
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Get telephony events from device", body = ApiResponse),
+        (status = 200, description = "Get telephony events from device", body = GenericResponse),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),
@@ -41,7 +41,7 @@ pub async fn get_device_telephony(
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Mute request sent", body = ApiResponse),
+        (status = 200, description = "Mute request sent", body = GenericResponse),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),

@@ -39,7 +39,7 @@ pub use systemvolume::*;
 pub use telephony::*;
 pub use volume::*;
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct Tool {
     pub name: String,
     pub description: String,
@@ -56,7 +56,7 @@ pub struct Tool {
     pub available: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct ToolParameter {
     pub name: String,
     pub param_type: String,
@@ -64,7 +64,7 @@ pub struct ToolParameter {
     pub description: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct ToolsResponse {
     pub tools: Vec<Tool>,
     pub count: usize,

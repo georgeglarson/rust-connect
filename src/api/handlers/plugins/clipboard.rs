@@ -12,7 +12,7 @@ use crate::utils::errors::Error;
     path = "/api/v1/clipboard",
     tag = "clipboard",
     responses(
-        (status = 200, description = "Get current clipboard content", body = ApiResponse),
+        (status = 200, description = "Get current clipboard content", body = GenericResponse),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
     security(("api_key" = []))
@@ -32,7 +32,7 @@ pub async fn get_clipboard(
     tag = "clipboard",
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "Set clipboard content on connected devices", body = ApiResponse),
+        (status = 200, description = "Set clipboard content on connected devices", body = GenericResponse),
         (status = 400, description = "Invalid request", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
@@ -89,7 +89,7 @@ pub async fn set_clipboard(
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Clipboard sync request sent", body = ApiResponse),
+        (status = 200, description = "Clipboard sync request sent", body = GenericResponse),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),

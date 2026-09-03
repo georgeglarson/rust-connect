@@ -15,7 +15,7 @@ use crate::utils::errors::Error;
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Get connectivity report from device", body = ApiResponse),
+        (status = 200, description = "Get connectivity report from device", body = GenericResponse),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found or no connectivity data", body = ApiError),
     ),

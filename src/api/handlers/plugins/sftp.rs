@@ -18,7 +18,7 @@ use crate::plugins::Plugin;
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "SFTP request sent to device", body = ApiResponse),
+        (status = 200, description = "SFTP request sent to device", body = GenericResponse),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),
@@ -58,7 +58,7 @@ pub async fn request_sftp(
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Get SFTP connection info", body = ApiResponse),
+        (status = 200, description = "Get SFTP connection info", body = GenericResponse),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found or SFTP not available", body = ApiError),
     ),
@@ -130,7 +130,7 @@ fn state_label(s: &MountState) -> &'static str {
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Mount state (mounted or already mounted)", body = ApiResponse),
+        (status = 200, description = "Mount state (mounted or already mounted)", body = GenericResponse),
         (status = 400, description = "No SFTP credentials yet — call POST /sftp/request first", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
@@ -190,7 +190,7 @@ pub async fn mount_sftp(
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Mount released", body = ApiResponse),
+        (status = 200, description = "Mount released", body = GenericResponse),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "No mount to release for this device", body = ApiError),
     ),

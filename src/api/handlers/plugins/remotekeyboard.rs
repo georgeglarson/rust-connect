@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+// utoipa `body = …` resolves schema names, not paths; the import keeps the name in scope for readers
+use crate::api::types::GenericResponse;
 use axum::{
     extract::{Path, State},
     Json,
@@ -56,7 +59,7 @@ fn keypress_payload(req: &SendKeypressRequest) -> serde_json::Value {
     tag = "remotekeyboard",
     request_body = SendKeypressRequest,
     responses(
-        (status = 200, description = "Keypress sent successfully", body = ApiResponse<serde_json::Value>),
+        (status = 200, description = "Keypress sent successfully", body = GenericResponse),
         (status = 400, description = "Invalid device ID", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found or not connected", body = ApiError),

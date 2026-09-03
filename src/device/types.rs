@@ -114,6 +114,7 @@ impl DeviceType {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Device {
     /// Unique device identifier
+    #[schema(value_type = String)]
     pub id: DeviceId,
 
     /// Human-readable device name
@@ -130,6 +131,7 @@ pub struct Device {
 
     /// Network address (if connected)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
     pub address: Option<SocketAddr>,
 
     /// Protocol version

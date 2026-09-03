@@ -83,7 +83,7 @@ pub async fn get_local_sinks(
     ),
     request_body = LocalSinkControlRequest,
     responses(
-        (status = 200, description = "Control command applied", body = ApiResponse<serde_json::Value>),
+        (status = 200, description = "Control command applied", body = GenericResponse),
         (status = 400, description = "Invalid request", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 503, description = "No audio backend available", body = ApiError),

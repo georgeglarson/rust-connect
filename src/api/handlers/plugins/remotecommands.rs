@@ -1,3 +1,7 @@
+// utoipa `body = …` resolves schema names, not paths; the imports keep the
+// names in scope for readers.
+#[allow(unused_imports)]
+use crate::api::types::{GenericResponse, RemoteCommandsResponseWrapper};
 use axum::{
     extract::{Path, State},
     Json,
@@ -29,7 +33,7 @@ pub struct RemoteCommandsResponse {
     path = "/api/v1/devices/{device_id}/remotecommands",
     tag = "remotecommands",
     responses(
-        (status = 200, description = "List of remote commands", body = ApiResponse<RemoteCommandsResponse>),
+        (status = 200, description = "List of remote commands", body = RemoteCommandsResponseWrapper),
         (status = 400, description = "Invalid device ID", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found or not connected", body = ApiError),
@@ -68,7 +72,7 @@ pub async fn get_remotecommands(
     path = "/api/v1/devices/{device_id}/remotecommands/{key}/trigger",
     tag = "remotecommands",
     responses(
-        (status = 200, description = "Command triggered", body = ApiResponse<serde_json::Value>),
+        (status = 200, description = "Command triggered", body = GenericResponse),
         (status = 400, description = "Invalid device ID", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found or not connected", body = ApiError),

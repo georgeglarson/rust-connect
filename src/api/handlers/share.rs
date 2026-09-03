@@ -8,6 +8,9 @@ use std::sync::Arc;
 
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::ApiResponse;
+#[allow(unused_imports)]
+// utoipa `body = …` resolves schema names, not paths; the import keeps the name in scope for readers
+use crate::api::types::{ApiError, GenericResponse, ShareTextRequest, ShareUrlRequest};
 use crate::app::AppState;
 use crate::plugins::share::ReceivedFile;
 use crate::protocol::types::Packet;
@@ -18,17 +21,14 @@ use crate::utils::errors::Error;
     path = "/api/v1/share/files",
     tag = "share",
     responses(
-        (status = 200, description = "List shared files received from devices", body = ApiResponse),
+        (status = 200, description = "List shared files received from devices", body = GenericResponse),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
     security(("api_key" = []))
 )]
 pub async fn list_share_files(
     State(state): State<Arc<AppState>>,
-) -> Result<
-    Json<ApiResponse<serde_json::Value>>,
-    (axum::http::StatusCode, Json<crate::api::types::ApiError>),
-> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
     let received: Vec<ReceivedFile> = state.plugins.share.received_files().await;
     let files: Vec<_> = received
         .into_iter()
@@ -53,10 +53,10 @@ pub async fn list_share_files(
         ("device_id" = String, Path, description = "Device unique identifier"),
         ("filename" = Option<String>, Query, description = "Filename to send (overrides the multipart part name)")
     ),
-    request_body(description = "Raw file bytes, or multipart/form-data with a single file part", content = axum::body::Bytes),
+    request_body(description = "Raw file bytes, or multipart/form-data with a single file part", content = Vec<u8>),
     responses(
         (status = 200, description = "File sent to device", body = serde_json::Value),
-        (status = 401, description = "Invalid or missing API key", body = crate::api::types::ApiError),
+        (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
     security(("api_key" = []))
 )]
@@ -65,10 +65,7 @@ pub async fn send_file_to_device(
     Path(device_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     request: axum::extract::Request,
-) -> Result<
-    Json<ApiResponse<serde_json::Value>>,
-    (axum::http::StatusCode, Json<crate::api::types::ApiError>),
-> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {
@@ -230,7 +227,7 @@ pub struct UploadMeta {
 pub async fn stream_upload_to_file(
     request: axum::extract::Request,
     dest: &std::path::Path,
-) -> Result<UploadMeta, (axum::http::StatusCode, Json<crate::api::types::ApiError>)> {
+) -> Result<UploadMeta, (axum::http::StatusCode, Json<ApiError>)> {
     use tokio::io::AsyncWriteExt;
 
     // RFC 2045 media types are case-insensitive.
@@ -359,22 +356,19 @@ fn build_share_url_packet(url: &str) -> Packet {
     path = "/api/v1/devices/{device_id}/share/text",
     tag = "share",
     params(("device_id" = String, Path, description = "Device unique identifier")),
-    request_body = crate::api::types::ShareTextRequest,
+    request_body = ShareTextRequest,
     responses(
         (status = 200, description = "Text sent to device", body = serde_json::Value),
-        (status = 400, description = "Invalid request", body = crate::api::types::ApiError),
-        (status = 401, description = "Invalid or missing API key", body = crate::api::types::ApiError),
+        (status = 400, description = "Invalid request", body = ApiError),
+        (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
     security(("api_key" = []))
 )]
 pub async fn send_text_to_device(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(body): Json<crate::api::types::ShareTextRequest>,
-) -> Result<
-    Json<ApiResponse<serde_json::Value>>,
-    (axum::http::StatusCode, Json<crate::api::types::ApiError>),
-> {
+    Json(body): Json<ShareTextRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     if body.text.is_empty() {
@@ -413,22 +407,19 @@ pub async fn send_text_to_device(
     path = "/api/v1/devices/{device_id}/share/url",
     tag = "share",
     params(("device_id" = String, Path, description = "Device unique identifier")),
-    request_body = crate::api::types::ShareUrlRequest,
+    request_body = ShareUrlRequest,
     responses(
         (status = 200, description = "URL sent to device", body = serde_json::Value),
-        (status = 400, description = "Invalid or disallowed URL", body = crate::api::types::ApiError),
-        (status = 401, description = "Invalid or missing API key", body = crate::api::types::ApiError),
+        (status = 400, description = "Invalid or disallowed URL", body = ApiError),
+        (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
     security(("api_key" = []))
 )]
 pub async fn send_url_to_device(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(body): Json<crate::api::types::ShareUrlRequest>,
-) -> Result<
-    Json<ApiResponse<serde_json::Value>>,
-    (axum::http::StatusCode, Json<crate::api::types::ApiError>),
-> {
+    Json(body): Json<ShareUrlRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     let Some(scheme) = crate::plugins::share::allowed_url_scheme(&body.url) else {
@@ -565,15 +556,14 @@ mod tests {
 
     #[test]
     fn test_share_text_request_deserializes() {
-        let body: crate::api::types::ShareTextRequest =
-            serde_json::from_str(r#"{"text":"remember the milk"}"#)
-                .expect("request body must parse");
+        let body: ShareTextRequest = serde_json::from_str(r#"{"text":"remember the milk"}"#)
+            .expect("request body must parse");
         assert_eq!(body.text, "remember the milk");
     }
 
     #[test]
     fn test_share_url_request_deserializes() {
-        let body: crate::api::types::ShareUrlRequest =
+        let body: ShareUrlRequest =
             serde_json::from_str(r#"{"url":"https://kde.org/"}"#).expect("request body must parse");
         assert_eq!(body.url, "https://kde.org/");
     }

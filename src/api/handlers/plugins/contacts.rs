@@ -15,7 +15,7 @@ use crate::utils::errors::Error;
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Contacts sync requested from device", body = ApiResponse),
+        (status = 200, description = "Contacts sync requested from device", body = GenericResponse),
         (status = 400, description = "Invalid request or device not connected", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
@@ -59,7 +59,7 @@ pub async fn sync_contacts(
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Stored contacts for the device", body = ApiResponse),
+        (status = 200, description = "Stored contacts for the device", body = GenericResponse),
         (status = 400, description = "Invalid device id", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),

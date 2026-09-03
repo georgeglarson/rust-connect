@@ -17,7 +17,7 @@ use crate::utils::errors::Error;
         ("limit" = Option<usize>, Query, description = "Maximum number of threads to return (default 50)")
     ),
     responses(
-        (status = 200, description = "Get SMS threads from device", body = ApiResponse),
+        (status = 200, description = "Get SMS threads from device", body = GenericResponse),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),
@@ -59,7 +59,7 @@ pub async fn get_sms_threads(
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "SMS threads request sent", body = ApiResponse),
+        (status = 200, description = "SMS threads request sent", body = GenericResponse),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),
@@ -125,7 +125,7 @@ mod conversations_request_tests {
         ("thread_id" = i64, Path, description = "SMS thread ID")
     ),
     responses(
-        (status = 200, description = "Get SMS thread messages", body = ApiResponse),
+        (status = 200, description = "Get SMS thread messages", body = GenericResponse),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),
@@ -155,7 +155,7 @@ pub async fn get_sms_thread(
     ),
     request_body = SendSmsRequest,
     responses(
-        (status = 200, description = "SMS sent to device", body = ApiResponse),
+        (status = 200, description = "SMS sent to device", body = GenericResponse),
         (status = 400, description = "Invalid request", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
