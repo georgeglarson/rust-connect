@@ -25,9 +25,15 @@ use tracing::{debug, info, warn};
 use crate::plugins::events::{PluginEvent, PluginEventBroadcaster};
 use crate::plugins::sftp::mounter::{MountOutcome, MountRequest, Mounter, UnmountOutcome};
 use crate::protocol::types::Packet;
-use crate::utils::errors::Result;
+use crate::utils::errors::{Error, Result};
 
 use super::plugin::Plugin;
+
+/// Wall-clock budget for one sshfs mount attempt or fusermount unmount,
+/// waited on from async code (see `mount_via_mounter`/`unmount_via_mounter`).
+/// Mirrors kdeconnect-kde's own `mounter.cpp:32` 10s wait-for-result
+/// timeout.
+const MOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub mod mounter;
 
@@ -93,6 +99,11 @@ pub struct SftpPlugin {
     /// sshfs is ever pointed at (kdeconnect-kde mounter.cpp:81-94). `None`
     /// only in test constructions; production wires it in loader.rs.
     connection_manager: Option<Arc<crate::protocol::ConnectionManager>>,
+    /// Bound on `mount_via_mounter`/`unmount_via_mounter`'s wait for the
+    /// blocking-pool task. Defaults to `MOUNT_TIMEOUT`; overridden only by
+    /// the test-only `with_mount_timeout` so a timeout test doesn't need
+    /// to sleep for the real 10s production budget.
+    mount_timeout: std::time::Duration,
 }
 
 impl Default for SftpPlugin {
@@ -147,7 +158,16 @@ impl SftpPlugin {
             mounter: Arc::new(mounter_inst),
             plugin_events,
             connection_manager: None,
+            mount_timeout: MOUNT_TIMEOUT,
         }
+    }
+
+    /// Test-only override of `mount_timeout` — lets a timeout test use a
+    /// short bound instead of sleeping for the real production budget.
+    #[cfg(test)]
+    fn with_mount_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.mount_timeout = timeout;
+        self
     }
 
     #[allow(clippy::expect_used)]
@@ -219,6 +239,50 @@ impl SftpPlugin {
         }
     }
 
+    /// Runs `Mounter::mount` (a synchronous sshfs spawn + wait) on the
+    /// blocking thread pool and bounds the wait with `MOUNT_TIMEOUT`.
+    /// Calling `Mounter::mount` directly from an async fn — the pre-fix
+    /// shape — blocks the tokio worker thread for however long sshfs
+    /// takes to connect and authenticate, which on a dead/unreachable
+    /// phone is "however long the TCP stack takes to give up," i.e.
+    /// effectively unbounded. `spawn_blocking` moves that wait off the
+    /// worker thread; `spawn_blocking` cannot forcibly cancel the
+    /// underlying OS thread (there is no cooperative cancellation point
+    /// inside a blocking subprocess wait), so a timeout only bounds how
+    /// long THIS caller waits — the orphaned thread finishes sshfs's own
+    /// wait on its own in the background. That trade (bounded caller wait,
+    /// occasional orphaned blocking thread) is the standard shape for
+    /// wrapping non-cancellable blocking work from async code.
+    async fn mount_via_mounter(&self, req: MountRequest, password: String) -> Result<MountOutcome> {
+        let mounter = self.mounter.clone();
+        let join = tokio::task::spawn_blocking(move || mounter.mount(&req, &password));
+        match tokio::time::timeout(self.mount_timeout, join).await {
+            Ok(join_result) => {
+                join_result.map_err(|e| Error::Internal(format!("mount task panicked: {e}")))?
+            }
+            Err(_elapsed) => Ok(MountOutcome::Failed(format!(
+                "sshfs mount timed out after {}s",
+                self.mount_timeout.as_secs_f64()
+            ))),
+        }
+    }
+
+    /// `Mounter::unmount` counterpart of `mount_via_mounter` — see its doc
+    /// for why this exists instead of calling `Mounter::unmount` directly.
+    async fn unmount_via_mounter(&self, mp: PathBuf) -> Result<UnmountOutcome> {
+        let mounter = self.mounter.clone();
+        let join = tokio::task::spawn_blocking(move || mounter.unmount(&mp));
+        match tokio::time::timeout(self.mount_timeout, join).await {
+            Ok(join_result) => {
+                join_result.map_err(|e| Error::Internal(format!("unmount task panicked: {e}")))?
+            }
+            Err(_elapsed) => Ok(UnmountOutcome::Failed(format!(
+                "fusermount unmount timed out after {}s",
+                self.mount_timeout.as_secs_f64()
+            ))),
+        }
+    }
+
     /// Mount the device's filesystem. Returns the resulting status. The
     /// mount is recorded in the table; `PluginEvent::SftpUpdate` is
     /// broadcast with the new state.
@@ -239,7 +303,7 @@ impl SftpPlugin {
         // the right state.
         self.set_mount_state(device_id, MountState::Mounting);
 
-        let outcome = self.mounter.mount(&req, &info.password)?;
+        let outcome = self.mount_via_mounter(req, info.password.clone()).await?;
         let final_state = match outcome {
             MountOutcome::Mounted => MountState::Mounted,
             MountOutcome::Failed(msg) => MountState::Failed(msg),
@@ -255,7 +319,7 @@ impl SftpPlugin {
     /// Unmount the device's filesystem. No-op if nothing is mounted.
     pub async fn unmount_device(&self, device_id: &str) -> Result<MountStatus> {
         let mp = self.mount_point(device_id);
-        let outcome = self.mounter.unmount(&mp)?;
+        let outcome = self.unmount_via_mounter(mp.clone()).await?;
         let final_state = match outcome {
             UnmountOutcome::Unmounted => MountState::Unmounted,
             UnmountOutcome::Failed(msg) => MountState::Failed(msg),
@@ -284,7 +348,7 @@ impl SftpPlugin {
     pub async fn cleanup_device(&self, device_id: &str) {
         let mp = self.mount_point(device_id);
         if mp.exists() {
-            let _ = self.mounter.unmount(&mp);
+            let _ = self.unmount_via_mounter(mp).await;
         }
         self.set_mount_state(device_id, MountState::Unmounted);
         if let Ok(mut connections) = self.connections.write() {
@@ -370,7 +434,7 @@ impl SftpPlugin {
         // Tear down the stale mount first; we deliberately ignore its
         // outcome (it may be in a half-torn-down state from the phone's
         // side) and let the new mount attempt speak for itself.
-        let _ = self.mounter.unmount(&self.mount_point(device_id));
+        let _ = self.unmount_via_mounter(self.mount_point(device_id)).await;
         self.mount_device(device_id, info).await
     }
 
@@ -953,6 +1017,73 @@ mod tests {
         match stored.state {
             MountState::Failed(msg) => assert!(msg.contains("connection refused")),
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// A `CommandRunner` whose `run_with_stdin` sleeps past a small test
+    /// timeout — stands in for an sshfs process that never returns (dead
+    /// peer, hung network stack). Blocking-`std::thread::sleep`, not
+    /// `tokio::time::sleep` — it must actually occupy a blocking-pool OS
+    /// thread the way a real subprocess wait would, or the test would not
+    /// exercise `spawn_blocking` at all.
+    struct SleepyRunner {
+        sleep_for: std::time::Duration,
+    }
+
+    impl CommandRunner for SleepyRunner {
+        fn which(&self, name: &str) -> Option<PathBuf> {
+            Some(PathBuf::from(format!("/usr/bin/{name}")))
+        }
+        fn run_with_stdin(
+            &self,
+            _program: &Path,
+            _args: &[OsString],
+            _stdin_payload: Option<&str>,
+        ) -> Result<CommandOutput> {
+            std::thread::sleep(self.sleep_for);
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Pre-fix, `mount_device` called `Mounter::mount` directly on the
+    /// async task — a hung sshfs process (modeled here by `SleepyRunner`)
+    /// blocked `mount_device`'s `.await` forever, with no bound. Post-fix,
+    /// `mount_via_mounter` wraps the call in `spawn_blocking` + a timeout;
+    /// this test proves `mount_device` returns `MountState::Failed`
+    /// (a timeout report) well within the test's own timeout guard,
+    /// instead of hanging.
+    #[tokio::test]
+    async fn mount_reports_timeout_instead_of_hanging_on_dead_sshfs() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let plugin = SftpPlugin::with_mounter(
+            Arc::new(crate::plugins::events::PluginEventBroadcaster::new(
+                8, "test",
+            )),
+            dir.path().to_path_buf(),
+            Arc::new(SleepyRunner {
+                sleep_for: std::time::Duration::from_millis(500),
+            }),
+        )
+        .with_mount_timeout(std::time::Duration::from_millis(50));
+
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            plugin.mount_device("dev1", &sample_info()),
+        )
+        .await
+        .expect("mount_device must return well within 2s, not hang on the dead sshfs process")
+        .expect("mount call");
+
+        match status.state {
+            MountState::Failed(msg) => assert!(
+                msg.contains("timed out"),
+                "expected a timeout message, got: {msg}"
+            ),
+            other => panic!("expected Failed(timeout), got {other:?}"),
         }
     }
 

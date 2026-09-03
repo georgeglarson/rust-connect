@@ -530,6 +530,21 @@ pub struct ActivatedEvent {
     pub barrier_id: u32,
 }
 
+/// Pure computation behind `PortalSession::release`'s `cursor_position`.
+/// `deltax`/`deltay` are peer-controlled (the phone's release packet);
+/// `bx.saturating_add(deltax)` / `by.saturating_add(deltay)` clamp to the
+/// `i32` range instead of overflow-panicking a debug build (or silently
+/// wrapping to a nonsense screen position in release) when a malicious or
+/// buggy peer sends an extreme delta like `i32::MAX`. Extracted as a free
+/// function so the saturation behavior is unit-testable without a live
+/// portal `Connection`.
+fn release_cursor_position(bx: i32, by: i32, deltax: i32, deltay: i32) -> (f64, f64) {
+    (
+        f64::from(bx.saturating_add(deltax)),
+        f64::from(by.saturating_add(deltay)),
+    )
+}
+
 impl std::fmt::Debug for PortalSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PortalSession")
@@ -805,11 +820,8 @@ impl PortalSession {
             .barrier_origin
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let opts = Options::new().insert_doubles(
-            "cursor_position",
-            f64::from(bx + deltax),
-            f64::from(by + deltay),
-        );
+        let (cx, cy) = release_cursor_position(bx, by, deltax, deltay);
+        let opts = Options::new().insert_doubles("cursor_position", cx, cy);
         let body = (self.session_handle.clone(), opts.into_body());
         let _: () = call_input_capture(&self.conn, "Release", &body)
             .await
@@ -1559,4 +1571,38 @@ where
         )
         .await?;
     msg.body().deserialize::<R>()
+}
+
+#[cfg(test)]
+mod release_cursor_position_tests {
+    use super::*;
+
+    /// A peer-supplied `deltax` of `i32::MAX` against a nonzero barrier
+    /// origin must not panic (a plain `bx + deltax` overflow-panics in a
+    /// debug build) and must saturate to `i32::MAX`, not wrap around to a
+    /// negative/nonsense position.
+    #[test]
+    fn test_release_cursor_position_saturates_on_max_delta() {
+        let (cx, cy) = release_cursor_position(1000, 2000, i32::MAX, 0);
+        assert_eq!(cx, f64::from(i32::MAX));
+        assert_eq!(cy, f64::from(2000));
+    }
+
+    /// Same on the negative side — `i32::MIN` against a nonzero origin
+    /// saturates to `i32::MIN` instead of overflow-panicking or wrapping
+    /// positive.
+    #[test]
+    fn test_release_cursor_position_saturates_on_min_delta() {
+        let (cx, cy) = release_cursor_position(-1000, -2000, i32::MIN, i32::MIN);
+        assert_eq!(cx, f64::from(i32::MIN));
+        assert_eq!(cy, f64::from(i32::MIN));
+    }
+
+    /// Ordinary in-range deltas are unaffected by the saturating change.
+    #[test]
+    fn test_release_cursor_position_ordinary_delta_unchanged() {
+        let (cx, cy) = release_cursor_position(100, 200, 50, -30);
+        assert_eq!(cx, 150.0);
+        assert_eq!(cy, 170.0);
+    }
 }

@@ -761,7 +761,13 @@ impl Plugin for NotificationPlugin {
                 if let DesktopAction::Replace(replaces_id) = action {
                     builder.id(replaces_id);
                 }
-                match builder.show() {
+                // `show()` does a blocking zbus round trip (the sync xdg
+                // backend spins up its own connection); calling it inline
+                // here blocks the tokio worker thread running this async
+                // handler for the duration of the D-Bus call. `show_async`
+                // does the same round trip over the async zbus connection
+                // instead, so the await point actually yields.
+                match builder.show_async().await {
                     Ok(handle) => {
                         if !id.is_empty() {
                             self.dedupe_record_shown(device_id, id, handle.id());

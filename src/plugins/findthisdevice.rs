@@ -172,18 +172,30 @@ impl Plugin for FindThisDevicePlugin {
 /// Real backend: best-effort default-sink unmute, play the bundled alarm
 /// with the first available player, restore the mute afterwards.
 struct ProcessRingBackend {
-    alarm_file: std::sync::Mutex<Option<Arc<tempfile::NamedTempFile>>>,
+    // `Arc`-wrapped (not a bare `std::sync::Mutex` field) so `ring()` can
+    // clone a 'static handle and hand it to `spawn_blocking` — the
+    // temp-file creation + write is blocking I/O and must not run
+    // directly on the async task (see `alarm_path_blocking`'s doc).
+    alarm_file: Arc<std::sync::Mutex<Option<Arc<tempfile::NamedTempFile>>>>,
 }
 
 impl ProcessRingBackend {
     fn new() -> Self {
         Self {
-            alarm_file: std::sync::Mutex::new(None),
+            alarm_file: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
-    fn alarm_path(&self) -> Option<PathBuf> {
-        let mut guard = self.alarm_file.lock().unwrap_or_else(|e| e.into_inner());
+    /// Free function (not `&self`) so it can be moved into
+    /// `tokio::task::spawn_blocking` with only an owned `Arc` clone of
+    /// the cache, not a borrow of `self` — `spawn_blocking`'s closure
+    /// must be `'static`. Creates and writes the alarm temp file on
+    /// first use (blocking `tempfile`/`std::fs::write`), then caches the
+    /// handle for every ring after.
+    fn alarm_path_blocking(
+        alarm_file: &std::sync::Mutex<Option<Arc<tempfile::NamedTempFile>>>,
+    ) -> Option<PathBuf> {
+        let mut guard = alarm_file.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref tf) = *guard {
             return Some(tf.path().to_path_buf());
         }
@@ -288,10 +300,26 @@ fn which_exists(bin: &str) -> bool {
 #[async_trait::async_trait]
 impl RingBackend for ProcessRingBackend {
     async fn ring(&self) -> bool {
-        let Some((player, args)) = Self::player() else {
+        // Both lookups are blocking (`which_exists` shells out to `which`
+        // per candidate; the alarm path may create + write a temp file):
+        // run them on the blocking thread pool instead of inline on this
+        // async task. `ring()` already runs inside a `tokio::spawn`ed
+        // task (see `handle_packet`), so this doesn't block a packet
+        // handler directly, but it still parks a runtime worker thread
+        // for the duration of every `which` invocation and the first
+        // temp-file write.
+        let Some((player, args)) = tokio::task::spawn_blocking(Self::player)
+            .await
+            .unwrap_or(None)
+        else {
             return false;
         };
-        let Some(alarm) = self.alarm_path() else {
+        let alarm_file = self.alarm_file.clone();
+        let Some(alarm) =
+            tokio::task::spawn_blocking(move || Self::alarm_path_blocking(&alarm_file))
+                .await
+                .unwrap_or(None)
+        else {
             return false;
         };
 

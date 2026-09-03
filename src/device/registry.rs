@@ -53,6 +53,14 @@ pub struct DeviceRegistry {
     /// see that method's doc) as a fallback. Documented, accepted
     /// degradation: production always wires the handle.
     paired_ids: Option<PairedIds>,
+    /// Serializes `save_to_disk` snapshot+write+rename. Without it,
+    /// concurrent callers (e.g. two devices reaching `Paired` back to
+    /// back) each write their own snapshot to the SAME `path.with_extension
+    /// ("tmp")` and rename over each other — the loser's rename can land
+    /// after the winner's, silently discarding whichever snapshot lost the
+    /// race, or a reader can open the temp path mid-write. One lock per
+    /// registry makes the whole sequence atomic relative to itself.
+    save_lock: tokio::sync::Mutex<()>,
 }
 
 impl Default for DeviceRegistry {
@@ -67,6 +75,7 @@ impl DeviceRegistry {
             devices: Arc::new(RwLock::new(HashMap::new())),
             persist_path: None,
             paired_ids: None,
+            save_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -75,6 +84,7 @@ impl DeviceRegistry {
             devices: Arc::new(RwLock::new(HashMap::new())),
             persist_path: Some(persist_path),
             paired_ids: None,
+            save_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -292,6 +302,15 @@ impl DeviceRegistry {
             Some(p) => p.clone(),
             None => return Err(Error::ConfigError("No persist path configured".to_string())),
         };
+
+        // Serialize the whole snapshot+write+rename sequence. Two
+        // concurrent callers otherwise race on the SAME `path.with_extension
+        // ("tmp")`: one's `write` can land between the other's `write` and
+        // `rename`, or the renames themselves can interleave, silently
+        // dropping whichever snapshot lost. Held for the duration of this
+        // call (not just the rename) so the file on disk always matches one
+        // caller's own snapshot, never an interleaving of two.
+        let _save_guard = self.save_lock.lock().await;
 
         let devices = self.devices.read().await;
         // Gate on TRUE pairing, not `Device::is_paired()` — that method
@@ -568,6 +587,54 @@ mod tests {
         assert_eq!(registry2.count().await, 2);
         assert!(registry2.contains(&"dev-1".to_string()).await);
         assert!(registry2.contains(&"dev-2".to_string()).await);
+        Ok(())
+    }
+
+    /// 50 concurrent `save_to_disk` calls on one registry share the SAME
+    /// `path.with_extension("tmp")` temp file. Pre-fix, each call's
+    /// write+rename runs unsynchronized: one caller's write can land
+    /// between another's write and rename, or renames can interleave, so
+    /// `devices.json` can end up truncated, mid-write, or simply missing
+    /// the device — a `serde_json::from_str` that errors, or a successful
+    /// parse with an empty map, both demonstrate the race. The
+    /// `save_lock` fix serializes the whole snapshot+write+rename
+    /// sequence so every one of the 50 calls leaves a fully-formed file
+    /// containing the one paired device.
+    #[tokio::test]
+    async fn test_concurrent_save_to_disk_produces_valid_file() -> anyhow::Result<()> {
+        let temp = tempfile::TempDir::new().expect("Value expected to be present");
+        let path = temp.path().join("devices.json");
+
+        let registry = Arc::new(DeviceRegistry::with_persistence(path.clone()));
+        let mut d1 = test_device("dev-1");
+        d1.state = DeviceState::Paired;
+        d1.paired_at = Some(chrono::Utc::now());
+        registry
+            .add(d1)
+            .await
+            .expect("Value expected to be present");
+
+        let mut handles = Vec::new();
+        for _ in 0..50 {
+            let registry = registry.clone();
+            handles.push(tokio::spawn(async move {
+                registry.save_to_disk().await.expect("save_to_disk failed");
+            }));
+        }
+        for h in handles {
+            h.await.expect("save task panicked");
+        }
+
+        let data = tokio::fs::read_to_string(&path)
+            .await
+            .expect("devices.json should exist after 50 concurrent saves");
+        let parsed: HashMap<DeviceId, Device> =
+            serde_json::from_str(&data).expect("devices.json must parse as valid JSON");
+        assert!(
+            parsed.contains_key("dev-1"),
+            "devices.json must still contain dev-1 after concurrent saves, got: {:?}",
+            parsed.keys().collect::<Vec<_>>()
+        );
         Ok(())
     }
 
