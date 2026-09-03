@@ -13,11 +13,13 @@ the existing KDE Connect Android app.
 - KDE Connect protocol on the LAN: UDP and mDNS discovery, TCP transport,
   TLS 1.2 with TOFU pinning, SAS pairing, byte-compatible with the Android
   app.
-- 24 plugins wired end-to-end: ping, battery, notification, sms,
+- 25 plugins wired end-to-end: ping, battery, notification, sms,
   clipboard, share, mpris, telephony, pausemusic, connectivity, sftp,
   mousepad, lock, systemvolume, findmyphone, findthisdevice, presenter,
   contacts, runcommand, sendnotifications, remotekeyboard, digitizer,
-  screensaver-inhibit, remotecommands.
+  screensaver-inhibit, remotecommands, shareinputdevices (InputCapture
+  portal producer + libei transport). The remotecontrol pointer producer
+  (desktop to phone) shipped 2026-08-26.
 - REST API (`/api/v1/`) as the single control surface, with an SSE event
   stream at `/api/v1/events`; the primary consumers are automated agents.
 - A CLI client on top of that API (`status`, `devices`, `pair`, `unpair`,
@@ -58,10 +60,10 @@ peer, upstream-derived fixture, or applicable environment proves the behavior.
 
 ## Next
 
-- Sprint 3 of the functional-completeness plan: audit and implement the
-  remaining upstream feature union (remotecontrol, shareinputdevices,
-  virtualmonitor), and build the kdeconnectd independent-peer interop
-  harness that announcement claims require.
+- Sprint 3 of the functional-completeness plan: remotecontrol and
+  shareinputdevices landed (2026-08-23 and 08-26); virtualmonitor is the
+  remaining upstream feature. The kdeconnectd independent-peer interop
+  harness (`tests/interop/`) exists and is source-pinned.
 - Then Sprint 4 (device/desktop/soak matrices) and Sprint 5 (evidence
   closure as a release gate). Sprints 0–2 are complete: the ledger exists
   and is lint-enforced, advertised features have their desktop effects,

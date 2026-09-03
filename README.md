@@ -275,7 +275,7 @@ src/
   cli/               clap CLI and the client-mode subcommands
   device/            Device registry, lifecycle, event broadcasting
   protocol/          KDE Connect protocol (discovery, connection, pairing, packet, router, crypto, connection_loop, listener, payload_transfer)
-  plugins/           Plugin system, 24 plugins (ping, battery, notification, sms, clipboard, share, mpris, telephony, pausemusic, connectivity, sftp, mousepad, lock, systemvolume, findmyphone, findthisdevice, presenter, contacts, runcommand, sendnotifications, remotekeyboard, digitizer, screensaver_inhibit, remotecommands)
+  plugins/           Plugin system, 25 plugins (ping, battery, notification, sms, clipboard, share, mpris, telephony, pausemusic, connectivity, sftp, mousepad, lock, systemvolume, findmyphone, findthisdevice, presenter, contacts, runcommand, sendnotifications, remotekeyboard, digitizer, screensaver_inhibit, remotecommands, shareinputdevices)
   services/          Service manager and connection orchestration
   config/            Settings
   utils/             Errors, logging

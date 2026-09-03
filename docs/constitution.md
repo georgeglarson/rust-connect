@@ -36,7 +36,7 @@ SRP is the primary organizing principle. Every module, struct, and function has 
 - **Layers don't skip.** `api` → `app` → `protocol`. Never `api` → `protocol` directly. Each layer translates between the layer above and the layer below.
 - **Dependencies flow down.** Higher layers depend on lower layers. Lower layers never depend on higher layers. If `protocol` needs something from `api`, extract an interface in `protocol` that `api` implements.
 - **No circular references.** If A imports B and B imports A, extract a shared interface or move the shared concept to a third module.
-- **Files ≤ 500 lines** (production code, excluding tests). This is not arbitrary — it's the natural result of SRP. If a file exceeds this, it has more than one responsibility.
+- **Files ≤ 500 lines** (production code, excluding tests) is the target, not an enforced gate. This is the natural result of SRP: a file past it usually has more than one responsibility. Known exceptions as of 2026-09-02: `api/handlers/device.rs` (~1100 lines) and `plugins/mpris/mod.rs` (~2900 lines); new code must not add to that list, and a change that touches one of them should split before it grows.
 - **Functions ≤ 50 lines.** Same logic. A 200-line function is doing multiple things.
 - **Max 3 levels of indentation.** Deep nesting means the function is tracking multiple concerns simultaneously. Extract.
 

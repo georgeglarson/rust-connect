@@ -82,5 +82,11 @@ documented here so reviewers do not file them as bugs. See
   `payloadSize`.
 - REST API key authentication with constant-time comparison; key file
   written with owner-only permissions.
-- systemd hardening directives in `packaging/rust-connect.service`
-  (`NoNewPrivileges`, `ProtectSystem=strict`, and friends).
+- systemd hardening directives in `packaging/rust-connect.service`:
+  `ProtectSystem=strict` with explicit `ReadWritePaths`, `PrivateTmp`,
+  `ProtectKernelTunables/Modules/Logs`, `ProtectControlGroups`,
+  `ProtectClock`, `ProtectHostname`, `RestrictNamespaces`,
+  `RestrictRealtime`, `RestrictAddressFamilies`, a `SystemCallFilter`
+  allowlist, and `DeviceAllow` limited to `/dev/uinput` and `/dev/fuse`.
+  `NoNewPrivileges` is deliberately OFF: SFTP mounts go through the
+  setuid `fusermount3`, which `NoNewPrivileges=yes` would block.

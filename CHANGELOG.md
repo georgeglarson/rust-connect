@@ -42,11 +42,11 @@ than a delta against a previous version.
 - KDE Connect protocol on the LAN: UDP discovery, TCP transport, TLS 1.2
   with mutual authentication and TOFU certificate pinning, and SAS pairing
   byte-compatible with the Android app's `PairingHandler`.
-- 24 plugins: ping, battery, notification, sms, clipboard, share, mpris,
+- 25 plugins: ping, battery, notification, sms, clipboard, share, mpris,
   telephony, pausemusic, connectivity, sftp, mousepad, lock, systemvolume,
   findmyphone, findthisdevice, presenter, contacts, runcommand,
-  sendnotifications, remotekeyboard, digitizer, screensaver-inhibit, and
-  remotecommands.
+  sendnotifications, remotekeyboard, digitizer, screensaver-inhibit,
+  remotecommands, and shareinputdevices.
 - Real desktop integration for clipboard (wl-clipboard, both directions
   with echo suppression) and MPRIS (zbus on the session bus, player
   discovery plus play/pause/seek/volume relay). Both degrade to a logged
