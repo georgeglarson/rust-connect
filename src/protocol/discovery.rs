@@ -10,6 +10,7 @@
 use socket2::{Domain, Protocol, Socket, Type as SockType};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::net::UdpSocket;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::protocol::packet::PacketSerializer;
@@ -332,19 +333,28 @@ impl DiscoveryService {
     /// tokio::spawn(async move {
     ///     service.start_listening(|identity, addr| {
     ///         println!("Discovered: {} at {}", identity.device_name, addr);
-    ///     }).await;
+    ///     }, tokio_util::sync::CancellationToken::new()).await;
     /// });
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn start_listening<F>(&self, mut callback: F)
+    pub async fn start_listening<F>(&self, mut callback: F, shutdown: CancellationToken)
     where
         F: FnMut(Identity, SocketAddr),
     {
         info!(event = "listening_started", "Started listening for devices");
 
         loop {
-            match self.listen().await {
+            // A4 (2026-09-02 audit): a bare loop here never ended, and every
+            // daemon stop paid a 5 s join timeout for it.
+            let result = tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!(event = "listening_stopped", "Discovery listener stopped on shutdown");
+                    return;
+                }
+                result = self.listen() => result,
+            };
+            match result {
                 Ok((identity, addr)) => {
                     callback(identity, addr);
                 }

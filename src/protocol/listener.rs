@@ -39,7 +39,7 @@ impl TcpListenerService {
         Self { state, identity }
     }
 
-    pub async fn run(&self) -> Result<(), std::io::Error> {
+    pub async fn run(&self, shutdown: CancellationToken) -> Result<(), std::io::Error> {
         let preferred_port = self.state.settings.tcp_port;
         let (listener, actual_port) = Self::bind_port(preferred_port).await?;
         info!(
@@ -48,28 +48,7 @@ impl TcpListenerService {
             event = "tcp_listener_ready",
             "TCP listener bound for incoming device connections"
         );
-
-        let inbound_slots = Arc::new(Semaphore::new(MAX_INBOUND_CONNECTIONS));
-        loop {
-            match listener.accept().await {
-                Ok((stream, addr)) => {
-                    info!(peer = %addr, event = "tcp_connection_received", "Incoming TCP connection");
-                    let Some(permit) = try_acquire_inbound_slot(&inbound_slots) else {
-                        warn!(peer = %addr, event = "inbound_connection_dropped_at_cap", "Inbound handler cap reached, dropping connection");
-                        continue;
-                    };
-                    let state = self.state.clone();
-                    let identity = self.identity.clone();
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        Self::handle_connection(state, stream, addr, identity).await;
-                    });
-                }
-                Err(e) => {
-                    warn!(error = %e, event = "tcp_accept_failed", "Failed to accept TCP connection");
-                }
-            }
-        }
+        self.run_from_bound(listener, shutdown).await
     }
 
     pub async fn bind_port(preferred: u16) -> Result<(TcpListener, u16), std::io::Error> {
@@ -86,7 +65,11 @@ impl TcpListenerService {
             })
     }
 
-    pub async fn run_from_bound(&self, listener: TcpListener) -> Result<(), std::io::Error> {
+    pub async fn run_from_bound(
+        &self,
+        listener: TcpListener,
+        shutdown: CancellationToken,
+    ) -> Result<(), std::io::Error> {
         info!(
             event = "tcp_listener_ready",
             "TCP listener running from pre-bound socket"
@@ -94,7 +77,16 @@ impl TcpListenerService {
 
         let inbound_slots = Arc::new(Semaphore::new(MAX_INBOUND_CONNECTIONS));
         loop {
-            match listener.accept().await {
+            // A4 (2026-09-02 audit): a bare accept loop never ended, and
+            // every daemon stop paid a 5 s join timeout for it.
+            let accepted = tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!(event = "tcp_listener_stopped", "TCP listener stopped on shutdown");
+                    return Ok(());
+                }
+                accepted = listener.accept() => accepted,
+            };
+            match accepted {
                 Ok((stream, addr)) => {
                     info!(peer = %addr, event = "tcp_connection_received", "Incoming TCP connection");
                     let Some(permit) = try_acquire_inbound_slot(&inbound_slots) else {

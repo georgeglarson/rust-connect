@@ -112,11 +112,15 @@ async fn start_discovery(
 
     let state_clone = state.clone();
     let discovery_listen = discovery.clone();
+    let listen_shutdown = shutdown.clone();
     let listen_handle = tokio::spawn(async move {
         discovery_listen
-            .start_listening(move |remote_identity, addr| {
-                on_device_discovered(state_clone.clone(), remote_identity, addr)
-            })
+            .start_listening(
+                move |remote_identity, addr| {
+                    on_device_discovered(state_clone.clone(), remote_identity, addr)
+                },
+                listen_shutdown,
+            )
             .await;
     });
 
@@ -315,12 +319,12 @@ fn start_tcp_listener(
     state: &Arc<AppState>,
     listener: tokio::net::TcpListener,
     identity: Identity,
-    _shutdown: CancellationToken,
+    shutdown: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let state = state.clone();
     Some(tokio::spawn(async move {
         let svc = crate::protocol::listener::TcpListenerService::new(state, identity);
-        if let Err(e) = svc.run_from_bound(listener).await {
+        if let Err(e) = svc.run_from_bound(listener, shutdown).await {
             warn!(error = %e, event = "tcp_listener_error", "TCP listener error");
         }
     }))
@@ -328,7 +332,7 @@ fn start_tcp_listener(
 
 async fn start_api_server(
     state: &Arc<AppState>,
-    _shutdown: CancellationToken,
+    shutdown: CancellationToken,
 ) -> Result<Option<tokio::task::JoinHandle<()>>> {
     if !state.settings.api_enabled {
         return Ok(None);
@@ -365,10 +369,13 @@ async fn start_api_server(
     Ok(Some(tokio::spawn(async move {
         // into_make_service_with_connect_info provides ConnectInfo<SocketAddr>;
         // the rate limiter buckets per client IP and breaks without it.
+        // A4 (2026-09-02 audit): without graceful shutdown this task never
+        // ended and every daemon stop paid a 5 s join timeout for it.
         if let Err(e) = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
         {
             tracing::error!(error = %e, event = "api_server_failed", "API server stopped");
@@ -438,6 +445,38 @@ mod tests {
             .to_string()
             .contains("another rust-connect instance is already running"));
     }
+    /// A4 (2026-09-02 audit): every stop of the daemon took exactly 15 s
+    /// because the discovery listen loop, the TCP accept loop and the API
+    /// server never observed the shutdown token, so `stop_services` burned
+    /// three 5 s join timeouts before persisting anything. A cancelled
+    /// token must bring every service task home promptly.
+    #[tokio::test]
+    async fn test_stop_services_returns_promptly_after_shutdown() {
+        let (base_state, _t) = test_state();
+        let mut settings = base_state.settings.clone();
+        settings.tcp_port = 0;
+        settings.udp_port = 0;
+        settings.api_bind = "127.0.0.1".to_string();
+        settings.api_port = 0;
+        let state =
+            Arc::new(AppState::new_without_input(settings).expect("Value expected to be present"));
+        state.connection_manager.set_device_identity(OUR_ID, "Us");
+        let shutdown = CancellationToken::new();
+
+        let handles = start_services(state.clone(), peer_identity(0), shutdown.clone())
+            .await
+            .expect("services must start on ephemeral ports");
+
+        shutdown.cancel();
+        let started = std::time::Instant::now();
+        stop_services(handles, &state).await;
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "stop_services took {took:?}; the service tasks are not observing the shutdown token"
+        );
+    }
+
     #[tokio::test]
     async fn test_mdns_resolve_unknown_device_registers_and_dials() {
         let (state, _t) = test_state();
