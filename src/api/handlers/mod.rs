@@ -31,7 +31,13 @@ use crate::app::AppState;
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
-        "uptime_seconds": state.started_at.elapsed().as_secs()
+        "uptime_seconds": state.started_at.elapsed().as_secs(),
+        // vk #973: lets a lint compare the running daemon to origin/main.
+        "build": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "git_sha": crate::GIT_SHA,
+            "dirty": env!("RC_GIT_DIRTY") == "1"
+        }
     }))
 }
 

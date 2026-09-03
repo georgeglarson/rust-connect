@@ -36,7 +36,7 @@ const MAX_SHARE_FILE_BYTES: u64 = 100 * 1024 * 1024;
 #[derive(Parser, Debug)]
 #[command(
     name = "rust-connect",
-    version,
+    version = crate::BUILD_VERSION,
     about = "A modern, API-first reimplementation of KDE Connect in Rust"
 )]
 pub struct Cli {
