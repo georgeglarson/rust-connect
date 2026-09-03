@@ -293,24 +293,7 @@ impl SftpPlugin {
 
     /// `Mounter::unmount` counterpart of `mount_via_mounter_tracked` —
     /// see its doc for why this exists instead of calling
-    /// `Mounter::unmount` directly. Kept for `startup_sweep`, which runs
-    /// before any connection exists and needs no device-lock handoff.
-    async fn unmount_via_mounter(&self, mp: PathBuf) -> Result<UnmountOutcome> {
-        let mounter = self.mounter.clone();
-        let join = tokio::task::spawn_blocking(move || mounter.unmount(&mp));
-        match tokio::time::timeout(self.mount_timeout, join).await {
-            Ok(join_result) => {
-                join_result.map_err(|e| Error::Internal(format!("unmount task panicked: {e}")))?
-            }
-            Err(_elapsed) => Ok(UnmountOutcome::Failed(format!(
-                "fusermount unmount timed out after {}s",
-                self.mount_timeout.as_secs_f64()
-            ))),
-        }
-    }
-
-    /// Tracked variant of `unmount_via_mounter`; see
-    /// `mount_via_mounter_tracked` for why the leftover matters.
+    /// `Mounter::unmount` directly, and why the leftover matters.
     async fn unmount_via_mounter_tracked(
         &self,
         mp: PathBuf,
@@ -556,8 +539,11 @@ impl SftpPlugin {
     /// (or `fusermount -u`) on every `sftp-*` directory left by a
     /// previous crash. Does NOT require sshfs on PATH — a host that
     /// installs the daemon but never sshfs still gets a clean restart.
-    /// Each unmount goes through `unmount_via_mounter`, so one wedged
-    /// leftover costs at most `mount_timeout` of daemon start.
+    /// Each unmount is bounded by `mount_timeout`, so one wedged leftover
+    /// costs at most that much of daemon start. A timed-out unmount keeps
+    /// running in the background, and the sweep keeps the path's device
+    /// lock held until it exits so a later mount cannot race the orphan
+    /// (PR #40 review round 3, cubic-dev P1).
     pub async fn startup_sweep(&self) -> Vec<String> {
         let mounts_dir = self.data_dir.join("mounts");
         let mut released = Vec::new();
@@ -572,7 +558,24 @@ impl SftpPlugin {
                 continue;
             }
             let path = entry.path();
-            let outcome = self.unmount_via_mounter(path.clone()).await;
+            let device_id = s.strip_prefix("sftp-").unwrap_or(&s).to_string();
+            let outcome = match self.acquire_mount_lock(&device_id).await {
+                Ok(guard) => {
+                    let (outcome, leftover) = self.unmount_via_mounter_tracked(path.clone()).await;
+                    Self::hand_lock_to_leftover_task(guard, leftover);
+                    outcome
+                }
+                Err(msg) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %msg,
+                        event = "sftp_sweep_lock_busy",
+                        "Startup sweep skipped a path: mount lock busy"
+                    );
+                    released.push(format!("{}:skipped", path.display()));
+                    continue;
+                }
+            };
             let label = match &outcome {
                 Ok(UnmountOutcome::Unmounted) => {
                     // Best-effort: remove the now-empty dir so the next
@@ -596,6 +599,29 @@ impl SftpPlugin {
         device_id: &str,
         info: &SftpConnectionInfo,
     ) -> Result<MountStatus> {
+        // Acquire the device's mount lock BEFORE checking state: another
+        // cleanup can change the state between a check and the lock, and
+        // remounting a device that is no longer mounted would resurrect
+        // a dead session (PR #40 review round 3, cubic-dev P1). Then
+        // hold the lock across the WHOLE unmount + remount: any gap
+        // between them lets a disconnect cleanup or a second mount
+        // interleave on the same path (PR #40 review round 2,
+        // cubic-dev P2). Tear down the stale mount first; we
+        // deliberately ignore its outcome (it may be in a half-torn-down
+        // state from the phone's side) and let the new mount attempt
+        // speak for itself.
+        let remount_guard = match self.acquire_mount_lock(device_id).await {
+            Ok(guard) => guard,
+            Err(msg) => {
+                let state = MountState::Failed(msg);
+                self.set_mount_state(device_id, state.clone());
+                self.broadcast_update(device_id, info, &state, None);
+                return Ok(MountStatus {
+                    state,
+                    mount_point: None,
+                });
+            }
+        };
         let currently_mounted = matches!(
             self.get_mount_status(device_id).state,
             MountState::Mounted | MountState::Mounting
@@ -603,23 +629,6 @@ impl SftpPlugin {
         if !currently_mounted {
             return Ok(self.get_mount_status(device_id));
         }
-        // Hold the device's mount lock across the WHOLE unmount +
-        // remount: any gap between them lets a disconnect cleanup or a
-        // second mount interleave on the same path (PR #40 review
-        // round 2, cubic-dev P2). Tear down the stale mount first; we
-        // deliberately ignore its outcome (it may be in a half-torn-down
-        // state from the phone's side) and let the new mount attempt
-        // speak for itself.
-        let remount_guard = match self.acquire_mount_lock(device_id).await {
-            Ok(guard) => guard,
-            Err(msg) => {
-                self.set_mount_state(device_id, MountState::Failed(msg.clone()));
-                return Ok(MountStatus {
-                    state: MountState::Failed(msg),
-                    mount_point: None,
-                });
-            }
-        };
         let (unmount_outcome, leftover) = self
             .unmount_via_mounter_tracked(self.mount_point(device_id))
             .await;
@@ -628,14 +637,18 @@ impl SftpPlugin {
             // The old unmount is still draining on the blocking pool;
             // remounting now could be released by the orphan. Keep the
             // lock held until it exits and report the failure.
-            let msg = format!(
+            let state = MountState::Failed(format!(
                 "remount skipped: previous unmount still draining after {}s",
                 self.mount_timeout.as_secs_f64()
-            );
-            self.set_mount_state(device_id, MountState::Failed(msg.clone()));
+            ));
+            self.set_mount_state(device_id, state.clone());
+            // Subscribed clients hold the previous mounted view; the
+            // failure must reach them like every other transition
+            // (PR #40 review round 3, cubic-dev P3).
+            self.broadcast_update(device_id, info, &state, None);
             Self::hand_lock_to_leftover_task(remount_guard, leftover);
             return Ok(MountStatus {
-                state: MountState::Failed(msg),
+                state,
                 mount_point: None,
             });
         }
@@ -2075,6 +2088,174 @@ mod tests {
             status.state
         );
         drop(busy);
+    }
+
+    /// PR #40 review round 3 (cubic-dev P1): a startup-sweep unmount that
+    /// timed out keeps running after the sweep returns; the sweep must
+    /// keep the path excluded until it exits, so a new connection's mount
+    /// waits for the drain instead of being released by the late
+    /// fusermount.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_sweep_timeout_keeps_path_excluded_until_orphan_exits() {
+        /// Records mount/unmount phase order and sleeps like a slow
+        /// fusermount so the sweep times out while the unmount runs.
+        struct OrderingRunner {
+            events: Arc<Mutex<Vec<&'static str>>>,
+            sleep_for: std::time::Duration,
+        }
+
+        impl CommandRunner for OrderingRunner {
+            fn which(&self, name: &str) -> Option<PathBuf> {
+                Some(PathBuf::from(format!("/usr/bin/{name}")))
+            }
+
+            fn run_with_stdin(
+                &self,
+                _program: &Path,
+                args: &[OsString],
+                _stdin: Option<&str>,
+            ) -> Result<CommandOutput> {
+                let is_mount = args.iter().any(|a| a.to_string_lossy().contains('@'));
+                let (start, end) = if is_mount {
+                    ("mount-start", "mount-end")
+                } else {
+                    ("unmount-start", "unmount-end")
+                };
+                self.events.lock().unwrap().push(start);
+                std::thread::sleep(self.sleep_for);
+                self.events.lock().unwrap().push(end);
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        // 300 ms unmount, 200 ms mount_timeout: the sweep returns at
+        // ~200 ms while the orphan drains until ~300 ms.
+        let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let plugin = Arc::new(
+            SftpPlugin::with_mounter(
+                Arc::new(crate::plugins::events::PluginEventBroadcaster::new(
+                    8, "test",
+                )),
+                dir.path().to_path_buf(),
+                Arc::new(OrderingRunner {
+                    events: events.clone(),
+                    sleep_for: std::time::Duration::from_millis(300),
+                }),
+            )
+            .with_mount_timeout(std::time::Duration::from_millis(200)),
+        );
+        std::fs::create_dir_all(dir.path().join("mounts").join("sftp-dev1"))
+            .expect("leftover mount dir");
+
+        let released = plugin.startup_sweep().await;
+        assert!(
+            released.iter().any(|r| r.ends_with(":failed")),
+            "expected the timed-out sweep unmount to report failed: {released:?}"
+        );
+
+        // The orphan still owns the path; a new connection's mount must
+        // wait for it instead of racing it.
+        plugin
+            .mount_device("dev1", &sample_info())
+            .await
+            .expect("mount after drain");
+        let ev = events.lock().unwrap();
+        let mount_start = ev
+            .iter()
+            .position(|e| *e == "mount-start")
+            .expect("mount ran");
+        let unmount_end = ev
+            .iter()
+            .position(|e| *e == "unmount-end")
+            .expect("unmount ran");
+        assert!(
+            mount_start > unmount_end,
+            "new mount raced the sweep's orphaned unmount: {ev:?}"
+        );
+    }
+
+    /// PR #40 review round 3 (cubic-dev P1): re_mount_if_mounted checked
+    /// the state before acquiring the device lock; another cleanup could
+    /// unmount the device in between and the rotation would resurrect a
+    /// dead session. The state check must happen under the lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn re_mount_stands_down_when_state_changed_before_lock() {
+        let runner = ScriptedRunner::always_succeed();
+        let argv_log = runner.argv_log.clone();
+        let (plugin, _d) = test_plugin_with_runner(runner);
+        let plugin = Arc::new(plugin);
+        plugin.set_mount_state("dev1", MountState::Mounted);
+
+        // Hold the device lock so re_mount blocks on acquisition.
+        let busy = plugin.mount_lock_for("dev1").lock_owned().await;
+        let p = plugin.clone();
+        let info = sample_info();
+        let task = tokio::spawn(async move { p.re_mount_if_mounted("dev1", &info).await });
+        // While it waits, another cleanup unmounts the device.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        plugin.set_mount_state("dev1", MountState::Unmounted);
+        drop(busy);
+
+        let status = task.await.expect("re_mount completes").expect("status");
+        assert!(
+            matches!(status.state, MountState::Unmounted),
+            "expected the current (unmounted) state, got {:?}",
+            status.state
+        );
+        let log = argv_log.lock().unwrap();
+        assert!(
+            log.is_empty(),
+            "re_mount touched the mount path of an already-unmounted device: {log:?}"
+        );
+    }
+
+    /// PR #40 review round 3 (cubic-dev P3): the remount abort path
+    /// (previous unmount still draining) must broadcast the Failed state
+    /// like every other transition.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remount_abort_broadcasts_failed_state() {
+        let broadcaster = Arc::new(crate::plugins::events::PluginEventBroadcaster::new(
+            8, "test",
+        ));
+        let mut events_rx = broadcaster.subscribe();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let plugin = SftpPlugin::with_mounter(
+            broadcaster.clone(),
+            dir.path().to_path_buf(),
+            Arc::new(SleepyRunner {
+                sleep_for: std::time::Duration::from_millis(300),
+            }),
+        )
+        .with_mount_timeout(std::time::Duration::from_millis(50));
+        plugin.set_mount_state("dev1", MountState::Mounted);
+
+        let status = plugin
+            .re_mount_if_mounted("dev1", &sample_info())
+            .await
+            .expect("status");
+        let failed_draining = match &status.state {
+            MountState::Failed(msg) => msg.contains("still draining"),
+            _ => false,
+        };
+        assert!(
+            failed_draining,
+            "expected draining abort, got {:?}",
+            status.state
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("the Failed state must be broadcast")
+            .expect("event");
+        assert!(
+            matches!(event, PluginEvent::SftpUpdate { ref device_id, mounted: false, .. } if device_id == "dev1"),
+            "expected an SftpUpdate for dev1, got {event:?}"
+        );
     }
 
     /// PR #40 review round 2 (cubic-dev P2): device ids arrive from the
