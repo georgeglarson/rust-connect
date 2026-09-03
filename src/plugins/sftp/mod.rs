@@ -104,6 +104,10 @@ pub struct SftpPlugin {
     /// the test-only `with_mount_timeout` so a timeout test doesn't need
     /// to sleep for the real 10s production budget.
     mount_timeout: std::time::Duration,
+    /// Per-device lock serializing the disconnect cleanup and a
+    /// replacement mount: both operate on the same `sftp-<device>` path
+    /// (PR #40 review). One entry per device id, created on first use.
+    mount_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl Default for SftpPlugin {
@@ -159,6 +163,7 @@ impl SftpPlugin {
             plugin_events,
             connection_manager: None,
             mount_timeout: MOUNT_TIMEOUT,
+            mount_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -299,6 +304,13 @@ impl SftpPlugin {
             path: info.path.clone(),
             mount_point: mp.clone(),
         };
+        // Serialize with a disconnect cleanup racing for the same path:
+        // the cleanup unmounts under this same lock, so a reconnect's
+        // mount either precedes it (and the cleanup sees the live
+        // connection and stands down) or follows it (and mounts a clean
+        // path) — it never overlaps the unmount (PR #40 review).
+        let mount_lock = self.mount_lock_for(device_id);
+        let _mount_guard = mount_lock.lock().await;
         // Transition to Mounting FIRST so a concurrent mount request sees
         // the right state.
         self.set_mount_state(device_id, MountState::Mounting);
@@ -446,8 +458,35 @@ impl SftpPlugin {
         }
     }
 
+    fn mount_lock_for(&self, device_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.mount_locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(device_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     async fn cleanup_mount_on_disconnect(&self, device_id: &str, live_mount: bool) {
         let mp = mount_point_for(&self.data_dir, device_id);
+        let cleanup_lock = self.mount_lock_for(device_id);
+        let _cleanup_guard = cleanup_lock.lock().await;
+        // The registry awaits plugins sequentially, so this cleanup can be
+        // delayed behind other plugins' handlers — long enough for the
+        // device to reconnect and even re-mount. If a live connection
+        // exists for the device now, this cleanup belongs to a stale
+        // teardown: the newer session owns the mount path, and unmounting
+        // here would release its live mount (PR #40 review, cubic-dev P1).
+        if let Some(cm) = &self.connection_manager {
+            let id = device_id.to_string();
+            if cm.get_generation(&id).await.is_some() {
+                debug!(
+                    device_id = %device_id,
+                    event = "sftp_disconnect_cleanup_superseded",
+                    "Disconnect cleanup superseded by a newer connection; leaving the mount alone"
+                );
+                return;
+            }
+        }
         if !live_mount {
             self.set_mount_state(device_id, MountState::Unmounted);
             debug!(
@@ -1635,6 +1674,129 @@ mod tests {
         assert_eq!(
             plugin.get_mount_status("device1").state,
             MountState::Unmounted
+        );
+    }
+
+    /// PR #40 review (cubic-dev P1): a device that reconnects while the old
+    /// connection's disconnect cleanup is still pending mounts the same
+    /// `sftp-<device>` path. The stale cleanup must recognize the newer
+    /// connection superseded it and stand down — unmounting would release
+    /// the replacement's live mount.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnect_cleanup_does_not_unmount_a_replacement_mount() {
+        // LINK_PEER_ID holds a live link: the device already reconnected
+        // before the old teardown's cleanup gets to run.
+        let (cm, _server, _t) = cm_with_live_link().await;
+        let runner = ScriptedRunner::always_succeed();
+        let argv_log = runner.argv_log.clone();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let plugin = SftpPlugin::with_mounter(
+            Arc::new(crate::plugins::events::PluginEventBroadcaster::new(
+                8, "test",
+            )),
+            dir.path().to_path_buf(),
+            Arc::new(runner),
+        )
+        .with_connection_manager(cm);
+        plugin.set_mount_state(LINK_PEER_ID, MountState::Mounted);
+        std::fs::create_dir_all(plugin.mount_point(LINK_PEER_ID)).expect("mount directory");
+
+        plugin.cleanup_mount_on_disconnect(LINK_PEER_ID, true).await;
+
+        assert_eq!(
+            plugin.get_mount_status(LINK_PEER_ID).state,
+            MountState::Mounted
+        );
+        let log = argv_log.lock().unwrap();
+        assert!(
+            log.is_empty(),
+            "stale disconnect cleanup ran fusermount on the replacement's mount: {log:?}"
+        );
+    }
+
+    /// Same race from the other side: when the disconnect cleanup wins the
+    /// device first, the replacement mount must wait for the in-flight
+    /// unmount instead of mounting into it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacement_mount_waits_for_in_flight_disconnect_unmount() {
+        /// Records mount/unmount phase order and sleeps like a slow
+        /// fusermount so the two operations overlap unless serialized.
+        struct OrderingRunner {
+            events: Arc<Mutex<Vec<&'static str>>>,
+            sleep_for: std::time::Duration,
+        }
+
+        impl CommandRunner for OrderingRunner {
+            fn which(&self, name: &str) -> Option<PathBuf> {
+                Some(PathBuf::from(format!("/usr/bin/{name}")))
+            }
+
+            fn run_with_stdin(
+                &self,
+                _program: &Path,
+                args: &[OsString],
+                _stdin: Option<&str>,
+            ) -> Result<CommandOutput> {
+                let is_mount = args.iter().any(|a| a.to_string_lossy().contains('@'));
+                let (start, end) = if is_mount {
+                    ("mount-start", "mount-end")
+                } else {
+                    ("unmount-start", "unmount-end")
+                };
+                self.events.lock().unwrap().push(start);
+                std::thread::sleep(self.sleep_for);
+                self.events.lock().unwrap().push(end);
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let plugin = Arc::new(
+            SftpPlugin::with_mounter(
+                Arc::new(crate::plugins::events::PluginEventBroadcaster::new(
+                    8, "test",
+                )),
+                dir.path().to_path_buf(),
+                Arc::new(OrderingRunner {
+                    events: events.clone(),
+                    sleep_for: std::time::Duration::from_millis(300),
+                }),
+            )
+            .with_mount_timeout(std::time::Duration::from_secs(5)),
+        );
+        plugin.set_mount_state("dev1", MountState::Mounted);
+
+        // Cleanup starts first and grabs the device's mount lock.
+        let c = plugin.clone();
+        let cleanup = tokio::spawn(async move {
+            c.cleanup_mount_on_disconnect("dev1", true).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        plugin
+            .mount_device("dev1", &sample_info())
+            .await
+            .expect("replacement mount");
+        cleanup.await.expect("cleanup completes");
+
+        assert_eq!(plugin.get_mount_status("dev1").state, MountState::Mounted);
+        let ev = events.lock().unwrap();
+        let mount_start = ev
+            .iter()
+            .position(|e| *e == "mount-start")
+            .expect("mount ran");
+        let unmount_end = ev
+            .iter()
+            .position(|e| *e == "unmount-end")
+            .expect("unmount ran");
+        assert!(
+            mount_start > unmount_end,
+            "replacement mount started before the in-flight unmount finished: {ev:?}"
         );
     }
 }
