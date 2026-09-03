@@ -252,6 +252,36 @@ impl DeviceRegistry {
         devices.values().cloned().collect()
     }
 
+    /// Read-modify-write under ONE write lock (2026-09-02 audit, C2). The
+    /// closure sees the current record and may change it or refuse; a
+    /// concurrent caller sees the result, never the same stale snapshot.
+    /// `get` + `update` as two lock scopes let two callers both validate
+    /// against one snapshot, both report success, and one silently lose.
+    pub async fn modify<T>(
+        &self,
+        id: &DeviceId,
+        f: impl FnOnce(&mut Device) -> Result<T>,
+    ) -> Result<T> {
+        let mut devices = self.devices.write().await;
+        let device = devices
+            .get_mut(id)
+            .ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
+        // The id is the map key (and `Device.id` is public): a closure that
+        // rewrote it would leave the record under the old key with a
+        // different id inside. Refuse and restore (PR #39 review).
+        // Restore the WHOLE record, not just the id: a closure that changed
+        // the id and another field must not half-commit (PR #39 review).
+        let original = device.clone();
+        let result = f(device);
+        if device.id != original.id {
+            *device = original;
+            return Err(Error::InvalidRequest(
+                "DeviceRegistry::modify must not change the device id".to_string(),
+            ));
+        }
+        result
+    }
+
     pub async fn update(&self, device: Device) -> Result<()> {
         let mut devices = self.devices.write().await;
         if !devices.contains_key(&device.id) {
@@ -415,6 +445,31 @@ mod tests {
             DeviceType::Phone,
             7,
         )
+    }
+
+    /// PR #39 review (cubic): `Device.id` is public and is the map key, so a
+    /// `modify` closure that rewrote it would leave the record stored under
+    /// the old key with a different id inside. The change is refused and
+    /// the id restored.
+    #[tokio::test]
+    async fn test_modify_refuses_to_change_the_device_id() -> anyhow::Result<()> {
+        let registry = DeviceRegistry::new();
+        registry.add(test_device("dev-1")).await?;
+        let result = registry
+            .modify(&"dev-1".to_string(), |device| {
+                device.id = "dev-2".to_string();
+                device.name = "renamed".to_string();
+                Ok(())
+            })
+            .await;
+        assert!(result.is_err(), "an id change must be refused");
+        let stored = registry.get(&"dev-1".to_string()).await?;
+        assert_eq!(stored.id, "dev-1", "the stored id must be restored");
+        assert_ne!(
+            stored.name, "renamed",
+            "a refused modify must not half-commit its other changes"
+        );
+        Ok(())
     }
 
     #[tokio::test]
