@@ -61,10 +61,10 @@ pub fn load_default_plugins(
         // entry point (bootstrap.rs create_state), same as clipboard/mpris.
         pausemusic: Arc::new(super::PausemusicPlugin::new()),
         connectivity: Arc::new(super::ConnectivityPlugin::new()),
-        sftp: Arc::new(super::SftpPlugin::with_events_and_data_dir(
-            plugin_events.clone(),
-            data_dir,
-        )),
+        sftp: Arc::new(
+            super::SftpPlugin::with_events_and_data_dir(plugin_events.clone(), data_dir)
+                .with_connection_manager(connection_manager.clone()),
+        ),
         mousepad: Arc::new(mousepad),
         lock: Arc::new(super::LockPlugin::new()),
         // The systemvolume provider side needs the connection manager

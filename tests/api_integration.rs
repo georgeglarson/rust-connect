@@ -10,7 +10,6 @@ use rust_connect::api::build_router;
 use rust_connect::app::AppState;
 use rust_connect::config::settings::AppSettings;
 use rust_connect::device::{Device, DeviceType};
-use rust_connect::plugins::Plugin;
 use utoipa::OpenApi;
 
 async fn create_test_app() -> (Arc<AppState>, tempfile::TempDir, String) {
@@ -570,22 +569,18 @@ async fn test_unpair_drops_sftp_credentials() {
     // Plant pairing + SFTP creds as if the device had connected and
     // sent an sftp packet.
     receive_and_accept_with_cert(&state, device_id).await;
-    let pkt = rust_connect::protocol::types::Packet::new(
-        "kdeconnect.sftp".to_string(),
-        serde_json::json!({
-            "ip": "192.168.1.50",
-            "port": 1740,
-            "user": "kdeconnect",
-            "password": "device-secret-7c3",
-            "path": "/storage/emulated/0"
-        }),
+    state.plugins.sftp.plant_connection_for_test(
+        device_id,
+        rust_connect::plugins::sftp::SftpConnectionInfo {
+            ip: "192.168.1.50".to_string(),
+            port: 1740,
+            user: "kdeconnect".to_string(),
+            password: "device-secret-7c3".to_string(),
+            path: "/storage/emulated/0".to_string(),
+            multi_paths: vec![],
+            path_names: vec![],
+        },
     );
-    state
-        .plugins
-        .sftp
-        .handle_packet(device_id, pkt)
-        .await
-        .expect("handle sftp packet");
     assert!(state.plugins.sftp.get_connection(device_id).is_some());
 
     let app = build_router(state.clone());
@@ -619,22 +614,18 @@ async fn test_unpair_drops_sftp_credentials() {
 async fn test_daemon_shutdown_releases_sftp() {
     let (state, _temp, _api_key) = create_test_app().await;
     let device_id = "shutdown-sftp-aaaaaaaaaaaaaaaaaa";
-    let pkt = rust_connect::protocol::types::Packet::new(
-        "kdeconnect.sftp".to_string(),
-        serde_json::json!({
-            "ip": "192.168.1.51",
-            "port": 1740,
-            "user": "kdeconnect",
-            "password": "shutdown-secret",
-            "path": "/"
-        }),
+    state.plugins.sftp.plant_connection_for_test(
+        device_id,
+        rust_connect::plugins::sftp::SftpConnectionInfo {
+            ip: "192.168.1.51".to_string(),
+            port: 1740,
+            user: "kdeconnect".to_string(),
+            password: "shutdown-secret".to_string(),
+            path: "/".to_string(),
+            multi_paths: vec![],
+            path_names: vec![],
+        },
     );
-    state
-        .plugins
-        .sftp
-        .handle_packet(device_id, pkt)
-        .await
-        .expect("handle sftp packet");
     assert!(state.plugins.sftp.get_connection(device_id).is_some());
 
     state.plugins.sftp.cleanup_all().await;
@@ -700,22 +691,18 @@ async fn test_sftp_info_response_includes_mount_state() {
     let (state, _temp, api_key) = create_test_app().await;
     let device_id = "sftp-info-state-aaaaaaaaaaaaaaaa";
     // Plant credentials so the endpoint returns 200 (not 404).
-    let pkt = rust_connect::protocol::types::Packet::new(
-        "kdeconnect.sftp".to_string(),
-        serde_json::json!({
-            "ip": "192.168.1.55",
-            "port": 1740,
-            "user": "kdeconnect",
-            "password": "state-secret",
-            "path": "/storage/emulated/0"
-        }),
+    state.plugins.sftp.plant_connection_for_test(
+        device_id,
+        rust_connect::plugins::sftp::SftpConnectionInfo {
+            ip: "192.168.1.55".to_string(),
+            port: 1740,
+            user: "kdeconnect".to_string(),
+            password: "state-secret".to_string(),
+            path: "/storage/emulated/0".to_string(),
+            multi_paths: vec![],
+            path_names: vec![],
+        },
     );
-    state
-        .plugins
-        .sftp
-        .handle_packet(device_id, pkt)
-        .await
-        .expect("handle sftp packet");
     let app = build_router(state);
     let response = app
         .oneshot(
