@@ -921,12 +921,20 @@ mod lane_c_repro_tests {
 
             let mut events = broadcaster.subscribe();
 
+            // On odd iterations task A yields first so task B's
+            // Paired->Pairing lands before A's Pairing->Connected: that is
+            // the chained two-success path, exercised deterministically
+            // (PR #39 review: the test must not pass on serialized rejects
+            // alone). Even iterations race unbiased.
             let lifecycle_a = lifecycle.clone();
             let id_a = id.clone();
-            let task_a =
-                tokio::spawn(
-                    async move { lifecycle_a.transition(&id_a, DeviceState::Connected).await },
-                );
+            let yield_first = i % 2 == 1;
+            let task_a = tokio::spawn(async move {
+                if yield_first {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+                lifecycle_a.transition(&id_a, DeviceState::Connected).await
+            });
             let lifecycle_b = lifecycle.clone();
             let id_b = id.clone();
             let task_b =
@@ -1009,6 +1017,10 @@ mod lane_c_repro_tests {
             both_succeeded + serialized_rejects,
             ITERATIONS,
             "every iteration must land in one of the two serialized outcomes"
+        );
+        assert!(
+            both_succeeded > 0,
+            "the chained two-success path must be exercised at least once"
         );
         assert_eq!(
             lost_updates, 0,
