@@ -28,6 +28,10 @@ pub(crate) struct Connection {
     pub(crate) generation: u64,
     pub(crate) peer_cert: Option<Vec<u8>>,
     pub(crate) peer_addr: Option<std::net::SocketAddr>,
+    /// Our own address on this link, captured before TLS. The payload
+    /// sender advertises it (2026-09-02 audit, D3): a route probe picked
+    /// the default-route address, which is wrong under a VPN exit node.
+    pub(crate) local_addr: Option<std::net::SocketAddr>,
 }
 
 pub struct ConnectionManager {
@@ -777,10 +781,17 @@ impl ConnectionManager {
         }
         self.remove_cancel_token(device_id).await;
         let conn_handle = connections.remove(device_id);
+        // B3 (2026-09-02 audit): release the connections lock BEFORE the
+        // socket shutdown. On a stalled peer the shutdown blocks until
+        // TCP_USER_TIMEOUT (30 s), and every lookup, send, accept and
+        // connect for every other device waited behind this lock for it.
+        drop(connections);
 
         if let Some(handle) = conn_handle {
             let mut write_stream = handle.write_stream.lock().await;
-            let _ = write_stream.shutdown().await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(2), write_stream.shutdown())
+                    .await;
             info!(
                 device_id = %device_id,
                 event = "connection_disconnected",
@@ -897,6 +908,12 @@ impl ConnectionManager {
     /// The remote address of the live link, if known. Fallback transfer
     /// address when a payloadTransferInfo arrives without an `ip` — the
     /// sender is necessarily the connected peer.
+    /// Our own address on the device's live link (see `Connection::local_addr`).
+    pub async fn get_local_addr(&self, device_id: &DeviceId) -> Option<std::net::SocketAddr> {
+        let connections = self.connections.read().await;
+        connections.get(device_id)?.local_addr
+    }
+
     pub async fn get_peer_addr(&self, device_id: &DeviceId) -> Option<std::net::SocketAddr> {
         let connections = self.connections.read().await;
         connections.get(device_id)?.peer_addr

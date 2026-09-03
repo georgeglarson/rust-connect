@@ -195,6 +195,142 @@ async fn test_send_timeout_tears_down_the_link() {
     server_handle.abort();
 }
 
+/// B3 (2026-09-02 audit): `disconnect` held the connections write lock
+/// across the dying socket's `shutdown().await`. On a stalled peer that is
+/// bounded only by TCP_USER_TIMEOUT (30 s), and every `is_connected`,
+/// `send_packet`, accept and connect for EVERY device waited behind it.
+#[tokio::test]
+async fn test_disconnect_of_a_stalled_peer_does_not_block_other_lookups() {
+    init_crypto();
+    let temp_dir = tempfile::TempDir::new().expect("Value expected to be present");
+    let cert_manager = Arc::new(CertificateManager::new(temp_dir.path().to_path_buf()));
+    cert_manager.init().expect("Value expected to be present");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Value expected to be present");
+    let addr = listener.local_addr().expect("Value expected to be present");
+
+    let client_cm = Arc::new(
+        ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present"),
+    );
+    let server_cm =
+        ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present");
+    server_cm.set_device_identity("server-self-aaaaaaaaaaaaaaaaaaaa", "Test Server");
+
+    // The peer completes TLS and then never reads.
+    let server_handle = tokio::spawn(async move {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("Value expected to be present");
+        server_cm
+            .accept_test("client-deviceaaaaaaaaaaaaaaaaaaa".to_string(), stream)
+            .await
+            .expect("Value expected to be present");
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    });
+
+    let server_device_id = "server-deviceaaaaaaaaaaaaaaaaaaa".to_string();
+    client_cm
+        .connect(&server_device_id, addr)
+        .await
+        .expect("Value expected to be present");
+    let generation = client_cm
+        .get_generation(&server_device_id)
+        .await
+        .expect("Value expected to be present");
+
+    // Fill every buffer between us and the peer so the socket is stalled.
+    // Write through the raw stream lock, not send_packet (which now tears
+    // the link down on its own timeout).
+    {
+        let connections = client_cm.connections.read().await;
+        let conn = connections
+            .get(&server_device_id)
+            .cloned()
+            .expect("Value expected to be present");
+        drop(connections);
+        let mut w = conn.write_stream.lock().await;
+        let chunk = vec![b'x'; 1024 * 1024];
+        for _ in 0..64 {
+            use tokio::io::AsyncWriteExt;
+            if tokio::time::timeout(std::time::Duration::from_millis(50), w.write_all(&chunk))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+
+    let cm = client_cm.clone();
+    let id = server_device_id.clone();
+    let disconnecting = tokio::spawn(async move { cm.disconnect(&id, generation).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let started = std::time::Instant::now();
+    let other = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client_cm.is_connected(&"some-other-device-aaaaaaaaaaaaaa".to_string()),
+    )
+    .await;
+    assert!(
+        other.is_ok() && started.elapsed() < std::time::Duration::from_millis(500),
+        "a lookup for another device waited {:?} behind one stalled disconnect",
+        started.elapsed()
+    );
+
+    disconnecting.abort();
+    server_handle.abort();
+}
+
+/// D3 (2026-09-02 audit): the payload sender advertised whatever address
+/// a UDP probe to 8.8.8.8 picked (the default route), which is wrong under
+/// a VPN exit node. The link's own local address is the right source, so
+/// the connection records it.
+#[tokio::test]
+async fn test_connection_records_its_local_address() {
+    init_crypto();
+    let temp_dir = tempfile::TempDir::new().expect("Value expected to be present");
+    let cert_manager = Arc::new(CertificateManager::new(temp_dir.path().to_path_buf()));
+    cert_manager.init().expect("Value expected to be present");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Value expected to be present");
+    let addr = listener.local_addr().expect("Value expected to be present");
+    let client_cm =
+        ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present");
+    let server_cm =
+        ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present");
+    server_cm.set_device_identity("server-self-aaaaaaaaaaaaaaaaaaaa", "Test Server");
+    let server_handle = tokio::spawn(async move {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("Value expected to be present");
+        server_cm
+            .accept_test("client-deviceaaaaaaaaaaaaaaaaaaa".to_string(), stream)
+            .await
+            .expect("Value expected to be present");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    });
+
+    let server_device_id = "server-deviceaaaaaaaaaaaaaaaaaaa".to_string();
+    client_cm
+        .connect(&server_device_id, addr)
+        .await
+        .expect("Value expected to be present");
+
+    let local = client_cm
+        .get_local_addr(&server_device_id)
+        .await
+        .expect("a live link must know its local address");
+    assert!(local.ip().is_loopback(), "got {local}");
+    server_handle.abort();
+}
+
 #[tokio::test]
 async fn test_connect_disconnect_reconnect() {
     init_crypto();

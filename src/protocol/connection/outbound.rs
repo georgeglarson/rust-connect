@@ -37,6 +37,7 @@ impl ConnectionManager {
                 })?;
 
         configure_keepalive(&tcp_stream);
+        let local_addr = tcp_stream.local_addr().ok();
 
         let generation = {
             let mut gens = self.generations.write().await;
@@ -66,6 +67,7 @@ impl ConnectionManager {
             generation,
             peer_cert: peer_cert_der,
             peer_addr: Some(addr),
+            local_addr,
         };
 
         let mut connections = self.connections.write().await;
@@ -167,6 +169,7 @@ impl ConnectionManager {
         };
 
         configure_keepalive(&tcp_stream);
+        let local_addr = tcp_stream.local_addr().ok();
 
         // Fallback 2 (parity-checklist.md gap 5; lanlinkprovider.cpp
         // tcpSocketConnected's write-failure leg, :395-399): the dial
@@ -340,6 +343,7 @@ impl ConnectionManager {
             generation,
             peer_cert: peer_cert_der,
             peer_addr: Some(addr),
+            local_addr,
         };
 
         let old_handle = {

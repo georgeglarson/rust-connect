@@ -30,6 +30,7 @@ impl ConnectionManager {
         tcp_stream: TcpStream,
     ) -> Result<(DeviceId, Identity, u64)> {
         let peer_addr = tcp_stream.peer_addr().ok();
+        let local_addr = tcp_stream.local_addr().ok();
         trace!(peer = ?peer_addr, event = "accept_incoming_start", "Starting accept_incoming");
 
         // Same keepalive as the outbound path (30s idle / 10s interval /
@@ -243,6 +244,7 @@ impl ConnectionManager {
                 generation,
                 peer_cert: peer_cert_der.clone(),
                 peer_addr,
+                local_addr,
             };
 
             let evicted = connections.insert(device_id.clone(), Arc::new(connection));
@@ -275,6 +277,7 @@ impl ConnectionManager {
         tcp_stream: TcpStream,
     ) -> Result<u64> {
         let peer_addr = tcp_stream.peer_addr().ok();
+        let local_addr = tcp_stream.local_addr().ok();
         let (tls_stream, peer_cert_der) =
             tls::tls_connect(self.cert_manager.clone(), &device_id, tcp_stream).await?;
 
@@ -308,6 +311,7 @@ impl ConnectionManager {
             generation,
             peer_cert: peer_cert_der.clone(),
             peer_addr,
+            local_addr,
         };
 
         let mut connections = self.connections.write().await;
@@ -325,6 +329,7 @@ impl ConnectionManager {
     #[cfg(any(test, feature = "test-helpers"))]
     pub async fn accept_test(&self, device_id: DeviceId, tcp_stream: TcpStream) -> Result<u64> {
         let peer_addr = tcp_stream.peer_addr().ok();
+        let local_addr = tcp_stream.local_addr().ok();
         let our_id = {
             let guard = self.device_id.read().unwrap_or_else(|e| e.into_inner());
             guard.clone()
@@ -351,6 +356,7 @@ impl ConnectionManager {
             generation,
             peer_cert,
             peer_addr,
+            local_addr,
         };
 
         let mut connections = self.connections.write().await;
@@ -368,6 +374,7 @@ impl ConnectionManager {
         tcp_port: u16,
     ) -> Result<u64> {
         let peer_addr = tcp_stream.peer_addr().ok();
+        let local_addr = tcp_stream.local_addr().ok();
         let our_id = {
             let guard = self.device_id.read().unwrap_or_else(|e| e.into_inner());
             guard.clone()
@@ -464,6 +471,7 @@ impl ConnectionManager {
             generation,
             peer_cert,
             peer_addr,
+            local_addr,
         };
 
         let mut connections = self.connections.write().await;
@@ -480,6 +488,7 @@ impl ConnectionManager {
         tcp_port: u16,
     ) -> Result<u64> {
         let peer_addr = tcp_stream.peer_addr().ok();
+        let local_addr = tcp_stream.local_addr().ok();
         let our_id = {
             let guard = self.device_id.read().unwrap_or_else(|e| e.into_inner());
             guard.clone()
@@ -587,6 +596,7 @@ impl ConnectionManager {
             generation,
             peer_cert,
             peer_addr,
+            local_addr,
         };
 
         let mut connections = self.connections.write().await;
