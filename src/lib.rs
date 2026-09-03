@@ -66,3 +66,20 @@ pub use utils::{init_logging, init_logging_from_env, Error, LogFormat, Result};
 /// `builder_with_provider` (ring), so no process-global initialization is
 /// needed. Kept for API compatibility with existing call sites.
 pub fn init_crypto_provider() {}
+
+/// The build's git sha, stamped by `build.rs` (vk #973); "unknown" outside
+/// a git checkout.
+pub const GIT_SHA: &str = env!("RC_GIT_SHA");
+
+/// `<crate version> (<sha>[-dirty])` — what `--version` and the health
+/// endpoint report, so the running binary can be compared to `origin/main`.
+pub const BUILD_VERSION: &str = if matches!(env!("RC_GIT_DIRTY").as_bytes(), b"1") {
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("RC_GIT_SHA"),
+        "-dirty)"
+    )
+} else {
+    concat!(env!("CARGO_PKG_VERSION"), " (", env!("RC_GIT_SHA"), ")")
+};

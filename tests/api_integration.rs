@@ -1041,6 +1041,40 @@ async fn test_sse_events_returns_stream_content_type() {
     );
 }
 
+/// #973: the installed daemon trailed main for six days once and three
+/// days again this week, caught only by comparing file mtimes. The health
+/// endpoint carries the build's git sha so a lint can compare it to
+/// origin/main.
+#[tokio::test]
+async fn test_health_reports_the_build_git_sha() {
+    let (state, _temp, _key) = create_test_app().await;
+    let app = build_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let sha = json["build"]["git_sha"].as_str().unwrap_or("");
+    assert!(
+        sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+        "health must carry the build git sha; got {json}"
+    );
+    assert_eq!(
+        json["build"]["version"],
+        env!("CARGO_PKG_VERSION"),
+        "{json}"
+    );
+}
+
 #[tokio::test]
 async fn test_health_endpoint_no_auth_required() {
     let (state, _temp, _api_key) = create_test_app().await;

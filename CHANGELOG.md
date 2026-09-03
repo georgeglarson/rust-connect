@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The binary knows its build: `rust-connect --version` prints
+  `<version> (<git sha>[-dirty])` and `GET /api/v1/health` carries a
+  `build` object with `version`, `git_sha`, and `dirty`, so an installed
+  daemon can be compared to `origin/main` (vk #973).
+
 ### Fixed
 
 - The deb's postinst no longer runs `systemctl --global enable`, which
