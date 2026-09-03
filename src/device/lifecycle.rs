@@ -890,6 +890,7 @@ mod lane_c_repro_tests {
     async fn test_concurrent_transitions_from_same_state_lose_an_update() {
         const ITERATIONS: usize = 50;
         let mut both_succeeded = 0usize;
+        let mut serialized_rejects = 0usize;
         let mut lost_updates = 0usize;
 
         for i in 0..ITERATIONS {
@@ -934,15 +935,23 @@ mod lane_c_repro_tests {
                 );
 
             let (res_a, res_b) = tokio::join!(task_a, task_b);
-            let res_a = res_a.expect("Value expected to be present");
-            let res_b = res_b.expect("Value expected to be present");
+            let res_a = res_a.expect("task a joined");
+            let res_b = res_b.expect("task b joined");
 
-            if res_a.is_err() || res_b.is_err() {
-                // Serialized naturally this iteration (one call observed
-                // the other's committed state and got a legitimately
-                // invalid transition) — not the race window we're
-                // after, move on.
-                continue;
+            // Every iteration is accounted for (PR #39 review: the test
+            // must not pass vacuously). Serialized under one lock, exactly
+            // two stories are possible: both succeed with chained events,
+            // or one succeeds and the other is refused as an invalid
+            // transition FROM the first one's result. Any other error is a
+            // test-setup failure, not a race outcome.
+            match (&res_a, &res_b) {
+                (Ok(()), Ok(())) => {}
+                (Err(Error::InvalidStateTransition { .. }), Ok(()))
+                | (Ok(()), Err(Error::InvalidStateTransition { .. })) => {
+                    serialized_rejects += 1;
+                    continue;
+                }
+                other => panic!("iteration {i}: unexpected outcome {other:?}"),
             }
             both_succeeded += 1;
 
@@ -994,7 +1003,12 @@ mod lane_c_repro_tests {
         }
 
         eprintln!(
-            "both-succeeded (raced) iterations: {both_succeeded}/{ITERATIONS}, lost-update iterations: {lost_updates}"
+            "both-succeeded iterations: {both_succeeded}/{ITERATIONS}, serialized rejects: {serialized_rejects}, lost-update iterations: {lost_updates}"
+        );
+        assert_eq!(
+            both_succeeded + serialized_rejects,
+            ITERATIONS,
+            "every iteration must land in one of the two serialized outcomes"
         );
         assert_eq!(
             lost_updates, 0,

@@ -269,10 +269,12 @@ impl DeviceRegistry {
         // The id is the map key (and `Device.id` is public): a closure that
         // rewrote it would leave the record under the old key with a
         // different id inside. Refuse and restore (PR #39 review).
-        let key = device.id.clone();
+        // Restore the WHOLE record, not just the id: a closure that changed
+        // the id and another field must not half-commit (PR #39 review).
+        let original = device.clone();
         let result = f(device);
-        if device.id != key {
-            device.id = key;
+        if device.id != original.id {
+            *device = original;
             return Err(Error::InvalidRequest(
                 "DeviceRegistry::modify must not change the device id".to_string(),
             ));
@@ -456,12 +458,17 @@ mod tests {
         let result = registry
             .modify(&"dev-1".to_string(), |device| {
                 device.id = "dev-2".to_string();
+                device.name = "renamed".to_string();
                 Ok(())
             })
             .await;
         assert!(result.is_err(), "an id change must be refused");
         let stored = registry.get(&"dev-1".to_string()).await?;
         assert_eq!(stored.id, "dev-1", "the stored id must be restored");
+        assert_ne!(
+            stored.name, "renamed",
+            "a refused modify must not half-commit its other changes"
+        );
         Ok(())
     }
 
