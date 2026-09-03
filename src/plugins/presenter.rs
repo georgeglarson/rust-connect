@@ -64,13 +64,17 @@ pub struct PresenterRequest {
 /// remainder across calls so small movements accumulate instead of
 /// rounding away to zero.
 fn scaled_pixels(delta: f64, remainder: &mut f64) -> i32 {
-    // B2 (2026-09-02 audit): JSON `1e400` parses to infinity. Carrying it
-    // into the remainder would turn every later movement — from any
-    // device, the handle is shared — into a max-magnitude jump.
-    if !delta.is_finite() {
+    // B2 (2026-09-02 audit, corrected 09-03): the remainder is shared by
+    // every device on the single uinput handle, so an infinite `total`
+    // would turn every later movement from any device into a
+    // max-magnitude jump until a `stop`. serde_json never yields a
+    // non-finite f64 (`1e400`, `NaN`, `Infinity` are all parse errors),
+    // but a finite `1e308` parses and overflows once scaled, so the
+    // check has to sit on the scaled sum, not on the raw delta.
+    let total = delta * POINTER_SCALE + *remainder;
+    if !total.is_finite() {
         return 0;
     }
-    let total = delta * POINTER_SCALE + *remainder;
     let whole = total.round() as i32;
     *remainder = total - f64::from(whole);
     whole
@@ -336,11 +340,37 @@ mod tests {
         assert!(!req.stop);
     }
 
-    /// B2 (2026-09-02 audit): JSON `1e400` deserializes to `f64::INFINITY`.
-    /// An infinite delta must not poison the sub-pixel remainder — the
-    /// remainder is shared by every device on the single uinput handle, so
-    /// one hostile packet would turn every later movement from any device
-    /// into a max-magnitude jump until a `stop`.
+    /// B2 (2026-09-02 audit, corrected 09-03): the sub-pixel remainder is
+    /// shared by every device on the single uinput handle, so one poisoned
+    /// value turns every later movement from any device into a
+    /// max-magnitude jump until a `stop`. The wire cannot deliver a
+    /// non-finite float (serde_json rejects `1e400`, `NaN`, and `Infinity`),
+    /// but it delivers `1e308` fine, and `1e308 * POINTER_SCALE` overflows
+    /// to infinity after a raw-delta finite check. The guard has to sit on
+    /// the scaled sum.
+    #[tokio::test]
+    async fn test_scaled_pixels_survives_finite_delta_that_overflows_when_scaled() {
+        let wire: serde_json::Result<PresenterRequest> = serde_json::from_str(r#"{"dx": 1e400}"#);
+        assert!(
+            wire.is_err(),
+            "serde_json accepted 1e400; the non-finite gate is live after all"
+        );
+        let wire: PresenterRequest =
+            serde_json::from_str(r#"{"dx": 1e308}"#).expect("1e308 is a valid JSON number");
+        let delta = wire.dx.expect("dx present");
+        assert!(delta.is_finite());
+
+        let mut rem = 0.0;
+        let _ = scaled_pixels(delta, &mut rem);
+        assert!(
+            rem.is_finite(),
+            "remainder poisoned by a finite delta: {rem}"
+        );
+        assert_eq!(scaled_pixels(0.0123, &mut rem), 12);
+    }
+
+    /// Boundary case for the same guard: not reachable from the wire (see
+    /// above), kept so the guard's contract is stated for direct callers.
     #[tokio::test]
     async fn test_scaled_pixels_ignores_non_finite_delta() {
         let mut rem = 0.0;
