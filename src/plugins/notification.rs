@@ -679,10 +679,11 @@ impl Plugin for NotificationPlugin {
     /// its id after a disconnect or an unpair. The plugin had no disconnect
     /// handler before.
     ///
-    /// B5 (2026-09-03 audit): Android re-sends its full active-notification
-    /// list on every reconnect; clearing the live dedupe map made every
-    /// re-send `Post` a fresh desktop popup. Before clearing, MERGE the
-    /// device's live entries into the disconnect-surviving shadow
+    /// Audit 2026-09-02 §C re-dump finding (2026-09-03): Android re-sends
+    /// its full active-notification list on every reconnect; clearing the
+    /// live dedupe map made every re-send `Post` a fresh desktop popup.
+    /// Before clearing, MERGE the device's live entries into the
+    /// disconnect-surviving shadow
     /// (`dedupe_shadow`) so the resync suppresses unchanged notifications
     /// and replaces changed ones via the saved server id. History, icons,
     /// and the live dedupe clear are unchanged — the shadow holds only a
@@ -1889,7 +1890,7 @@ mod cancel_semantics_tests {
     }
 
     // =====================================================================
-    // Reconnect dedupe shadow (B5 — 2026-09-03 audit followup).
+    // Reconnect dedupe shadow (audit 2026-09-02 §C re-dump finding).
     // Android re-sends its full active-notification list on every reconnect.
     // B4's `on_disconnected` empties the live dedupe map; without the
     // shadow, every re-send would `Post` and ~130 desktop popups would
@@ -2412,7 +2413,7 @@ mod dedupe_bound_tests {
         );
     }
 
-    /// B5 (2026-09-03 audit followup): the disconnect-surviving shadow
+    /// Audit 2026-09-02 §C re-dump finding: the disconnect-surviving shadow
     /// must also stay bounded. Its keyspace mirrors the live map's (same
     /// (device, id) keys), which is bounded by history eviction coupling,
     /// so merge-on-disconnect adds at most the live-map size for the
