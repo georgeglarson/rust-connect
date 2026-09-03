@@ -127,6 +127,74 @@ async fn test_connect_and_communicate() {
     let _ = server_handle.await;
 }
 
+/// A3 (2026-09-02 audit): `send_packet` bounds `write_all` with a short
+/// timeout. tokio-rustls hands back partial counts under backpressure, so a
+/// timed-out write leaves part of the packet queued and the rest never
+/// written; the next packet on the same stream lands after the truncated
+/// line and the peer drops both. A link whose framing is undefined must not
+/// stay in the map: a send timeout tears it down.
+#[tokio::test]
+async fn test_send_timeout_tears_down_the_link() {
+    init_crypto();
+    let temp_dir = tempfile::TempDir::new().expect("Value expected to be present");
+    let cert_manager = Arc::new(CertificateManager::new(temp_dir.path().to_path_buf()));
+    cert_manager.init().expect("Value expected to be present");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Value expected to be present");
+    let addr = listener.local_addr().expect("Value expected to be present");
+
+    let client_cm =
+        ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present");
+    let server_cm =
+        ConnectionManager::new(cert_manager.clone()).expect("Value expected to be present");
+    server_cm.set_device_identity("server-self-aaaaaaaaaaaaaaaaaaaa", "Test Server");
+
+    // The peer completes TLS and then never reads: socket buffers fill,
+    // the write backpressures, the send times out.
+    let server_handle = tokio::spawn(async move {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("Value expected to be present");
+        server_cm
+            .accept_test("client-deviceaaaaaaaaaaaaaaaaaaa".to_string(), stream)
+            .await
+            .expect("Value expected to be present");
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    });
+
+    let server_device_id = "server-deviceaaaaaaaaaaaaaaaaaaa".to_string();
+    client_cm
+        .connect(&server_device_id, addr)
+        .await
+        .expect("Value expected to be present");
+
+    let big = Packet::new(
+        "kdeconnect.test".to_string(),
+        serde_json::json!({ "blob": "x".repeat(4 * 1024 * 1024) }),
+    );
+    let mut last = Ok(());
+    for _ in 0..64 {
+        last = client_cm.send_packet(&server_device_id, &big).await;
+        if last.is_err() {
+            break;
+        }
+    }
+    let err = last.expect_err("a peer that never reads must time the send out");
+    assert!(
+        matches!(err, Error::ConnectionTimeout(_)),
+        "expected a send timeout, got {err}"
+    );
+    assert!(
+        !client_cm.is_connected(&server_device_id).await,
+        "a timed-out send leaves the stream's framing undefined; the link must be torn down"
+    );
+
+    server_handle.abort();
+}
+
 #[tokio::test]
 async fn test_connect_disconnect_reconnect() {
     init_crypto();
