@@ -111,6 +111,7 @@ upgrade continuity).
 ```
 rust-connect                    # Daemon with REST API (port 9090)
 rust-connect --no-api           # Daemon without the REST API
+rust-connect --version          # 0.1.0 (<git sha>[-dirty])
 rust-connect --help             # Full options
 ```
 
@@ -119,9 +120,7 @@ daemon. The API key is read from the data-dir `api_key` file
 (`~/.local/share/rust-connect/api_key`) unless `--api-key` /
 `RUST_CONNECT_API_KEY` is given; the base URL defaults to
 `http://127.0.0.1:9090` unless `--api-url` / `RUST_CONNECT_API_URL` is set.
-`--json` prints the raw API envelope for scripting. A key given as `--api-key`
-is visible in the process listing (`ps`, `/proc/<pid>/cmdline`), so prefer the
-environment variable or the key file on a shared machine.
+`--json` prints the raw API envelope for scripting.
 
 A key passed as `--api-key` lands in `/proc/<pid>/cmdline`, which any
 local user can read, and in your shell history. The key file is the
@@ -164,6 +163,10 @@ GET    /api/v1/events?api_key=YOUR_KEY           SSE event stream (text/event-st
 GET    /api/v1/health                            Liveness, no auth required
 GET    /docs                                     Swagger UI (spec: /api-docs/openapi.json)
 ```
+
+`/api/v1/health` also reports the running build: a `build` object with
+`version`, `git_sha`, and `dirty`, the same values `--version` prints, so an
+installed daemon can be compared to `origin/main`.
 
 All endpoints except `/api/v1/health` require the API key as an
 `X-API-Key` header. The `api_key` query parameter is accepted only on
