@@ -289,7 +289,10 @@ mod receive_security {
         std::fs::write(&src, content).unwrap();
 
         let sender = PayloadTransfer::new(cm_sender, RECEIVER_ID.to_string());
-        let (mut info, send_handle) = sender.send_file(&src).await.unwrap();
+        let (mut info, send_handle) = sender
+            .send_file(&src, "127.0.0.1".parse().expect("ip"))
+            .await
+            .unwrap();
         info.ip = Some("127.0.0.1".to_string()); // loopback for the test
 
         let plugin = SharePlugin::new()

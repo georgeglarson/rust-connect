@@ -938,7 +938,10 @@ async fn usb_send_file_to_android() {
         cert_manager.clone(),
         android_device_id.clone(),
     );
-    let (transfer_info, send_handle) = transfer.send_file(&src).await.unwrap();
+    let (transfer_info, send_handle) = transfer
+        .send_file(&src, "127.0.0.1".parse().expect("ip"))
+        .await
+        .unwrap();
 
     let share_packet = Packet::new(
         "kdeconnect.share.request".to_string(),
