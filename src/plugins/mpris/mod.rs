@@ -640,6 +640,11 @@ impl MprisCore {
 // Plugin
 // =====================================================================
 
+/// Cap on distinct players tracked per device (2026-09-02 audit, B5): a
+/// `player` update carrying no `playerList` never prunes, so a peer
+/// streaming fresh names would grow the list without bound.
+pub const MAX_PLAYERS_PER_DEVICE: usize = 32;
+
 pub struct MprisPlugin {
     /// Remote-role store: phone players per device (pre-existing).
     players: Arc<StdRwLock<HashMap<String, Vec<MprisInfo>>>>,
@@ -880,8 +885,17 @@ impl MprisPlugin {
                     .position(|p| p.player.as_deref() == Some(player_name.as_str()))
                 {
                     list[pos] = info.clone();
-                } else {
+                } else if list.len() < MAX_PLAYERS_PER_DEVICE {
                     list.push(info.clone());
+                } else {
+                    // B5 (2026-09-02 audit): without a `playerList` there is
+                    // no pruning, so unknown names past the cap are refused.
+                    warn!(
+                        device_id = %device_id,
+                        player = %player_name,
+                        event = "mpris_player_cap",
+                        "Refusing a new player past the per-device cap"
+                    );
                 }
             }
         }
@@ -1465,6 +1479,30 @@ mod tests {
     // -----------------------------------------------------------------
     // Plugin identity + capability honesty
     // -----------------------------------------------------------------
+
+    /// B5 (2026-09-02 audit): a `player` update without `playerList`
+    /// skipped the only pruning path, so a peer streaming distinct player
+    /// names grew the per-device list without bound. Past the cap, new
+    /// names are refused (existing ones still update).
+    #[tokio::test]
+    async fn test_players_per_device_are_capped() {
+        let plugin = MprisPlugin::new(Arc::new(PluginEventBroadcaster::new(8, "test")));
+        for i in 0..(MAX_PLAYERS_PER_DEVICE + 25) {
+            let packet = Packet::new(
+                "kdeconnect.mpris".to_string(),
+                serde_json::json!({ "player": format!("player-{i}"), "isPlaying": false }),
+            );
+            plugin
+                .handle_packet("phone1", packet)
+                .await
+                .expect("handle");
+        }
+        assert_eq!(
+            plugin.get_players("phone1").len(),
+            MAX_PLAYERS_PER_DEVICE,
+            "players per device must be capped"
+        );
+    }
 
     #[tokio::test]
     async fn test_mpris_plugin_name() {

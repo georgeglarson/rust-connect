@@ -58,6 +58,12 @@ pub struct SmsThread {
 
 type SmsThreadStore = HashMap<ThreadKey, Vec<SmsMessage>>;
 
+/// Caps on peer-fed SMS state (2026-09-02 audit, B5): thread ids are
+/// peer-controlled, so both the thread count per device and the messages
+/// per thread are bounded, oldest out.
+pub const MAX_SMS_THREADS_PER_DEVICE: usize = 200;
+pub const MAX_SMS_MESSAGES_PER_THREAD: usize = 500;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SmsMessagePayload {
     #[serde(default)]
@@ -170,10 +176,30 @@ impl Plugin for SmsPlugin {
                     event = "sms_received",
                     "Received individual SMS message"
                 );
-                threads
-                    .entry((device_id.to_string(), msg.thread_id.unwrap_or(0)))
-                    .or_default()
-                    .push(msg);
+                let key = (device_id.to_string(), msg.thread_id.unwrap_or(0));
+                if !threads.contains_key(&key) {
+                    // New thread: evict this device's oldest thread (by its
+                    // newest message date) once the per-device cap is hit.
+                    let device_threads = threads.iter().filter(|(k, _)| k.0 == device_id).count();
+                    if device_threads >= MAX_SMS_THREADS_PER_DEVICE {
+                        if let Some(oldest) = threads
+                            .iter()
+                            .filter(|(k, _)| k.0 == device_id)
+                            .min_by_key(|(_, msgs)| {
+                                msgs.iter().filter_map(|m| m.date).max().unwrap_or(0)
+                            })
+                            .map(|(k, _)| k.clone())
+                        {
+                            threads.remove(&oldest);
+                        }
+                    }
+                }
+                let thread = threads.entry(key).or_default();
+                thread.push(msg);
+                if thread.len() > MAX_SMS_MESSAGES_PER_THREAD {
+                    let excess = thread.len() - MAX_SMS_MESSAGES_PER_THREAD;
+                    thread.drain(..excess);
+                }
             }
         }
 
@@ -253,6 +279,69 @@ mod tests {
         assert!(plugin
             .outgoing_capabilities()
             .contains(&"kdeconnect.sms.request".to_string()));
+    }
+
+    fn sms_packet(thread_id: i64, message_id: i64) -> Packet {
+        Packet::new(
+            "kdeconnect.sms.messages".to_string(),
+            serde_json::json!({"messages": [{
+                "messageID": message_id,
+                "threadID": thread_id,
+                "addresses": [{"address": "+1234567890"}],
+                "body": format!("m{message_id}"),
+                "date": 1700000000000i64 + message_id,
+                "type": 1,
+                "read": 0
+            }]}),
+        )
+    }
+
+    /// B5 (2026-09-02 audit): thread ids are peer-controlled and the
+    /// store grew without bound for the life of a connection. Thread count
+    /// per device and messages per thread are both capped, oldest out.
+    #[tokio::test]
+    async fn test_sms_threads_per_device_are_capped() {
+        let plugin = SmsPlugin::new();
+        for t in 0..(MAX_SMS_THREADS_PER_DEVICE as i64 + 25) {
+            plugin
+                .handle_packet("phone1", sms_packet(t, t))
+                .await
+                .expect("handle");
+        }
+        let threads = plugin.get_threads("phone1");
+        assert_eq!(
+            threads.len(),
+            MAX_SMS_THREADS_PER_DEVICE,
+            "thread count must be capped"
+        );
+        assert!(
+            !plugin
+                .get_thread("phone1", MAX_SMS_THREADS_PER_DEVICE as i64 + 24)
+                .is_empty(),
+            "the newest thread must survive eviction"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sms_messages_per_thread_are_capped() {
+        let plugin = SmsPlugin::new();
+        for m in 0..(MAX_SMS_MESSAGES_PER_THREAD as i64 + 25) {
+            plugin
+                .handle_packet("phone1", sms_packet(7, m))
+                .await
+                .expect("handle");
+        }
+        let msgs = plugin.get_thread("phone1", 7);
+        assert_eq!(
+            msgs.len(),
+            MAX_SMS_MESSAGES_PER_THREAD,
+            "messages per thread must be capped"
+        );
+        assert_eq!(
+            msgs.last().and_then(|m| m.body.as_deref()),
+            Some(format!("m{}", MAX_SMS_MESSAGES_PER_THREAD as i64 + 24).as_str()),
+            "the newest message must survive eviction"
+        );
     }
 
     #[tokio::test]
