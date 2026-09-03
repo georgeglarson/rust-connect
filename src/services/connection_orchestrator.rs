@@ -137,6 +137,25 @@ async fn run_connection_sequence(
     .await
 }
 
+/// Removes a device id from `ConnectionManager::pending_connections` when
+/// dropped, so every exit path of a dial — success, error, panic — releases
+/// the in-flight marker. Shared by the discovery dial and the reconnect loop
+/// (2026-09-02 audit, C1b: the reconnect loop never registered, so a
+/// discovery event could dial the same device concurrently).
+struct PendingGuard {
+    pending: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        // Poison-tolerant: the add path recovers via into_inner(), so
+        // the remove path must too or entries leak forever.
+        let mut lock = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        lock.remove(&self.id);
+    }
+}
+
 /// Reconnect loop with exponential backoff.
 async fn reconnect_loop(
     state: Arc<AppState>,
@@ -183,11 +202,33 @@ async fn reconnect_loop(
             None => return,
         };
 
-        match state
+        // Same in-flight marker as the discovery dial: if another dial for
+        // this device is already under way, this attempt yields to it.
+        if !state
             .connection_manager
-            .connect_to_device(&our_identity, addr, Some(&identity))
+            .add_pending_connection(&device_id)
             .await
         {
+            debug!(
+                device_id = %device_id,
+                attempt = attempt,
+                event = "reconnect_yielded_to_pending_dial",
+                "Another dial to this device is in flight; skipping this attempt"
+            );
+            continue;
+        }
+        let connect_result = {
+            let _guard = PendingGuard {
+                pending: state.connection_manager.pending_connections.clone(),
+                id: device_id.clone(),
+            };
+            state
+                .connection_manager
+                .connect_to_device(&our_identity, addr, Some(&identity))
+                .await
+        };
+
+        match connect_result {
             Ok((connected_id, remote_identity, new_generation)) => {
                 info!(
                     device_id = %connected_id,
@@ -292,20 +333,6 @@ pub fn spawn_discovered_connection(state: Arc<AppState>, identity: Identity, add
             .await
         {
             return;
-        }
-
-        struct PendingGuard {
-            pending: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-            id: String,
-        }
-
-        impl Drop for PendingGuard {
-            fn drop(&mut self) {
-                // Poison-tolerant: the add path recovers via into_inner(), so
-                // the remove path must too or entries leak forever.
-                let mut lock = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-                lock.remove(&self.id);
-            }
         }
 
         let connect_result = {
@@ -577,6 +604,68 @@ mod tests {
             .await
             .expect("reconnect loop must exit promptly on shutdown during backoff")
             .expect("Value expected to be present");
+    }
+
+    /// Lane-C repro (audit-2026-09-02-remaining-brief.md, section C, lead
+    /// 1, second anchor): `reconnect_loop` (`:141`) dials via
+    /// `connect_to_device` with no `add_pending_connection` guard at all,
+    /// unlike `spawn_discovered_connection` (`:284-328`), which registers
+    /// in `pending_connections` before it dials and is deduped by it on a
+    /// second concurrent call for the same device. This marks the device
+    /// pending FIRST — exactly what a concurrent discovery-triggered dial
+    /// would have done — and shows `reconnect_loop` still completes a
+    /// real TCP dial to it, unaware the device is already "in flight" per
+    /// that guard. Deterministic, not a timing race: `reconnect_loop`
+    /// simply never reads `pending_connections`.
+    #[tokio::test]
+    async fn test_reconnect_loop_ignores_pending_connections_guard() {
+        let (state, _t) = test_state();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Value expected to be present");
+        let addr = listener.local_addr().expect("Value expected to be present");
+
+        // Simulate a discovery-triggered dial already in flight for this
+        // device (what `spawn_discovered_connection` registers before it
+        // calls `connect_to_device`).
+        assert!(
+            state
+                .connection_manager
+                .add_pending_connection(&PEER_ID.to_string())
+                .await,
+            "first pending registration must succeed"
+        );
+        // The guard works as intended for ITS OWN callers: a second
+        // discovery-triggered dial for the same device is deduped.
+        assert!(
+            !state
+                .connection_manager
+                .add_pending_connection(&PEER_ID.to_string())
+                .await,
+            "a second discovery-triggered dial for the same device must be deduped by the pending guard"
+        );
+
+        let state_clone = state.clone();
+        let peer_id = PEER_ID.to_string();
+        tokio::spawn(async move {
+            reconnect_loop(state_clone, peer_identity(), addr, peer_id).await;
+        });
+
+        // reconnect_loop's first attempt fires after the attempt=1 backoff
+        // (base 1s + up to 25% jitter). If it respected
+        // `pending_connections` the way `spawn_discovered_connection`
+        // does, it would see the device already pending and skip dialing
+        // — the listener would never observe a connection.
+        let accept =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await;
+        assert!(
+            accept.is_err(),
+            "reconnect_loop dialed {addr} despite {PEER_ID} already being marked pending by \
+             another caller — it never checks or registers in `pending_connections`, unlike \
+             spawn_discovered_connection's add_pending_connection guard which would have deduped \
+             a second discovery-triggered dial for the same id"
+        );
     }
 
     /// P2 self-guard: a discovered identity carrying OUR OWN device id
