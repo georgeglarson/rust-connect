@@ -29,6 +29,22 @@ fn try_acquire_inbound_slot(slots: &Arc<Semaphore>) -> Option<tokio::sync::Owned
     slots.clone().try_acquire_owned().ok()
 }
 
+/// Who holds a listening TCP port, as `ss -lptn` reports it (process name
+/// and pid; only sockets of our own uid are attributed). None when `ss` is
+/// missing or shows nothing.
+fn port_holder(port: u16) -> Option<String> {
+    let out = std::process::Command::new("ss")
+        .args(["-H", "-lptn", &format!("sport = :{port}")])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let users = text.lines().find_map(|l| {
+        let start = l.find("users:(")?;
+        Some(l[start..].trim().to_string())
+    })?;
+    Some(users)
+}
+
 pub struct TcpListenerService {
     state: Arc<AppState>,
     identity: Identity,
@@ -56,11 +72,15 @@ impl TcpListenerService {
             .await
             .map(|listener| (listener, preferred))
             .map_err(|error| {
+                // Name the holder instead of guessing (2026-09-02: the
+                // guess "another rust-connect instance" was true, but the
+                // instance belonged to the GDM greeter's user and the
+                // fixed string cost an hour of journal archaeology).
+                let holder = port_holder(preferred)
+                    .unwrap_or_else(|| "holder not visible (not our uid?)".to_string());
                 std::io::Error::new(
                     error.kind(),
-                    format!(
-                        "failed to bind protocol port {preferred}: {error}; another rust-connect instance is already running"
-                    ),
+                    format!("failed to bind protocol port {preferred}: {error}; held by {holder}"),
                 )
             })
     }
@@ -353,6 +373,30 @@ mod tests {
 
     static PORT_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The EADDRINUSE error asserted "another rust-connect instance is
+    /// already running" without looking. On 2026-09-02 that was true but
+    /// the holder was the GDM greeter's instance, and the fixed string
+    /// cost an hour of journal archaeology. The error now names the holder.
+    #[tokio::test]
+    async fn test_bind_port_error_names_the_holder() {
+        let holder = tokio::net::TcpListener::bind("0.0.0.0:0")
+            .await
+            .expect("Value expected to be present");
+        let port = holder
+            .local_addr()
+            .expect("Value expected to be present")
+            .port();
+        let err = TcpListenerService::bind_port(port)
+            .await
+            .expect_err("the port is held");
+        let msg = err.to_string();
+        let pid = std::process::id().to_string();
+        assert!(
+            msg.contains(&pid),
+            "bind error must name the holder (this test process, pid {pid}); got: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn test_inbound_slot_cap_rejects_overflow_and_recovers() {
         let slots = Arc::new(Semaphore::new(MAX_INBOUND_CONNECTIONS));
@@ -399,9 +443,7 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
         assert!(error.to_string().contains(&port.to_string()));
-        assert!(error
-            .to_string()
-            .contains("another rust-connect instance is already running"));
+        assert!(error.to_string().contains("held by"));
         drop(occupied);
     }
 

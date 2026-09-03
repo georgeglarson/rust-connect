@@ -294,6 +294,21 @@ impl DiscoveryService {
             return Err(Error::DiscoveryError("ignored_own".to_string()));
         }
 
+        if crate::protocol::is_split_brain(
+            &addr.ip(),
+            &self.identity.device_id,
+            &identity.device_id,
+        ) {
+            warn!(
+                device_id = %identity.device_id,
+                device_name = %identity.device_name,
+                from = %addr,
+                event = "split_brain_suspected",
+                "Another KDE Connect implementation is announcing from THIS host: \
+                 two daemons will compete for the same paired phones"
+            );
+        }
+
         info!(
             device_id = %identity.device_id,
             device_name = %identity.device_name,

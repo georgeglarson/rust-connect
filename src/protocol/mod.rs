@@ -41,6 +41,33 @@ pub use types::{
 /// link-local, CGNAT (100.64.0.0/10), or IPv6 ULA (fc00::/7). Android
 /// refuses KDE Connect traffic from any other address — it is a LAN
 /// protocol (LanLinkProvider.java:138-141, 215-218).
+/// Whether `ip` is one of THIS host's addresses. No interface enumeration:
+/// a UDP socket connected to a local address reports that address as its
+/// own local end (the kernel routes it over loopback). Any failure reads
+/// as "not local".
+pub fn is_local_address(ip: &std::net::IpAddr) -> bool {
+    if ip.is_loopback() {
+        return true;
+    }
+    let bind = if ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let Ok(socket) = std::net::UdpSocket::bind(bind) else {
+        return false;
+    };
+    if socket.connect((*ip, 9)).is_err() {
+        return false;
+    }
+    socket.local_addr().map(|a| a.ip() == *ip).unwrap_or(false)
+}
+
+/// Split-brain signature (2026-09-02 audit): an identity from one of our
+/// own addresses under a device id that is not ours means another KDE
+/// Connect implementation is running on this host. Seen three times in a
+/// month (stock kdeconnectd twice, the GDM greeter's rust-connect once);
+/// each time it competed for the paired phones and took hours to find.
+pub fn is_split_brain(source: &std::net::IpAddr, our_id: &str, their_id: &str) -> bool {
+    their_id != our_id && is_local_address(source)
+}
+
 pub fn is_private_address(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
@@ -107,5 +134,45 @@ mod tests {
                 "{refused} must be refused"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod split_brain_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// Split-brain detector (2026-09-02 audit, opportunity): three
+    /// incidents this month shared one signature — an identity arriving
+    /// from one of OUR OWN addresses under a foreign device id (stock
+    /// kdeconnectd twice, the GDM greeter's rust-connect once). The
+    /// classifier answers "is this source address ours" without
+    /// enumerating interfaces: a UDP socket connected to a local address
+    /// reports that same address as its local end.
+    #[test]
+    fn test_loopback_is_a_local_address() {
+        assert!(is_local_address(&"127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_test_net_is_not_a_local_address() {
+        // 192.0.2.1 (TEST-NET-1) is never assigned to a real interface.
+        assert!(!is_local_address(&"192.0.2.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_foreign_id_from_a_local_address_is_a_split_brain() {
+        let ours = "our-device-aaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(is_split_brain(
+            &"127.0.0.1".parse().unwrap(),
+            ours,
+            "other-device-aaaaaaaaaaaaaaaaaaaa"
+        ));
+        assert!(!is_split_brain(&"127.0.0.1".parse().unwrap(), ours, ours));
+        assert!(!is_split_brain(
+            &"192.0.2.1".parse().unwrap(),
+            ours,
+            "other-device-aaaaaaaaaaaaaaaaaaaa"
+        ));
     }
 }
