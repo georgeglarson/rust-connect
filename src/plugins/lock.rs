@@ -54,11 +54,11 @@ impl LockPlugin {
 #[async_trait::async_trait]
 impl Plugin for LockPlugin {
     /// B4 (2026-09-02 audit): a device's last lock state must not outlive
-    /// its connection or its pairing.
-    fn on_disconnected(&self, device_id: &str) {
-        if let Ok(mut states) = self.states.try_write() {
-            states.remove(device_id);
-        }
+    /// its connection or its pairing. PR #40 review: the original
+    /// `try_write` silently skipped the removal while a reader held
+    /// `states`; await the write lock instead so the removal always lands.
+    async fn on_disconnected(&self, device_id: &str) {
+        self.states.write().await.remove(device_id);
     }
 
     fn name(&self) -> &str {
@@ -177,7 +177,7 @@ mod tests {
             .await
             .expect("handle");
         assert_eq!(plugin.is_locked("phone1").await, Some(true));
-        plugin.on_disconnected("phone1");
+        plugin.on_disconnected("phone1").await;
         assert_eq!(plugin.is_locked("phone1").await, None);
     }
 
@@ -352,5 +352,38 @@ mod tests {
             serde_json::json!({ "deviceId": "phone" }),
         );
         assert!(plugin.handle_packet("device1", packet).await.is_ok());
+    }
+
+    /// PR #40 review (coderabbit): the B4 handler used `try_write` and
+    /// silently skipped the removal while a reader held `states`
+    /// (`handle_packet` / `is_locked`), leaving stale lock state after
+    /// disconnect. The trait is async now — await the write lock instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_disconnected_waits_for_readers_instead_of_skipping_removal() {
+        let plugin = Arc::new(LockPlugin::new());
+        plugin
+            .handle_packet(
+                "phone1",
+                Packet::new(
+                    "kdeconnect.lock".to_string(),
+                    serde_json::json!({ "isLocked": true }),
+                ),
+            )
+            .await
+            .expect("handle");
+        assert_eq!(plugin.is_locked("phone1").await, Some(true));
+
+        let held = plugin.states.read().await;
+        let p = plugin.clone();
+        let task = tokio::spawn(async move { p.on_disconnected("phone1").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !task.is_finished(),
+            "on_disconnected must wait for the reader, not skip the removal"
+        );
+        drop(held);
+        task.await
+            .expect("on_disconnected completes once the reader releases");
+        assert_eq!(plugin.is_locked("phone1").await, None);
     }
 }

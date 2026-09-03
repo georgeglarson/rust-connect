@@ -182,7 +182,7 @@ impl Plugin for ScreensaverInhibitPlugin {
         vec![]
     }
 
-    fn on_disconnected(&self, device_id: &str) {
+    async fn on_disconnected(&self, device_id: &str) {
         let cookie = self
             .cookies
             .write()
@@ -358,7 +358,7 @@ mod tests {
         assert!(wait_until(|| plugin.cookie_for("device1").is_some()).await);
         let cookie = plugin.cookie_for("device1").unwrap();
 
-        plugin.on_disconnected("device1");
+        plugin.on_disconnected("device1").await;
         assert!(wait_until(|| !backend.uninhibits.read().unwrap().is_empty()).await);
         assert_eq!(backend.uninhibits.read().unwrap().clone(), vec![cookie]);
         assert!(plugin.cookie_for("device1").is_none());
@@ -368,7 +368,7 @@ mod tests {
     async fn test_disconnect_without_connect_is_noop() {
         let backend = Arc::new(MockBackend::new());
         let plugin = ScreensaverInhibitPlugin::new().with_backend(backend.clone());
-        plugin.on_disconnected("device1");
+        plugin.on_disconnected("device1").await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(backend.uninhibits.read().unwrap().is_empty());
     }
@@ -390,7 +390,7 @@ mod tests {
         assert_ne!(c1, c2);
 
         // device1 leaving lifts only its own inhibition.
-        plugin.on_disconnected("device1");
+        plugin.on_disconnected("device1").await;
         assert!(wait_until(|| !backend.uninhibits.read().unwrap().is_empty()).await);
         assert_eq!(backend.uninhibits.read().unwrap().clone(), vec![c1]);
         assert!(plugin.cookie_for("device2").is_some());
@@ -400,6 +400,6 @@ mod tests {
     async fn test_no_backend_degrades_cleanly() {
         let plugin = ScreensaverInhibitPlugin::new();
         assert!(plugin.on_connected("device1").is_empty());
-        plugin.on_disconnected("device1"); // must not panic
+        plugin.on_disconnected("device1").await; // must not panic
     }
 }

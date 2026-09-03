@@ -317,7 +317,7 @@ impl Plugin for ContactsPlugin {
         vec![self.request_all_uids_timestamps()]
     }
 
-    fn on_disconnected(&self, device_id: &str) {
+    async fn on_disconnected(&self, device_id: &str) {
         if let Ok(mut devices) = self.devices.write() {
             devices.remove(device_id);
         }
@@ -788,7 +788,7 @@ mod tests {
         );
         plugin.handle_packet("d", p).await.unwrap();
         assert_eq!(plugin.get_contacts("d").len(), 1);
-        plugin.on_disconnected("d");
+        plugin.on_disconnected("d").await;
         assert!(plugin.get_contacts("d").is_empty());
     }
 

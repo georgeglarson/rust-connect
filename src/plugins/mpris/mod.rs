@@ -1209,7 +1209,7 @@ impl Plugin for MprisPlugin {
     fn is_backend_available(&self) -> bool {
         self.backend.read().map(|b| b.is_some()).unwrap_or(false)
     }
-    fn on_disconnected(&self, device_id: &str) {
+    async fn on_disconnected(&self, device_id: &str) {
         if let Ok(mut players) = self.players.write() {
             players.remove(device_id);
         }
@@ -2855,7 +2855,7 @@ mod tests {
             .await
             .expect("Value expected to be present");
         assert_eq!(plugin.get_players("device1").len(), 1);
-        plugin.on_disconnected("device1");
+        plugin.on_disconnected("device1").await;
         assert!(plugin.get_players("device1").is_empty());
     }
 

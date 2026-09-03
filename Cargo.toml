@@ -19,7 +19,7 @@ test-helpers = []
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["net", "fs", "process", "sync", "time", "rt-multi-thread", "macros", "io-util", "signal", "signal-hook-registry"] }
+tokio = { version = "1.19.1", features = ["net", "fs", "process", "sync", "time", "rt-multi-thread", "macros", "io-util", "signal", "signal-hook-registry"] }
 tokio-util = "0.7"
 
 # Web framework

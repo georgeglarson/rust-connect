@@ -54,7 +54,7 @@ impl Plugin for BatteryPlugin {
         vec!["kdeconnect.battery.request".to_string()]
     }
 
-    fn on_disconnected(&self, device_id: &str) {
+    async fn on_disconnected(&self, device_id: &str) {
         if let Ok(mut batteries) = self.batteries.write() {
             batteries.remove(device_id);
         }
@@ -178,7 +178,7 @@ mod tests {
             .expect("Value expected to be present");
         assert!(plugin.get_battery("phone-1").is_some());
 
-        plugin.on_disconnected("phone-1");
+        plugin.on_disconnected("phone-1").await;
         assert!(plugin.get_battery("phone-1").is_none());
     }
 

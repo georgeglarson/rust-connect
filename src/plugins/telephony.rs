@@ -123,7 +123,7 @@ impl Plugin for TelephonyPlugin {
         vec![MUTE_REQUEST_PACKET_TYPE.to_string()]
     }
 
-    fn on_disconnected(&self, device_id: &str) {
+    async fn on_disconnected(&self, device_id: &str) {
         if let Ok(mut calls) = self.calls.write() {
             calls.remove(device_id);
         }
@@ -483,7 +483,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plugin.get_calls("device1").len(), 1);
-        plugin.on_disconnected("device1");
+        plugin.on_disconnected("device1").await;
         assert!(plugin.get_calls("device1").is_empty());
     }
 

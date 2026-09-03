@@ -72,7 +72,7 @@ impl Plugin for ConnectivityPlugin {
         vec![]
     }
 
-    fn on_disconnected(&self, device_id: &str) {
+    async fn on_disconnected(&self, device_id: &str) {
         if let Ok(mut reports) = self.reports.write() {
             reports.remove(device_id);
         }
@@ -209,7 +209,7 @@ mod tests {
             .expect("Value expected to be present");
         assert!(plugin.get_report("device1").is_some());
 
-        plugin.on_disconnected("device1");
+        plugin.on_disconnected("device1").await;
         assert!(plugin.get_report("device1").is_none());
     }
 

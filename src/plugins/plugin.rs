@@ -20,7 +20,10 @@ pub trait Plugin: Send + Sync {
         vec![]
     }
 
-    fn on_disconnected(&self, device_id: &str) {
+    /// Runs on the connection task when a device's link drops. Async so a
+    /// plugin with blocking cleanup (sftp's fusermount) can bound it with
+    /// `spawn_blocking` + a timeout instead of stalling the disconnect.
+    async fn on_disconnected(&self, device_id: &str) {
         let _ = device_id;
     }
 

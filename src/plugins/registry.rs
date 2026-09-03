@@ -223,9 +223,20 @@ impl PluginRegistry {
     }
 
     pub async fn notify_disconnected(&self, device_id: &str) {
-        let plugins = self.plugins.read().await;
-        for (name, plugin) in plugins.iter() {
-            plugin.on_disconnected(device_id);
+        // Snapshot the plugin Arcs and release the read guard BEFORE
+        // awaiting: plugin cleanup (sftp unmounts, up to `mount_timeout`
+        // each) can hold the loop for seconds, and keeping the guard
+        // across the awaits blocks every register/unregister for the
+        // whole wait (PR #40 review).
+        let plugins: Vec<(String, Arc<dyn Plugin>)> = self
+            .plugins
+            .read()
+            .await
+            .iter()
+            .map(|(name, plugin)| (name.clone(), Arc::clone(plugin)))
+            .collect();
+        for (name, plugin) in &plugins {
+            plugin.on_disconnected(device_id).await;
             debug!(plugin = %name, device_id = %device_id, event = "plugin_disconnected", "Notified plugin of disconnection");
         }
     }
@@ -460,7 +471,7 @@ mod tests {
             vec![]
         }
 
-        fn on_disconnected(&self, device_id: &str) {
+        async fn on_disconnected(&self, device_id: &str) {
             self.disconnected_devices
                 .lock()
                 .expect("Value expected to be present")
@@ -508,5 +519,84 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         assert_eq!(disconnected, vec!["dev-1", "dev-2"]);
+    }
+
+    /// PR #40 review (coderabbit + cubic-dev): the notify loop held the
+    /// `plugins` read guard across every `on_disconnected` await. The sftp
+    /// cleanup alone can take up to `mount_timeout` per device, so
+    /// `register`/`unregister` blocked for the whole cleanup. The guard
+    /// must be released before the awaits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn notify_disconnected_does_not_block_registration_on_slow_cleanup() {
+        struct SlowCleanupPlugin {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl Plugin for SlowCleanupPlugin {
+            fn name(&self) -> &str {
+                "slow-cleanup"
+            }
+
+            fn incoming_capabilities(&self) -> Vec<String> {
+                vec![]
+            }
+
+            fn outgoing_capabilities(&self) -> Vec<String> {
+                vec![]
+            }
+
+            async fn handle_packet(
+                &self,
+                _device_id: &str,
+                _packet: Packet,
+            ) -> Result<Option<Vec<Packet>>> {
+                Ok(None)
+            }
+
+            async fn on_disconnected(&self, _device_id: &str) {
+                // notify_one, not notify_waiters: the counterpart can fire
+                // while this task is between this notify and registering
+                // the release waiter below; notify_one stores a permit
+                // instead of losing the wake (hung the full suite once).
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+        }
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let registry = Arc::new(PluginRegistry::new());
+        registry
+            .register(Arc::new(SlowCleanupPlugin {
+                entered: entered.clone(),
+                release: release.clone(),
+            }))
+            .await;
+
+        // Register the waiter BEFORE spawning so the notify can't be lost.
+        let entered_fut = entered.notified();
+        tokio::pin!(entered_fut);
+        entered_fut.as_mut().enable();
+
+        let r = registry.clone();
+        let notify = tokio::spawn(async move { r.notify_disconnected("dev-1").await });
+        entered_fut.await; // cleanup is now mid-await inside notify_disconnected
+
+        // Registration must not wait for the cleanup to finish.
+        let r = registry.clone();
+        let registered = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            r.register(Arc::new(MockPlugin::new("late", vec![]))),
+        )
+        .await;
+        assert!(
+            registered.is_ok(),
+            "register blocked while notify_disconnected awaited a slow plugin"
+        );
+
+        release.notify_one();
+        notify.await.expect("notify_disconnected completes");
     }
 }

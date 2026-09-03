@@ -147,7 +147,7 @@ impl Plugin for SmsPlugin {
         )]
     }
 
-    fn on_disconnected(&self, device_id: &str) {
+    async fn on_disconnected(&self, device_id: &str) {
         if let Ok(mut threads) = self.threads.write() {
             threads.retain(|(did, _), _| did != device_id);
         }
@@ -365,7 +365,7 @@ mod tests {
             .expect("Value expected to be present");
         assert!(!plugin.get_threads("phone-1").is_empty());
 
-        plugin.on_disconnected("phone-1");
+        plugin.on_disconnected("phone-1").await;
         assert!(plugin.get_threads("phone-1").is_empty());
     }
 
@@ -393,7 +393,7 @@ mod tests {
             .await
             .expect("Value expected to be present");
 
-        plugin.on_disconnected("phone-1");
+        plugin.on_disconnected("phone-1").await;
         assert!(plugin.get_threads("phone-1").is_empty());
         assert!(!plugin.get_threads("phone-2").is_empty());
     }
