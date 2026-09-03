@@ -208,7 +208,7 @@ pub async fn create_state(settings: AppSettings) -> Result<Arc<AppState>> {
     // The sweep uses fusermount3 only — it does NOT require sshfs to be
     // installed, so a fresh host that just installed the daemon still
     // gets a clean restart.
-    let released = state.plugins.sftp.startup_sweep();
+    let released = state.plugins.sftp.startup_sweep().await;
     if !released.is_empty() {
         info!(
             count = released.len(),

@@ -269,7 +269,7 @@ impl Plugin for DigitizerPlugin {
         vec![]
     }
 
-    fn on_disconnected(&self, device_id: &str) {
+    async fn on_disconnected(&self, device_id: &str) {
         self.end_session(device_id);
     }
 

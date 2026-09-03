@@ -80,7 +80,7 @@ impl Plugin for RemoteCommandsPlugin {
         )]
     }
 
-    fn on_disconnected(&self, device_id: &str) {
+    async fn on_disconnected(&self, device_id: &str) {
         if let Ok(mut commands) = self.commands.write() {
             commands.remove(device_id);
         }
@@ -327,7 +327,7 @@ mod tests {
             )
             .await
             .unwrap();
-        plugin.on_disconnected("device1");
+        plugin.on_disconnected("device1").await;
         assert!(plugin.get_commands("device1").is_none());
         assert!(!plugin.can_add_command("device1"));
     }

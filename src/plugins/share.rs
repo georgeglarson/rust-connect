@@ -666,7 +666,7 @@ impl Plugin for SharePlugin {
         vec!["kdeconnect.share.request".to_string()]
     }
 
-    fn on_disconnected(&self, device_id: &str) {
+    async fn on_disconnected(&self, device_id: &str) {
         self.batch_totals
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -1437,7 +1437,7 @@ mod tests {
             .expect("handling must not error");
         assert!(plugin.batch_totals("phone-1").is_some());
 
-        plugin.on_disconnected("phone-1");
+        plugin.on_disconnected("phone-1").await;
         assert_eq!(plugin.batch_totals("phone-1"), None);
     }
 

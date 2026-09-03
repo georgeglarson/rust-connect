@@ -203,7 +203,7 @@ impl Plugin for PresenterPlugin {
     /// The sub-pixel remainder is shared by every device on the single
     /// uinput handle; a device that vanishes mid-gesture must not leave
     /// its fraction behind for the next one (2026-09-02 audit, B2).
-    fn on_disconnected(&self, _device_id: &str) {
+    async fn on_disconnected(&self, _device_id: &str) {
         if let Ok(mut guard) = self.input_device.lock() {
             if let Some(ref mut dev) = *guard {
                 dev.reset();

@@ -379,7 +379,7 @@ impl Plugin for PausemusicPlugin {
         self.backend.read().map(|b| b.is_some()).unwrap_or(false)
     }
 
-    fn on_disconnected(&self, device_id: &str) {
+    async fn on_disconnected(&self, device_id: &str) {
         // Upstream loses pausedSources when the per-device plugin is
         // destroyed — no resume, players stay paused. Match that.
         // Poison-tolerant like every other lock site in this file.
@@ -867,7 +867,7 @@ mod tests {
             )
             .await
             .unwrap();
-        plugin.on_disconnected("device1");
+        plugin.on_disconnected("device1").await;
         assert!(plugin.paused_for("device1").is_empty());
         assert!(backend.resumed().is_empty());
     }

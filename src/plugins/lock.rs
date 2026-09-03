@@ -55,7 +55,7 @@ impl LockPlugin {
 impl Plugin for LockPlugin {
     /// B4 (2026-09-02 audit): a device's last lock state must not outlive
     /// its connection or its pairing.
-    fn on_disconnected(&self, device_id: &str) {
+    async fn on_disconnected(&self, device_id: &str) {
         if let Ok(mut states) = self.states.try_write() {
             states.remove(device_id);
         }
@@ -177,7 +177,7 @@ mod tests {
             .await
             .expect("handle");
         assert_eq!(plugin.is_locked("phone1").await, Some(true));
-        plugin.on_disconnected("phone1");
+        plugin.on_disconnected("phone1").await;
         assert_eq!(plugin.is_locked("phone1").await, None);
     }
 

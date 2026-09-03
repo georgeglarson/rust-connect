@@ -564,7 +564,7 @@ impl Plugin for NotificationPlugin {
     /// desktop dedupe keys, cached icons — so nothing stays servable under
     /// its id after a disconnect or an unpair. The plugin had no disconnect
     /// handler before.
-    fn on_disconnected(&self, device_id: &str) {
+    async fn on_disconnected(&self, device_id: &str) {
         self.history
             .write()
             .unwrap_or_else(|e| e.into_inner())

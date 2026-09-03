@@ -386,7 +386,9 @@ impl SftpPlugin {
     /// (or `fusermount -u`) on every `sftp-*` directory left by a
     /// previous crash. Does NOT require sshfs on PATH — a host that
     /// installs the daemon but never sshfs still gets a clean restart.
-    pub fn startup_sweep(&self) -> Vec<String> {
+    /// Each unmount goes through `unmount_via_mounter`, so one wedged
+    /// leftover costs at most `mount_timeout` of daemon start.
+    pub async fn startup_sweep(&self) -> Vec<String> {
         let mounts_dir = self.data_dir.join("mounts");
         let mut released = Vec::new();
         let entries = match std::fs::read_dir(&mounts_dir) {
@@ -400,7 +402,7 @@ impl SftpPlugin {
                 continue;
             }
             let path = entry.path();
-            let outcome = self.mounter.unmount(&path);
+            let outcome = self.unmount_via_mounter(path.clone()).await;
             let label = match &outcome {
                 Ok(UnmountOutcome::Unmounted) => {
                     // Best-effort: remove the now-empty dir so the next
@@ -444,7 +446,7 @@ impl SftpPlugin {
         }
     }
 
-    fn cleanup_mount_on_disconnect(&self, device_id: &str, live_mount: bool) {
+    async fn cleanup_mount_on_disconnect(&self, device_id: &str, live_mount: bool) {
         let mp = mount_point_for(&self.data_dir, device_id);
         if !live_mount {
             self.set_mount_state(device_id, MountState::Unmounted);
@@ -456,7 +458,7 @@ impl SftpPlugin {
             return;
         }
 
-        match self.mounter.unmount(&mp) {
+        match self.unmount_via_mounter(mp).await {
             Ok(UnmountOutcome::Unmounted) => {
                 self.set_mount_state(device_id, MountState::Unmounted);
                 info!(
@@ -562,12 +564,13 @@ impl Plugin for SftpPlugin {
         self.mounter.is_available()
     }
 
-    fn on_disconnected(&self, device_id: &str) {
+    async fn on_disconnected(&self, device_id: &str) {
         if let Ok(mut connections) = self.connections.write() {
             connections.remove(device_id);
         }
         let mp = mount_point_for(&self.data_dir, device_id);
-        self.cleanup_mount_on_disconnect(device_id, mount_point_is_live(&mp));
+        self.cleanup_mount_on_disconnect(device_id, mount_point_is_live(&mp))
+            .await;
     }
 
     async fn handle_packet(&self, device_id: &str, packet: Packet) -> Result<Option<Vec<Packet>>> {
@@ -1056,6 +1059,69 @@ mod tests {
     /// this test proves `mount_device` returns `MountState::Failed`
     /// (a timeout report) well within the test's own timeout guard,
     /// instead of hanging.
+    /// `on_disconnected` runs on the connection task. Pre-fix it called
+    /// `Mounter::unmount` inline, so a hung `fusermount3` (a FUSE mount
+    /// whose sshfs is wedged on a dead peer is the common way to get one)
+    /// stalled the disconnect path for as long as the process took, with
+    /// no bound. Post-fix it goes through `unmount_via_mounter`
+    /// (`spawn_blocking` + `mount_timeout`), so the caller returns at the
+    /// timeout and the state stays `Mounted` for the startup sweep to
+    /// retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnect_returns_at_timeout_on_hung_fusermount() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let plugin = SftpPlugin::with_mounter(
+            Arc::new(crate::plugins::events::PluginEventBroadcaster::new(
+                8, "test",
+            )),
+            dir.path().to_path_buf(),
+            Arc::new(SleepyRunner {
+                sleep_for: std::time::Duration::from_millis(1500),
+            }),
+        )
+        .with_mount_timeout(std::time::Duration::from_millis(50));
+        plugin.set_mount_state("live", MountState::Mounted);
+        std::fs::create_dir_all(plugin.mount_point("live")).expect("live mount directory");
+
+        let started = std::time::Instant::now();
+        plugin.cleanup_mount_on_disconnect("live", true).await;
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(750),
+            "disconnect blocked on the hung unmount for {took:?}"
+        );
+        assert_eq!(plugin.get_mount_status("live").state, MountState::Mounted);
+    }
+
+    /// Same bound for the startup sweep: one wedged leftover mount must
+    /// not hold up daemon start for longer than `mount_timeout` per entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_sweep_returns_at_timeout_on_hung_fusermount() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let plugin = SftpPlugin::with_mounter(
+            Arc::new(crate::plugins::events::PluginEventBroadcaster::new(
+                8, "test",
+            )),
+            dir.path().to_path_buf(),
+            Arc::new(SleepyRunner {
+                sleep_for: std::time::Duration::from_millis(1500),
+            }),
+        )
+        .with_mount_timeout(std::time::Duration::from_millis(50));
+        std::fs::create_dir_all(dir.path().join("mounts").join("sftp-stuck"))
+            .expect("stale mount dir");
+
+        let started = std::time::Instant::now();
+        let released = plugin.startup_sweep().await;
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(750),
+            "startup sweep blocked on the hung unmount for {took:?}"
+        );
+        assert_eq!(released.len(), 1);
+        assert!(released[0].ends_with(":failed"), "got {released:?}");
+    }
+
     #[tokio::test]
     async fn mount_reports_timeout_instead_of_hanging_on_dead_sshfs() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1290,8 +1356,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn startup_sweep_releases_stale_mounts() {
+    #[tokio::test]
+    async fn startup_sweep_releases_stale_mounts() {
         // The data dir has two stale sftp-* dirs from a previous crash.
         // The fake runner reports UnmountOutcome::Unmounted for them.
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1315,7 +1381,7 @@ mod tests {
             dir.path().to_path_buf(),
             Arc::new(runner),
         );
-        let released = plugin.startup_sweep();
+        let released = plugin.startup_sweep().await;
         assert_eq!(released.len(), 2, "two sftp-* dirs swept: {released:?}");
         // Stale dirs removed after unmount.
         assert!(!mounts_dir.join("sftp-dev1").exists());
@@ -1324,8 +1390,8 @@ mod tests {
         assert!(other.exists());
     }
 
-    #[test]
-    fn startup_sweep_safe_when_mounts_dir_missing() {
+    #[tokio::test]
+    async fn startup_sweep_safe_when_mounts_dir_missing() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         // No mounts/ subdir at all.
         let plugin = SftpPlugin::with_mounter(
@@ -1335,12 +1401,12 @@ mod tests {
             dir.path().to_path_buf(),
             Arc::new(ScriptedRunner::always_succeed()),
         );
-        let released = plugin.startup_sweep();
+        let released = plugin.startup_sweep().await;
         assert!(released.is_empty());
     }
 
-    #[test]
-    fn startup_sweep_safe_when_sshfs_missing() {
+    #[tokio::test]
+    async fn startup_sweep_safe_when_sshfs_missing() {
         // sshfs is NOT on PATH: a startup sweep must still run for any
         // stale mounts left by a previous daemon. (kdeconnect-kde's
         // sweep is implicit in mounter construction; we make it explicit
@@ -1380,7 +1446,7 @@ mod tests {
             dir.path().to_path_buf(),
             Arc::new(NoSshfsRunner),
         );
-        let released = plugin.startup_sweep();
+        let released = plugin.startup_sweep().await;
         assert_eq!(released.len(), 1);
         assert!(!mounts_dir.join("sftp-stale").exists());
     }
@@ -1513,7 +1579,7 @@ mod tests {
         std::fs::create_dir_all(&mount_point).expect("stale mount directory");
         plugin.set_mount_state("stale", MountState::Mounted);
 
-        plugin.on_disconnected("stale");
+        plugin.on_disconnected("stale").await;
 
         assert!(argv_log.lock().unwrap().is_empty());
         assert_eq!(
@@ -1522,8 +1588,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn disconnect_failed_live_unmount_keeps_state_for_retry() {
+    #[tokio::test]
+    async fn disconnect_failed_live_unmount_keeps_state_for_retry() {
         let runner = ScriptedRunner::with_outcomes(
             MountOutcome::Mounted,
             UnmountOutcome::Failed("busy".to_string()),
@@ -1533,7 +1599,7 @@ mod tests {
         plugin.set_mount_state("live", MountState::Mounted);
         std::fs::create_dir_all(plugin.mount_point("live")).expect("live mount directory");
 
-        plugin.cleanup_mount_on_disconnect("live", true);
+        plugin.cleanup_mount_on_disconnect("live", true).await;
 
         assert_eq!(argv_log.lock().unwrap().len(), 1);
         assert_eq!(plugin.get_mount_status("live").state, MountState::Mounted);
@@ -1564,7 +1630,7 @@ mod tests {
             plugin.get_mount_status("device1").state,
             MountState::Mounted
         );
-        plugin.on_disconnected("device1");
+        plugin.on_disconnected("device1").await;
         assert!(plugin.get_connection("device1").is_none());
         assert_eq!(
             plugin.get_mount_status("device1").state,

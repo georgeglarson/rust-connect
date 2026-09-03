@@ -225,7 +225,7 @@ impl PluginRegistry {
     pub async fn notify_disconnected(&self, device_id: &str) {
         let plugins = self.plugins.read().await;
         for (name, plugin) in plugins.iter() {
-            plugin.on_disconnected(device_id);
+            plugin.on_disconnected(device_id).await;
             debug!(plugin = %name, device_id = %device_id, event = "plugin_disconnected", "Notified plugin of disconnection");
         }
     }
@@ -460,7 +460,7 @@ mod tests {
             vec![]
         }
 
-        fn on_disconnected(&self, device_id: &str) {
+        async fn on_disconnected(&self, device_id: &str) {
             self.disconnected_devices
                 .lock()
                 .expect("Value expected to be present")

@@ -548,7 +548,7 @@ impl Plugin for SystemVolumePlugin {
         Vec::new()
     }
 
-    fn on_disconnected(&self, device_id: &str) {
+    async fn on_disconnected(&self, device_id: &str) {
         self.sinks
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -1559,7 +1559,7 @@ mod tests {
             .handle_packet("device1", controller_state_packet(kde_sink_list()))
             .await
             .unwrap();
-        plugin.on_disconnected("device1");
+        plugin.on_disconnected("device1").await;
         assert!(plugin.get_sinks("device1").is_empty());
     }
 
