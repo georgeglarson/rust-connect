@@ -498,53 +498,13 @@ impl ConnectionManager {
         );
         conn_handle.info.lock().await.last_activity = chrono::Utc::now();
 
-        let mut write_stream = conn_handle.write_stream.lock().await;
+        let outcome = {
+            let mut write_stream = conn_handle.write_stream.lock().await;
+            Self::write_framed(&mut *write_stream, &bytes, device_id).await
+        };
 
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            write_stream.write_all(&bytes),
-        )
-        .await
-        {
-            Ok(Ok(())) => {
-                trace!(
-                    device_id = %device_id,
-                    event = "write_all_complete",
-                    "write_all completed successfully, flushing..."
-                );
-                let flush_result = tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
-                    write_stream.flush(),
-                )
-                .await;
-                match flush_result {
-                    Ok(Ok(())) => {
-                        trace!(device_id = %device_id, event = "flush_complete", "Flush completed");
-                    }
-                    Ok(Err(e)) => {
-                        error!(
-                            device_id = %device_id,
-                            error = %e,
-                            event = "packet_flush_failed",
-                            "Failed to flush packet"
-                        );
-                        return Err(Error::ConnectionError(format!(
-                            "Failed to flush packet to {}: {}",
-                            device_id, e
-                        )));
-                    }
-                    Err(_) => {
-                        error!(
-                            device_id = %device_id,
-                            event = "packet_flush_timeout",
-                            "Timed out flushing packet"
-                        );
-                        return Err(Error::ConnectionTimeout(format!(
-                            "Timed out flushing packet to {}",
-                            device_id
-                        )));
-                    }
-                }
+        match outcome {
+            Ok(()) => {
                 conn_handle.info.lock().await.increment_sent();
                 debug!(
                     device_id = %device_id,
@@ -555,6 +515,45 @@ impl ConnectionManager {
                 transcript::record(device_id, Direction::Out, packet);
                 Ok(())
             }
+            Err(e) => {
+                // A failed or timed-out write leaves the stream's framing
+                // undefined: tokio-rustls hands back partial counts under
+                // backpressure, so a cancelled `write_all` has queued part
+                // of this packet and never written the rest, and the next
+                // packet would land after the truncated line (the peer
+                // drops both). The link is no longer usable — tear it down
+                // (2026-09-02 audit, A3). Generation-scoped, so a same-cert
+                // replacement that already holds the slot is untouched. The
+                // write guard is released above: `disconnect` takes the
+                // connections lock and then this same write lock.
+                warn!(
+                    device_id = %device_id,
+                    error = %e,
+                    event = "send_failure_teardown",
+                    "Send failed; tearing the link down (stream framing undefined)"
+                );
+                let _ = self.disconnect(device_id, conn_handle.generation).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Write one serialized packet and flush it, each half bounded by a
+    /// short timeout so a stalled peer cannot wedge every plugin behind
+    /// the write lock. Any error means the bytes on the wire are not a
+    /// complete line — the caller tears the link down.
+    async fn write_framed<W: tokio::io::AsyncWrite + Unpin>(
+        write_stream: &mut W,
+        bytes: &[u8],
+        device_id: &DeviceId,
+    ) -> Result<()> {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            write_stream.write_all(bytes),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 error!(
                     device_id = %device_id,
@@ -562,10 +561,10 @@ impl ConnectionManager {
                     event = "packet_send_failed",
                     "Failed to send packet"
                 );
-                Err(Error::ConnectionError(format!(
+                return Err(Error::ConnectionError(format!(
                     "Failed to send packet to {}: {}",
                     device_id, e
-                )))
+                )));
             }
             Err(_) => {
                 error!(
@@ -573,8 +572,45 @@ impl ConnectionManager {
                     event = "packet_send_timeout",
                     "Timed out sending packet"
                 );
-                Err(Error::ConnectionTimeout(format!(
+                return Err(Error::ConnectionTimeout(format!(
                     "Timed out sending packet to {}",
+                    device_id
+                )));
+            }
+        }
+
+        trace!(
+            device_id = %device_id,
+            event = "write_all_complete",
+            "write_all completed successfully, flushing..."
+        );
+        match tokio::time::timeout(std::time::Duration::from_millis(100), write_stream.flush())
+            .await
+        {
+            Ok(Ok(())) => {
+                trace!(device_id = %device_id, event = "flush_complete", "Flush completed");
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                error!(
+                    device_id = %device_id,
+                    error = %e,
+                    event = "packet_flush_failed",
+                    "Failed to flush packet"
+                );
+                Err(Error::ConnectionError(format!(
+                    "Failed to flush packet to {}: {}",
+                    device_id, e
+                )))
+            }
+            Err(_) => {
+                error!(
+                    device_id = %device_id,
+                    event = "packet_flush_timeout",
+                    "Timed out flushing packet"
+                );
+                Err(Error::ConnectionTimeout(format!(
+                    "Timed out flushing packet to {}",
                     device_id
                 )))
             }
