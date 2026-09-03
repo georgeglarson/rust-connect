@@ -37,7 +37,18 @@ use crate::utils::errors::{Error, Result};
 
 /// The KDE Connect DNS-SD service type. `_udp` is NOT a typo — see the
 /// module docs for the citations.
+#[cfg(not(any(test, feature = "test-helpers")))]
 pub const SERVICE_TYPE: &str = "_kdeconnect._udp.local.";
+/// Test builds announce and browse a service type no real KDE Connect
+/// peer knows (2026-09-02 audit, D2): `cargo test` was publishing fixture
+/// identities that the paired A15 dialed and that the live daemon on the
+/// same host registered. Loopback scoping is not enough — Linux delivers
+/// looped multicast to every local member of the group — so the type
+/// itself changes. Every `cargo test` build carries `test-helpers` (the
+/// crate is its own dev-dependency with that feature); `cargo build
+/// --locked`, which the interop harness and the release use, never does.
+#[cfg(any(test, feature = "test-helpers"))]
+pub const SERVICE_TYPE: &str = "_kdeconnect-test._udp.local.";
 
 /// mDNS announcer + browser for this device.
 pub struct MdnsDiscoveryService {
@@ -380,8 +391,9 @@ mod tests {
 
     #[test]
     fn test_resolved_to_identity_reads_reference_shape() {
+        let good_name = format!("peer-device-aaaaaaaaaaaaaaaaaaaaaa.{SERVICE_TYPE}");
         let resolved = service_view(
-            "peer-device-aaaaaaaaaaaaaaaaaaaaaa._kdeconnect._udp.local.",
+            &good_name,
             "192.168.1.50"
                 .parse()
                 .expect("Value expected to be present"),
@@ -419,8 +431,9 @@ mod tests {
     fn test_resolved_to_identity_falls_back_to_instance_name_for_id() {
         // No `id` TXT: the instance name is the device id in both reference
         // implementations (module docs).
+        let good_name = format!("peer-device-aaaaaaaaaaaaaaaaaaaaaa.{SERVICE_TYPE}");
         let resolved = service_view(
-            "peer-device-aaaaaaaaaaaaaaaaaaaaaa._kdeconnect._udp.local.",
+            &good_name,
             "192.168.1.50"
                 .parse()
                 .expect("Value expected to be present"),
@@ -437,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_resolved_to_identity_rejects_unusable_services() {
-        let good_name = "peer-device-aaaaaaaaaaaaaaaaaaaaaa._kdeconnect._udp.local.";
+        let good_name = &format!("peer-device-aaaaaaaaaaaaaaaaaaaaaa.{SERVICE_TYPE}")[..];
         let good_ip: std::net::IpAddr = "192.168.1.50"
             .parse()
             .expect("Value expected to be present");
@@ -546,6 +559,47 @@ mod tests {
             .await
             .expect("browsing must stop on shutdown")
             .expect("join");
+    }
+
+    /// D2 (2026-09-02 audit): `cargo test` must never publish a fixture
+    /// that a real KDE Connect peer would act on. The `svc-mgr-peer-device…`
+    /// and `mdns-our-device…` fixtures were discovered by the paired A15
+    /// over `_kdeconnect._udp` and, on 2026-09-02, landed in the LIVE
+    /// daemon's device registry on this host. Loopback scoping is not
+    /// enough (Linux delivers looped multicast to every local member of
+    /// the group), so test builds announce under a test-only service type
+    /// that no phone and no production daemon browses.
+    #[tokio::test]
+    async fn test_announcer_in_test_builds_is_invisible_to_production_browsers() {
+        let identity = our_identity();
+        let _service = MdnsDiscoveryService::new(&identity).expect("announce");
+
+        let browser = ServiceDaemon::new().expect("browser daemon");
+        let receiver = browser
+            .browse("_kdeconnect._udp.local.")
+            .expect("browse the production service type");
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                match receiver.recv_async().await {
+                    Ok(ServiceEvent::ServiceResolved(resolved))
+                        if resolved.get_fullname().starts_with(&identity.device_id) =>
+                    {
+                        break true;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        let _ = browser.shutdown();
+
+        assert!(
+            !seen,
+            "a production-type browser resolved the test fixture {}: cargo test is announcing to real peers",
+            identity.device_id
+        );
     }
 
     /// Task 2.2 (vk #994): `reannounce` must cause a REAL, observable
