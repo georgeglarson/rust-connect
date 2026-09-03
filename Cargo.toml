@@ -60,7 +60,7 @@ utoipa-swagger-ui = { version = "6", features = ["axum"] }
 
 # Configuration
 config = "0.14"
-toml = "0.8"
+toml = "1.1"
 
 # Error handling
 thiserror = "1"
