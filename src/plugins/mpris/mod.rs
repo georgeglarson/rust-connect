@@ -973,7 +973,8 @@ impl MprisPlugin {
             cm.cert_manager.clone(),
             device_id.to_string(),
         );
-        let (transfer_info, handle) = match transfer.send_file(&source.path).await {
+        let local_ip = cm.get_local_addr(&device_id.to_string()).await?.ip();
+        let (transfer_info, handle) = match transfer.send_file(&source.path, local_ip).await {
             Ok(result) => result,
             Err(e) => {
                 warn!(

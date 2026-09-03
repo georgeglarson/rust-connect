@@ -129,7 +129,13 @@ pub async fn send_file_to_device(
     let transfer =
         crate::protocol::payload_transfer::PayloadTransfer::new(cert_manager, device_id.clone());
 
-    let (transfer_info, handle) = match transfer.send_file(&temp_path).await {
+    let Some(local_addr) = state.connection_manager.get_local_addr(&device_id).await else {
+        return Err(api_err(Error::ConnectionError(format!(
+            "No live link to {} to send the file over",
+            device_id
+        ))));
+    };
+    let (transfer_info, handle) = match transfer.send_file(&temp_path, local_addr.ip()).await {
         Ok(result) => result,
         Err(e) => {
             return Err(api_err(Error::Internal(format!(

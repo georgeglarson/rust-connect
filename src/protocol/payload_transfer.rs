@@ -448,9 +448,14 @@ impl PayloadTransfer {
         Ok((bytes, destination))
     }
 
+    /// `local_ip` is our address on the link to the receiving device
+    /// (`ConnectionManager::get_local_addr`), which is what the receiver
+    /// dials back to. A route probe was used before (2026-09-02 audit, D3)
+    /// and picked the default-route address — wrong under a VPN exit node.
     pub async fn send_file(
         &self,
         file_path: &std::path::Path,
+        local_ip: std::net::IpAddr,
     ) -> Result<(PayloadTransferInfo, tokio::task::JoinHandle<Result<()>>)> {
         // The declared size sets the total transfer deadline; a big file over
         // a slow link must not die at the flat floor while still progressing.
@@ -465,7 +470,7 @@ impl PayloadTransfer {
             .map_err(|e| Error::ConnectionError(format!("Cannot get listener address: {}", e)))?;
 
         let transfer_info = PayloadTransferInfo {
-            ip: Some(self.local_ip().await?),
+            ip: Some(local_ip.to_string()),
             port: local_addr.port(),
             available_streams: 1,
             total_streams: 1,
@@ -570,18 +575,6 @@ impl PayloadTransfer {
             "No free ports in transfer range 1739-1764".to_string(),
         ))
     }
-
-    async fn local_ip(&self) -> Result<String> {
-        let socket = std::net::UdpSocket::bind("0.0.0.0:0")
-            .map_err(|e| Error::ConnectionError(format!("Failed to bind socket: {}", e)))?;
-        socket
-            .connect("8.8.8.8:80")
-            .map_err(|e| Error::ConnectionError(format!("Failed to connect socket: {}", e)))?;
-        let local_addr = socket
-            .local_addr()
-            .map_err(|e| Error::ConnectionError(format!("Failed to get local address: {}", e)))?;
-        Ok(local_addr.ip().to_string())
-    }
 }
 
 #[cfg(test)]
@@ -602,6 +595,21 @@ mod tests {
         let transfer =
             PayloadTransfer::new(cert_manager, "test-deviceaaaaaaaaaaaaaaaaaaaaa".to_string());
         (transfer, temp_dir)
+    }
+
+    /// D3 (2026-09-02 audit): the advertised transfer address is the
+    /// caller-supplied link address, never a route probe.
+    #[tokio::test]
+    async fn test_send_file_advertises_the_given_local_ip() {
+        let (transfer, temp) = setup();
+        let path = temp.path().join("payload.bin");
+        std::fs::write(&path, b"hello").expect("write");
+        let (info, handle) = transfer
+            .send_file(&path, "127.0.0.1".parse().expect("ip"))
+            .await
+            .expect("send_file");
+        assert_eq!(info.ip.as_deref(), Some("127.0.0.1"));
+        handle.abort();
     }
 
     #[test]
@@ -671,7 +679,9 @@ mod tests {
             .await
             .expect("Value expected to be present");
 
-        let result = transfer.send_file(&file_path).await;
+        let result = transfer
+            .send_file(&file_path, "127.0.0.1".parse().expect("ip"))
+            .await;
         assert!(result.is_ok());
         let (info, handle) = result.expect("Value expected to be present");
         assert_eq!(info.available_streams, 1);
@@ -707,7 +717,7 @@ mod tests {
             .expect("write test file");
 
         let (_info, handle) = transfer
-            .send_file(&file_path)
+            .send_file(&file_path, "127.0.0.1".parse().expect("ip"))
             .await
             .expect("send_file must set up the listener");
         // Nobody connects to the advertised port — the spawned task's
@@ -735,7 +745,10 @@ mod tests {
     async fn test_send_file_nonexistent_fails() {
         let (transfer, _temp) = setup();
         let result = transfer
-            .send_file(std::path::Path::new("/nonexistent/file.txt"))
+            .send_file(
+                std::path::Path::new("/nonexistent/file.txt"),
+                "127.0.0.1".parse().expect("ip"),
+            )
             .await;
         assert!(result.is_err());
     }
@@ -807,7 +820,12 @@ mod tests {
     #[tokio::test]
     async fn test_send_file_directory_as_path_sets_up_listener() {
         let (transfer, _temp) = setup();
-        let result = transfer.send_file(std::path::Path::new("/tmp")).await;
+        let result = transfer
+            .send_file(
+                std::path::Path::new("/tmp"),
+                "127.0.0.1".parse().expect("ip"),
+            )
+            .await;
         assert!(
             result.is_ok(),
             "send_file should succeed in setting up listener even for directory"
@@ -1014,7 +1032,10 @@ mod tls_tests {
         tokio::fs::write(&src, content).await.expect("write src");
 
         let sender = PayloadTransfer::new(cm_a, RECEIVER_ID.to_string());
-        let (mut info, send_handle) = sender.send_file(&src).await.expect("send_file");
+        let (mut info, send_handle) = sender
+            .send_file(&src, "127.0.0.1".parse().expect("ip"))
+            .await
+            .expect("send_file");
         info.ip = Some("127.0.0.1".to_string()); // loopback for the test
 
         let dest = t_b.path().join("dest.bin");
@@ -1077,7 +1098,10 @@ mod tls_tests {
         tokio::fs::write(&src, content).await.expect("write src");
 
         let sender = PayloadTransfer::new(cm_a, RECEIVER_ID.to_string());
-        let (mut info, send_handle) = sender.send_file(&src).await.expect("send_file");
+        let (mut info, send_handle) = sender
+            .send_file(&src, "127.0.0.1".parse().expect("ip"))
+            .await
+            .expect("send_file");
         info.ip = Some("127.0.0.1".to_string());
 
         let dest = t_b.path().join("dest.bin");
