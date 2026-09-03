@@ -560,6 +560,32 @@ impl NotificationPlugin {
 
 #[async_trait::async_trait]
 impl Plugin for NotificationPlugin {
+    /// B4 (2026-09-02 audit): drop everything the device sent — history,
+    /// desktop dedupe keys, cached icons — so nothing stays servable under
+    /// its id after a disconnect or an unpair. The plugin had no disconnect
+    /// handler before.
+    fn on_disconnected(&self, device_id: &str) {
+        self.history
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|entry| entry.device_id.as_str() != device_id);
+        self.dedupe
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(dev, _), _| dev.as_str() != device_id);
+        let hashes = self
+            .icon_lru
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(device_id)
+            .unwrap_or_default();
+        for hash in hashes {
+            if let Some(path) = self.icon_path(device_id, &hash) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
     fn name(&self) -> &str {
         "notification"
     }

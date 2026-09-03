@@ -589,6 +589,72 @@ async fn test_unpair_device() {
 /// Unpair must release SFTP credentials and any tracked mount, even
 /// when the device is not currently connected. Mirrors the lifecycle
 /// matrix in the lane brief.
+/// B4 (2026-09-02 audit): unpair revokes trust, so nothing a device sent
+/// while trusted may remain servable under its id afterwards. The REST
+/// unpair cleaned only SFTP state; notification history (and its icons)
+/// survived, and the notification plugin had no disconnect handler at all.
+#[tokio::test]
+async fn test_unpair_drops_notification_state() {
+    use rust_connect::plugins::Plugin;
+    let (state, _temp, api_key) = create_test_app().await;
+    let device_id = "unpair-notif-aaaaaaaaaaaaaaaaaaaa";
+    state
+        .pairing_handler
+        .paired_handle()
+        .write()
+        .await
+        .insert(device_id.to_string(), chrono::Utc::now());
+
+    let pkt = rust_connect::protocol::types::Packet::new(
+        "kdeconnect.notification".to_string(),
+        serde_json::json!({
+            "id": "n-1",
+            "appName": "Mail",
+            "title": "hello",
+            "text": "world",
+            "ticker": "hello: world"
+        }),
+    );
+    state
+        .plugins
+        .notification
+        .handle_packet(device_id, pkt)
+        .await
+        .expect("handle notification packet");
+    assert_eq!(
+        state
+            .plugins
+            .notification
+            .get_history(Some(device_id), 10)
+            .len(),
+        1,
+        "precondition: the notification was stored"
+    );
+
+    let app = build_router(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/devices/{device_id}/unpair"))
+                .header("X-API-Key", &api_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert!(
+        state
+            .plugins
+            .notification
+            .get_history(Some(device_id), 10)
+            .is_empty(),
+        "notification history must not survive unpair"
+    );
+}
+
 #[tokio::test]
 async fn test_unpair_drops_sftp_credentials() {
     let (state, _temp, api_key) = create_test_app().await;
