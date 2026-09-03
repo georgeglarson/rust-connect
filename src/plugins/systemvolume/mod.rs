@@ -65,6 +65,10 @@ use backend::{detect as detect_pactl, LocalSinkState, SubscribeEvent, VolumeBack
 #[cfg(test)]
 use backend::MockBackend;
 
+/// PulseAudio `PA_VOLUME_NORM`; the ceiling used when the sink's own
+/// `max_volume` is not yet known (kde reports it per sink, pulse.cpp:71).
+const DEFAULT_MAX_VOLUME: i64 = 65_536;
+
 /// One PulseAudio sink as the desktop peer describes it.
 ///
 /// Keys match the object kdeconnect-kde puts in `sinkList`
@@ -734,6 +738,16 @@ impl SystemVolumePlugin {
         // Upstream applies volume FIRST (pulse.cpp:43-46), then
         // muted (49), then enabled (51). We mirror.
         if let Some(volume) = body.get("volume").and_then(|v| v.as_i64()) {
+            // B6 (2026-09-02 audit): clamp to the sink's own ceiling
+            // (pulse.cpp:71,94 — `max_volume`) and to 0, before the value
+            // reaches pactl. The MPRIS backend clamps for the same reason.
+            let max_volume = self
+                .local_sinks_handle()
+                .read()
+                .ok()
+                .and_then(|sinks| sinks.get(name).and_then(|s| s.max_volume))
+                .unwrap_or(DEFAULT_MAX_VOLUME);
+            let volume = volume.clamp(0, max_volume.max(0));
             if let Err(e) = backend.set_volume(name, volume).await {
                 warn!(
                     device_id = %device_id,
@@ -1392,6 +1406,42 @@ mod tests {
         // volume path issues set_volume AND set_muted(false) per pulse.cpp:46
         assert!(calls.iter().any(|c| c.starts_with("set_volume:s1:32768")));
         assert!(calls.iter().any(|c| c == "set_muted:s1:false"));
+    }
+
+    /// B6 (2026-09-02 audit): a peer-supplied `volume` reached pactl
+    /// unclamped. The sink's own `max_volume` (pulse.cpp:71,94) is the
+    /// ceiling and 0 the floor; the MPRIS backend already clamps for the
+    /// same reason.
+    #[tokio::test]
+    async fn test_volume_request_is_clamped_to_the_sink_max() {
+        for (requested, expected) in [(10_000_000_i64, 65_536_i64), (-5, 0)] {
+            let backend = MockBackend::new().with_sinks(vec![LocalSinkState {
+                name: "s1".to_string(),
+                max_volume: Some(65_536),
+                volume: Some(0),
+                muted: Some(false),
+                enabled: Some(true),
+                description: Some("d".to_string()),
+            }]);
+            let backend_arc = backend.clone();
+            let plugin = SystemVolumePlugin::new();
+            plugin.set_backend(backend).await;
+            plugin.disable_watcher_for_test();
+            plugin
+                .handle_packet(
+                    "phone1",
+                    request_packet(json!({ "name": "s1", "volume": requested })),
+                )
+                .await
+                .unwrap();
+            let calls = backend_arc.calls();
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c == &format!("set_volume:s1:{expected}")),
+                "volume {requested} must reach the backend as {expected}; calls: {calls:?}"
+            );
+        }
     }
 
     #[tokio::test]
