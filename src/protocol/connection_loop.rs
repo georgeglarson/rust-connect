@@ -273,6 +273,14 @@ pub async fn run_packet_loop(
                                         if let Err(e) = pairing.unpair(device_id).await {
                                             debug!(device_id = %device_id, error = %e, "Failed to unpair after rejection");
                                         }
+                                        // B4 (2026-09-02 audit): same
+                                        // teardown as the read-error arm —
+                                        // lifecycle + plugin state — while
+                                        // this generation owns the link.
+                                        if let Ok(true) = cm.disconnect(device_id, generation).await {
+                                            lifecycle.try_transition(device_id, DeviceState::Disconnected).await;
+                                            plugin_registry.notify_disconnected(device_id).await;
+                                        }
                                         return LoopResult::Disconnected;
                                     }
                                     // Requested: we started pairing and got

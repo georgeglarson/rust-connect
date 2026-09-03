@@ -53,6 +53,14 @@ impl LockPlugin {
 
 #[async_trait::async_trait]
 impl Plugin for LockPlugin {
+    /// B4 (2026-09-02 audit): a device's last lock state must not outlive
+    /// its connection or its pairing.
+    fn on_disconnected(&self, device_id: &str) {
+        if let Ok(mut states) = self.states.try_write() {
+            states.remove(device_id);
+        }
+    }
+
     fn name(&self) -> &str {
         "lock"
     }
@@ -152,6 +160,26 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
     use super::*;
+
+    /// B4 (2026-09-02 audit): the plugin had no disconnect handler, so a
+    /// device's last lock state outlived its connection and its pairing.
+    #[tokio::test]
+    async fn test_on_disconnected_forgets_the_device_state() {
+        let plugin = LockPlugin::new();
+        plugin
+            .handle_packet(
+                "phone1",
+                Packet::new(
+                    "kdeconnect.lock".to_string(),
+                    serde_json::json!({ "isLocked": true }),
+                ),
+            )
+            .await
+            .expect("handle");
+        assert_eq!(plugin.is_locked("phone1").await, Some(true));
+        plugin.on_disconnected("phone1");
+        assert_eq!(plugin.is_locked("phone1").await, None);
+    }
 
     #[tokio::test]
     async fn test_lock_plugin_name() {

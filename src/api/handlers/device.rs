@@ -309,6 +309,9 @@ pub async fn unpair_device(
     // and mount belong to the previous pairing. Drop them on the way
     // out so a fresh pairing starts clean.
     state.plugins.sftp.cleanup_device(&device_id).await;
+    // B4 (2026-09-02 audit): every plugin drops what the device sent while
+    // trusted (notification history and icons, lock state, …).
+    state.plugin_registry.notify_disconnected(&device_id).await;
 
     // Idempotent: a peer-initiated `pair=false` may already have cleared
     // our local pair state by the time the harness's DELETE arrives — the
