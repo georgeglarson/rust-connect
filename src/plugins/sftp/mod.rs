@@ -89,6 +89,10 @@ pub struct SftpPlugin {
     data_dir: PathBuf,
     mounter: Arc<Mounter>,
     plugin_events: Arc<PluginEventBroadcaster>,
+    /// Source of the authenticated link's peer address — the ONLY address
+    /// sshfs is ever pointed at (kdeconnect-kde mounter.cpp:81-94). `None`
+    /// only in test constructions; production wires it in loader.rs.
+    connection_manager: Option<Arc<crate::protocol::ConnectionManager>>,
 }
 
 impl Default for SftpPlugin {
@@ -142,10 +146,32 @@ impl SftpPlugin {
             data_dir,
             mounter: Arc::new(mounter_inst),
             plugin_events,
+            connection_manager: None,
         }
     }
 
     #[allow(clippy::expect_used)]
+    /// Wire the connection manager so the sshfs target is the address of
+    /// the TLS link the credentials arrived on, never the packet's `ip`.
+    pub fn with_connection_manager(
+        mut self,
+        connection_manager: Arc<crate::protocol::ConnectionManager>,
+    ) -> Self {
+        self.connection_manager = Some(connection_manager);
+        self
+    }
+
+    /// Plant credentials as if they had arrived on a live link. Test-only:
+    /// production credentials enter through `handle_packet`, which binds
+    /// the sshfs target to the authenticated link's address and validates
+    /// the peer-supplied fields (2026-09-02 audit, B1).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn plant_connection_for_test(&self, device_id: &str, info: SftpConnectionInfo) {
+        if let Ok(mut connections) = self.connections.write() {
+            connections.insert(device_id.to_string(), info);
+        }
+    }
+
     pub fn get_connection(&self, device_id: &str) -> Option<SftpConnectionInfo> {
         let connections = self.connections.read().unwrap_or_else(|e| e.into_inner());
         connections.get(device_id).cloned()
@@ -407,6 +433,30 @@ impl SftpPlugin {
     }
 }
 
+/// `user@ip:path` is argv[0] to sshfs (mounter.rs `build_sshfs_args`). A
+/// `user` that starts with `-` is parsed as an option (`-oProxyCommand=…`
+/// is command execution as the daemon's user); `@` or `:` inside it shifts
+/// what sshfs reads as host and path. The remote path must be absolute
+/// (Android sends `/` and absolute `multiPaths`).
+fn validate_sshfs_fields(user: &str, path: &str) -> std::result::Result<(), &'static str> {
+    if user.is_empty() {
+        return Err("empty user");
+    }
+    if user.starts_with('-') {
+        return Err("user starts with '-' (sshfs option)");
+    }
+    if !user
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err("user contains characters outside [A-Za-z0-9._-]");
+    }
+    if !path.starts_with('/') {
+        return Err("remote path is not absolute");
+    }
+    Ok(())
+}
+
 fn mount_point_for(data_dir: &std::path::Path, device_id: &str) -> PathBuf {
     data_dir.join("mounts").join(format!("sftp-{device_id}"))
 }
@@ -471,12 +521,32 @@ impl Plugin for SftpPlugin {
             return Ok(None);
         }
 
-        let ip = packet
-            .body
-            .get("ip")
-            .and_then(|v| v.as_str())
-            .unwrap_or("127.0.0.1")
-            .to_string();
+        // The sshfs target is the peer address of the authenticated TLS
+        // link, never the `ip` the packet claims (kdeconnect-kde
+        // mounter.cpp:81-94; its expected-fields set does not list `ip`).
+        // A paired-but-hostile peer could otherwise point the desktop's
+        // sshfs session, password included, at any host (2026-09-02
+        // audit, B1). The packet's `ip` is honored only when no connection
+        // manager is wired (test constructions).
+        let ip = match &self.connection_manager {
+            Some(cm) => match cm.get_peer_addr(&device_id.to_string()).await {
+                Some(addr) => addr.ip().to_string(),
+                None => {
+                    warn!(
+                        device_id = %device_id,
+                        event = "sftp_no_link_address",
+                        "SFTP credentials arrived with no live link address; dropping"
+                    );
+                    return Ok(None);
+                }
+            },
+            None => packet
+                .body
+                .get("ip")
+                .and_then(|v| v.as_str())
+                .unwrap_or("127.0.0.1")
+                .to_string(),
+        };
         let port = packet
             .body
             .get("port")
@@ -522,6 +592,16 @@ impl Plugin for SftpPlugin {
                     .collect()
             })
             .unwrap_or_default();
+
+        if let Err(reason) = validate_sshfs_fields(&user, &path) {
+            warn!(
+                device_id = %device_id,
+                reason,
+                event = "sftp_credentials_rejected",
+                "SFTP credentials rejected; not stored"
+            );
+            return Ok(None);
+        }
 
         let info = SftpConnectionInfo {
             ip,
@@ -683,6 +763,124 @@ mod tests {
             Arc::new(runner),
         );
         (plugin, dir)
+    }
+
+    const LINK_OUR_ID: &str = "sftp-our-aaaaaaaaaaaaaaaaaaaaaaaa";
+    const LINK_PEER_ID: &str = "sftp-peer-aaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// A ConnectionManager holding a live in-process TLS link to
+    /// `LINK_PEER_ID`, so `get_peer_addr` has a real address (127.0.0.1)
+    /// to hand out. Same shape as share.rs's `cm_with_live_link`.
+    async fn cm_with_live_link() -> (
+        Arc<crate::protocol::ConnectionManager>,
+        tokio::task::JoinHandle<()>,
+        tempfile::TempDir,
+    ) {
+        use crate::protocol::{CertificateManager, ConnectionManager};
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let certs = Arc::new(CertificateManager::new(temp.path().to_path_buf()));
+        certs.init().expect("init");
+        let server_cm = Arc::new(ConnectionManager::new(certs.clone()).expect("cm"));
+        server_cm.set_device_identity(LINK_OUR_ID, "Us");
+        let client_cm = Arc::new(ConnectionManager::new(certs).expect("cm"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = server_cm.clone();
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            server
+                .accept_test(LINK_PEER_ID.to_string(), stream)
+                .await
+                .expect("accept_test");
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+        client_cm
+            .connect(&LINK_PEER_ID.to_string(), addr)
+            .await
+            .expect("connect");
+        (client_cm, handle, temp)
+    }
+
+    fn sftp_packet(ip: &str, user: &str, path: &str) -> Packet {
+        Packet::new(
+            "kdeconnect.sftp".to_string(),
+            serde_json::json!({
+                "ip": ip,
+                "port": 1740,
+                "user": user,
+                "password": "phonesecret",
+                "path": path,
+                "multiPaths": ["/storage/emulated/0"],
+                "pathNames": ["Internal"]
+            }),
+        )
+    }
+
+    /// B1 (2026-09-02 audit): the sshfs target is the address of the
+    /// authenticated TLS link, never the `ip` the packet claims
+    /// (kdeconnect-kde mounter.cpp:81-94 uses the link address; its
+    /// expected-fields set does not even list `ip`). A paired-but-hostile
+    /// peer could otherwise point the desktop's sshfs session, password
+    /// included, at any host.
+    #[tokio::test]
+    async fn handle_packet_takes_ip_from_the_live_link_not_the_packet() {
+        let (cm, server, _t) = cm_with_live_link().await;
+        let (plugin, _d) = test_plugin_with_runner(ScriptedRunner::always_succeed());
+        let plugin = plugin.with_connection_manager(cm);
+
+        plugin
+            .handle_packet(LINK_PEER_ID, sftp_packet("203.0.113.9", "kdeconnect", "/"))
+            .await
+            .expect("handle_packet");
+
+        let stored = plugin
+            .get_connection(LINK_PEER_ID)
+            .expect("credentials must be stored");
+        assert_eq!(
+            stored.ip, "127.0.0.1",
+            "sshfs target must be the link peer address, not the packet's claim"
+        );
+        server.abort();
+    }
+
+    /// B1: `user@ip:path` is argv[0] to sshfs. A `user` that starts with
+    /// `-` is an option (`-oProxyCommand=…` is command execution), and `@`
+    /// or `:` inside it shifts what sshfs parses as host and path. Such
+    /// packets are dropped, never stored.
+    #[tokio::test]
+    async fn handle_packet_rejects_option_or_separator_shaped_user() {
+        for user in ["-oProxyCommand=id", "kde@evil", "kde:x", "", "kde connect"] {
+            let (plugin, _d) = test_plugin_with_runner(ScriptedRunner::always_succeed());
+            plugin
+                .handle_packet("dev-1", sftp_packet("192.168.1.50", user, "/"))
+                .await
+                .expect("handle_packet");
+            assert!(
+                plugin.get_connection("dev-1").is_none(),
+                "user {user:?} must be rejected, not stored"
+            );
+        }
+    }
+
+    /// B1: the remote path must be absolute (Android sends `/` and absolute
+    /// multiPaths); anything else is not a path we asked for.
+    #[tokio::test]
+    async fn handle_packet_rejects_relative_remote_path() {
+        let (plugin, _d) = test_plugin_with_runner(ScriptedRunner::always_succeed());
+        plugin
+            .handle_packet(
+                "dev-1",
+                sftp_packet("192.168.1.50", "kdeconnect", "storage"),
+            )
+            .await
+            .expect("handle_packet");
+        assert!(plugin.get_connection("dev-1").is_none());
     }
 
     #[test]
