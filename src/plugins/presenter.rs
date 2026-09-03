@@ -64,6 +64,12 @@ pub struct PresenterRequest {
 /// remainder across calls so small movements accumulate instead of
 /// rounding away to zero.
 fn scaled_pixels(delta: f64, remainder: &mut f64) -> i32 {
+    // B2 (2026-09-02 audit): JSON `1e400` parses to infinity. Carrying it
+    // into the remainder would turn every later movement — from any
+    // device, the handle is shared — into a max-magnitude jump.
+    if !delta.is_finite() {
+        return 0;
+    }
     let total = delta * POINTER_SCALE + *remainder;
     let whole = total.round() as i32;
     *remainder = total - f64::from(whole);
@@ -188,6 +194,17 @@ impl Plugin for PresenterPlugin {
 
     fn outgoing_capabilities(&self) -> Vec<String> {
         vec![]
+    }
+
+    /// The sub-pixel remainder is shared by every device on the single
+    /// uinput handle; a device that vanishes mid-gesture must not leave
+    /// its fraction behind for the next one (2026-09-02 audit, B2).
+    fn on_disconnected(&self, _device_id: &str) {
+        if let Ok(mut guard) = self.input_device.lock() {
+            if let Some(ref mut dev) = *guard {
+                dev.reset();
+            }
+        }
     }
 
     async fn handle_packet(&self, device_id: &str, packet: Packet) -> Result<Option<Vec<Packet>>> {
@@ -317,6 +334,20 @@ mod tests {
         assert!(req.dx.is_none());
         assert!(req.dy.is_none());
         assert!(!req.stop);
+    }
+
+    /// B2 (2026-09-02 audit): JSON `1e400` deserializes to `f64::INFINITY`.
+    /// An infinite delta must not poison the sub-pixel remainder — the
+    /// remainder is shared by every device on the single uinput handle, so
+    /// one hostile packet would turn every later movement from any device
+    /// into a max-magnitude jump until a `stop`.
+    #[tokio::test]
+    async fn test_scaled_pixels_ignores_non_finite_delta() {
+        let mut rem = 0.0;
+        assert_eq!(scaled_pixels(f64::INFINITY, &mut rem), 0);
+        assert_eq!(scaled_pixels(f64::NAN, &mut rem), 0);
+        assert!(rem.is_finite(), "remainder poisoned: {rem}");
+        assert_eq!(scaled_pixels(0.0123, &mut rem), 12);
     }
 
     #[tokio::test]
