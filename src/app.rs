@@ -54,39 +54,32 @@ impl AppState {
         // expired one, we answered with plugin traffic instead of pair=true,
         // and the unpaired phone correctly rejected with pair=false.
         //
-        // The pairing handler is built first, then we extract its
-        // inner paired-ids handle for the device registry (finding
-        // L2-1, Sprint 2 security audit — registry must tell
-        // truly-paired devices from pre-auth ones that merely
-        // reached Connected), then wire the broadcaster in (Task
-        // #1042 fix lane E — pairing-event seam) so accept /
-        // force-accept emit `DeviceEvent::Paired` and `unpair`
-        // emits `DeviceEvent::Unpaired`. Capability gates that
-        // filter on `is_paired` (e.g. shareinputdevices' M4
-        // pairing-gate lane) re-evaluate on those events.
-        let pairing_handler = Arc::new(PairingHandler::new(cert_manager.clone()));
-
-        // Built before the registry so its shared paired-ids handle
-        // (finding L2-1, Sprint 2 security audit) can be wired in at
-        // construction: the registry needs to tell truly-paired devices
-        // from pre-auth ones that merely reached Connected.
-        let devices_path = settings.data_dir.join("devices.json");
-        let registry = Arc::new(
-            DeviceRegistry::with_persistence(devices_path)
-                .with_paired_source(pairing_handler.paired_handle()),
-        );
+        // The broadcaster is wired into the handler (Task #1042 fix lane
+        // E — pairing-event seam) so accept / force-accept emit
+        // `DeviceEvent::Paired` and `unpair` emits `DeviceEvent::Unpaired`;
+        // capability gates that filter on `is_paired` re-evaluate on those.
+        // ONE pairing handler, fully wired (persistence + broadcaster)
+        // BEFORE the registry borrows its paired-ids handle. The handle is
+        // the inner `Arc` of THIS handler's paired map; a second
+        // `PairingHandler::new` allocates a fresh map, and a registry
+        // holding the first handler's handle never sees a real pairing —
+        // devices.json was written as `{}` on every save for a month
+        // (2026-09-02 audit A2, pinned by `tests::test_registry_persists_
+        // a_device_the_live_pairing_handler_marks_paired`).
         let broadcaster = Arc::new(EventBroadcaster::new(256, "device"));
-        // Wire persistence + broadcaster into the pairing handler
-        // (Task #1042 fix lane E — pairing-event seam). The
-        // builder consumes the `PairingHandler` value (not the
-        // outer Arc) and returns a fresh one; the registry
-        // already holds the inner paired-ids `Arc` clone, so it
-        // observes the new broadcaster-wired state via that
-        // shared inner handle — no extra wiring needed.
         let pairing_handler = Arc::new(
             PairingHandler::new(cert_manager.clone())
                 .with_persistence(pairing_path)
                 .with_broadcaster(broadcaster.clone()),
+        );
+
+        // The registry needs to tell truly-paired devices from pre-auth
+        // ones that merely reached Connected (finding L2-1, Sprint 2
+        // security audit), so it shares the live handler's paired map.
+        let devices_path = settings.data_dir.join("devices.json");
+        let registry = Arc::new(
+            DeviceRegistry::with_persistence(devices_path)
+                .with_paired_source(pairing_handler.paired_handle()),
         );
         let lifecycle = Arc::new(LifecycleManager::new(registry.clone(), broadcaster.clone()));
 
@@ -264,6 +257,44 @@ impl AppState {
             event = "init_packets_undelivered",
             "Could not deliver plugin init packets; the device will get them \
              when it next connects, but may show no features until then"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::expect_used)]
+    use super::*;
+    use crate::device::types::{Device, DeviceType};
+
+    /// Regression for the 2026-09-02 audit finding A2: `AppState::new`
+    /// built the registry's paired-ids handle from one `PairingHandler`
+    /// and then stored a DIFFERENT `PairingHandler` in the state, so the
+    /// registry never saw a real pairing and `devices.json` was always
+    /// written as `{}`. The registry's own unit tests wire the handle by
+    /// hand and could not catch it; only a test through `AppState` can.
+    #[tokio::test]
+    async fn test_registry_persists_a_device_the_live_pairing_handler_marks_paired() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let settings = AppSettings::new_with_data_dir(temp.path().to_path_buf());
+        let state = AppState::new_without_input(settings).unwrap();
+
+        let id = "paired-device-aaaaaaaaaaaaaaaaaaaaa".to_string();
+        state
+            .pairing_handler
+            .paired_handle()
+            .write()
+            .await
+            .insert(id.clone(), chrono::Utc::now());
+
+        let device = Device::new(id.clone(), "Phone".to_string(), DeviceType::Phone, 8);
+        state.registry.add(device).await.unwrap();
+
+        let json = std::fs::read_to_string(temp.path().join("devices.json")).unwrap();
+        assert!(
+            json.contains(&id),
+            "devices.json must carry a device the live pairing handler says is paired; got {json}"
         );
     }
 }

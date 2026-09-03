@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Upgrading now removes a prior global enable; enabling is per user with
   `systemctl --user enable --now rust-connect.service`.
   Pinned by `tests/packaging_lint.rs`.
+- `devices.json` was written as `{}` on every save: the device registry
+  borrowed its paired-ids handle from a pairing handler that was then
+  discarded, so no device ever counted as paired for persistence or for the
+  unpaired-eviction cap. Device records now survive a restart.
 
 First public release. Everything below is the initial feature set rather
 than a delta against a previous version.
