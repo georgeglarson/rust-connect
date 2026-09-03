@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The deb's postinst no longer runs `systemctl --global enable`, which
+  started a daemon in every user manager on the host, greeter users
+  included (Fedora's `gdm-greeter` ran its own instance at every boot with
+  a fresh identity, dialed paired phones, and held port 1716 until login).
+  Upgrading now removes a prior global enable; enabling is per user with
+  `systemctl --user enable --now rust-connect.service`.
+  Pinned by `tests/packaging_lint.rs`.
+
 First public release. Everything below is the initial feature set rather
 than a delta against a previous version.
 
