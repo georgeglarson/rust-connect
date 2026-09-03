@@ -15,7 +15,7 @@ use crate::utils::errors::Error;
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Get battery info from device", body = ApiResponse),
+        (status = 200, description = "Get battery info from device", body = GenericResponse),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found or no battery data", body = ApiError),
     ),
@@ -45,7 +45,7 @@ pub async fn get_device_battery(
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Battery request sent", body = ApiResponse),
+        (status = 200, description = "Battery request sent", body = GenericResponse),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),

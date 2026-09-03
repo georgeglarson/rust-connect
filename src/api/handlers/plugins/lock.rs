@@ -16,7 +16,7 @@ use crate::utils::errors::Error;
     ),
     request_body = LockDeviceRequest,
     responses(
-        (status = 200, description = "Lock command sent to device", body = ApiResponse),
+        (status = 200, description = "Lock command sent to device", body = GenericResponse),
         (status = 400, description = "Invalid request", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),

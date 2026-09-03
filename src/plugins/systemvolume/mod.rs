@@ -70,7 +70,7 @@ use backend::MockBackend;
 /// Keys match the object kdeconnect-kde puts in `sinkList`
 /// (systemvolumeplugin-pulse.cpp:90-95) and that kdeconnect-android
 /// reads in .../systemvolume/Sink.kt:26-31.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SinkState {
     pub name: String,

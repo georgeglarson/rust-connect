@@ -9,6 +9,9 @@
 //! serialize the SAME struct the consume side deserializes, so the producer
 //! cannot drift from the parser.
 
+#[allow(unused_imports)]
+// utoipa `body = …` resolves schema names, not paths; the import keeps the name in scope for readers
+use crate::api::types::GenericResponse;
 use axum::{
     extract::{Path, State},
     Json,
@@ -69,7 +72,7 @@ fn build(action: &PointerAction) -> Result<MousepadRequest, Error> {
     request_body = PointerAction,
     params(("device_id" = String, Path, description = "Device unique identifier")),
     responses(
-        (status = 200, description = "Pointer action sent", body = ApiResponse<serde_json::Value>),
+        (status = 200, description = "Pointer action sent", body = GenericResponse),
         (status = 400, description = "Invalid device ID or button", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found or not connected", body = ApiError),

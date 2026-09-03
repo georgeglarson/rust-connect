@@ -15,7 +15,7 @@ use crate::utils::errors::Error;
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Ring request sent to device", body = ApiResponse),
+        (status = 200, description = "Ring request sent to device", body = GenericResponse),
         (status = 400, description = "Invalid request or device not connected", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),

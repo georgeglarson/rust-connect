@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::api::handlers::RemoteCommandsResponse;
 use crate::device::types::{Device, DeviceState, DeviceType};
 use crate::utils::errors::ErrorCode;
 
@@ -15,6 +16,8 @@ use crate::utils::errors::ErrorCode;
     DeviceResponse = ApiResponse<Device>,
     PairResponseWrapper = ApiResponse<PairResponse>,
     PingResponse = ApiResponse<serde_json::Value>,
+    GenericResponse = ApiResponse<serde_json::Value>,
+    RemoteCommandsResponseWrapper = ApiResponse<RemoteCommandsResponse>,
     PluginsResponse = ApiResponse<PluginListResponse>,
 )]
 pub struct ApiResponse<T: Serialize> {

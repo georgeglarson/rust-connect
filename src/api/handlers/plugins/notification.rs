@@ -61,7 +61,7 @@ pub async fn get_notifications(
     ),
     request_body = SendNotificationRequest,
     responses(
-        (status = 200, description = "Notification sent to device", body = ApiResponse),
+        (status = 200, description = "Notification sent to device", body = GenericResponse),
         (status = 400, description = "Invalid request", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
@@ -132,7 +132,7 @@ pub(crate) fn build_notification_reply_packet(
     ),
     request_body = ReplyNotificationRequest,
     responses(
-        (status = 200, description = "Notification reply sent to device", body = ApiResponse),
+        (status = 200, description = "Notification reply sent to device", body = GenericResponse),
         (status = 400, description = "Invalid request", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
@@ -251,7 +251,7 @@ pub(crate) fn build_notification_action_packet(
     ),
     request_body = NotificationActionRequest,
     responses(
-        (status = 200, description = "Notification action sent to device", body = ApiResponse),
+        (status = 200, description = "Notification action sent to device", body = GenericResponse),
         (status = 400, description = "Unknown action or disconnected device", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
@@ -340,7 +340,7 @@ mod task_1_4_wire_tests {
         ("notification_id" = String, Path, description = "Notification ID to dismiss on the device")
     ),
     responses(
-        (status = 200, description = "Dismiss request sent to device", body = ApiResponse),
+        (status = 200, description = "Dismiss request sent to device", body = GenericResponse),
         (status = 400, description = "Invalid request", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
