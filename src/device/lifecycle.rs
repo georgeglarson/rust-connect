@@ -150,8 +150,10 @@ impl LifecycleManager {
             // site was fixed. Same field split as DeviceRegistry::upsert_device:
             // the lifecycle owns state and pairing, the identity owns this.
             // Same single-lock shape as `transition` (audit C2).
-            let _ = self
-                .registry
+            // Propagate a miss: if the record was removed between the
+            // `contains` check and this refresh, the caller must not see
+            // Ok(()) for an identity it never applied (PR #39 review).
+            self.registry
                 .modify(device_id, |existing| {
                     existing.name = identity.device_name.clone();
                     existing.device_type = DeviceType::parse_device_type(&identity.device_type);
@@ -168,7 +170,7 @@ impl LifecycleManager {
                     existing.update_last_seen();
                     Ok(())
                 })
-                .await;
+                .await?;
             false
         };
 
@@ -850,16 +852,23 @@ mod inbound_capability_tests {
 
 #[cfg(test)]
 mod lane_c_repro_tests {
-    //! Lane-C repro (audit-2026-09-02-remaining-brief.md, section C, lead
-    //! 2): `LifecycleManager::transition` is a get-then-mutate-then-write
-    //! sequence (`registry.get` at :31, `registry.update` at :67, two
-    //! separate lock acquisitions) and `DeviceRegistry::update`
-    //! (registry.rs :245-251) is a blind insert with no compare-and-swap.
-    //! Two concurrent transitions off the SAME starting state race: both
-    //! `get()`s can observe the same pre-race state, both independently
-    //! validate and broadcast a `StateChanged` event, but only the
-    //! LAST `update()` to land actually persists — the other caller's
-    //! reported-successful transition is silently discarded.
+    //! Regression for the 2026-09-02 audit's lifecycle lost-update race.
+    //!
+    //! Historical context (pre-fix): `LifecycleManager::transition` did
+    //! `registry.get`, validated in user code, then `registry.update` — two
+    //! separate lock acquisitions, and `update` was a blind insert with no
+    //! compare-and-swap. Two concurrent transitions off the SAME starting
+    //! state could both observe the pre-race snapshot, both validate, both
+    //! broadcast `StateChanged`, and only the last `update` persisted: the
+    //! other caller's reported-successful transition was silently lost
+    //! (12 of 13 raced iterations on a multi-thread runtime).
+    //!
+    //! Current behavior: `transition` validates and writes inside one
+    //! `DeviceRegistry::modify` call under the write lock, so the second
+    //! caller validates against the first caller's committed result. Two
+    //! `Ok(())`s are then legitimate only when their events chain
+    //! (`old_state` of the second equals `new_state` of the first); this
+    //! test fails if both events ever claim the same `old_state`.
     #![allow(clippy::expect_used)]
     use super::*;
     use crate::device::types::{Device, DeviceType};
