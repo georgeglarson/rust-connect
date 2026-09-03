@@ -23,6 +23,14 @@ const MAX_ICONS_PER_DEVICE: usize = 64;
 const MAX_NOTIFICATION_ICON_BYTES: u64 = 512 * 1024;
 const ICON_DIR_NAME: &str = "notification-icons";
 
+/// Disconnect-surviving dedupe shadow TTL. Finite so a wrong shadow
+/// entry self-heals within a day; 24 h specifically to cover overnight
+/// suspend without a morning re-dump of unchanged notifications.
+/// (Longer: nothing is lost — content-changed still Replace, new still
+/// Post, history/SSE re-populate regardless. Shorter: the morning
+/// reconnect would re-dump the whole pile.)
+const DEDUPE_SHADOW_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 /// Escape peer-controlled text for the freedesktop notification server, whose
 /// body is a limited HTML subset: unescaped title/text would let a paired
 /// device inject markup and links into the local notification UI (phishing).
@@ -102,6 +110,19 @@ pub struct NotificationPlugin {
     /// re-send posted a brand-new desktop popup (live: ~25 notifications
     /// ×12 re-syncs in 5 minutes, 2026-08-03).
     dedupe: Arc<RwLock<HashMap<(String, String), DedupeEntry>>>,
+    /// Disconnect-surviving dedupe shadow. Android re-sends its full
+    /// active-notification list on every reconnect; B4's `on_disconnected`
+    /// empties the live `dedupe` map for correctness, but without a
+    /// shadow every re-send would `Post` a fresh desktop popup
+    /// (~130/sleep-wake cycle, ~720 pile observed 2026-09-03).
+    ///
+    /// The shadow holds a content hash and the last server id per
+    /// (device, id) — never servable content. On a live-map miss,
+    /// `dedupe_track` consults the shadow and restores a live entry so
+    /// the resync suppresses (unchanged content) or replaces (changed
+    /// content with the saved server id). Short-lived by TTL
+    /// (`DEDUPE_SHADOW_TTL`).
+    dedupe_shadow: Arc<RwLock<HashMap<(String, String), ShadowEntry>>>,
     icon_root: PathBuf,
     icon_lru: Arc<RwLock<HashMap<String, VecDeque<String>>>>,
     max_icons_per_device: usize,
@@ -117,6 +138,20 @@ struct DedupeEntry {
     /// The notification server's id for our post (0 = not yet shown: the
     /// freedesktop spec treats replaces_id 0 as "new notification").
     replaces_id: u32,
+}
+
+/// A ghost of a past desktop post that survives `on_disconnected`. No
+/// servable content — a content hash and the last server id, with a
+/// TTL so a wrong entry self-heals. Populated from the live dedupe map
+/// at disconnect, consulted on a live-map miss during reconnect.
+#[derive(Debug, Clone, Copy)]
+struct ShadowEntry {
+    /// Same content signature as `DedupeEntry::signature`.
+    signature: u64,
+    /// Server id of our last post (0 = tracked but never shown).
+    replaces_id: u32,
+    /// Monotonic expiry; expired entries are pruned when encountered.
+    expires: std::time::Instant,
 }
 
 /// What the desktop side should do with an incoming notification.
@@ -179,6 +214,7 @@ impl NotificationPlugin {
                 MAX_NOTIFICATION_HISTORY,
             ))),
             dedupe: Arc::new(RwLock::new(HashMap::new())),
+            dedupe_shadow: Arc::new(RwLock::new(HashMap::new())),
             icon_root: std::env::temp_dir().join("rust-connect-notification-icons"),
             icon_lru: Arc::new(RwLock::new(HashMap::new())),
             max_icons_per_device: MAX_ICONS_PER_DEVICE,
@@ -197,6 +233,7 @@ impl NotificationPlugin {
                 MAX_NOTIFICATION_HISTORY,
             ))),
             dedupe: Arc::new(RwLock::new(HashMap::new())),
+            dedupe_shadow: Arc::new(RwLock::new(HashMap::new())),
             icon_root: std::env::temp_dir().join("rust-connect-notification-icons"),
             icon_lru: Arc::new(RwLock::new(HashMap::new())),
             max_icons_per_device: MAX_ICONS_PER_DEVICE,
@@ -415,18 +452,76 @@ impl NotificationPlugin {
         self.dedupe.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
+    /// Test accessor: number of (device_id, id) keys the disconnect-surviving
+    /// shadow currently holds. Mirror of `dedupe_size`; used to assert the
+    /// shadow stays bounded. Not part of the public API.
+    #[cfg(test)]
+    pub fn dedupe_shadow_size(&self) -> usize {
+        self.dedupe_shadow
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
     /// Decide the desktop action for an incoming (non-cancel) notification
     /// and track it. The map records INTENT (replaces_id 0 until a show
     /// succeeds and fills it in), so a failed or headless show simply keeps
     /// the last decision — consistent, never a double-post.
+    ///
+    /// On a live-map miss, consult the disconnect-surviving shadow so a
+    /// reconnect resync (which Android re-sends as a full list) suppresses
+    /// unchanged notifications and replaces changed ones via the saved
+    /// server id. Shadow restoration always re-populates the live map so
+    /// subsequent re-sends hit the live path; expired entries are pruned
+    /// when encountered.
     fn dedupe_track(&self, device_id: &str, id: &str, signature: u64) -> DesktopAction {
         let key = (device_id.to_string(), id.to_string());
-        let mut map = self.dedupe.write().unwrap_or_else(|e| e.into_inner());
-        match map.get(&key) {
-            Some(entry) if entry.signature == signature => DesktopAction::Suppress,
-            Some(entry) => {
-                let replaces_id = entry.replaces_id;
-                map.insert(
+        let mut dedupe = self.dedupe.write().unwrap_or_else(|e| e.into_inner());
+        let mut shadow = self
+            .dedupe_shadow
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+
+        if let Some(entry) = dedupe.get(&key) {
+            if entry.signature == signature {
+                return DesktopAction::Suppress;
+            }
+            let replaces_id = entry.replaces_id;
+            dedupe.insert(
+                key,
+                DedupeEntry {
+                    signature,
+                    replaces_id,
+                },
+            );
+            return DesktopAction::Replace(replaces_id);
+        }
+
+        // Live-map miss: consult the shadow. An expired entry is removed
+        // when encountered (TTL is the self-heal guarantee).
+        let now = std::time::Instant::now();
+        let shadow_hit = match shadow.get(&key).cloned() {
+            Some(entry) if entry.expires <= now => {
+                shadow.remove(&key);
+                None
+            }
+            other => other,
+        };
+
+        match shadow_hit {
+            Some(shadow_entry) if shadow_entry.signature == signature => {
+                dedupe.insert(
+                    key,
+                    DedupeEntry {
+                        signature: shadow_entry.signature,
+                        replaces_id: shadow_entry.replaces_id,
+                    },
+                );
+                DesktopAction::Suppress
+            }
+            Some(shadow_entry) if shadow_entry.replaces_id != 0 => {
+                let replaces_id = shadow_entry.replaces_id;
+                dedupe.insert(
                     key,
                     DedupeEntry {
                         signature,
@@ -435,8 +530,21 @@ impl NotificationPlugin {
                 );
                 DesktopAction::Replace(replaces_id)
             }
+            Some(_) => {
+                // Tracked but never shown (headless/failed post): restore
+                // and Post so the next show attempt re-establishes a live
+                // server id.
+                dedupe.insert(
+                    key,
+                    DedupeEntry {
+                        signature,
+                        replaces_id: 0,
+                    },
+                );
+                DesktopAction::Post
+            }
             None => {
-                map.insert(
+                dedupe.insert(
                     key,
                     DedupeEntry {
                         signature,
@@ -462,13 +570,19 @@ impl NotificationPlugin {
     }
 
     /// Drop the dedupe entry for a cancelled notification, returning the
-    /// server id to close, if any.
+    /// server id to close, if any. Also drops the shadow entry: cancel
+    /// and dismiss must forget the notification completely across
+    /// disconnects (a future identical notification posts fresh).
     fn dedupe_take(&self, device_id: &str, id: &str) -> Option<u32> {
-        self.dedupe
+        let key = (device_id.to_string(), id.to_string());
+        let mut dedupe = self.dedupe.write().unwrap_or_else(|e| e.into_inner());
+        let mut shadow = self
+            .dedupe_shadow
             .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&(device_id.to_string(), id.to_string()))
-            .map(|entry| entry.replaces_id)
+            .unwrap_or_else(|e| e.into_inner());
+        let replaces_id = dedupe.remove(&key).map(|entry| entry.replaces_id);
+        shadow.remove(&key);
+        replaces_id
     }
 
     pub fn get_history(&self, device_id: Option<&str>, limit: usize) -> Vec<NotificationEntry> {
@@ -564,15 +678,62 @@ impl Plugin for NotificationPlugin {
     /// desktop dedupe keys, cached icons — so nothing stays servable under
     /// its id after a disconnect or an unpair. The plugin had no disconnect
     /// handler before.
+    ///
+    /// B5 (2026-09-03 audit): Android re-sends its full active-notification
+    /// list on every reconnect; clearing the live dedupe map made every
+    /// re-send `Post` a fresh desktop popup. Before clearing, MERGE the
+    /// device's live entries into the disconnect-surviving shadow
+    /// (`dedupe_shadow`) so the resync suppresses unchanged notifications
+    /// and replaces changed ones via the saved server id. History, icons,
+    /// and the live dedupe clear are unchanged — the shadow holds only a
+    /// content hash and a server id, never servable state, so the
+    /// "nothing stays servable under its id" guarantee holds.
     async fn on_disconnected(&self, device_id: &str) {
         self.history
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|entry| entry.device_id.as_str() != device_id);
-        self.dedupe
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|(dev, _), _| dev.as_str() != device_id);
+
+        // Lock order: history → dedupe → drop dedupe → shadow (alone).
+        // Collect the device's live entries, then clear (B4 unchanged).
+        // Taking the shadow inside the dedupe guard would be a fourth
+        // nesting level; the brief's lock-order rule forbids it here.
+        let collected: Vec<((String, String), ShadowEntry)> = {
+            let mut map = self.dedupe.write().unwrap_or_else(|e| e.into_inner());
+            let now = std::time::Instant::now();
+            let entries: Vec<_> = map
+                .iter()
+                .filter(|((dev, _), _)| dev.as_str() == device_id)
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        ShadowEntry {
+                            signature: v.signature,
+                            replaces_id: v.replaces_id,
+                            expires: now + DEDUPE_SHADOW_TTL,
+                        },
+                    )
+                })
+                .collect();
+            map.retain(|(dev, _), _| dev.as_str() != device_id);
+            entries
+        };
+
+        // Merge (insert/overwrite per key, leave others untouched) and
+        // prune expired entries for ALL devices — keeps the map tight
+        // without a timer, at the cost of one O(n) sweep per disconnect.
+        {
+            let mut shadow = self
+                .dedupe_shadow
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let now = std::time::Instant::now();
+            shadow.retain(|_, entry| entry.expires > now);
+            for (k, v) in collected {
+                shadow.insert(k, v);
+            }
+        }
+
         let hashes = self
             .icon_lru
             .write()
@@ -1726,6 +1887,255 @@ mod cancel_semantics_tests {
             "after a dismiss the entry is gone: identical content posts fresh"
         );
     }
+
+    // =====================================================================
+    // Reconnect dedupe shadow (B5 — 2026-09-03 audit followup).
+    // Android re-sends its full active-notification list on every reconnect.
+    // B4's `on_disconnected` empties the live dedupe map; without the
+    // shadow, every re-send would `Post` and ~130 desktop popups would
+    // fire per sleep/wake cycle (live: 720 pile by evening, 2026-09-03).
+    // =====================================================================
+
+    /// R1 — A re-send of the same notification after a disconnect must NOT
+    /// post a new desktop popup. The live dedupe map is dropped at
+    /// disconnect, but a shadow of recently-seen ids survives; the resync
+    /// that follows must find them there. Pre-fix: `Post` (the defect).
+    #[tokio::test]
+    async fn test_reconnect_resend_suppressed_by_shadow() {
+        let plugin = make_plugin();
+        let dev = "devabcdef0123456789abcdef0123aaaa";
+        let sig = content_signature("Signal", "Alice", "hi");
+
+        assert_eq!(plugin.dedupe_track(dev, "n1", sig), DesktopAction::Post);
+        plugin.on_disconnected(dev).await;
+        assert_eq!(
+            plugin.dedupe_track(dev, "n1", sig),
+            DesktopAction::Suppress,
+            "a re-send after disconnect must be suppressed by the shadow"
+        );
+    }
+
+    /// R2 — A disconnect-then-resend with CHANGED content must carry the
+    /// saved server id from before the disconnect, so the freedesktop
+    /// server replaces the existing popup rather than posting a duplicate.
+    /// Pre-fix: `Post` (the live map is empty after disconnect).
+    #[tokio::test]
+    async fn test_reconnect_content_change_replaces_with_saved_server_id() {
+        let plugin = make_plugin();
+        let dev = "devabcdef0123456789abcdef0123aaaa";
+        let sig1 = content_signature("Signal", "Alice", "hi");
+        let sig2 = content_signature("Signal", "Alice", "hi again");
+
+        assert_eq!(plugin.dedupe_track(dev, "n1", sig1), DesktopAction::Post);
+        plugin.dedupe_record_shown(dev, "n1", 42);
+        plugin.on_disconnected(dev).await;
+        assert_eq!(
+            plugin.dedupe_track(dev, "n1", sig2),
+            DesktopAction::Replace(42),
+            "content-changed re-send after disconnect must replace the saved popup"
+        );
+    }
+
+    /// R3 — The shadow is per-device. A second device with the same
+    /// notification id is independent; the shadow only suppresses the
+    /// device that disconnected.
+    #[tokio::test]
+    async fn test_shadow_is_per_device() {
+        let plugin = make_plugin();
+        let dev_a = "devabcdef0123456789abcdef0123aaaa";
+        let dev_b = "devabcdef0123456789abcdef0123bbbb";
+        let sig = content_signature("Signal", "Alice", "hi");
+
+        assert_eq!(plugin.dedupe_track(dev_a, "n1", sig), DesktopAction::Post);
+        plugin.on_disconnected(dev_a).await;
+
+        // B's id is independent of A's shadow.
+        assert_eq!(
+            plugin.dedupe_track(dev_b, "n1", sig),
+            DesktopAction::Post,
+            "a different device's notification is independent"
+        );
+        // A's re-send still suppresses via A's shadow.
+        assert_eq!(
+            plugin.dedupe_track(dev_a, "n1", sig),
+            DesktopAction::Suppress,
+            "A's shadow still suppresses A's re-send"
+        );
+    }
+
+    /// Companion — TTL is the self-heal guarantee. An expired shadow
+    /// entry must NOT suppress; it must be removed when encountered.
+    #[tokio::test]
+    async fn test_shadow_entry_expires_after_ttl() {
+        let plugin = make_plugin();
+        let dev = "devabcdef0123456789abcdef0123aaaa";
+        let sig = content_signature("Signal", "t", "x");
+
+        assert_eq!(plugin.dedupe_track(dev, "n1", sig), DesktopAction::Post);
+        plugin.on_disconnected(dev).await;
+
+        // Seed an already-expired shadow entry directly.
+        {
+            let mut shadow = plugin
+                .dedupe_shadow
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            shadow.insert(
+                (dev.to_string(), "n1".to_string()),
+                ShadowEntry {
+                    signature: sig,
+                    replaces_id: 0,
+                    expires: std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_secs(1))
+                        .expect("monotonic now is well past 1s after epoch"),
+                },
+            );
+        }
+
+        assert_eq!(
+            plugin.dedupe_track(dev, "n1", sig),
+            DesktopAction::Post,
+            "expired shadow entries must not suppress"
+        );
+        assert_eq!(
+            plugin.dedupe_shadow_size(),
+            0,
+            "the expired entry must be removed when encountered"
+        );
+
+        // An unexpired entry, by contrast, persists across a missed lookup.
+        let mut shadow = plugin
+            .dedupe_shadow
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        shadow.insert(
+            (dev.to_string(), "n2".to_string()),
+            ShadowEntry {
+                signature: content_signature("Signal", "t", "y"),
+                replaces_id: 7,
+                expires: std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            },
+        );
+        drop(shadow);
+        assert_eq!(
+            plugin.dedupe_shadow_size(),
+            1,
+            "an unexpired entry must remain in the shadow"
+        );
+    }
+
+    /// Companion — A cancel after a post forgets the notification from
+    /// both the live dedupe map AND the shadow. After a subsequent
+    /// disconnect, the cancelled id posts fresh.
+    #[tokio::test]
+    async fn test_shadow_cancelled_ids_are_forgotten() {
+        let plugin = make_plugin();
+        let dev = "devabcdef0123456789abcdef0123aaaa";
+        let sig = content_signature("Signal", "t", "x");
+
+        assert_eq!(plugin.dedupe_track(dev, "n1", sig), DesktopAction::Post);
+        plugin.dedupe_record_shown(dev, "n1", 99);
+
+        // Cancel drops both live dedupe and shadow.
+        let replaces_id = plugin.dedupe_take(dev, "n1");
+        assert_eq!(
+            replaces_id,
+            Some(99),
+            "dedupe_take returns the saved server id"
+        );
+
+        // After cancel, the shadow must be empty for this id (even after
+        // a disconnect, a cancelled id should NOT merge into shadow).
+        plugin.on_disconnected(dev).await;
+
+        assert_eq!(
+            plugin.dedupe_track(dev, "n1", sig),
+            DesktopAction::Post,
+            "cancelled ids must not be resurrected by the shadow"
+        );
+    }
+
+    /// Companion — Same forget behavior via the dismiss() path (which
+    /// also calls dedupe_take internally).
+    #[tokio::test]
+    async fn test_shadow_dismissed_ids_are_forgotten() {
+        let plugin = make_plugin();
+        let dev = "devabcdef0123456789abcdef0123aaaa";
+        let sig = content_signature("Signal", "t", "x");
+
+        post(&plugin, dev, "n1", false).await;
+        assert!(plugin.dismiss(dev, "n1"));
+        plugin.on_disconnected(dev).await;
+
+        assert_eq!(
+            plugin.dedupe_track(dev, "n1", sig),
+            DesktopAction::Post,
+            "dismissed ids must not be resurrected by the shadow"
+        );
+    }
+
+    /// Companion — Merge, not replace. Disconnecting two devices
+    /// independently keeps both shadows.
+    #[tokio::test]
+    async fn test_shadow_merge_across_disconnects() {
+        let plugin = make_plugin();
+        let dev_a = "devabcdef0123456789abcdef0123aaaa";
+        let dev_b = "devabcdef0123456789abcdef0123bbbb";
+        let sig = content_signature("Signal", "t", "x");
+
+        assert_eq!(plugin.dedupe_track(dev_a, "n1", sig), DesktopAction::Post);
+        assert_eq!(plugin.dedupe_track(dev_b, "n2", sig), DesktopAction::Post);
+
+        plugin.on_disconnected(dev_a).await;
+        plugin.on_disconnected(dev_b).await;
+
+        assert_eq!(
+            plugin.dedupe_track(dev_a, "n1", sig),
+            DesktopAction::Suppress,
+            "A's shadow persists across A's disconnect"
+        );
+        assert_eq!(
+            plugin.dedupe_track(dev_b, "n2", sig),
+            DesktopAction::Suppress,
+            "B's shadow persists across B's disconnect"
+        );
+    }
+
+    /// Companion — Merge, not replace, on a PARTIAL re-send between two
+    /// disconnects. The shadow entry for an id not in the second cycle's
+    /// re-send must persist.
+    #[tokio::test]
+    async fn test_shadow_partial_resend_keeps_unarrived_ids() {
+        let plugin = make_plugin();
+        let dev = "devabcdef0123456789abcdef0123aaaa";
+        let sig1 = content_signature("Signal", "n1", "x");
+        let sig2 = content_signature("Signal", "n2", "x");
+
+        // First cycle: both ids arrive and are tracked.
+        assert_eq!(plugin.dedupe_track(dev, "n1", sig1), DesktopAction::Post);
+        assert_eq!(plugin.dedupe_track(dev, "n2", sig2), DesktopAction::Post);
+
+        // Disconnect: both go into the shadow.
+        plugin.on_disconnected(dev).await;
+
+        // Second cycle: only n1 is re-sent (phone's local cache dropped n2).
+        // Simulate the live-map miss path by re-tracking only n1.
+        assert_eq!(
+            plugin.dedupe_track(dev, "n1", sig1),
+            DesktopAction::Suppress,
+            "n1's re-send is suppressed by its shadow entry"
+        );
+
+        // Disconnect again: n1's shadow entry is refreshed with a fresh TTL.
+        plugin.on_disconnected(dev).await;
+
+        // n2 must still be suppressed — its shadow entry was never overwritten.
+        assert_eq!(
+            plugin.dedupe_track(dev, "n2", sig2),
+            DesktopAction::Suppress,
+            "n2 was not in the second cycle but is still in the shadow"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1999,6 +2409,54 @@ mod dedupe_bound_tests {
             plugin.dedupe_size(),
             0,
             "cancellation must drop the dedupe key it names"
+        );
+    }
+
+    /// B5 (2026-09-03 audit followup): the disconnect-surviving shadow
+    /// must also stay bounded. Its keyspace mirrors the live map's (same
+    /// (device, id) keys), which is bounded by history eviction coupling,
+    /// so merge-on-disconnect adds at most the live-map size for the
+    /// disconnecting device. Pre-fix, the shadow was unbounded.
+    #[tokio::test]
+    async fn test_shadow_map_stays_bounded_under_unique_id_flood() {
+        let plugin = make_plugin();
+        let dev = "devabcdef0123456789abcdef01234567";
+        let total = MAX_NOTIFICATION_HISTORY * 5;
+
+        for i in 0..total {
+            let packet = Packet::new(
+                "kdeconnect.notification".to_string(),
+                serde_json::json!({
+                    "id": format!("notif-{}", i),
+                    "appName": "TestApp",
+                    "title": format!("Notification {}", i),
+                    "text": "Body"
+                }),
+            );
+            plugin
+                .handle_packet(dev, packet)
+                .await
+                .expect("Value expected to be present");
+        }
+
+        // Pre-disconnect: shadow empty (no disconnect yet, no merge).
+        assert_eq!(
+            plugin.dedupe_shadow_size(),
+            0,
+            "no merge happens without a disconnect"
+        );
+
+        plugin.on_disconnected(dev).await;
+
+        assert!(
+            plugin.dedupe_shadow_size() <= MAX_NOTIFICATION_HISTORY,
+            "shadow must be bounded by history cap (got {})",
+            plugin.dedupe_shadow_size()
+        );
+        assert_eq!(
+            plugin.dedupe_size(),
+            0,
+            "live dedupe must be cleared for the device after disconnect"
         );
     }
 }
