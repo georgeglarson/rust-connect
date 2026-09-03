@@ -196,6 +196,7 @@ pub enum ErrorCode {
 
     // API
     Unauthorized,
+    RateLimited,
     InvalidRequest,
     NotFound,
 
@@ -244,6 +245,7 @@ impl ErrorCode {
             Self::ConfigError => "CONFIG_ERROR",
             Self::InvalidConfigValue => "INVALID_CONFIG_VALUE",
             Self::Unauthorized => "UNAUTHORIZED",
+            Self::RateLimited => "RATE_LIMITED",
             Self::InvalidRequest => "INVALID_REQUEST",
             Self::NotFound => "NOT_FOUND",
             Self::IoError => "IO_ERROR",
@@ -261,6 +263,7 @@ impl ErrorCode {
     pub fn http_status(&self) -> u16 {
         match self {
             Self::Unauthorized => 401,
+            Self::RateLimited => 429,
             Self::NotFound | Self::DeviceNotFound | Self::PluginNotFound | Self::FileNotFound => {
                 404
             }

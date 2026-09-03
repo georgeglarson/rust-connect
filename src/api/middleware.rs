@@ -60,6 +60,19 @@ static RATE_LIMITERS: std::sync::OnceLock<moka::sync::Cache<IpAddr, ClientRateLi
 /// the test suite instead of catching anything.
 static MISSING_CONNECT_INFO: std::sync::Once = std::sync::Once::new();
 
+/// The 429 response in the documented `{status, error, metadata}` envelope
+/// (2026-09-02 audit, A6: it was plain text with no Content-Type).
+pub(crate) fn rate_limited_response() -> Response {
+    let body = crate::api::types::ApiError::new(
+        crate::utils::errors::ErrorCode::RateLimited,
+        "Rate limit exceeded".to_string(),
+    );
+    let mut resp = (axum::http::StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
+    resp.headers_mut()
+        .insert("Retry-After", HeaderValue::from_static("60"));
+    resp
+}
+
 pub async fn rate_limiter(request: Request, next: Next) -> Response {
     let limiters = RATE_LIMITERS.get_or_init(|| {
         moka::sync::Cache::builder()
@@ -101,11 +114,7 @@ pub async fn rate_limiter(request: Request, next: Next) -> Response {
     limiters.insert(client_ip, entry);
 
     if is_rate_limited {
-        let mut resp = Response::new(axum::body::Body::from("Rate limit exceeded"));
-        *resp.status_mut() = axum::http::StatusCode::TOO_MANY_REQUESTS;
-        resp.headers_mut()
-            .insert("Retry-After", HeaderValue::from_static("60"));
-        return resp;
+        return rate_limited_response();
     }
 
     next.run(request).await
@@ -149,14 +158,14 @@ pub async fn auth_middleware(
     };
 
     if !is_valid {
+        // A6 (2026-09-02 audit): the documented envelope, not a bare
+        // `{"error": ...}` — the 401 is the first failure every client sees.
         let error_response = (
             axum::http::StatusCode::UNAUTHORIZED,
-            axum::Json(serde_json::json!({
-                "error": {
-                    "code": "UNAUTHORIZED",
-                    "message": "Invalid or missing API key"
-                }
-            })),
+            axum::Json(crate::api::types::ApiError::new(
+                crate::utils::errors::ErrorCode::Unauthorized,
+                "Invalid or missing API key".to_string(),
+            )),
         );
         return Err(error_response);
     }
@@ -237,5 +246,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A6 (2026-09-02 audit): the 429 body was plain text with no
+    /// Content-Type; agents parsing the documented envelope broke on it.
+    #[tokio::test]
+    async fn test_rate_limited_response_uses_the_error_envelope() {
+        let resp = super::rate_limited_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get("Retry-After")
+                .and_then(|v| v.to_str().ok()),
+            Some("60")
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("429 body must be JSON");
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["error"]["code"], "RATE_LIMITED");
+        assert!(json["metadata"].is_object());
     }
 }

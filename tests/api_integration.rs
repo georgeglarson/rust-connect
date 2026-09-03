@@ -170,6 +170,34 @@ async fn test_api_key_auth_rejects_no_key() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// A6 (2026-09-02 audit): docs/constitution.md promises every response is
+/// `{status, data|error, metadata}` with a machine-readable `error.code`.
+/// The 401 body was a bare `{"error": {...}}` — the single most common
+/// failure any client hits.
+#[tokio::test]
+async fn test_unauthorized_response_uses_the_error_envelope() {
+    let (state, _temp) = create_test_app_with_keys(vec!["secret-key".to_string()]).await;
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "error", "body: {json}");
+    assert_eq!(json["error"]["code"], "UNAUTHORIZED", "body: {json}");
+    assert!(json["metadata"].is_object(), "metadata missing: {json}");
+}
+
 #[tokio::test]
 async fn test_swagger_ui_and_openapi_require_auth() {
     // security-audit-2026-08 API-1: /docs and /api-docs/openapi.json sit
