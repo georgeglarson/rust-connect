@@ -266,7 +266,18 @@ impl DeviceRegistry {
         let device = devices
             .get_mut(id)
             .ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
-        f(device)
+        // The id is the map key (and `Device.id` is public): a closure that
+        // rewrote it would leave the record under the old key with a
+        // different id inside. Refuse and restore (PR #39 review).
+        let key = device.id.clone();
+        let result = f(device);
+        if device.id != key {
+            device.id = key;
+            return Err(Error::InvalidRequest(
+                "DeviceRegistry::modify must not change the device id".to_string(),
+            ));
+        }
+        result
     }
 
     pub async fn update(&self, device: Device) -> Result<()> {
@@ -432,6 +443,26 @@ mod tests {
             DeviceType::Phone,
             7,
         )
+    }
+
+    /// PR #39 review (cubic): `Device.id` is public and is the map key, so a
+    /// `modify` closure that rewrote it would leave the record stored under
+    /// the old key with a different id inside. The change is refused and
+    /// the id restored.
+    #[tokio::test]
+    async fn test_modify_refuses_to_change_the_device_id() -> anyhow::Result<()> {
+        let registry = DeviceRegistry::new();
+        registry.add(test_device("dev-1")).await?;
+        let result = registry
+            .modify(&"dev-1".to_string(), |device| {
+                device.id = "dev-2".to_string();
+                Ok(())
+            })
+            .await;
+        assert!(result.is_err(), "an id change must be refused");
+        let stored = registry.get(&"dev-1".to_string()).await?;
+        assert_eq!(stored.id, "dev-1", "the stored id must be restored");
+        Ok(())
     }
 
     #[tokio::test]
