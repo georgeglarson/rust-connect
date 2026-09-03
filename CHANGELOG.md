@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Split-brain detector: an identity announcing from one of this host's own
+  addresses under a foreign device id logs `split_brain_suspected` (three
+  such incidents in a month competed for the paired phones), and a port
+  1716 bind failure names the process holding the port instead of
+  guessing.
+
 ### Fixed
 
 - The deb's postinst no longer runs `systemctl --global enable`, which

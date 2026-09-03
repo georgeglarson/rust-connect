@@ -247,6 +247,16 @@ fn on_mdns_device_resolved(state: Arc<AppState>, identity: Identity, addr: std::
             if device_id == our_id {
                 return;
             }
+            if crate::protocol::is_split_brain(&addr.ip(), &our_id, &device_id) {
+                warn!(
+                    device_id = %device_id,
+                    device_name = %identity.device_name,
+                    address = %addr,
+                    event = "split_brain_suspected",
+                    "Another KDE Connect implementation is announcing from THIS host: \
+                     two daemons will compete for the same paired phones"
+                );
+            }
         }
 
         // Already connected: nothing to do (Android MdnsDiscovery.kt
