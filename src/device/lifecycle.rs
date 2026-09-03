@@ -28,43 +28,53 @@ impl LifecycleManager {
     }
 
     pub async fn transition(&self, device_id: &DeviceId, new_state: DeviceState) -> Result<()> {
-        let mut device = self.registry.get(device_id).await?;
-        let old_state = device.state;
+        // Validate and mutate under one registry write lock (2026-09-02
+        // audit, C2): with `get` then `update` as separate scopes, two
+        // concurrent callers both validated against the same snapshot, both
+        // broadcast StateChanged, and one caller's write was silently lost.
+        let old_state = self
+            .registry
+            .modify(device_id, |device| {
+                let old_state = device.state;
+                if old_state == new_state {
+                    return Ok(None);
+                }
+                if !old_state.can_transition_to(&new_state) {
+                    warn!(
+                        device_id = %device_id,
+                        old_state = ?old_state,
+                        new_state = ?new_state,
+                        "Invalid state transition attempted"
+                    );
+                    return Err(Error::InvalidStateTransition {
+                        from: old_state,
+                        to: new_state,
+                    });
+                }
 
-        if old_state == new_state {
+                device.state = new_state;
+                device.state_since = Utc::now();
+
+                // A transition is contact with the device, so the record
+                // should say so. last_seen used to advance only on discovery
+                // upserts, which left a device that stayed connected drifting
+                // hours behind reality.
+                device.update_last_seen();
+
+                // Restamp on every entry into Paired, not just the first.
+                // `paired_at` reads as "paired since" in the API and
+                // `paired.json` records the CURRENT pairing; the previous
+                // `is_none()` guard made this field mean "first ever paired",
+                // so the two stores disagreed after any re-pair.
+                if new_state == DeviceState::Paired {
+                    device.paired_at = Some(Utc::now());
+                }
+                Ok(Some(old_state))
+            })
+            .await?;
+        let Some(old_state) = old_state else {
             return Ok(());
-        }
-
-        if !old_state.can_transition_to(&new_state) {
-            warn!(
-                device_id = %device_id,
-                old_state = ?old_state,
-                new_state = ?new_state,
-                "Invalid state transition attempted"
-            );
-            return Err(Error::InvalidStateTransition {
-                from: old_state,
-                to: new_state,
-            });
-        }
-
-        device.state = new_state;
-        device.state_since = Utc::now();
-
-        // A transition is contact with the device, so the record should say so.
-        // last_seen used to advance only on discovery upserts, which left a
-        // device that stayed connected drifting hours behind reality.
-        device.update_last_seen();
-
-        // Restamp on every entry into Paired, not just the first. `paired_at`
-        // reads as "paired since" in the API and `paired.json` records the
-        // CURRENT pairing; the previous `is_none()` guard made this field mean
-        // "first ever paired", so the two stores disagreed after any re-pair.
-        if new_state == DeviceState::Paired {
-            device.paired_at = Some(Utc::now());
-        }
-
-        self.registry.update(device).await?;
+        };
 
         info!(
             device_id = %device_id,
@@ -139,22 +149,26 @@ impl LifecycleManager {
             // exactly what the live daemon showed after only the UDP-discovery
             // site was fixed. Same field split as DeviceRegistry::upsert_device:
             // the lifecycle owns state and pairing, the identity owns this.
-            if let Ok(mut existing) = self.registry.get(device_id).await {
-                existing.name = identity.device_name.clone();
-                existing.device_type = DeviceType::parse_device_type(&identity.device_type);
-                existing.protocol_version = identity.protocol_version;
-                // Same empty-cap guard as the UDP-discovery site — this
-                // reconnect path bypassed it when the guard lived inline
-                // in upsert_device (PR #12 review finding): a crafted
-                // empty-cap identity arriving over the connection path
-                // could still wipe learned capabilities.
-                existing.apply_capability_update(
-                    identity.incoming_capabilities.clone(),
-                    identity.outgoing_capabilities.clone(),
-                );
-                existing.update_last_seen();
-                self.registry.update(existing).await?;
-            }
+            // Same single-lock shape as `transition` (audit C2).
+            let _ = self
+                .registry
+                .modify(device_id, |existing| {
+                    existing.name = identity.device_name.clone();
+                    existing.device_type = DeviceType::parse_device_type(&identity.device_type);
+                    existing.protocol_version = identity.protocol_version;
+                    // Same empty-cap guard as the UDP-discovery site — this
+                    // reconnect path bypassed it when the guard lived inline
+                    // in upsert_device (PR #12 review finding): a crafted
+                    // empty-cap identity arriving over the connection path
+                    // could still wipe learned capabilities.
+                    existing.apply_capability_update(
+                        identity.incoming_capabilities.clone(),
+                        identity.outgoing_capabilities.clone(),
+                    );
+                    existing.update_last_seen();
+                    Ok(())
+                })
+                .await;
             false
         };
 
@@ -831,5 +845,152 @@ mod inbound_capability_tests {
         );
         assert_eq!(got.outgoing_capabilities, vec!["kdeconnect.battery"]);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lane_c_repro_tests {
+    //! Lane-C repro (audit-2026-09-02-remaining-brief.md, section C, lead
+    //! 2): `LifecycleManager::transition` is a get-then-mutate-then-write
+    //! sequence (`registry.get` at :31, `registry.update` at :67, two
+    //! separate lock acquisitions) and `DeviceRegistry::update`
+    //! (registry.rs :245-251) is a blind insert with no compare-and-swap.
+    //! Two concurrent transitions off the SAME starting state race: both
+    //! `get()`s can observe the same pre-race state, both independently
+    //! validate and broadcast a `StateChanged` event, but only the
+    //! LAST `update()` to land actually persists — the other caller's
+    //! reported-successful transition is silently discarded.
+    #![allow(clippy::expect_used)]
+    use super::*;
+    use crate::device::types::{Device, DeviceType};
+
+    fn setup() -> (Arc<DeviceRegistry>, Arc<EventBroadcaster>, LifecycleManager) {
+        let registry = Arc::new(DeviceRegistry::new());
+        let broadcaster = Arc::new(EventBroadcaster::new(16, "device"));
+        let lifecycle = LifecycleManager::new(registry.clone(), broadcaster.clone());
+        (registry, broadcaster, lifecycle)
+    }
+
+    /// Multi-thread runtime: the race window between `registry.get` and
+    /// `registry.update` is a handful of nanoseconds with no forced yield
+    /// in between, so a single-threaded runtime would never preempt one
+    /// task mid-transition to let the other interleave. Real OS-thread
+    /// parallelism (as `contacts.rs`'s flood tests already use) is what
+    /// gives the two lock acquisitions a chance to interleave for real.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_transitions_from_same_state_lose_an_update() {
+        const ITERATIONS: usize = 50;
+        let mut both_succeeded = 0usize;
+        let mut lost_updates = 0usize;
+
+        for i in 0..ITERATIONS {
+            let (registry, broadcaster, lifecycle) = setup();
+            let id = format!("race-dev-{i:03}-aaaaaaaaaaaaaaaaaaaa");
+            registry
+                .add(Device::new(
+                    id.clone(),
+                    "phone".to_string(),
+                    DeviceType::Phone,
+                    8,
+                ))
+                .await
+                .expect("Value expected to be present");
+
+            // Walk to Paired sequentially (no race here) so both racing
+            // calls below start from the SAME valid predecessor state:
+            // (Paired, Connected) and (Paired, Pairing) are both valid
+            // per DeviceState::can_transition_to.
+            lifecycle
+                .transition(&id, DeviceState::Pairing)
+                .await
+                .expect("Value expected to be present");
+            lifecycle
+                .transition(&id, DeviceState::Paired)
+                .await
+                .expect("Value expected to be present");
+
+            let mut events = broadcaster.subscribe();
+
+            let lifecycle_a = lifecycle.clone();
+            let id_a = id.clone();
+            let task_a =
+                tokio::spawn(
+                    async move { lifecycle_a.transition(&id_a, DeviceState::Connected).await },
+                );
+            let lifecycle_b = lifecycle.clone();
+            let id_b = id.clone();
+            let task_b =
+                tokio::spawn(
+                    async move { lifecycle_b.transition(&id_b, DeviceState::Pairing).await },
+                );
+
+            let (res_a, res_b) = tokio::join!(task_a, task_b);
+            let res_a = res_a.expect("Value expected to be present");
+            let res_b = res_b.expect("Value expected to be present");
+
+            if res_a.is_err() || res_b.is_err() {
+                // Serialized naturally this iteration (one call observed
+                // the other's committed state and got a legitimately
+                // invalid transition) — not the race window we're
+                // after, move on.
+                continue;
+            }
+            both_succeeded += 1;
+
+            // Drain every StateChanged event this device produced during
+            // the race.
+            let mut seen_targets = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if let DeviceEvent::StateChanged {
+                    device_id,
+                    old_state,
+                    new_state,
+                } = event
+                {
+                    if device_id == id {
+                        seen_targets.push((old_state, new_state));
+                    }
+                }
+            }
+            assert_eq!(
+                seen_targets.len(),
+                2,
+                "iteration {i}: both transitions returned Ok(()), both must have broadcast a StateChanged event, got {seen_targets:?}"
+            );
+
+            let final_state = registry
+                .get(&id)
+                .await
+                .expect("Value expected to be present")
+                .state;
+
+            assert!(
+                final_state == DeviceState::Connected || final_state == DeviceState::Pairing,
+                "iteration {i}: final state {final_state:?} must be one of the two racing targets"
+            );
+
+            // Two Ok(())s are legitimate when the calls serialized: the
+            // second one validated against the FIRST one's result (its
+            // event's old_state is the first one's new_state). A lost
+            // update is when both events claim the same old_state — both
+            // read the same snapshot, both "succeeded", and the record can
+            // only hold one of them.
+            let same_snapshot = seen_targets[0].0 == seen_targets[1].0;
+            if same_snapshot {
+                lost_updates += 1;
+                eprintln!(
+                    "iteration {i}: both transition() calls returned Ok(()) from the same snapshot (events: {seen_targets:?}) but the registry only holds {final_state:?} — the other caller's reported-successful transition was lost"
+                );
+            }
+        }
+
+        eprintln!(
+            "both-succeeded (raced) iterations: {both_succeeded}/{ITERATIONS}, lost-update iterations: {lost_updates}"
+        );
+        assert_eq!(
+            lost_updates, 0,
+            "LifecycleManager::transition's get-then-update TOCTOU lost {lost_updates}/{both_succeeded} racing updates that both reported success \
+             (registry.rs update() at :245-251 is a blind insert with no compare-and-swap against the version `transition` originally read)"
+        );
     }
 }

@@ -252,6 +252,23 @@ impl DeviceRegistry {
         devices.values().cloned().collect()
     }
 
+    /// Read-modify-write under ONE write lock (2026-09-02 audit, C2). The
+    /// closure sees the current record and may change it or refuse; a
+    /// concurrent caller sees the result, never the same stale snapshot.
+    /// `get` + `update` as two lock scopes let two callers both validate
+    /// against one snapshot, both report success, and one silently lose.
+    pub async fn modify<T>(
+        &self,
+        id: &DeviceId,
+        f: impl FnOnce(&mut Device) -> Result<T>,
+    ) -> Result<T> {
+        let mut devices = self.devices.write().await;
+        let device = devices
+            .get_mut(id)
+            .ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
+        f(device)
+    }
+
     pub async fn update(&self, device: Device) -> Result<()> {
         let mut devices = self.devices.write().await;
         if !devices.contains_key(&device.id) {
