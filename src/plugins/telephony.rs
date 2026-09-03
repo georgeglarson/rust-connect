@@ -62,6 +62,11 @@ where
     Ok(is_cancel_value(&value))
 }
 
+/// Cap on retained call events per device (2026-09-02 audit, B5): each
+/// entry may carry a base64 `phoneThumbnail`, and a paired peer could grow
+/// the log without bound for the life of a connection. Oldest out.
+pub const MAX_CALLS_PER_DEVICE: usize = 100;
+
 pub struct TelephonyPlugin {
     calls: Arc<StdRwLock<HashMap<String, Vec<TelephonyInfo>>>>,
     plugin_events: Arc<PluginEventBroadcaster>,
@@ -154,10 +159,12 @@ impl Plugin for TelephonyPlugin {
         // (telephonyplugin.cpp:74-79). Appending would duplicate the entry.
         if !info.is_cancel {
             if let Ok(mut calls) = self.calls.write() {
-                calls
-                    .entry(device_id.to_string())
-                    .or_default()
-                    .push(info.clone());
+                let log = calls.entry(device_id.to_string()).or_default();
+                log.push(info.clone());
+                if log.len() > MAX_CALLS_PER_DEVICE {
+                    let excess = log.len() - MAX_CALLS_PER_DEVICE;
+                    log.drain(..excess);
+                }
             }
         }
 
@@ -432,6 +439,35 @@ mod tests {
             .await
             .is_ok());
         assert_eq!(plugin.get_calls("device1").len(), 1);
+    }
+
+    /// B5 (2026-09-02 audit): the per-device call log grew without bound
+    /// for the life of a connection, each entry carrying a base64
+    /// thumbnail. Oldest entries are evicted past `MAX_CALLS_PER_DEVICE`.
+    #[tokio::test]
+    async fn test_call_log_is_capped_per_device() {
+        let (plugin, _broadcaster) = setup();
+        for i in 0..(MAX_CALLS_PER_DEVICE + 25) {
+            let packet = Packet::new(
+                "kdeconnect.telephony".to_string(),
+                serde_json::json!({
+                    "event": "missedCall",
+                    "phoneNumber": format!("+1555{i:07}"),
+                    "contactName": format!("caller {i}")
+                }),
+            );
+            plugin
+                .handle_packet("phone1", packet)
+                .await
+                .expect("handle");
+        }
+        let calls = plugin.get_calls("phone1");
+        assert_eq!(calls.len(), MAX_CALLS_PER_DEVICE, "call log must be capped");
+        assert_eq!(
+            calls.last().and_then(|c| c.contact_name.as_deref()),
+            Some(format!("caller {}", MAX_CALLS_PER_DEVICE + 24).as_str()),
+            "the newest call must survive eviction"
+        );
     }
 
     #[tokio::test]
