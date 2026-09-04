@@ -302,6 +302,7 @@ impl Plugin for ScreensaverInhibitPlugin {
         // cookie instead of storing it.
         let device_id_spawn = device_id.clone();
         let backend_spawn = backend;
+        let stale_bound = self.uninhibit_timeout();
         tokio::spawn(async move {
             let cookie = match backend_spawn.inhibit(APP_NAME, REASON).await {
                 Some(c) => c,
@@ -335,7 +336,14 @@ impl Plugin for ScreensaverInhibitPlugin {
                     event = "screensaver_inhibit_stale_released",
                     "inhibit completed after disconnect; releasing its own cookie"
                 );
-                backend_spawn.uninhibit_and_stimulate(cookie).await;
+                // Same bound as the disconnect path (review FINDINGS #1):
+                // a wedged session bus must not park the stale task
+                // forever. `screensaver_uninhibited` /
+                // `screensaver_uninhibit_timed_out` from
+                // bounded_uninhibit completes the audit's
+                // every-cookie-accounted oracle.
+                Self::bounded_uninhibit(&backend_spawn, &device_id_spawn, cookie, stale_bound)
+                    .await;
                 return;
             }
             info!(
@@ -453,7 +461,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
     struct MockBackend {
@@ -536,6 +544,79 @@ mod tests {
 
         async fn uninhibit_and_stimulate(&self, cookie: u32) {
             self.uninhibits.write().unwrap().push(cookie);
+        }
+    }
+
+    /// Gated inhibit + cancel-detecting hanging uninhibit. The inhibit
+    /// parks on a Notify gate (drives a stale task deterministically);
+    /// the uninhibit records its start, installs a drop-guard, then
+    /// parks forever. The drop-guard flips `cancelled` only when the
+    /// future is DROPPED — which a timeout-wrapped await does on expiry
+    /// and an unbounded await never does. That difference is the
+    /// assertion: every uninhibit the plugin awaits must be bounded
+    /// (audit §C family: a wedged session bus must not park a task
+    /// forever, wherever in the lifecycle the call happens).
+    struct GatedHangBackend {
+        inhibits: StdRwLock<Vec<(String, String)>>,
+        next_cookie: AtomicUsize,
+        in_flight_cookie: StdRwLock<Option<u32>>,
+        gate: Notify,
+        uninhibit_started: StdRwLock<Vec<u32>>,
+        uninhibit_cancelled: AtomicBool,
+    }
+
+    impl GatedHangBackend {
+        fn new() -> Self {
+            Self {
+                inhibits: StdRwLock::new(Vec::new()),
+                next_cookie: AtomicUsize::new(100),
+                in_flight_cookie: StdRwLock::new(None),
+                gate: Notify::new(),
+                uninhibit_started: StdRwLock::new(Vec::new()),
+                uninhibit_cancelled: AtomicBool::new(false),
+            }
+        }
+
+        fn release(&self) {
+            self.gate.notify_one();
+        }
+
+        fn in_flight_cookie(&self) -> Option<u32> {
+            *self.in_flight_cookie.read().unwrap()
+        }
+
+        fn started(&self) -> Vec<u32> {
+            self.uninhibit_started.read().unwrap().clone()
+        }
+
+        fn cancelled(&self) -> bool {
+            self.uninhibit_cancelled.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ScreensaverBackend for GatedHangBackend {
+        async fn inhibit(&self, app_name: &str, reason: &str) -> Option<u32> {
+            self.inhibits
+                .write()
+                .unwrap()
+                .push((app_name.to_string(), reason.to_string()));
+            let cookie = self.next_cookie.fetch_add(1, Ordering::SeqCst) as u32;
+            *self.in_flight_cookie.write().unwrap() = Some(cookie);
+            self.gate.notified().await;
+            Some(cookie)
+        }
+
+        async fn uninhibit_and_stimulate(&self, cookie: u32) {
+            self.uninhibit_started.write().unwrap().push(cookie);
+            struct CancelGuard<'a>(&'a AtomicBool);
+            impl Drop for CancelGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _guard = CancelGuard(&self.uninhibit_cancelled);
+            std::future::pending::<()>().await;
         }
     }
 
@@ -844,5 +925,48 @@ mod tests {
             "disconnect must return promptly even if uninhibit parks (took {elapsed:?})"
         );
         assert!(plugin.cookie_for("device1").is_none());
+    }
+
+    /// FINDINGS #1 (review round): the stale-task self-clean must be
+    /// bounded, not just the disconnect path. A stale inhibit task whose
+    /// `uninhibit_and_stimulate` hangs must not park the spawned task
+    /// forever — the await has to be dropped at the bound, exactly like
+    /// `on_disconnected`'s awaited cleanup. Red on the branch under
+    /// review: the stale path awaited the backend call with no timeout.
+    #[tokio::test]
+    async fn test_stale_task_self_clean_is_bounded_under_hang() {
+        let backend = Arc::new(GatedHangBackend::new());
+        let bound = std::time::Duration::from_millis(150);
+        let plugin = ScreensaverInhibitPlugin::new()
+            .with_backend(backend.clone())
+            .with_uninhibit_timeout(bound);
+
+        // Connect; the inhibit task parks on the gate before returning
+        // its cookie.
+        plugin.on_connected("device1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let issued = backend
+            .in_flight_cookie()
+            .expect("the gated inhibit task should have fetched its cookie");
+
+        // Disconnect while the inhibit is in flight: the generation
+        // bumps, the slot goes Idle, nothing is awaited on this path.
+        plugin.on_disconnected("device1").await;
+
+        // Release: the task is stale and must self-clean — into a
+        // backend whose uninhibit hangs.
+        backend.release();
+        assert!(
+            wait_until(|| backend.started().contains(&issued)).await,
+            "the stale task must call uninhibit for its own cookie"
+        );
+        assert!(
+            wait_until(|| backend.cancelled()).await,
+            "the stale task's uninhibit must be dropped at the bound, not awaited forever"
+        );
+        assert!(
+            plugin.cookie_for("device1").is_none(),
+            "no cookie stored: the stale task self-cleaned"
+        );
     }
 }
