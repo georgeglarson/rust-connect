@@ -77,6 +77,14 @@ pub struct ConnectionManager {
     /// `test-helpers` so production builds carry zero overhead.
     #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) fake_connected: Arc<std::sync::Mutex<std::collections::HashSet<DeviceId>>>,
+    /// Test-only generation shadow. Lets the registry-level
+    /// supersede guard (audit §C) be exercised without standing up a
+    /// real TLS pair: a test inserts a generation here, and
+    /// `get_generation` consults it under `cfg(test)` after the real
+    /// `connections` map. Empty in production — the test path is
+    /// compiled out and `get_generation` skips the shadow entirely.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) test_generations: Arc<std::sync::RwLock<HashMap<DeviceId, u64>>>,
 }
 
 /// Android caps identity/packet lines at 512 KiB (LanLinkProvider.java:68,
@@ -218,6 +226,8 @@ impl ConnectionManager {
             peer_capabilities: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(any(test, feature = "test-helpers"))]
             fake_connected: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            #[cfg(any(test, feature = "test-helpers"))]
+            test_generations: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
     }
 
@@ -444,6 +454,34 @@ impl ConnectionManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         fake.remove(device_id);
+    }
+
+    /// Test-only mutator: declare a generation as live for `device_id`
+    /// without a real TLS handshake, so `get_generation` returns `Some`
+    /// for it. The registry-level supersede guard (audit §C) reads
+    /// `get_generation`; without this seam the only way to exercise
+    /// the guard in a unit test is to spin up a real TLS pair. Empty
+    /// in production — the helper and the shadow it writes to are
+    /// both compiled out.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn mark_generation_for_test(&self, device_id: &str, generation: u64) {
+        let mut shadow = self
+            .test_generations
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        shadow.insert(device_id.to_string(), generation);
+    }
+
+    /// Test-only mutator: remove the test-only generation entry for
+    /// `device_id`. Symmetric with `mark_generation_for_test`.
+    /// Idempotent.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn unmark_generation_for_test(&self, device_id: &str) {
+        let mut shadow = self
+            .test_generations
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        shadow.remove(device_id);
     }
 
     pub async fn send_packet(&self, device_id: &DeviceId, packet: &Packet) -> Result<()> {
@@ -781,6 +819,19 @@ impl ConnectionManager {
         }
         self.remove_cancel_token(device_id).await;
         let conn_handle = connections.remove(device_id);
+        // Test shadow (audit §C): the supersede guard's
+        // `get_generation` reads this map under cfg(test), and a
+        // successful disconnect must clear it so the next
+        // `notify_disconnected` doesn't see a stale "live" entry.
+        // Production builds compile the call out.
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            let mut shadow = self
+                .test_generations
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            shadow.remove(device_id);
+        }
         // B3 (2026-09-02 audit): release the connections lock BEFORE the
         // socket shutdown. On a stalled peer the shutdown blocks until
         // TCP_USER_TIMEOUT (30 s), and every lookup, send, accept and
@@ -803,13 +854,45 @@ impl ConnectionManager {
 
     pub async fn is_connected(&self, device_id: &DeviceId) -> bool {
         let connections = self.connections.read().await;
-        connections.contains_key(device_id)
+        if connections.contains_key(device_id) {
+            return true;
+        }
+        // Test shadow (audit §C): the supersede guard and the
+        // call-site audit tests need a "device is connected" answer
+        // without standing up a real TLS pair. Empty in production —
+        // the read is compiled out.
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            let shadow = self
+                .test_generations
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if shadow.contains_key(device_id) {
+                return true;
+            }
+        }
+        false
     }
 
     pub async fn get_generation(&self, device_id: &DeviceId) -> Option<u64> {
         let connections = self.connections.read().await;
-        let handle = connections.get(device_id)?;
-        Some(handle.generation)
+        if let Some(handle) = connections.get(device_id) {
+            return Some(handle.generation);
+        }
+        // Test shadow (audit §C): lets the registry-level supersede
+        // guard be exercised in unit tests without a real TLS pair.
+        // Production builds see the empty map and skip the read.
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            let shadow = self
+                .test_generations
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(gen) = shadow.get(device_id) {
+                return Some(*gen);
+            }
+        }
+        None
     }
 
     /// True while the live connection for `device_id` is exactly

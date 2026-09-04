@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::protocol::types::Packet;
 use crate::utils::errors::{Error, Result};
@@ -23,6 +23,15 @@ pub struct PluginInfo {
 pub struct PluginRegistry {
     plugins: Arc<RwLock<HashMap<String, Arc<dyn Plugin>>>>,
     capability_index: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    /// Optional reference to the connection manager. When wired, the
+    /// registry treats `notify_disconnected` as advisory only: a live
+    /// generation for the device means the session continues and the
+    /// incoming teardown is stale. Plugin state is per-device, not
+    /// per-link — every plugin's view is stale together, so one guard
+    /// covers them all. `None` falls through to the previous behavior
+    /// (dispatch every teardown), which keeps every existing test and
+    /// harness that never wired a connection manager working unchanged.
+    connection_manager: Option<Arc<crate::protocol::ConnectionManager>>,
 }
 
 impl PluginRegistry {
@@ -30,7 +39,20 @@ impl PluginRegistry {
         Self {
             plugins: Arc::new(RwLock::new(HashMap::new())),
             capability_index: Arc::new(RwLock::new(HashMap::new())),
+            connection_manager: None,
         }
+    }
+
+    /// Wire the connection manager so the registry can stand down
+    /// `notify_disconnected` when a same-cert replacement is already live
+    /// for the device. The audit §C residual window (a replacement can
+    /// register between the guard check and the plugin dispatch) is
+    /// recorded in FINDINGS.md — closing it would require threading a
+    /// generation through the `Plugin` trait, which buys nothing
+    /// measurable against 17 impls of churn.
+    pub fn with_connection_manager(mut self, cm: Arc<crate::protocol::ConnectionManager>) -> Self {
+        self.connection_manager = Some(cm);
+        self
     }
 
     pub async fn register(&self, plugin: Arc<dyn Plugin>) {
@@ -223,6 +245,30 @@ impl PluginRegistry {
     }
 
     pub async fn notify_disconnected(&self, device_id: &str) {
+        // Generation-scoped guard (audit §C). If a live generation
+        // exists for the device, the session continues and the
+        // incoming teardown is stale — do not dispatch to any plugin.
+        // Plugin state is per-device, not per-link: every plugin's
+        // view of the device is stale at once, so the single guard
+        // covers them all (sftp creds, screensaver slot, notification
+        // history, …). Read-only — never mutate the manager from here.
+        // Call sites that need a GENUINE teardown while a connection
+        // exists must remove the entry first (same ownership gate the
+        // connection-loop exit arms and `delete_device` already use);
+        // `unpair_device` was the lone exception and is fixed in the
+        // same change.
+        if let Some(cm) = &self.connection_manager {
+            let id = device_id.to_string();
+            if cm.get_generation(&id).await.is_some() {
+                info!(
+                    device_id = %device_id,
+                    event = "teardown_superseded_by_live_replacement",
+                    "Stale teardown while a live connection holds the device; not dispatching to plugins"
+                );
+                return;
+            }
+        }
+
         // Snapshot the plugin Arcs and release the read guard BEFORE
         // awaiting: plugin cleanup (sftp unmounts, up to `mount_timeout`
         // each) can hold the loop for seconds, and keeping the guard
@@ -598,5 +644,83 @@ mod tests {
 
         release.notify_one();
         notify.await.expect("notify_disconnected completes");
+    }
+
+    /// Audit §C, R1: a stale teardown that arrives while a same-cert
+    /// replacement is already live for the device must NOT dispatch to
+    /// any plugin — the session continues, plugin state is per-device,
+    /// and the SFTP creds / screensaver cookie / etc. all belong to the
+    /// replacement. Pre-fix: the registry hands the teardown to every
+    /// plugin and sftp wipes the replacement's freshly-stored creds.
+    /// Uses the real `ConnectionManager`'s test-only generation shadow
+    /// (no TLS handshake required) — the unit semantics of
+    /// `get_generation` are in-process.
+    #[tokio::test]
+    async fn test_notify_disconnected_superseded_while_replacement_live() {
+        let temp_dir = tempfile::TempDir::new().expect("Value expected to be present");
+        let cert_manager = Arc::new(crate::protocol::CertificateManager::new(
+            temp_dir.path().to_path_buf(),
+        ));
+        cert_manager.init().expect("Value expected to be present");
+        let cm = Arc::new(
+            crate::protocol::ConnectionManager::new(cert_manager)
+                .expect("Value expected to be present"),
+        );
+
+        let registry = PluginRegistry::new().with_connection_manager(cm.clone());
+        let plugin = Arc::new(NotifyMockPlugin::new("recorder"));
+        registry.register(plugin.clone()).await;
+
+        // A live replacement connection for "dev-1": get_generation
+        // must return Some so the guard stands down.
+        cm.mark_generation_for_test("dev-1", 7);
+
+        registry.notify_disconnected("dev-1").await;
+
+        let disconnected = plugin
+            .disconnected_devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert!(
+            disconnected.is_empty(),
+            "stale teardown must not reach any plugin while a live generation holds the device; got {disconnected:?}"
+        );
+    }
+
+    /// Audit §C, R2: companion to R1 — when no live generation
+    /// exists, the registry MUST still dispatch teardown so the
+    /// genuine-disconnect path keeps working. Pins the no-guard
+    /// baseline against an over-broad guard (one that swallowed
+    /// genuine teardowns alongside stale ones).
+    #[tokio::test]
+    async fn test_teardown_proceeds_when_no_live_connection() {
+        let temp_dir = tempfile::TempDir::new().expect("Value expected to be present");
+        let cert_manager = Arc::new(crate::protocol::CertificateManager::new(
+            temp_dir.path().to_path_buf(),
+        ));
+        cert_manager.init().expect("Value expected to be present");
+        let cm = Arc::new(
+            crate::protocol::ConnectionManager::new(cert_manager)
+                .expect("Value expected to be present"),
+        );
+
+        let registry = PluginRegistry::new().with_connection_manager(cm.clone());
+        let plugin = Arc::new(NotifyMockPlugin::new("recorder"));
+        registry.register(plugin.clone()).await;
+
+        // No live generation for "dev-1" — guard must pass.
+        registry.notify_disconnected("dev-1").await;
+
+        let disconnected = plugin
+            .disconnected_devices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(
+            disconnected,
+            vec!["dev-1".to_string()],
+            "genuine teardown must be dispatched when no live generation exists"
+        );
     }
 }
