@@ -305,6 +305,19 @@ pub async fn unpair_device(
 
     notify_peer_unpair(&state, &device_id).await;
 
+    // Generation-scoped forced teardown (audit §C). The
+    // registry-level guard stands down `notify_disconnected` while a
+    // live generation exists for the device; unpair must NEVER skip the
+    // trust-boundary teardown, so mirror `delete_device`'s pattern —
+    // disconnect owns the slot, the guard then passes, plugins drop
+    // what the device sent while trusted.
+    if state.connection_manager.is_connected(&device_id).await {
+        let generation = state.connection_manager.get_generation(&device_id).await;
+        if let Some(gen) = generation {
+            let _ = state.connection_manager.disconnect(&device_id, gen).await;
+        }
+    }
+
     // Unpair tears down the trust relationship; any SFTP credentials
     // and mount belong to the previous pairing. Drop them on the way
     // out so a fresh pairing starts clean.
@@ -1111,5 +1124,98 @@ mod tests {
 
         server1.abort();
         server2.abort();
+    }
+
+    /// Audit §C, R5: the forced path. Unpair is a trust-boundary
+    /// teardown — the registry-level guard stands down
+    /// `notify_disconnected` while a live generation exists for the
+    /// device; without the ordering fix in `unpair_device`, an
+    /// unpair of a still-connected device would skip the plugin
+    /// teardown entirely. Half-state (guard added, ordering not
+    /// fixed) makes this red: a recording mock plugin registered
+    /// alongside the live generation sees NO `on_disconnected`
+    /// call. Complete state (mirror `delete_device`'s
+    /// `disconnect`-before-`notify` pattern) makes it green: the
+    /// unpair removes the entry, the guard then sees None and
+    /// dispatches to every plugin.
+    #[tokio::test]
+    async fn test_unpair_teardown_runs_even_while_connected() {
+        let (state, _t) = test_state();
+        pair_locally(&state, PEER_ID).await;
+        // Mark a live generation WITHOUT the real TLS pair — the
+        // registry guard reads `get_generation`, the unpair's
+        // `disconnect` returns true on its own generation, and the
+        // guard then sees None when `notify_disconnected` runs.
+        state
+            .connection_manager
+            .mark_generation_for_test(PEER_ID, 7);
+
+        // Recording mock plugin: the assertion target. It records
+        // every device_id on_disconnected fires for; nothing else
+        // depends on it.
+        let recorder = Arc::new(UnpairRecorderPlugin::new());
+        state
+            .plugin_registry
+            .register(recorder.clone() as Arc<dyn crate::plugins::Plugin>)
+            .await;
+
+        let result = unpair_device(State(state.clone()), Path(PEER_ID.to_string())).await;
+        assert!(result.is_ok(), "unpair must succeed: {:?}", result.err());
+
+        // Trust-boundary teardown MUST have run. With a live
+        // generation before the unpair, the guard would skip
+        // notify_disconnected unless the unpair removed the entry
+        // first.
+        let disconnected = recorder.disconnected_for_test().await;
+        assert_eq!(
+            disconnected,
+            vec![PEER_ID.to_string()],
+            "recording plugin saw no on_disconnected during unpair of a connected device; the registry-level guard skipped the trust-boundary teardown"
+        );
+    }
+
+    /// Recording mock plugin for R5. Async `on_disconnected` to match
+    /// the real `Plugin` trait shape.
+    struct UnpairRecorderPlugin {
+        disconnected: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl UnpairRecorderPlugin {
+        fn new() -> Self {
+            Self {
+                disconnected: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        async fn disconnected_for_test(&self) -> Vec<String> {
+            self.disconnected.lock().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::plugins::Plugin for UnpairRecorderPlugin {
+        fn name(&self) -> &str {
+            "unpair-recorder-test"
+        }
+
+        fn incoming_capabilities(&self) -> Vec<String> {
+            vec![]
+        }
+
+        fn outgoing_capabilities(&self) -> Vec<String> {
+            vec![]
+        }
+
+        async fn handle_packet(
+            &self,
+            _device_id: &str,
+            _packet: crate::protocol::types::Packet,
+        ) -> crate::utils::errors::Result<Option<Vec<crate::protocol::types::Packet>>> {
+            Ok(None)
+        }
+
+        async fn on_disconnected(&self, device_id: &str) {
+            self.disconnected.lock().await.push(device_id.to_string());
+        }
     }
 }

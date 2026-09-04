@@ -85,7 +85,11 @@ impl AppState {
 
         let connection_manager = Arc::new(ConnectionManager::new(cert_manager.clone())?);
         let packet_router = Arc::new(PacketRouter::new());
-        let plugin_registry = Arc::new(PluginRegistry::new());
+        // Wire the connection manager so `notify_disconnected` stands
+        // down when a same-cert replacement is already live for the
+        // device (audit §C, registry-level supersede guard).
+        let plugin_registry =
+            Arc::new(PluginRegistry::new().with_connection_manager(connection_manager.clone()));
         let plugin_events = Arc::new(PluginEventBroadcaster::new(256, "plugin"));
         let shutdown = CancellationToken::new();
         let started_at = Instant::now();
