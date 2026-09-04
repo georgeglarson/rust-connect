@@ -2276,4 +2276,63 @@ mod tests {
         );
         assert!(locks.contains_key("dev-here"));
     }
+
+    /// Audit §C, R3: the customer-shaped test. The SFTP plugin's
+    /// `on_disconnected` is the FIRST thing a stale teardown reaches:
+    /// it removes the device's credential row from `connections` and
+    /// then calls `cleanup_mount_on_disconnect`. Today the mount
+    /// path's inner guard (`:727`) catches the live-replacement case,
+    /// but the `connections.remove` already happened — the replacement
+    /// then has no creds to work with until the next
+    /// `kdeconnect.sftp` packet. Post-fix: the registry-level guard
+    /// short-circuits before the plugin sees the teardown at all.
+    ///
+    /// Mirrors the audit's framing: a replacement is live, the
+    /// credentials row is planted for it, a stale teardown arrives.
+    /// Asserts the planted creds survive.
+    #[tokio::test]
+    async fn test_stale_teardown_does_not_wipe_replacement_credentials() {
+        let (plugin, _d) = test_plugin_with_runner(ScriptedRunner::always_succeed());
+
+        // Plant the replacement's freshly-stored credentials BEFORE
+        // moving the plugin into the registry — the SFTP plugin's
+        // `connections` table is the asset the stale teardown used to
+        // wipe.
+        let planted = sample_info();
+        plugin.plant_connection_for_test("dev-1", planted.clone());
+
+        // Mark a live replacement generation on the connection manager.
+        let certs = Arc::new(crate::protocol::CertificateManager::new(
+            _d.path().to_path_buf(),
+        ));
+        certs.init().expect("Value expected to be present");
+        let cm = Arc::new(
+            crate::protocol::ConnectionManager::new(certs).expect("Value expected to be present"),
+        );
+        cm.mark_generation_for_test("dev-1", 7);
+
+        // Wire the plugin's connection manager and exercise the
+        // registry-level guard via the registry's notify_disconnected.
+        let plugin = Arc::new(plugin.with_connection_manager(cm.clone()));
+        let trait_obj: Arc<dyn crate::plugins::Plugin> = plugin.clone();
+        let registry = crate::plugins::PluginRegistry::new().with_connection_manager(cm.clone());
+        registry.register(trait_obj).await;
+
+        registry.notify_disconnected("dev-1").await;
+
+        // The replacement's credentials row must still be there. We
+        // reach the inner SFTP plugin via the Arc<SftpPlugin> we
+        // kept before wrapping as a trait object — the credentials
+        // table lives in shared state, both Arcs see it.
+        let survivor = plugin.get_connection("dev-1");
+        assert!(
+            survivor.is_some(),
+            "the replacement's freshly-stored credentials were wiped by the stale teardown"
+        );
+        let survivor = survivor.expect("presence checked above");
+        assert_eq!(
+            survivor.password, planted.password,
+            "the replacement's password was clobbered by the stale teardown"
+        );
+    }
 }
