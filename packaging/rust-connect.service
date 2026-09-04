@@ -4,6 +4,10 @@ Documentation=https://github.com/georgeglarson/rust-connect
 After=graphical-session.target network-online.target
 Wants=network-online.target
 PartOf=graphical-session.target
+# Audit 2026-09-02 §E: refuse to start under a display-manager greeter's
+# user instance. Cheaper than postinst logic and survives every install
+# path — the postinst `--global disable` on upgrade stays as belt.
+ConditionUser=!gdm-greeter
 
 [Service]
 Type=simple
