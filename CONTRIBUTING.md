@@ -81,7 +81,7 @@ Read `src/` top-level first; the module names carry the layering.
 | `src/app.rs` | `AppState`, the shared handle everything else takes. |
 | `src/protocol/` | The KDE Connect wire protocol: `discovery.rs` (UDP), `listener.rs` and `connection/` (TCP + TLS), `pairing/`, `crypto.rs` (certificates, TOFU pinning, SAS), `packet.rs`, `router.rs`, `payload_transfer.rs`. |
 | `src/device/` | Device registry, lifecycle, event broadcasting. |
-| `src/plugins/` | The 24 plugins, plus `loader.rs` (registration) and `registry.rs` (dispatch). |
+| `src/plugins/` | The 25 plugins, plus `loader.rs` (registration) and `registry.rs` (dispatch). |
 | `src/api/` | axum REST API: `router.rs` (routes), `handlers/` (request processing), `auth.rs`, `middleware.rs`, `sse.rs` (the event stream), `openapi.rs`, `ui/` (the embedded troubleshooting page). |
 | `src/cli/` | clap definitions and the client-mode subcommands that drive a running daemon over its own REST API. |
 | `src/config/`, `src/services/`, `src/utils/` | Settings; service manager and connection orchestration; errors and logging. |

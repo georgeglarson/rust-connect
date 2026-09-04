@@ -168,7 +168,7 @@ Only process packets from **paired/trusted** devices. For unknown devices:
 - Send `{"pair": false}` back
 - Close connection
 
-**Supported packet types** (the 24 plugins registered in `src/plugins/loader.rs`; several share a packet type, so the roster is longer than this list):
+**Supported packet types** (the 25 plugins registered in `src/plugins/loader.rs`; several share a packet type, so the roster is longer than this list):
 - `kdeconnect.ping` → Respond with ping
 - `kdeconnect.notification` / `kdeconnect.notification.request` → Notification sync
 - `kdeconnect.share.request` → File transfer, shared text, or a shared URL.
@@ -201,7 +201,7 @@ Only process packets from **paired/trusted** devices. For unknown devices:
 - `kdeconnect.mousepad.echo` (incoming) → Keystroke echo for the remote-keyboard plugin, which sends `kdeconnect.mousepad.request` in the desktop-as-controller direction (the mousepad plugin handles the same packet type in the desktop-as-target direction; the router fans out to both).
 - `kdeconnect.notification.request` (incoming) → Handled twice, by the notification plugin for reply/dismiss requests from the phone, and by the sendnotifications plugin, which pushes desktop notifications to the phone as `kdeconnect.notification`.
 
-**The full 24-plugin roster** (the registration order, which is the order
+**The full 25-plugin roster** (the registration order, which is the order
 `PluginAccess::all()` yields in `src/plugins/mod.rs` — `load_all` in
 `src/plugins/loader.rs` registers them in exactly that sequence; the
 `PluginAccess` struct literal in `load_default_plugins` is a construction
@@ -209,7 +209,8 @@ order and deliberately differs): ping, battery,
 notification, sms, clipboard, share, mpris, telephony, pausemusic,
 connectivity, sftp, mousepad, lock, systemvolume, findmyphone,
 findthisdevice, presenter, contacts, runcommand, sendnotifications,
-remotekeyboard, digitizer, screensaver-inhibit, remotecommands.
+remotekeyboard, digitizer, screensaver-inhibit, remotecommands,
+shareinputdevices.
 
 Four of those register no packet type of their own and so do not appear
 in the list above. `pausemusic` listens on `kdeconnect.telephony`
