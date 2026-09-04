@@ -26,7 +26,7 @@
 //! clipboard/mpris/pausemusic-style.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 
 use tracing::{debug, info, warn};
 
@@ -50,11 +50,40 @@ pub(crate) trait ScreensaverBackend: Send + Sync {
 const APP_NAME: &str = "rust-connect";
 const REASON: &str = "Phone is connected";
 
+/// Wall-clock bound on a single `uninhibit_and_stimulate` awaited during
+/// teardown. Session-bus calls are milliseconds; the bound protects
+/// teardown latency (the registry awaits `on_disconnected`), not normal
+/// operation. Test-only override lives on the plugin struct.
+const DEFAULT_UNINHIBIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Per-device inhibit state machine. The generation counter is bumped on
+/// EVERY connect and disconnect; an in-flight inhibit task that outlives
+/// its connection generation sees a mismatch and self-cleans its own
+/// cookie. The slot persists across disconnects so the counter does not
+/// reset; only `Idle`/`Inhibiting`/`Inhibited` change. No servable
+/// content is held here (cookie integer only).
+struct InhibitSlot {
+    generation: u64,
+    state: InhibitState,
+}
+
+enum InhibitState {
+    /// No live or in-flight inhibition for this device.
+    Idle,
+    /// A connect-time inhibit call is in flight on a spawned task.
+    Inhibiting,
+    /// The live cookie we hold for this device.
+    Inhibited(u32),
+}
+
 pub struct ScreensaverInhibitPlugin {
     backend: StdRwLock<Option<Arc<dyn ScreensaverBackend>>>,
-    /// device_id → inhibit cookie (upstream: one per-device plugin
-    /// instance = one cookie per device).
-    cookies: Arc<StdRwLock<HashMap<String, u32>>>,
+    /// device_id → per-device slot. Map lock is held only to clone an
+    /// Arc; never held while a slot lock is held.
+    slots: Arc<StdRwLock<HashMap<String, Arc<StdMutex<InhibitSlot>>>>>,
+    /// Test-only override for the uninhibit await bound.
+    #[cfg(test)]
+    uninhibit_timeout: std::time::Duration,
 }
 
 impl Default for ScreensaverInhibitPlugin {
@@ -67,7 +96,9 @@ impl ScreensaverInhibitPlugin {
     pub fn new() -> Self {
         Self {
             backend: StdRwLock::new(None),
-            cookies: Arc::new(StdRwLock::new(HashMap::new())),
+            slots: Arc::new(StdRwLock::new(HashMap::new())),
+            #[cfg(test)]
+            uninhibit_timeout: DEFAULT_UNINHIBIT_TIMEOUT,
         }
     }
 
@@ -104,6 +135,12 @@ impl ScreensaverInhibitPlugin {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_uninhibit_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.uninhibit_timeout = timeout;
+        self
+    }
+
     fn backend(&self) -> Option<Arc<dyn ScreensaverBackend>> {
         self.backend
             .read()
@@ -111,14 +148,99 @@ impl ScreensaverInhibitPlugin {
             .clone()
     }
 
-    /// Test-visible cookie for a device.
+    /// Test-visible cookie for a device. Contract preserved: Some(c) iff
+    /// the slot's state is Inhibited(c).
     #[cfg(test)]
     pub(crate) fn cookie_for(&self, device_id: &str) -> Option<u32> {
-        self.cookies
+        let slot = self
+            .slots
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(device_id)
-            .copied()
+            .cloned()?;
+        let guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.state {
+            InhibitState::Inhibited(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Map lock → clone Arc → drop map lock. Slot critical sections
+    /// hold no awaits, so the map lock is never held while a slot is.
+    fn slot_for(&self, device_id: &str) -> Arc<StdMutex<InhibitSlot>> {
+        let map_read = self.slots.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = map_read.get(device_id) {
+            return existing.clone();
+        }
+        drop(map_read);
+        let mut map_write = self.slots.write().unwrap_or_else(|e| e.into_inner());
+        map_write
+            .entry(device_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(StdMutex::new(InhibitSlot {
+                    generation: 0,
+                    state: InhibitState::Idle,
+                }))
+            })
+            .clone()
+    }
+
+    /// Connect-side critical section: bump generation, capture
+    /// `my_gen`, transition state, note any prior cookie for release.
+    /// No awaits inside the slot lock.
+    fn begin_connect(&self, device_id: &str) -> (Arc<StdMutex<InhibitSlot>>, u64, Option<u32>) {
+        let slot = self.slot_for(device_id);
+        let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+        guard.generation = guard.generation.wrapping_add(1);
+        let my_gen = guard.generation;
+        let old = match std::mem::replace(&mut guard.state, InhibitState::Inhibiting) {
+            InhibitState::Inhibited(c) => Some(c),
+            _ => None,
+        };
+        drop(guard);
+        (slot, my_gen, old)
+    }
+
+    /// Disconnect-side critical section: bump generation, take the
+    /// state, reset to Idle. No awaits inside the slot lock.
+    fn begin_disconnect(&self, device_id: &str) -> (Arc<StdMutex<InhibitSlot>>, u64, InhibitState) {
+        let slot = self.slot_for(device_id);
+        let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+        guard.generation = guard.generation.wrapping_add(1);
+        let new_gen = guard.generation;
+        let taken = std::mem::replace(&mut guard.state, InhibitState::Idle);
+        drop(guard);
+        (slot, new_gen, taken)
+    }
+
+    /// Awaited, bounded uninhibit. Log-and-continue on expiry or error
+    /// (matches the `close_desktop_notification` style in
+    /// `notification.rs`). Bounded so a wedged session bus cannot stall
+    /// teardown latency indefinitely.
+    async fn bounded_uninhibit(
+        backend: &Arc<dyn ScreensaverBackend>,
+        device_id: &str,
+        cookie: u32,
+        timeout: std::time::Duration,
+    ) {
+        match tokio::time::timeout(timeout, backend.uninhibit_and_stimulate(cookie)).await {
+            Ok(()) => {
+                info!(
+                    device_id = %device_id,
+                    cookie = cookie,
+                    event = "screensaver_uninhibited",
+                    "Phone disconnected, lifting screensaver inhibition"
+                );
+            }
+            Err(_) => {
+                warn!(
+                    device_id = %device_id,
+                    cookie = cookie,
+                    event = "screensaver_uninhibit_timed_out",
+                    "uninhibit_and_stimulate did not return within the bound; giving up"
+                );
+            }
+        }
     }
 }
 
@@ -153,63 +275,130 @@ impl Plugin for ScreensaverInhibitPlugin {
             return vec![];
         };
 
+        // Sync critical section: bump generation, capture my_gen,
+        // transition to Inhibiting, note any prior cookie for release.
         let device_id = device_id.to_string();
-        let cookies = self.cookies.clone();
+        let (slot, my_gen, old_cookie) = self.begin_connect(&device_id);
+
+        if let Some(old) = old_cookie {
+            // Release a leaked prior cookie without blocking the
+            // connect path; log-and-continue on failure. Best-effort.
+            // Same bound as the disconnect path — one configured
+            // timeout governs every uninhibit the plugin performs.
+            let backend = backend.clone();
+            let device_id_release = device_id.clone();
+            let release_bound = self.uninhibit_timeout();
+            tokio::spawn(async move {
+                Self::bounded_uninhibit(&backend, &device_id_release, old, release_bound).await;
+            });
+        }
+
+        // Spawn the inhibit task carrying (slot, my_gen). The
+        // generation check is the whole fix: a task that outlives its
+        // connection sees a bumped generation and releases its own
+        // cookie instead of storing it.
+        let device_id_spawn = device_id.clone();
+        let backend_spawn = backend;
+        let stale_bound = self.uninhibit_timeout();
         tokio::spawn(async move {
-            match backend.inhibit(APP_NAME, REASON).await {
-                Some(cookie) => {
-                    info!(
-                        device_id = %device_id,
-                        cookie = cookie,
-                        event = "screensaver_inhibited",
-                        "Screensaver inhibited while phone is connected"
-                    );
-                    cookies
-                        .write()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(device_id, cookie);
-                }
+            let cookie = match backend_spawn.inhibit(APP_NAME, REASON).await {
+                Some(c) => c,
                 None => {
                     debug!(
-                        device_id = %device_id,
+                        device_id = %device_id_spawn,
                         event = "screensaver_inhibit_failed",
                         "Could not inhibit screensaver (no org.freedesktop.ScreenSaver service?)"
                     );
+                    return;
                 }
+            };
+
+            // Decide action under the lock, then release before any
+            // await so the slot's MutexGuard does not cross it (Send).
+            let release_now = {
+                let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.generation != my_gen {
+                    true
+                } else {
+                    guard.state = InhibitState::Inhibited(cookie);
+                    false
+                }
+            };
+
+            if release_now {
+                info!(
+                    device_id = %device_id_spawn,
+                    cookie = cookie,
+                    my_gen = my_gen,
+                    event = "screensaver_inhibit_stale_released",
+                    "inhibit completed after disconnect; releasing its own cookie"
+                );
+                // Same bound as the disconnect path (review FINDINGS #1):
+                // a wedged session bus must not park the stale task
+                // forever. `screensaver_uninhibited` /
+                // `screensaver_uninhibit_timed_out` from
+                // bounded_uninhibit completes the audit's
+                // every-cookie-accounted oracle.
+                Self::bounded_uninhibit(&backend_spawn, &device_id_spawn, cookie, stale_bound)
+                    .await;
+                return;
             }
+            info!(
+                device_id = %device_id_spawn,
+                cookie = cookie,
+                event = "screensaver_inhibited",
+                "Screensaver inhibited while phone is connected"
+            );
         });
 
         vec![]
     }
 
     async fn on_disconnected(&self, device_id: &str) {
-        let cookie = self
-            .cookies
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(device_id);
-        let Some(cookie) = cookie else {
-            return;
-        };
-        let Some(backend) = self.backend() else {
-            return;
-        };
+        // Sync critical section: bump generation, take state, reset.
+        let (_slot, _new_gen, taken) = self.begin_disconnect(device_id);
 
-        info!(
-            device_id = %device_id,
-            cookie = cookie,
-            event = "screensaver_uninhibited",
-            "Phone disconnected, lifting screensaver inhibition"
-        );
-        tokio::spawn(async move {
-            backend.uninhibit_and_stimulate(cookie).await;
-        });
+        let device_id = device_id.to_string();
+        match taken {
+            InhibitState::Inhibited(cookie) => {
+                let Some(backend) = self.backend() else {
+                    // No backend → cannot uninhibit. The slot is
+                    // already Idle; nothing more to do.
+                    return;
+                };
+                // Awaited bounded uninhibit. Audit §C: the previous
+                // spawn-and-return left the cookie held by the
+                // session bus if uninhibit ever hung; we now bound
+                // the wait so teardown latency stays predictable.
+                Self::bounded_uninhibit(&backend, &device_id, cookie, self.uninhibit_timeout())
+                    .await;
+            }
+            InhibitState::Inhibiting => {
+                // The in-flight inhibit task sees the bumped
+                // generation when it completes and self-cleans.
+                // Nothing to do here.
+            }
+            InhibitState::Idle => {}
+        }
     }
 
     async fn handle_packet(&self, device_id: &str, packet: Packet) -> Result<Option<Vec<Packet>>> {
         // No packet types — this should never be routed here.
         let _ = (device_id, packet);
         Ok(None)
+    }
+}
+
+impl ScreensaverInhibitPlugin {
+    fn uninhibit_timeout(&self) -> std::time::Duration {
+        #[cfg(test)]
+        {
+            self.uninhibit_timeout
+        }
+        #[cfg(not(test))]
+        {
+            DEFAULT_UNINHIBIT_TIMEOUT
+        }
     }
 }
 
@@ -269,7 +458,8 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
     struct MockBackend {
         inhibits: StdRwLock<Vec<(String, String)>>,
@@ -299,6 +489,169 @@ mod tests {
 
         async fn uninhibit_and_stimulate(&self, cookie: u32) {
             self.uninhibits.write().unwrap().push(cookie);
+        }
+    }
+
+    /// Gated fake: `inhibit` parks until the test releases it. Used to
+    /// drive deterministic interleavings between connect-time inhibit and
+    /// disconnect-time uninhibit (audit §C, PR #40 review).
+    struct GatedBackend {
+        inhibits: StdRwLock<Vec<(String, String)>>,
+        uninhibits: StdRwLock<Vec<u32>>,
+        next_cookie: AtomicUsize,
+        in_flight_cookie: StdRwLock<Option<u32>>,
+        gate: Notify,
+    }
+
+    impl GatedBackend {
+        fn new() -> Self {
+            Self {
+                inhibits: StdRwLock::new(Vec::new()),
+                uninhibits: StdRwLock::new(Vec::new()),
+                next_cookie: AtomicUsize::new(100),
+                in_flight_cookie: StdRwLock::new(None),
+                gate: Notify::new(),
+            }
+        }
+
+        fn release(&self) {
+            self.gate.notify_one();
+        }
+
+        /// Cookie the parked inhibit will return when released. Recorded
+        /// by the task itself, so the value is stable as long as the
+        /// task has reached `notified().await`.
+        fn in_flight_cookie(&self) -> Option<u32> {
+            *self.in_flight_cookie.read().unwrap()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ScreensaverBackend for GatedBackend {
+        async fn inhibit(&self, app_name: &str, reason: &str) -> Option<u32> {
+            self.inhibits
+                .write()
+                .unwrap()
+                .push((app_name.to_string(), reason.to_string()));
+            let cookie = self.next_cookie.fetch_add(1, Ordering::SeqCst) as u32;
+            *self.in_flight_cookie.write().unwrap() = Some(cookie);
+            self.gate.notified().await;
+            Some(cookie)
+        }
+
+        async fn uninhibit_and_stimulate(&self, cookie: u32) {
+            self.uninhibits.write().unwrap().push(cookie);
+        }
+    }
+
+    /// Gated inhibit + cancel-detecting hanging uninhibit. The inhibit
+    /// parks on a Notify gate (drives a stale task deterministically);
+    /// the uninhibit records its start, installs a drop-guard, then
+    /// parks forever. The drop-guard flips `cancelled` only when the
+    /// future is DROPPED — which a timeout-wrapped await does on expiry
+    /// and an unbounded await never does. That difference is the
+    /// assertion: every uninhibit the plugin awaits must be bounded
+    /// (audit §C family: a wedged session bus must not park a task
+    /// forever, wherever in the lifecycle the call happens).
+    struct GatedHangBackend {
+        inhibits: StdRwLock<Vec<(String, String)>>,
+        next_cookie: AtomicUsize,
+        in_flight_cookie: StdRwLock<Option<u32>>,
+        gate: Notify,
+        uninhibit_started: StdRwLock<Vec<u32>>,
+        uninhibit_cancelled: AtomicBool,
+    }
+
+    impl GatedHangBackend {
+        fn new() -> Self {
+            Self {
+                inhibits: StdRwLock::new(Vec::new()),
+                next_cookie: AtomicUsize::new(100),
+                in_flight_cookie: StdRwLock::new(None),
+                gate: Notify::new(),
+                uninhibit_started: StdRwLock::new(Vec::new()),
+                uninhibit_cancelled: AtomicBool::new(false),
+            }
+        }
+
+        fn release(&self) {
+            self.gate.notify_one();
+        }
+
+        fn in_flight_cookie(&self) -> Option<u32> {
+            *self.in_flight_cookie.read().unwrap()
+        }
+
+        fn started(&self) -> Vec<u32> {
+            self.uninhibit_started.read().unwrap().clone()
+        }
+
+        fn cancelled(&self) -> bool {
+            self.uninhibit_cancelled.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ScreensaverBackend for GatedHangBackend {
+        async fn inhibit(&self, app_name: &str, reason: &str) -> Option<u32> {
+            self.inhibits
+                .write()
+                .unwrap()
+                .push((app_name.to_string(), reason.to_string()));
+            let cookie = self.next_cookie.fetch_add(1, Ordering::SeqCst) as u32;
+            *self.in_flight_cookie.write().unwrap() = Some(cookie);
+            self.gate.notified().await;
+            Some(cookie)
+        }
+
+        async fn uninhibit_and_stimulate(&self, cookie: u32) {
+            self.uninhibit_started.write().unwrap().push(cookie);
+            struct CancelGuard<'a>(&'a AtomicBool);
+            impl Drop for CancelGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _guard = CancelGuard(&self.uninhibit_cancelled);
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Hanging fake: `uninhibit_and_stimulate` parks forever. Drives the
+    /// bounded-uninhibit timeout test (audit §C: awaited bounded cleanup,
+    /// not a spawn).
+    struct HangingBackend {
+        inhibits: StdRwLock<Vec<(String, String)>>,
+        #[allow(dead_code)]
+        uninhibits: StdRwLock<Vec<u32>>,
+        next_cookie: AtomicUsize,
+    }
+
+    impl HangingBackend {
+        fn new() -> Self {
+            Self {
+                inhibits: StdRwLock::new(Vec::new()),
+                uninhibits: StdRwLock::new(Vec::new()),
+                next_cookie: AtomicUsize::new(100),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ScreensaverBackend for HangingBackend {
+        async fn inhibit(&self, app_name: &str, reason: &str) -> Option<u32> {
+            self.inhibits
+                .write()
+                .unwrap()
+                .push((app_name.to_string(), reason.to_string()));
+            Some(self.next_cookie.fetch_add(1, Ordering::SeqCst) as u32)
+        }
+
+        async fn uninhibit_and_stimulate(&self, _cookie: u32) {
+            // Park forever; the production code must bound this with a
+            // timeout so teardown latency is not held hostage by a
+            // wedged session bus.
+            std::future::pending::<()>().await;
         }
     }
 
@@ -401,5 +754,319 @@ mod tests {
         let plugin = ScreensaverInhibitPlugin::new();
         assert!(plugin.on_connected("device1").is_empty());
         plugin.on_disconnected("device1").await; // must not panic
+    }
+
+    /// R1 gate test (audit §C, PR #40 review): if `on_disconnected`
+    /// arrives while the inhibit call is in flight, the cookie the call
+    /// subsequently returns must still be released. Pre-fix: the
+    /// disconnect early-returns (no stored cookie → nothing to do) and
+    /// the task then stores the cookie, which stays orphaned until the
+    /// next full connect/disconnect cycle. The screen would never lock
+    /// again. Post-fix: the disconnect bumps the slot's generation; the
+    /// in-flight inhibit task sees the bump and self-cleans its own
+    /// cookie rather than storing it. The cookie is released, and
+    /// `cookie_for` stays `None` — the slot never records the orphan.
+    #[tokio::test]
+    async fn test_disconnect_before_cookie_stored_still_uninhibits() {
+        let backend = Arc::new(GatedBackend::new());
+        let plugin = ScreensaverInhibitPlugin::new().with_backend(backend.clone());
+
+        // Connect. The inhibit task is spawned; the fake parks on the
+        // gate, so no cookie is stored yet.
+        plugin.on_connected("device1");
+        // Give the spawn a tick to enter the inhibit future.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            plugin.cookie_for("device1").is_none(),
+            "gate should hold the inhibit task open before the cookie is returned"
+        );
+
+        // Disconnect. The slot bumps its generation; the gated
+        // inhibit is still parked with the same cookie fetched.
+        plugin.on_disconnected("device1").await;
+
+        // Release the in-flight inhibit. With the fix in place, the
+        // task sees the bumped generation and self-cleans: it
+        // releases the cookie itself instead of storing it.
+        let issued = backend
+            .in_flight_cookie()
+            .expect("the gated inhibit task should have fetched its cookie");
+        backend.release();
+        assert!(
+            wait_until(|| backend.uninhibits.read().unwrap().contains(&issued)).await,
+            "the cookie issued after disconnect must be released by the stale inhibit task"
+        );
+        assert!(
+            plugin.cookie_for("device1").is_none(),
+            "no cookie should be stored after a stale inhibit self-cleans"
+        );
+    }
+
+    /// Audit §C, sibling leak: `notify_connected` fires on EVERY link
+    /// replace, so a second connect with no disconnect overwrites the
+    /// stored cookie via `insert` and leaks the first one. The slot
+    /// state machine must release the previous cookie before issuing a
+    /// fresh one.
+    #[tokio::test]
+    async fn test_connect_again_without_disconnect_releases_old_cookie() {
+        let backend = Arc::new(GatedBackend::new());
+        let plugin = ScreensaverInhibitPlugin::new().with_backend(backend.clone());
+
+        // First connect: park inhibit 1; capture cookie 1; release.
+        plugin.on_connected("device1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let cookie1 = backend
+            .in_flight_cookie()
+            .expect("first inhibit task should have fetched its cookie");
+        backend.release();
+        assert!(
+            wait_until(|| plugin.cookie_for("device1") == Some(cookie1)).await,
+            "first cookie should be stored once inhibit completes"
+        );
+
+        // Second connect without disconnect: park inhibit 2; release.
+        // The slot must release cookie 1 before issuing cookie 2, and
+        // store cookie 2.
+        plugin.on_connected("device1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let cookie2 = backend
+            .in_flight_cookie()
+            .expect("second inhibit task should have fetched its cookie");
+        backend.release();
+        assert!(
+            wait_until(|| plugin.cookie_for("device1") == Some(cookie2)).await,
+            "second cookie should be the current one once its inhibit completes"
+        );
+        assert!(
+            wait_until(|| backend.uninhibits.read().unwrap().contains(&cookie1)).await,
+            "first cookie must be released by the second connect (no-disconnect leak)"
+        );
+    }
+
+    /// Deterministic interleaving with the gated fake: a stale inhibit
+    /// task (in flight at disconnect time) must self-clean its own
+    /// cookie when it sees a bumped generation. No leaked cookies.
+    #[tokio::test]
+    async fn test_stale_inhibit_self_cleans_after_disconnect() {
+        let backend = Arc::new(GatedBackend::new());
+        let plugin = ScreensaverInhibitPlugin::new().with_backend(backend.clone());
+
+        // connect1: task parked
+        plugin.on_connected("device1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let cookie1 = backend
+            .in_flight_cookie()
+            .expect("first inhibit task should have fetched its cookie");
+        backend.release();
+        assert!(
+            wait_until(|| plugin.cookie_for("device1") == Some(cookie1)).await,
+            "connect1's cookie should be stored"
+        );
+
+        // disconnect: awaited uninhibit on cookie1
+        plugin.on_disconnected("device1").await;
+        assert!(
+            wait_until(|| backend.uninhibits.read().unwrap().contains(&cookie1)).await,
+            "cookie1 must be released on disconnect"
+        );
+        assert!(plugin.cookie_for("device1").is_none());
+
+        // Now the interleaving that the current code drops: connect2
+        // starts an inhibit task, which we then leave in flight when
+        // disconnect fires, then release the gate.
+        plugin.on_connected("device1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let cookie2 = backend
+            .in_flight_cookie()
+            .expect("second inhibit task should have fetched its cookie");
+        // disconnect2: today's code removes no cookie (slot is
+        // Inhibiting, not Inhibited) and forgets about cookie2.
+        plugin.on_disconnected("device1").await;
+        // Release the parked inhibit. Stale task: must self-clean.
+        backend.release();
+        assert!(
+            wait_until(|| backend.uninhibits.read().unwrap().contains(&cookie2)).await,
+            "stale connect2 task must release cookie2 itself after disconnect bumps generation"
+        );
+        assert!(plugin.cookie_for("device1").is_none());
+    }
+
+    /// Audit §C: awaited bounded uninhibit. A wedged session bus must
+    /// not stall `on_disconnected` forever; the registry awaits this.
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn test_on_disconnect_bounds_uninhibit_under_hang() {
+        let backend = Arc::new(HangingBackend::new());
+        // Tight override so the test stays in suite budget; production
+        // default is 5s.
+        let bound = std::time::Duration::from_millis(200);
+        let plugin = ScreensaverInhibitPlugin::new()
+            .with_backend(backend.clone())
+            .with_uninhibit_timeout(bound);
+
+        plugin.on_connected("device1");
+        assert!(wait_until(|| plugin.cookie_for("device1").is_some()).await);
+
+        let started = std::time::Instant::now();
+        let disconnect = tokio::time::timeout(
+            bound + std::time::Duration::from_millis(500),
+            plugin.on_disconnected("device1"),
+        );
+        let completed = disconnect.await;
+        assert!(
+            completed.is_ok(),
+            "on_disconnected must return within the bound even if uninhibit hangs"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < bound + std::time::Duration::from_millis(250),
+            "disconnect must return promptly even if uninhibit parks (took {elapsed:?})"
+        );
+        assert!(plugin.cookie_for("device1").is_none());
+    }
+
+    /// FINDINGS #1 (review round): the stale-task self-clean must be
+    /// bounded, not just the disconnect path. A stale inhibit task whose
+    /// `uninhibit_and_stimulate` hangs must not park the spawned task
+    /// forever — the await has to be dropped at the bound, exactly like
+    /// `on_disconnected`'s awaited cleanup. Red on the branch under
+    /// review: the stale path awaited the backend call with no timeout.
+    #[tokio::test]
+    async fn test_stale_task_self_clean_is_bounded_under_hang() {
+        let backend = Arc::new(GatedHangBackend::new());
+        let bound = std::time::Duration::from_millis(150);
+        let plugin = ScreensaverInhibitPlugin::new()
+            .with_backend(backend.clone())
+            .with_uninhibit_timeout(bound);
+
+        // Connect; the inhibit task parks on the gate before returning
+        // its cookie.
+        plugin.on_connected("device1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let issued = backend
+            .in_flight_cookie()
+            .expect("the gated inhibit task should have fetched its cookie");
+
+        // Disconnect while the inhibit is in flight: the generation
+        // bumps, the slot goes Idle, nothing is awaited on this path.
+        plugin.on_disconnected("device1").await;
+
+        // Release: the task is stale and must self-clean — into a
+        // backend whose uninhibit hangs.
+        backend.release();
+        assert!(
+            wait_until(|| backend.started().contains(&issued)).await,
+            "the stale task must call uninhibit for its own cookie"
+        );
+        assert!(
+            wait_until(|| backend.cancelled()).await,
+            "the stale task's uninhibit must be dropped at the bound, not awaited forever"
+        );
+        assert!(
+            plugin.cookie_for("device1").is_none(),
+            "no cookie stored: the stale task self-cleaned"
+        );
+    }
+
+    /// Timeout-plumbing consistency (review): the old-cookie release
+    /// spawn on connect-without-disconnect must honor the SAME bound as
+    /// the awaited disconnect path — the plugin's `uninhibit_timeout`,
+    /// overridable in tests — not a hard-coded production constant. Red
+    /// before the fix: the spawn used DEFAULT_UNINHIBIT_TIMEOUT (5 s), so
+    /// a hung release parked the spawned task for 5 s regardless of the
+    /// configured bound and no test could exercise its expiry.
+    #[tokio::test]
+    async fn test_old_cookie_release_spawn_honors_timeout_override() {
+        let backend = Arc::new(GatedHangBackend::new());
+        let bound = std::time::Duration::from_millis(150);
+        let plugin = ScreensaverInhibitPlugin::new()
+            .with_backend(backend.clone())
+            .with_uninhibit_timeout(bound);
+
+        // First connect: park, release, store cookie 1.
+        plugin.on_connected("device1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let cookie1 = backend
+            .in_flight_cookie()
+            .expect("first inhibit task should have fetched its cookie");
+        backend.release();
+        assert!(
+            wait_until(|| plugin.cookie_for("device1") == Some(cookie1)).await,
+            "first cookie should be stored once inhibit completes"
+        );
+
+        // Second connect with no disconnect: the spawn releases cookie 1
+        // — into a backend whose uninhibit hangs.
+        plugin.on_connected("device1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        backend.release();
+        assert!(
+            wait_until(|| backend.started().contains(&cookie1)).await,
+            "the old-cookie release spawn must call uninhibit for cookie 1"
+        );
+        assert!(
+            wait_until(|| backend.cancelled()).await,
+            "the release spawn's uninhibit must be dropped at the configured bound"
+        );
+    }
+
+    /// Brief companion interleaving, review round: BOTH inhibit tasks
+    /// parked when the disconnect + reconnect lands between them. The
+    /// landed suite only ever parks one at a time. Every cookie the
+    /// backend ever issued must be either the current cookie or
+    /// released — and exactly one may be current: the stale task must
+    /// self-clean without being able to clobber the newer generation's
+    /// slot, whichever task reaches the slot lock first.
+    #[tokio::test]
+    async fn test_two_parked_inhibit_tasks_both_accounted() {
+        let backend = Arc::new(GatedBackend::new());
+        let plugin = ScreensaverInhibitPlugin::new().with_backend(backend.clone());
+
+        // connect1: task 1 parks holding cookie 1.
+        plugin.on_connected("device1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let cookie1 = backend
+            .in_flight_cookie()
+            .expect("first inhibit task should have fetched its cookie");
+
+        // Disconnect under task 1, then reconnect: task 2 parks holding
+        // cookie 2 and owns generation 3.
+        plugin.on_disconnected("device1").await;
+        plugin.on_connected("device1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let cookie2 = backend
+            .in_flight_cookie()
+            .expect("second inhibit task should have fetched its cookie");
+        assert_ne!(cookie1, cookie2);
+
+        // Release both gates. Wake order is scheduler's choice; the
+        // generation check must make either order safe.
+        backend.release();
+        backend.release();
+
+        assert!(
+            wait_until(|| plugin.cookie_for("device1") == Some(cookie2)).await,
+            "the current generation's cookie must be the stored one"
+        );
+        assert!(
+            wait_until(|| backend.uninhibits.read().unwrap().contains(&cookie1)).await,
+            "the stale generation's cookie must self-clean"
+        );
+
+        // Accounting: every issued cookie is current or released, never
+        // both, never neither.
+        let current = plugin.cookie_for("device1");
+        let released = backend.uninhibits.read().unwrap().clone();
+        for issued in [cookie1, cookie2] {
+            let is_current = current == Some(issued);
+            let is_released = released.contains(&issued);
+            assert!(
+                is_current || is_released,
+                "cookie {issued} must be current or released"
+            );
+            assert_ne!(
+                is_current, is_released,
+                "cookie {issued} must not be both current and released"
+            );
+        }
     }
 }
