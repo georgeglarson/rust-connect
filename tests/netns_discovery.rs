@@ -347,6 +347,18 @@ fn netns_interface_down_up_triggers_reannounce() {
             let sender_identity = test_identity("netns-flap-sender");
             let listener_identity = test_identity("netns-flap-listener");
 
+            // ORDERING IS LOAD-BEARING (since the 2026-09-04 loopback
+            // scoping gate): in test builds `DiscoveryService::new` binds
+            // `127.0.0.1:port` and "broadcasts" to `127.0.0.1:port` — a
+            // UNICAST, not a broadcast. When two sockets hold the same
+            // addr:port via SO_REUSEADDR (this suite's sender + listener
+            // on one port), Linux delivers a unicast to ONLY the most
+            // recently bound socket (probe-verified 2026-09-04; broadcast
+            // delivery, the pre-gate behavior, reached every bound socket
+            // regardless of order). Construct the listener AFTER the
+            // sender or it will never see the sender's announcements and
+            // the listen() below times out. Same rule in scenarios 2 and
+            // 3 below.
             let sender = DiscoveryService::new(sender_identity, port)
                 .await
                 .expect("bind sender DiscoveryService inside the netns");
@@ -453,6 +465,8 @@ fn netns_address_change_triggers_reannounce() {
             let listener = DiscoveryService::new(listener_identity, port)
                 .await
                 .expect("bind listener DiscoveryService inside the netns (SO_REUSEADDR)");
+            // (listener-after-sender ordering matters here too — see
+            // scenario 1's delivery note above.)
 
             sender
                 .broadcast()
@@ -534,6 +548,8 @@ fn netns_mdns_down_fallback_observes_two_backoff_intervals() {
             let listener = DiscoveryService::new(listener_identity, port)
                 .await
                 .expect("bind listener DiscoveryService inside the netns (SO_REUSEADDR)");
+            // (listener-after-sender ordering matters here too — see
+            // scenario 1's delivery note above.)
 
             let shutdown = CancellationToken::new();
             let schedule_shutdown = shutdown.clone();
