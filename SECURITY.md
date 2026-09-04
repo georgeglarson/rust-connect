@@ -86,7 +86,20 @@ documented here so reviewers do not file them as bugs. See
   `ProtectSystem=strict` with explicit `ReadWritePaths`, `PrivateTmp`,
   `ProtectKernelTunables/Modules/Logs`, `ProtectControlGroups`,
   `ProtectClock`, `ProtectHostname`, `RestrictNamespaces`,
-  `RestrictRealtime`, `RestrictAddressFamilies`, a `SystemCallFilter`
-  allowlist, and `DeviceAllow` limited to `/dev/uinput` and `/dev/fuse`.
-  `NoNewPrivileges` is deliberately OFF: SFTP mounts go through the
-  setuid `fusermount3`, which `NoNewPrivileges=yes` would block.
+  `RestrictRealtime`, `RestrictAddressFamilies`, `SystemCallArchitectures=native`,
+  a `SystemCallFilter` allowlist, and `DeviceAllow` limited to
+  `/dev/uinput` and `/dev/fuse`. The unit refuses to start under a
+  display-manager greeter's user instance via `ConditionUser=!gdm-greeter`
+  — a stale greeter user would mint a fresh identity and hold port 1716
+  until login, racing real paired phones (audit 2026-09-02 §E).
+  `NoNewPrivileges` and `RestrictSUIDSGID` are deliberately OFF: unprivileged
+  users cannot `mount()` (needs `CAP_SYS_ADMIN`), so sshfs delegates to
+  the setuid `fusermount3` helper, which requires privilege elevation to
+  drop privileges. With either flag on, `fusermount3` core-dumps in
+  `drop_privs` (observed live 2026-08-06). The daemon itself stays
+  unprivileged; only the setuid helper it spawns can elevate. Keep the
+  `SystemCallFilter` carve-out for `fusermount3`'s privilege drop in sync
+  with the sftp-fuse drop-in documented in `docs/live-validation.md`;
+  after a systemd upgrade, re-diff the `@privileged` syscall set
+  against the unit line — drift silently breaks SFTP mounts
+  (EPERM/SIGSYS) or widens the sandbox.

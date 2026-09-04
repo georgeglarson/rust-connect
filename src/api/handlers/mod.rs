@@ -12,6 +12,9 @@ pub use plugins::*;
 pub use share::*;
 pub use ui::*;
 
+#[cfg(test)]
+mod device_tests;
+
 use axum::extract::State;
 use axum::Json;
 use std::sync::Arc;

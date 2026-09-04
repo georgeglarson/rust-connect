@@ -60,10 +60,10 @@ peer, upstream-derived fixture, or applicable environment proves the behavior.
 
 ## Next
 
-- Sprint 3 of the functional-completeness plan: remotecontrol and
-  shareinputdevices landed (2026-08-23 and 08-26); virtualmonitor is the
-  remaining upstream feature. The kdeconnectd independent-peer interop
-  harness (`tests/interop/`) exists and is source-pinned.
+- Sprint 3 of the functional-completeness plan is the last upstream
+  feature union row: virtualmonitor is the remaining piece. The
+  kdeconnectd independent-peer interop harness (`tests/interop/`) exists
+  and is source-pinned.
 - Then Sprint 4 (device/desktop/soak matrices) and Sprint 5 (evidence
   closure as a release gate). Sprints 0–2 are complete: the ledger exists
   and is lint-enforced, advertised features have their desktop effects,
