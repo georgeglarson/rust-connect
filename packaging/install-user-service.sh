@@ -12,6 +12,13 @@ BIN_DIR="${HOME}/.local/bin"
 UNIT_DIR="${HOME}/.config/systemd/user"
 
 echo "==> Building release binary"
+# Force build.rs to re-run so RC_GIT_SHA is re-stamped from THIS checkout's
+# HEAD. Without this, a warm shared target dir can answer "up to date" from
+# another worktree's release fingerprints (.git/HEAD doesn't move on a merge
+# of a packed ref), and the installed binary silently trails main — observed
+# live 2026-09-04: deploy reported 7dea30d on main bdf3bd9 until a forced
+# cargo clean -p. The touch costs a rebuild only when the stamp changes.
+touch "${REPO_ROOT}/build.rs"
 cargo build --release --locked --manifest-path "${REPO_ROOT}/Cargo.toml"
 
 echo "==> Installing binary to ${BIN_DIR}/rust-connect"
