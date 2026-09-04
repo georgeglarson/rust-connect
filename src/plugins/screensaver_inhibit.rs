@@ -1008,4 +1008,65 @@ mod tests {
             "the release spawn's uninhibit must be dropped at the configured bound"
         );
     }
+
+    /// Brief companion interleaving, review round: BOTH inhibit tasks
+    /// parked when the disconnect + reconnect lands between them. The
+    /// landed suite only ever parks one at a time. Every cookie the
+    /// backend ever issued must be either the current cookie or
+    /// released — and exactly one may be current: the stale task must
+    /// self-clean without being able to clobber the newer generation's
+    /// slot, whichever task reaches the slot lock first.
+    #[tokio::test]
+    async fn test_two_parked_inhibit_tasks_both_accounted() {
+        let backend = Arc::new(GatedBackend::new());
+        let plugin = ScreensaverInhibitPlugin::new().with_backend(backend.clone());
+
+        // connect1: task 1 parks holding cookie 1.
+        plugin.on_connected("device1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let cookie1 = backend
+            .in_flight_cookie()
+            .expect("first inhibit task should have fetched its cookie");
+
+        // Disconnect under task 1, then reconnect: task 2 parks holding
+        // cookie 2 and owns generation 3.
+        plugin.on_disconnected("device1").await;
+        plugin.on_connected("device1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let cookie2 = backend
+            .in_flight_cookie()
+            .expect("second inhibit task should have fetched its cookie");
+        assert_ne!(cookie1, cookie2);
+
+        // Release both gates. Wake order is scheduler's choice; the
+        // generation check must make either order safe.
+        backend.release();
+        backend.release();
+
+        assert!(
+            wait_until(|| plugin.cookie_for("device1") == Some(cookie2)).await,
+            "the current generation's cookie must be the stored one"
+        );
+        assert!(
+            wait_until(|| backend.uninhibits.read().unwrap().contains(&cookie1)).await,
+            "the stale generation's cookie must self-clean"
+        );
+
+        // Accounting: every issued cookie is current or released, never
+        // both, never neither.
+        let current = plugin.cookie_for("device1");
+        let released = backend.uninhibits.read().unwrap().clone();
+        for issued in [cookie1, cookie2] {
+            let is_current = current == Some(issued);
+            let is_released = released.contains(&issued);
+            assert!(
+                is_current || is_released,
+                "cookie {issued} must be current or released"
+            );
+            assert_ne!(
+                is_current, is_released,
+                "cookie {issued} must not be both current and released"
+            );
+        }
+    }
 }
