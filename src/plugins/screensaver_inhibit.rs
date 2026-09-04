@@ -1069,4 +1069,61 @@ mod tests {
             );
         }
     }
+
+    /// Audit §C, R4: the screensaver customer. Connected + inhibited,
+    /// replacement live, stale teardown. The slot must remain
+    /// Inhibited — the stale uninhibit must not lift the live
+    /// replacement's inhibition, which would leave the desktop
+    /// unlocked with the phone attached. Pre-fix: the registry awaits
+    /// sftp's slow cleanup, the screensaver slot uninhibits first, a
+    /// replacement's notify_connected arrives, but the slot is now
+    /// Idle-with-no-cookie until the next inhibit completes; the
+    /// desktop is "phone-attached-but-unlocked" until then. Post-fix:
+    /// the registry-level guard short-circuits, the plugin is never
+    /// called, the slot keeps its cookie.
+    #[tokio::test]
+    async fn test_stale_teardown_leaves_inhibit_slot_inhibited() {
+        let backend = Arc::new(MockBackend::new());
+        let plugin = Arc::new(ScreensaverInhibitPlugin::new().with_backend(backend.clone()));
+
+        // Drive the inhibit task to completion and confirm a cookie
+        // is held before the stale teardown arrives.
+        plugin.on_connected("device1");
+        assert!(wait_until(|| plugin.cookie_for("device1").is_some()).await);
+        let held_cookie = plugin.cookie_for("device1").expect("cookie stored");
+
+        // Wire the registry-level guard with a live replacement
+        // generation for the device — the same situation the
+        // screensaver-inhibit PR #40 review surfaced: a fresh
+        // generation is already in the slot while a stale teardown
+        // races against it.
+        let certs = Arc::new(crate::protocol::CertificateManager::new(
+            std::env::temp_dir().join("rust-connect-test-screensaver-registry"),
+        ));
+        certs.init().expect("Value expected to be present");
+        let cm = Arc::new(
+            crate::protocol::ConnectionManager::new(certs).expect("Value expected to be present"),
+        );
+        cm.mark_generation_for_test("device1", 7);
+
+        let registry = crate::plugins::PluginRegistry::new().with_connection_manager(cm.clone());
+        registry.register(plugin.clone()).await;
+
+        // Stale teardown. The plugin's `on_disconnected` is what would
+        // lift the inhibition; the registry-level guard must keep it
+        // from running.
+        registry.notify_disconnected("device1").await;
+
+        // The slot must still hold the cookie. No uninhibit fired.
+        assert_eq!(
+            plugin.cookie_for("device1"),
+            Some(held_cookie),
+            "stale teardown lifted the live replacement's inhibition"
+        );
+        assert!(
+            backend.uninhibits.read().unwrap().is_empty(),
+            "stale teardown must not have called uninhibit; backend saw {:?}",
+            backend.uninhibits.read().unwrap().clone()
+        );
+    }
 }
