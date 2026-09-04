@@ -283,16 +283,13 @@ impl Plugin for ScreensaverInhibitPlugin {
         if let Some(old) = old_cookie {
             // Release a leaked prior cookie without blocking the
             // connect path; log-and-continue on failure. Best-effort.
+            // Same bound as the disconnect path — one configured
+            // timeout governs every uninhibit the plugin performs.
             let backend = backend.clone();
             let device_id_release = device_id.clone();
+            let release_bound = self.uninhibit_timeout();
             tokio::spawn(async move {
-                Self::bounded_uninhibit(
-                    &backend,
-                    &device_id_release,
-                    old,
-                    DEFAULT_UNINHIBIT_TIMEOUT,
-                )
-                .await;
+                Self::bounded_uninhibit(&backend, &device_id_release, old, release_bound).await;
             });
         }
 
@@ -967,6 +964,48 @@ mod tests {
         assert!(
             plugin.cookie_for("device1").is_none(),
             "no cookie stored: the stale task self-cleaned"
+        );
+    }
+
+    /// Timeout-plumbing consistency (review): the old-cookie release
+    /// spawn on connect-without-disconnect must honor the SAME bound as
+    /// the awaited disconnect path — the plugin's `uninhibit_timeout`,
+    /// overridable in tests — not a hard-coded production constant. Red
+    /// before the fix: the spawn used DEFAULT_UNINHIBIT_TIMEOUT (5 s), so
+    /// a hung release parked the spawned task for 5 s regardless of the
+    /// configured bound and no test could exercise its expiry.
+    #[tokio::test]
+    async fn test_old_cookie_release_spawn_honors_timeout_override() {
+        let backend = Arc::new(GatedHangBackend::new());
+        let bound = std::time::Duration::from_millis(150);
+        let plugin = ScreensaverInhibitPlugin::new()
+            .with_backend(backend.clone())
+            .with_uninhibit_timeout(bound);
+
+        // First connect: park, release, store cookie 1.
+        plugin.on_connected("device1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let cookie1 = backend
+            .in_flight_cookie()
+            .expect("first inhibit task should have fetched its cookie");
+        backend.release();
+        assert!(
+            wait_until(|| plugin.cookie_for("device1") == Some(cookie1)).await,
+            "first cookie should be stored once inhibit completes"
+        );
+
+        // Second connect with no disconnect: the spawn releases cookie 1
+        // — into a backend whose uninhibit hangs.
+        plugin.on_connected("device1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        backend.release();
+        assert!(
+            wait_until(|| backend.started().contains(&cookie1)).await,
+            "the old-cookie release spawn must call uninhibit for cookie 1"
+        );
+        assert!(
+            wait_until(|| backend.cancelled()).await,
+            "the release spawn's uninhibit must be dropped at the configured bound"
         );
     }
 }
