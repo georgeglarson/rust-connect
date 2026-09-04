@@ -891,7 +891,10 @@ impl Plugin for NotificationPlugin {
                 self.dedupe_track(device_id, id, content_signature(app_name, title, text))
             };
             if matches!(action, DesktopAction::Suppress) {
-                debug!(
+                // INFO, not debug: suppression is the observable oracle for
+                // the re-dump shadow — the journal must be readable at the
+                // unit's default level (2026-09-04 soak-read follow-up).
+                info!(
                     device_id = %device_id,
                     notification_id = id,
                     event = "notification_represent_suppressed",
