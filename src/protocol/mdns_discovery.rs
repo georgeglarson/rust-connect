@@ -118,6 +118,37 @@ impl MdnsDiscoveryService {
         let daemon = ServiceDaemon::new()
             .map_err(|e| Error::DiscoveryError(format!("Failed to start mDNS daemon: {}", e)))?;
 
+        // Test builds must keep mDNS traffic on the loopback (D2 fixed
+        // the TYPE so phones don't recognize fixture announces; this
+        // gate keeps the multicast itself off the LAN so avahi/etc.
+        // don't churn parsing it). The `ServiceDaemon` applies
+        // `IfSelection` entries to its interface list as a sequence of
+        // overrides (service_daemon.rs `apply_intf_selections`: starts
+        // with every interface enabled, walks `if_selections`, last
+        // match wins), so an `enable_interface(LoopbackV4)` alone is a
+        // no-op — we must first `disable_interface(All)`, then
+        // re-enable only loopback. Verified empirically against the
+        // vendored mdns-sd 0.20.3 source.
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            daemon
+                .disable_interface(mdns_sd::IfKind::All)
+                .map_err(|e| {
+                    Error::DiscoveryError(format!(
+                        "Failed to disable non-loopback interfaces for test build: {}",
+                        e
+                    ))
+                })?;
+            daemon
+                .enable_interface(mdns_sd::IfKind::LoopbackV4)
+                .map_err(|e| {
+                    Error::DiscoveryError(format!(
+                        "Failed to enable loopback interface for test build: {}",
+                        e
+                    ))
+                })?;
+        }
+
         let service_info = build_service_info(identity)?;
         let port = identity.tcp_port.unwrap_or(DEFAULT_TCP_PORT);
         let fullname = service_info.get_fullname().to_string();
