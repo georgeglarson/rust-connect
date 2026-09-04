@@ -84,7 +84,24 @@ impl DiscoveryService {
     /// # }
     /// ```
     pub async fn new(identity: Identity, udp_port: u16) -> Result<Self> {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), udp_port);
+        // Test discovery on a production LAN used to leave the host: the
+        // UDP socket bound `0.0.0.0:port` (so it could hear real LAN
+        // traffic) and `broadcast_addr` targeted `255.255.255.255:port`
+        // (so every identity broadcast hit every subnet the host was on).
+        // D2 (2026-09-02) fixed the mDNS TYPE so phones don't recognize
+        // fixture announces; this gate fixes the UDP leg by collapsing
+        // both ends to loopback. The gate is the same one D2 verified:
+        // every `cargo test` build carries `test-helpers` via the
+        // dev-dependency (`rust-connect = { path = ".", features =
+        // ["test-helpers"] }`); `cargo build --locked` — interop harness
+        // and release — never does, so production builds compile the
+        // gate out entirely. R1 / R2 below pin both ends; the live LAN
+        // oracle is in FINDINGS.md.
+        #[cfg(any(test, feature = "test-helpers"))]
+        let bind_ip = Ipv4Addr::LOCALHOST;
+        #[cfg(not(any(test, feature = "test-helpers")))]
+        let bind_ip = Ipv4Addr::UNSPECIFIED;
+        let addr = SocketAddr::new(IpAddr::V4(bind_ip), udp_port);
 
         let socket = Socket::new(Domain::IPV4, SockType::DGRAM, Some(Protocol::UDP))
             .map_err(|e| Error::DiscoveryError(format!("Failed to create UDP socket: {}", e)))?;
@@ -159,6 +176,11 @@ impl DiscoveryService {
         Ok(Self {
             socket,
             identity,
+            // See the bind-IP gate above for the rationale — same
+            // `test-helpers` gate, same compile-out in production.
+            #[cfg(any(test, feature = "test-helpers"))]
+            broadcast_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), udp_port),
+            #[cfg(not(any(test, feature = "test-helpers")))]
             broadcast_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), udp_port),
         })
     }
@@ -854,6 +876,75 @@ mod tests {
             service.broadcast_addr.port(),
             configured_port,
             "DiscoveryService must broadcast on the configured UDP port"
+        );
+    }
+
+    /// Defect (2026-09-04, audit `fix-test-discovery-loopback-scoping`):
+    /// `DiscoveryService::new` must keep `cargo test` announcements on the
+    /// loopback — every other leg of test discovery is gated on
+    /// `#[cfg(any(test, feature = "test-helpers"))]` (SERVICE_TYPE) and the
+    /// same gate applies here, but the UDP broadcast path was still pointed
+    /// at `255.255.255.255:port` on every `cargo test` invocation. Today
+    /// this fails: the production code at `broadcast_addr` (line ~162) is
+    /// `Ipv4Addr::BROADCAST`. After the loopback-scoping fix it is
+    /// `127.0.0.1:port`. Production builds compile the gate out entirely
+    /// (byte-identical behavior — the gate is the same one D2 verified
+    /// ships only to test builds: `test-helpers` is a dev-dependency
+    /// feature, never set by `cargo build --locked`).
+    #[tokio::test]
+    async fn test_test_build_broadcast_is_loopback_scoped() {
+        let identity = create_test_identity("R1 Loopback Broadcast");
+        let port = find_unused_port().await;
+        let service = DiscoveryService::new(identity, port)
+            .await
+            .expect("DiscoveryService::new must succeed");
+
+        assert_eq!(
+            service.broadcast_addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            "test-build broadcast_addr must target 127.0.0.1:{port}, not \
+             255.255.255.255:{port} — cargo test must not send a UDP \
+             identity broadcast on the real LAN"
+        );
+        assert_ne!(
+            service.broadcast_addr.ip(),
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+            "test-build broadcast_addr must not be the LAN broadcast address"
+        );
+    }
+
+    /// Defect (2026-09-04, audit `fix-test-discovery-loopback-scoping`):
+    /// paired with R1 — a test-build listener must bind to the loopback,
+    /// not the LAN address. Today this fails: the production bind (line
+    /// ~87) is `0.0.0.0:port` (`Ipv4Addr::UNSPECIFIED`), so a test socket
+    /// receives traffic from any interface the host owns. After the fix
+    /// the bind is `127.0.0.1:port`.
+    #[tokio::test]
+    async fn test_test_build_listener_binds_loopback() {
+        let identity = create_test_identity("R2 Loopback Bind");
+        let port = find_unused_port().await;
+        let service = DiscoveryService::new(identity, port)
+            .await
+            .expect("DiscoveryService::new must succeed");
+
+        let local = service
+            .socket
+            .local_addr()
+            .expect("local_addr must succeed on a freshly bound socket");
+        assert_eq!(
+            local.ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "test-build DiscoveryService must bind to 127.0.0.1, got {local}"
+        );
+        assert_eq!(
+            local.port(),
+            port,
+            "test-build DiscoveryService must keep the configured UDP port"
+        );
+        assert_ne!(
+            local.ip(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            "test-build DiscoveryService must not bind 0.0.0.0"
         );
     }
 
