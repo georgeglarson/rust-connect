@@ -208,10 +208,34 @@ impl CertificateManager {
             rcgen::KeyPair::generate_rsa_for(&rcgen::PKCS_RSA_SHA512, rcgen::RsaKeySize::_2048)
                 .map_err(|e| Error::TlsError(format!("Failed to generate RSA key: {}", e)))?;
 
-        // Build certificate parameters. No subjectAltNames — the openssl-era
-        // certificates carried no extensions, and the device ID (which can
-        // contain '_') is not a valid dNSName anyway.
+        // Build certificate parameters. We emit exactly one subjectAltName
+        // entry: a dNSName carrying the device id. This is a DELIBERATE
+        // divergence from Android's SslHelper.kt:53-57 — Android's TLS layer
+        // has checkServerTrusted = Unit (trust-all at TLS, authenticity from
+        // a post-handshake fingerprint TOFU), so its CN-only certs ship
+        // fine. kdeconnectd's Qt TLS layer is the opposite: in client mode
+        // it sets the outgoing socket's peer-verify name to the device id
+        // (core/backends/lan/lanlinkprovider.cpp:604: setPeerVerifyName
+        // (deviceId)) and runs REAL hostname verification against the peer
+        // cert's SAN. Any error other than SelfSignedCertificate is fatal
+        // (lanlinkprovider.cpp:456, sslErrors). A SAN-less cert yields
+        // "The host name did not match any of the valid hosts for this
+        // certificate", the link aborts, kdeconnectd's post-rejection
+        // unpair fires, and our side honors it (PairingHandler::unpair →
+        // delete_peer_certificate, src/protocol/pairing/mod.rs:693) — a
+        // transient handshake becomes permanent depairing. The SAN fixes
+        // the trigger. Device ids may contain '_' (the Android spec
+        // allows it and real ids are hex); '_' is valid ASCII and rcgen's
+        // Ia5String accepts ASCII, so no real device id is rejected.
         let mut params = rcgen::CertificateParams::default();
+        params.subject_alt_names.push(rcgen::SanType::DnsName(
+            rcgen::string::Ia5String::try_from(device_id.to_string()).map_err(|e| {
+                Error::TlsError(format!(
+                    "device_id is not a valid IA5String for subjectAltName dNSName: {}",
+                    e
+                ))
+            })?,
+        ));
 
         // RDN order must match Android: CN, OU, O
         use rcgen::DnType;
@@ -1693,6 +1717,171 @@ mod tests {
         assert!(
             err.to_string().contains("exactly one"),
             "the error must name the single-certificate contract, got: {err}"
+        );
+    }
+
+    /// R1: the generated certificate MUST carry exactly one subjectAltName
+    /// dNSName equal to the device id, so kdeconnectd's Qt TLS layer
+    /// (core/backends/lan/lanlinkprovider.cpp:604: setPeerVerifyName) can
+    /// verify our cert against the id it dials with. CN, RDN order, and
+    /// the rest of the shape are unchanged.
+    #[test]
+    fn test_generated_cert_carries_device_id_san() {
+        use x509_parser::oid_registry::{
+            OID_X509_COMMON_NAME, OID_X509_ORGANIZATIONAL_UNIT, OID_X509_ORGANIZATION_NAME,
+        };
+        use x509_parser::prelude::GeneralName;
+
+        let (manager, _temp_dir) = setup();
+        let device_id = "rust-connect-cert-test-123456789"; // 32 chars, ld-h safe
+        let (cert_pem, _key_pem) = manager
+            .generate_certificate(device_id, "Cert Test")
+            .expect("generate test certificate");
+
+        let cert_der = pem_to_der(&cert_pem).expect("parse generated cert PEM to DER");
+        let cert = parse_x509_der(&cert_der).expect("parse generated cert DER");
+
+        // CN is unchanged — still the device id (kdeconnectd's stored-cert
+        // fingerprint TOFU and our own verification both key off CN).
+        let cn = cert
+            .subject()
+            .iter_common_name()
+            .next()
+            .and_then(|cn| cn.as_str().ok())
+            .map(|s| s.to_string())
+            .expect("cert has a CN");
+        assert_eq!(cn, device_id, "CN must remain the device id");
+
+        // RDN order is CN, OU, O (matching Android SslHelper.kt — see the
+        // existing comment in generate_certificate). x509-parser exposes
+        // subject attributes in DER order; iterating them must surface CN
+        // first, then OU, then O.
+        let attr_oids: Vec<_> = cert
+            .subject()
+            .iter_attributes()
+            .map(|a| a.attr_type().clone())
+            .collect();
+        assert!(
+            attr_oids.len() >= 3,
+            "expected at least CN, OU, O in subject, got {} attributes",
+            attr_oids.len()
+        );
+        assert_eq!(attr_oids[0], OID_X509_COMMON_NAME, "first RDN must be CN");
+        assert_eq!(
+            attr_oids[1], OID_X509_ORGANIZATIONAL_UNIT,
+            "second RDN must be OU"
+        );
+        assert_eq!(
+            attr_oids[2], OID_X509_ORGANIZATION_NAME,
+            "third RDN must be O"
+        );
+
+        // SAN: exactly one dNSName carrying the device id verbatim.
+        let san = cert
+            .subject_alternative_name()
+            .expect("parse SAN extension")
+            .expect("cert must carry a subjectAltName (R1)");
+        assert_eq!(san.value.general_names.len(), 1, "exactly one SAN entry");
+        match &san.value.general_names[0] {
+            GeneralName::DNSName(name) => assert_eq!(
+                name.to_string(),
+                device_id,
+                "SAN dNSName must equal the device id verbatim"
+            ),
+            other => panic!("SAN entry must be dNSName, got {:?}", other),
+        }
+    }
+
+    /// R2: device ids containing '_' are spec-valid (the Android spec
+    /// allows them and real ids are hex, so `_` is a permitted character
+    /// in the charset). Generation must succeed, and the SAN dNSName must
+    /// carry the underscore-bearing id verbatim — rcgen's Ia5String only
+    /// requires ASCII and `_` is ASCII, so the contract holds.
+    #[test]
+    fn test_generated_cert_san_accepts_underscore_id() {
+        use x509_parser::prelude::GeneralName;
+
+        let (manager, _temp_dir) = setup();
+        // 34 chars, contains '_' — within the validate_device_id length
+        // window (32..=38) and the [a-zA-Z0-9_-] charset.
+        let device_id = "rust_connect_test_device_aaaaaaa";
+
+        let (cert_pem, _key_pem) = manager
+            .generate_certificate(device_id, "Underscore Test")
+            .expect("generation must succeed for an underscore-bearing device id");
+
+        let cert_der = pem_to_der(&cert_pem).expect("parse generated cert PEM to DER");
+        let cert = parse_x509_der(&cert_der).expect("parse generated cert DER");
+
+        let san = cert
+            .subject_alternative_name()
+            .expect("parse SAN extension")
+            .expect("cert must carry a subjectAltName for the underscore id");
+        assert_eq!(san.value.general_names.len(), 1);
+        match &san.value.general_names[0] {
+            GeneralName::DNSName(name) => assert_eq!(
+                name.to_string(),
+                device_id,
+                "SAN dNSName must carry the underscore-bearing id verbatim"
+            ),
+            other => panic!("SAN entry must be dNSName, got {:?}", other),
+        }
+    }
+
+    /// Companion: the SAN addition must not perturb the existing
+    /// SslHelper.kt-pin semantics — the validity window (now−1y /
+    /// now+10y) and the 20-byte serial scheme. not_before is already
+    /// pinned by test_generate_certificate_not_before_one_year_back; this
+    /// pins the upper bound and the serial length.
+    #[test]
+    fn test_generated_cert_validity_and_serial_unchanged_after_san() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let (manager, _temp_dir) = setup();
+        let device_id = "validity-and-serial-deviceaaaaaaaaa"; // 34 chars
+        let (cert_pem, _key_pem) = manager
+            .generate_certificate(device_id, "Pinning")
+            .expect("generate test certificate");
+
+        // not_after: openssl's X509.not_after() returns &Asn1TimeRef
+        // directly; the comparison API lives there, not on ASN1Time.
+        let openssl_cert = openssl::x509::X509::from_pem(&cert_pem)
+            .expect("parse generated cert PEM with openssl");
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("read system time")
+            .as_secs() as i64;
+        let almost_ten_years = now_unix + 9 * 365 * 24 * 60 * 60;
+        let over_ten_years = now_unix + 10 * 365 * 24 * 60 * 60 + 60 * 24 * 60 * 60;
+        let almost_ten_years_asn1 =
+            openssl::asn1::Asn1Time::from_unix(almost_ten_years).expect("create ASN.1 time");
+        let over_ten_years_asn1 =
+            openssl::asn1::Asn1Time::from_unix(over_ten_years).expect("create ASN.1 time");
+        assert_eq!(
+            openssl_cert
+                .not_after()
+                .compare(&almost_ten_years_asn1)
+                .expect("compare"),
+            std::cmp::Ordering::Greater,
+            "notAfter must be roughly 10y ahead of now"
+        );
+        assert_eq!(
+            openssl_cert
+                .not_after()
+                .compare(&over_ten_years_asn1)
+                .expect("compare"),
+            std::cmp::Ordering::Less,
+            "notAfter must not be more than ~10y ahead of now"
+        );
+
+        // RFC 3280 20-byte serial — the openssl-era carry-over, retained
+        // by generate_certificate (see serial_buf = [0u8; 20]).
+        let cert_der = pem_to_der(&cert_pem).expect("parse generated cert PEM to DER");
+        let cert = parse_x509_der(&cert_der).expect("parse generated cert DER");
+        assert_eq!(
+            cert.raw_serial().len(),
+            20,
+            "serial must be 20 bytes (RFC 3280)"
         );
     }
 }
