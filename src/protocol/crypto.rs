@@ -249,10 +249,22 @@ impl CertificateManager {
             .distinguished_name
             .push(DnType::OrganizationName, "KDE");
 
-        // Generate 20-byte random serial number (as per RFC 3280)
+        // Generate 20-byte random serial number (RFC 5280 4.1.2.2 caps the
+        // ENCODED serial at 20 octets). The DER INTEGER writer pads with a
+        // leading 0x00 whenever the first byte's high bit is set — a raw
+        // 20-byte buffer therefore encodes to 21 octets on ~50% of
+        // generations — and it strips leading zero bytes, so a zero first
+        // byte encodes to 19 or fewer. Clearing the high bit AND forcing
+        // the low bit pins the encoded serial at exactly 20 octets every
+        // time (rcgen's own default serial does only the high-bit clear
+        // and accepts a variable length ≤ 20; the == 20 pin in
+        // test_generated_cert_validity_and_serial_unchanged_after_san is
+        // stricter). 158 random bits remain — well above the 64-bit
+        // entropy floor RFC 5280 recommends for serials.
         let mut serial_buf = [0u8; 20];
         rand::RngCore::try_fill_bytes(&mut rand::rngs::OsRng, &mut serial_buf)
             .map_err(|e| Error::TlsError(format!("Failed to generate serial: {}", e)))?;
+        serial_buf[0] = (serial_buf[0] & 0x7F) | 0x01;
         params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial_buf));
 
         // Validity period matching Android (SslHelper.kt:110-111):
