@@ -252,7 +252,7 @@ check "pairStateChanged signal observed on the kde private bus" \
 #   carries a subjectAltName dNSName with the device id in kdeconnectd's
 #   D-Bus-normalized form (underscores), which is the exact string its
 #   client-mode verification compares against. The scenario this note
-#   refused to run is covered end-to-end by tests/interop/m5_restart_kde.sh
+#   refused to run is covered end-to-end by tests/interop/m5_smoke.sh
 #   (pair → kdeconnectd-only restart → no rejection, TOFU intact, ping
 #   delivered), GREEN against the source-built reference v26.04.3.
 # - Phase 1 was kde-initiated; Phase 2 is rust-initiated. Both
