@@ -9,7 +9,10 @@
 #   tests/interop/run.sh m4             # M3 + the M4 unlock knobs (source-built
 #                                       # KDE reference + rust-side Xvfb +
 #                                       # mpris fake-player helper)
-#   tests/interop/run.sh all            # serial M1 → M2 → M3 → M4
+#   tests/interop/run.sh m5             # kdeconnectd-only restart (the SAN
+#                                       # fix's live oracle, vk #1045); needs
+#                                       # RC_KDECONNECTD for the source build
+#   tests/interop/run.sh all            # serial M1 → M2 → M3 → M4 → M5
 #   sudo tests/interop/run.sh m2        # already root
 #   RC_M2_SABOTAGE=skip-kde-accept tests/interop/run.sh m2
 #
@@ -38,15 +41,16 @@ case "$MILESTONE" in
     m2) SABOTAGE_ENV="RC_M2_SABOTAGE" ; BIN_ENV="RC_M2_BIN" ;;
     m3) SABOTAGE_ENV="RC_M3_SABOTAGE" ; BIN_ENV="RC_M3_BIN" ;;
     m4) SABOTAGE_ENV="RC_M4_SABOTAGE" ; BIN_ENV="RC_M4_BIN" ;;
+    m5) SABOTAGE_ENV="RC_M5_SABOTAGE" ; BIN_ENV="RC_M5_BIN" ;;
     all)
-        # One-command runner: serial M1 → M2 → M3 → M4. Each is its own
+        # One-command runner: serial M1 → M2 → M3 → M4 → M5. Each is its own
         # PASS/FAIL gate; we always attempt every milestone so a single
         # failure doesn't blind subsequent lanes, then exit non-zero if
         # any of them failed. The ZERO-LEAK invariant gates every
         # milestone independently inside lib.sh.
-        echo "[run.sh] all: serial M1 → M2 → M3 → M4 (each is its own PASS/FAIL gate)"
+        echo "[run.sh] all: serial M1 → M2 → M3 → M4 → M5 (each is its own PASS/FAIL gate)"
         any_fail=0
-        for ms in m1 m2 m3 m4; do
+        for ms in m1 m2 m3 m4 m5; do
             echo "[run.sh] === running $ms ==="
             if ! "${0}" "$ms"; then
                 echo "[run.sh] === $ms FAILED ===" >&2
@@ -62,7 +66,7 @@ case "$MILESTONE" in
         exit 0
         ;;
     *)
-        echo "[run.sh] FAIL: unknown milestone: $MILESTONE (allowed: m1 | m2 | m3 | m4 | all)" >&2
+        echo "[run.sh] FAIL: unknown milestone: $MILESTONE (allowed: m1 | m2 | m3 | m4 | m5 | all)" >&2
         exit 1
         ;;
 esac
@@ -93,10 +97,23 @@ RC_BIN="$REPO_ROOT/target/debug/rust-connect"
 SMOKE="$REPO_ROOT/tests/interop/${MILESTONE}_smoke.sh"
 [[ -f "$SMOKE" ]] || { echo "[run.sh] FAIL: smoke not found: $SMOKE" >&2; exit 1; }
 
+# The M4/M5 source-built reference's RUNPATH was baked to its build
+# worktree (since deleted), so the install's lib64 must ride
+# LD_LIBRARY_PATH — set explicitly here because sudo's env_reset strips
+# it from the invoking shell before the exec'd env(1) could inherit it.
+if [[ -n "${RC_KDECONNECTD:-}" ]]; then
+    KDE_LIB_PATH="$(dirname "$(dirname "$(readlink -f "$RC_KDECONNECTD")")")/lib64"
+    [[ -d "$KDE_LIB_PATH" ]] \
+        || { echo "[run.sh] FAIL: RC_KDECONNECTD=$RC_KDECONNECTD but no lib64 at $KDE_LIB_PATH" >&2; exit 1; }
+else
+    KDE_LIB_PATH=""
+fi
+
 exec "${SUDO[@]}" env \
     "$BIN_ENV=$RC_BIN" \
     "$SABOTAGE_ENV=$SABOTAGE_VAL" \
     "RC_KDECONNECTD=${RC_KDECONNECTD:-}" \
     "RC_RUST_DISPLAY=${RC_RUST_DISPLAY:-}" \
     "RC_MPRIS_FAKE=${RC_MPRIS_FAKE:-}" \
+    ${KDE_LIB_PATH:+"LD_LIBRARY_PATH=$KDE_LIB_PATH"} \
     bash "$SMOKE"

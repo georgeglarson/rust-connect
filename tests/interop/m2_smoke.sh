@@ -248,6 +248,13 @@ check "pairStateChanged signal observed on the kde private bus" \
 #   client mode compares against the rust id's subjectAltName — fresh
 #   post-restart, no grace window). Rust then deletes its peer cert
 #   fingerprint (TOFU wipe), losing the trust store for Phase 4.
+#   RESOLVED 2026-09-05 by fix-cert-san-deviceid: the generated cert now
+#   carries a subjectAltName dNSName with the device id in kdeconnectd's
+#   D-Bus-normalized form (underscores), which is the exact string its
+#   client-mode verification compares against. The scenario this note
+#   refused to run is covered end-to-end by tests/interop/m5_smoke.sh
+#   (pair → kdeconnectd-only restart → no rejection, TOFU intact, ping
+#   delivered), GREEN against the source-built reference v26.04.3.
 # - Phase 1 was kde-initiated; Phase 2 is rust-initiated. Both
 #   directions ARE exercised.
 log "=== Phase 2: rust-initiated pair (kde unpair first, then rust unpair) ==="

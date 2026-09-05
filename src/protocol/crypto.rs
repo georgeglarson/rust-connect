@@ -208,10 +208,54 @@ impl CertificateManager {
             rcgen::KeyPair::generate_rsa_for(&rcgen::PKCS_RSA_SHA512, rcgen::RsaKeySize::_2048)
                 .map_err(|e| Error::TlsError(format!("Failed to generate RSA key: {}", e)))?;
 
-        // Build certificate parameters. No subjectAltNames — the openssl-era
-        // certificates carried no extensions, and the device ID (which can
-        // contain '_') is not a valid dNSName anyway.
+        // Build certificate parameters. We emit exactly one subjectAltName
+        // entry: a dNSName carrying the device id in kdeconnectd's
+        // D-Bus-NORMALIZED form. This is a DELIBERATE divergence from
+        // Android's SslHelper.kt:53-57 — Android's TLS layer has
+        // checkServerTrusted = Unit (trust-all at TLS, authenticity from a
+        // post-handshake fingerprint TOFU), so its CN-only certs ship
+        // fine. kdeconnectd's Qt TLS layer is the opposite: when it
+        // accepts a TCP dial and runs as TLS client it sets the socket's
+        // peer-verify name to the device id (core/backends/lan/
+        // lanlinkprovider.cpp:604: setPeerVerifyName(deviceId)) and runs
+        // REAL hostname verification against the peer cert's SAN. Any
+        // error other than SelfSignedCertificate is fatal
+        // (lanlinkprovider.cpp:456, sslErrors): the link aborts,
+        // kdeconnectd's post-rejection unpair fires, and our side honors
+        // it (PairingHandler::unpair → delete_peer_certificate,
+        // src/protocol/pairing/mod.rs:693) — a transient handshake becomes
+        // permanent depairing. The SAN fixes the trigger.
+        //
+        // The verify name is the id AFTER NetworkPacket::unserialize's
+        // D-Bus normalization (networkpacket.cpp:82-87 →
+        // dbushelper.cpp:31 filterNonExportableCharacters: every char
+        // outside [A-Za-z0-9_] becomes '_'), and Qt's hostname match is
+        // exact — so a dashed UUID id must appear in the SAN with
+        // underscores. Carrying the raw id instead was rejected live
+        // ("The host name did not match any of the valid hosts for this
+        // certificate", source-built kdeconnectd v26.04.3, 2026-09-05).
+        // For Android-parity ids (hex / underscore) the normalized form
+        // IS the id verbatim. '_' is valid ASCII and rcgen's Ia5String
+        // accepts ASCII, so no real device id is rejected.
+        let san_dns_name: String = device_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
         let mut params = rcgen::CertificateParams::default();
+        params.subject_alt_names.push(rcgen::SanType::DnsName(
+            rcgen::string::Ia5String::try_from(san_dns_name).map_err(|e| {
+                Error::TlsError(format!(
+                    "device_id is not a valid IA5String for subjectAltName dNSName: {}",
+                    e
+                ))
+            })?,
+        ));
 
         // RDN order must match Android: CN, OU, O
         use rcgen::DnType;
@@ -225,10 +269,22 @@ impl CertificateManager {
             .distinguished_name
             .push(DnType::OrganizationName, "KDE");
 
-        // Generate 20-byte random serial number (as per RFC 3280)
+        // Generate 20-byte random serial number (RFC 5280 4.1.2.2 caps the
+        // ENCODED serial at 20 octets). The DER INTEGER writer pads with a
+        // leading 0x00 whenever the first byte's high bit is set — a raw
+        // 20-byte buffer therefore encodes to 21 octets on ~50% of
+        // generations — and it strips leading zero bytes, so a zero first
+        // byte encodes to 19 or fewer. Clearing the high bit AND forcing
+        // the low bit pins the encoded serial at exactly 20 octets every
+        // time (rcgen's own default serial does only the high-bit clear
+        // and accepts a variable length ≤ 20; the == 20 pin in
+        // test_generated_cert_validity_and_serial_unchanged_after_san is
+        // stricter). 158 random bits remain — well above the 64-bit
+        // entropy floor RFC 5280 recommends for serials.
         let mut serial_buf = [0u8; 20];
         rand::RngCore::try_fill_bytes(&mut rand::rngs::OsRng, &mut serial_buf)
             .map_err(|e| Error::TlsError(format!("Failed to generate serial: {}", e)))?;
+        serial_buf[0] = (serial_buf[0] & 0x7F) | 0x01;
         params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial_buf));
 
         // Validity period matching Android (SslHelper.kt:110-111):
@@ -1693,6 +1749,224 @@ mod tests {
         assert!(
             err.to_string().contains("exactly one"),
             "the error must name the single-certificate contract, got: {err}"
+        );
+    }
+
+    /// R1: the generated certificate MUST carry exactly one subjectAltName
+    /// dNSName equal to the device id, so kdeconnectd's Qt TLS layer
+    /// (core/backends/lan/lanlinkprovider.cpp:604: setPeerVerifyName) can
+    /// verify our cert against the id it dials with. CN, RDN order, and
+    /// the rest of the shape are unchanged.
+    #[test]
+    fn test_generated_cert_carries_device_id_san() {
+        use x509_parser::oid_registry::{
+            OID_X509_COMMON_NAME, OID_X509_ORGANIZATIONAL_UNIT, OID_X509_ORGANIZATION_NAME,
+        };
+        use x509_parser::prelude::GeneralName;
+
+        let (manager, _temp_dir) = setup();
+        let device_id = "rust-connect-cert-test-123456789"; // 32 chars, ld-h safe
+        let (cert_pem, _key_pem) = manager
+            .generate_certificate(device_id, "Cert Test")
+            .expect("generate test certificate");
+
+        let cert_der = pem_to_der(&cert_pem).expect("parse generated cert PEM to DER");
+        let cert = parse_x509_der(&cert_der).expect("parse generated cert DER");
+
+        // CN is unchanged — still the device id (kdeconnectd's stored-cert
+        // fingerprint TOFU and our own verification both key off CN).
+        let cn = cert
+            .subject()
+            .iter_common_name()
+            .next()
+            .and_then(|cn| cn.as_str().ok())
+            .map(|s| s.to_string())
+            .expect("cert has a CN");
+        assert_eq!(cn, device_id, "CN must remain the device id");
+
+        // RDN order is CN, OU, O (matching Android SslHelper.kt — see the
+        // existing comment in generate_certificate). x509-parser exposes
+        // subject attributes in DER order; iterating them must surface CN
+        // first, then OU, then O.
+        let attr_oids: Vec<_> = cert
+            .subject()
+            .iter_attributes()
+            .map(|a| a.attr_type().clone())
+            .collect();
+        assert!(
+            attr_oids.len() >= 3,
+            "expected at least CN, OU, O in subject, got {} attributes",
+            attr_oids.len()
+        );
+        assert_eq!(attr_oids[0], OID_X509_COMMON_NAME, "first RDN must be CN");
+        assert_eq!(
+            attr_oids[1], OID_X509_ORGANIZATIONAL_UNIT,
+            "second RDN must be OU"
+        );
+        assert_eq!(
+            attr_oids[2], OID_X509_ORGANIZATION_NAME,
+            "third RDN must be O"
+        );
+
+        // SAN: exactly one dNSName carrying the device id in the
+        // D-Bus-normalized form (see generate_certificate) — for this
+        // test id (dashes) that is the underscore form, which is what
+        // kdeconnectd's setPeerVerifyName compares against.
+        let san = cert
+            .subject_alternative_name()
+            .expect("parse SAN extension")
+            .expect("cert must carry a subjectAltName (R1)");
+        assert_eq!(san.value.general_names.len(), 1, "exactly one SAN entry");
+        match &san.value.general_names[0] {
+            GeneralName::DNSName(name) => assert_eq!(
+                name.to_string(),
+                "rust_connect_cert_test_123456789",
+                "SAN dNSName must equal the D-Bus-normalized device id"
+            ),
+            other => panic!("SAN entry must be dNSName, got {:?}", other),
+        }
+    }
+
+    /// R2: device ids containing '_' are spec-valid (the Android spec
+    /// allows them and real ids are hex, so `_` is a permitted character
+    /// in the charset). Generation must succeed, and the SAN dNSName must
+    /// carry the underscore-bearing id verbatim — rcgen's Ia5String only
+    /// requires ASCII and `_` is ASCII, so the contract holds.
+    #[test]
+    fn test_generated_cert_san_accepts_underscore_id() {
+        use x509_parser::prelude::GeneralName;
+
+        let (manager, _temp_dir) = setup();
+        // 34 chars, contains '_' — within the validate_device_id length
+        // window (32..=38) and the [a-zA-Z0-9_-] charset.
+        let device_id = "rust_connect_test_device_aaaaaaa";
+
+        let (cert_pem, _key_pem) = manager
+            .generate_certificate(device_id, "Underscore Test")
+            .expect("generation must succeed for an underscore-bearing device id");
+
+        let cert_der = pem_to_der(&cert_pem).expect("parse generated cert PEM to DER");
+        let cert = parse_x509_der(&cert_der).expect("parse generated cert DER");
+
+        let san = cert
+            .subject_alternative_name()
+            .expect("parse SAN extension")
+            .expect("cert must carry a subjectAltName for the underscore id");
+        assert_eq!(san.value.general_names.len(), 1);
+        match &san.value.general_names[0] {
+            GeneralName::DNSName(name) => assert_eq!(
+                name.to_string(),
+                device_id,
+                "SAN dNSName must carry the underscore-bearing id verbatim"
+            ),
+            other => panic!("SAN entry must be dNSName, got {:?}", other),
+        }
+    }
+
+    /// R4 (adversarial review, live-reproduced 2026-09-05): kdeconnectd
+    /// verifies the SAN dNSName against the device id AFTER D-Bus
+    /// normalization (NetworkPacket::unserialize →
+    /// DBusHelper::filterNonExportableCharacters: every char outside
+    /// [A-Za-z0-9_] becomes '_', networkpacket.cpp:82-87 +
+    /// dbushelper.cpp:31), and Qt's hostname match is exact — so a
+    /// dashed UUID id must appear in the SAN with underscores. The raw
+    /// form is rejected: "The host name did not match any of the valid
+    /// hosts for this certificate" (kdeconnectd v26.04.3, rust's
+    /// outbound dial, lanlinkprovider.cpp:563 → :604).
+    #[test]
+    fn test_generated_cert_san_is_kde_normalized_id() {
+        use x509_parser::prelude::GeneralName;
+
+        let (manager, _temp_dir) = setup();
+        let device_id = "e849573d-6af9-4275-bc36-2e759b1e8482"; // dashed, live-repro shape
+        let (cert_pem, _key_pem) = manager
+            .generate_certificate(device_id, "Normalization")
+            .expect("generate test certificate");
+
+        let cert_der = pem_to_der(&cert_pem).expect("parse generated cert PEM to DER");
+        let cert = parse_x509_der(&cert_der).expect("parse generated cert DER");
+        let san = cert
+            .subject_alternative_name()
+            .expect("parse SAN extension")
+            .expect("cert must carry a subjectAltName (R4)");
+        assert_eq!(san.value.general_names.len(), 1, "exactly one SAN entry");
+        match &san.value.general_names[0] {
+            GeneralName::DNSName(name) => assert_eq!(
+                name.to_string(),
+                "e849573d_6af9_4275_bc36_2e759b1e8482",
+                "SAN must carry the D-Bus-normalized (underscore) form — the form kdeconnectd's setPeerVerifyName compares against"
+            ),
+            other => panic!("SAN entry must be dNSName, got {:?}", other),
+        }
+
+        // CN stays the RAW id: kdeconnectd's addLink compares
+        // subjectDisplayName() against the packet id after BOTH are
+        // normalized (lanlinkprovider.cpp:637-644), and our own CN reader
+        // (extract_cn_from_der) expects the identity string verbatim.
+        let cn = cert
+            .subject()
+            .iter_common_name()
+            .next()
+            .and_then(|cn| cn.as_str().ok())
+            .map(|s| s.to_string())
+            .expect("cert has a CN");
+        assert_eq!(cn, device_id, "CN must remain the raw device id");
+    }
+
+    /// Companion: the SAN addition must not perturb the existing
+    /// SslHelper.kt-pin semantics — the validity window (now−1y /
+    /// now+10y) and the 20-byte serial scheme. not_before is already
+    /// pinned by test_generate_certificate_not_before_one_year_back; this
+    /// pins the upper bound and the serial length.
+    #[test]
+    fn test_generated_cert_validity_and_serial_unchanged_after_san() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let (manager, _temp_dir) = setup();
+        let device_id = "validity-and-serial-deviceaaaaaaaaa"; // 34 chars
+        let (cert_pem, _key_pem) = manager
+            .generate_certificate(device_id, "Pinning")
+            .expect("generate test certificate");
+
+        // not_after: openssl's X509.not_after() returns &Asn1TimeRef
+        // directly; the comparison API lives there, not on ASN1Time.
+        let openssl_cert = openssl::x509::X509::from_pem(&cert_pem)
+            .expect("parse generated cert PEM with openssl");
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("read system time")
+            .as_secs() as i64;
+        let almost_ten_years = now_unix + 9 * 365 * 24 * 60 * 60;
+        let over_ten_years = now_unix + 10 * 365 * 24 * 60 * 60 + 60 * 24 * 60 * 60;
+        let almost_ten_years_asn1 =
+            openssl::asn1::Asn1Time::from_unix(almost_ten_years).expect("create ASN.1 time");
+        let over_ten_years_asn1 =
+            openssl::asn1::Asn1Time::from_unix(over_ten_years).expect("create ASN.1 time");
+        assert_eq!(
+            openssl_cert
+                .not_after()
+                .compare(&almost_ten_years_asn1)
+                .expect("compare"),
+            std::cmp::Ordering::Greater,
+            "notAfter must be roughly 10y ahead of now"
+        );
+        assert_eq!(
+            openssl_cert
+                .not_after()
+                .compare(&over_ten_years_asn1)
+                .expect("compare"),
+            std::cmp::Ordering::Less,
+            "notAfter must not be more than ~10y ahead of now"
+        );
+
+        // RFC 3280 20-byte serial — the openssl-era carry-over, retained
+        // by generate_certificate (see serial_buf = [0u8; 20]).
+        let cert_der = pem_to_der(&cert_pem).expect("parse generated cert PEM to DER");
+        let cert = parse_x509_der(&cert_der).expect("parse generated cert DER");
+        assert_eq!(
+            cert.raw_serial().len(),
+            20,
+            "serial must be 20 bytes (RFC 3280)"
         );
     }
 }
