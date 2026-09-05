@@ -24,8 +24,11 @@
 #       delete_peer_certificate, src/protocol/pairing/mod.rs:693) was
 #       what made a transient handshake failure into a permanent
 #       depairing.
-#   (d) a ping round-trips post-restart — end-to-end reachability proof
-#       on the new link.
+#   (d) a ping is DELIVERED rust → kde post-restart — the REST POST is
+#       accepted (sent:true on a live connection) and the packet shows
+#       up on the kde side. A strict round-trip is not achievable
+#       against the plugin-less source reference (nothing on the kde
+#       side can originate a reply); see Phase 6.
 #
 # SURFACES (M5-specific, full citations in the report):
 #   Same as M2 — the new surface this milestone covers is the SAN shape
@@ -52,7 +55,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # implemented (the SAN regression cannot be simulated in-script without
 # rewriting rust's on-disk cert mid-run; a future lane could add
 # `no-san` by stripping the SAN extension from $RUST_OWN_CERT with
-# `openssl x509 ... -extfile` before the restart). See FINDINGS.md.
+# `openssl x509 ... -extfile` before the restart).
 case "$RC_SABOTAGE" in
     "")
         ;;
@@ -124,19 +127,11 @@ log "pre-restart rust fingerprint for $KDE_ID: $PRE_FP_CONTENT"
 # Record the rust cert SAN shape BEFORE the restart. This is the
 # structural companion to the runtime assertions: the new cert our side
 # sends on the post-restart dial MUST carry exactly one dNSName SAN
-# equal to $RUST_ID. The openssl::x509 inspection reuses a tiny inline
-# parser — no harness dependency on rcgen / x509-parser.
-parse_rust_cert_san_dnsname() {
-    # Args: $1 = path to rust's own cert PEM (own.crt under cert_dir).
-    # Outputs the dNSName from the SAN extension on stdout, or empty.
-    openssl::x509::X509::from_pem "$1" 2>/dev/null \
-        || openssl x509 -in "$1" -noout -text 2>/dev/null \
-            | sed -n '/X509v3 Subject Alternative Name/,/^[^ ]/p' \
-            | grep -oE 'DNS:[^,]+' \
-            | sed 's/^DNS://'
-}
-# The openssl::x509::X509::from_pem form above is invalid shell; fall back
-# to the openssl CLI in all cases — same source of truth.
+# equal to $RUST_ID — the D-Bus-NORMALIZED form of our id (dashes become
+# underscores; networkpacket.cpp:82-87 + dbushelper.cpp:31), because that
+# is the string kdeconnectd's setPeerVerifyName compares against. A raw
+# dashed SAN here is the exact shape the 2026-09-05 review round caught
+# being rejected live.
 RUST_OWN_CERT="$RUST_FP_DIR/own.crt"
 if [[ ! -f "$RUST_OWN_CERT" ]]; then
     # Adopt-legacy layout: own.crt was added 2026-07; older layouts key
@@ -171,16 +166,46 @@ log "PRE_RESTART_LOG_OFFSET=$PRE_RESTART_LOG_OFFSET"
 
 restart_kde
 
-# The kdeconnectd log lines we MUST NOT see after the restart:
-#   "The host name did not match any of the valid hosts for this certificate"
-# Qt's hostname-verification failure — this is the SAN fix's trigger.
-REJECTION_FOUND=1
-sed -n "${PRE_RESTART_LOG_OFFSET},\$p" "$KDE_LOG" \
-    | grep -qE "valid hosts for this certificate" \
-    && REJECTION_FOUND=0
-check "no Qt 'valid hosts for this certificate' rejection after kde restart (SAN fix)" \
-    "$REJECTION_FOUND" \
-    "the rejection text appeared in $KDE_LOG post-restart"
+# The rejection only fires on kdeconnectd's TLS-CLIENT path — when RUST
+# TCP-dials kde, kde accepts and runs startClientEncryption +
+# setPeerVerifyName (lanlinkprovider.cpp:563 → :604). When kdeconnectd
+# wins the dial race instead it runs TLS-server (:383), which never
+# hostname-checks, and the scenario silently proves nothing (observed
+# 2026-09-05: run 1 masked the defect, run 3 fired it 1s after
+# restart). Nudge kde to re-broadcast so rust's UDP discovery (which
+# carries the real tcpPort; the mDNS path resolves port 0 and its dials
+# always fail) provokes the outbound dial deterministically.
+kde_force_on_network_change
+log "forceOnNetworkChange issued (rust-dial provocation)"
+
+kde_client_ssl_path_ran() {
+    sed -n "${PRE_RESTART_LOG_OFFSET},\$p" "$KDE_LOG" \
+        | grep -q "Starting client ssl"
+}
+wait_for 15 "kdeconnectd TLS-client path to run post-restart (Starting client ssl)" \
+    kde_client_ssl_path_ran \
+    || die "kdeconnectd never took its TLS-client path post-restart — the scenario did not exercise the defect trigger (see $KDE_LOG from line $PRE_RESTART_LOG_OFFSET)"
+
+# The rejection, when it fires, lands ~1s after the dial — a grep run
+# immediately after the handshake misses it (observed 2026-09-05: the
+# defective cert was rejected at +1s while an earlier check at +0s saw
+# a clean log). Let the dial cycle settle before asserting absence.
+sleep 3
+
+# The kdeconnectd log line we MUST NOT see anywhere in the post-restart
+# segment: "The host name did not match any of the valid hosts for this
+# certificate" — Qt's hostname-verification failure, the SAN fix's
+# trigger. PASS only on ABSENCE; fail with the log excerpt when present.
+if sed -n "${PRE_RESTART_LOG_OFFSET},\$p" "$KDE_LOG" \
+        | grep -qE "valid hosts for this certificate"; then
+    REJECTION_EXCERPT=$(sed -n "${PRE_RESTART_LOG_OFFSET},\$p" "$KDE_LOG" \
+        | grep -E "valid hosts for this certificate|Disconnecting due to fatal" | head -2)
+    check "no Qt 'valid hosts for this certificate' rejection after kde restart (SAN fix)" \
+        1 "rejection present in $KDE_LOG post-restart: $REJECTION_EXCERPT"
+else
+    check "no Qt 'valid hosts for this certificate' rejection after kde restart (SAN fix)" \
+        0 ""
+fi
 
 # ---------------------------------------------------------------- Phase 4
 # Pair state and trust store must SURVIVE the restart. Same persistence
@@ -231,29 +256,44 @@ check "rust fingerprint content unchanged after kde-only restart" \
     "pre='$PRE_FP_CONTENT' post='$POST_FP_CONTENT'"
 
 # ---------------------------------------------------------------- Phase 6
-# End-to-end reachability on the new link. A ping round-trips rust →
-# kde on the post-restart TLS connection — proves the trust chain is
-# intact at the application layer (not just that the sockets are open).
-log "=== Phase 6: ping round-trips post-restart ==="
-# nudge the kde side to broadcast after the restart so the rust side
-# knows the link is live; otherwise rust's ping may land on a socket
-# the kde side has not finished bringing up yet.
-kde_force_on_network_change
-log "forceOnNetworkChange issued (post-restart nudge)"
+# End-to-end delivery on the new link. A strict ping ROUND-TRIP is not
+# achievable against this reference: the source-built kdeconnectd loads
+# no plugins (its identity announces incomingCapabilities:[]), so
+# nothing on the kde side can originate a reply. The honest oracles:
+#   (i) the REST ping POST returns {"sent": true} — rust accepted the
+#       packet onto a live connection (send_packet fails on a missing
+#       connection), and
+#  (ii) the ping packet ARRIVES at kde — its log records the received
+#       packet (as "discarding unsupported packet \"kdeconnect.ping\""
+#       for this plugin-less reference), proving rust → kde delivery on
+#       the post-restart TLS link.
+# The previous revision grepped rust's log for a "ping_response_received"
+# event that exists nowhere in the codebase — an oracle that could never
+# pass (caught 2026-09-05).
+log "=== Phase 6: ping delivery post-restart ==="
 
-wait_for 30 "rust can ping kde on the post-restart link" \
-    bash -c "rust_ping '$KDE_ID' >/dev/null 2>&1 && \
-             sed 's/\x1b\[[0-9;]*m//g' '$RUST_LOG' | grep -qE 'ping_response_received.*$KDE_ID'" \
-    || die "rust could not round-trip a ping to $KDE_ID on the post-restart link"
+PING_RESP=""
+rust_ping_capture() {
+    # rc_api_post_body (lib.sh) POSTs JSON with -f: a non-2xx yields an
+    # empty body with a nonzero rc, surfaced in the failure detail below.
+    PING_RESP=$(rc_api_post_body "/api/v1/ping" "{\"device_id\":\"$KDE_ID\"}") \
+        && grep -q '"sent":true' <<<"$PING_RESP"
+}
+wait_for 30 "rust ping POST accepted on the post-restart link" \
+    rust_ping_capture \
+    || die "ping POST never returned sent:true for $KDE_ID (last response: '${PING_RESP:-<empty, likely non-2xx>}')"
 
-PING_OK=1
-rust_ping "$KDE_ID" >/dev/null 2>&1
-if sed 's/\x1b\[[0-9;]*m//g' "$RUST_LOG" 2>/dev/null \
-        | grep -qE "ping_response_received.*$KDE_ID"; then
-    PING_OK=0
-fi
-check "ping round-trips rust → kde on the post-restart link" \
-    "$PING_OK" "no ping_response_received for $KDE_ID in $RUST_LOG"
+check "ping POST accepted (sent:true) on the post-restart link" 0 "$PING_RESP"
+
+kde_received_ping() {
+    sed -n "${PRE_RESTART_LOG_OFFSET},\$p" "$KDE_LOG" | grep -q "kdeconnect.ping"
+}
+wait_for 15 "kde received the ping packet on the post-restart link" \
+    kde_received_ping \
+    || fail "kde log shows no kdeconnect.ping receipt post-restart (delivery oracle absent)"
+check "ping packet delivered rust → kde on the post-restart link" \
+    "$([ "$(sed -n "${PRE_RESTART_LOG_OFFSET},\$p" "$KDE_LOG" | grep -c 'kdeconnect.ping')" -gt 0 ] && echo 0 || echo 1)" \
+    "no kdeconnect.ping in $KDE_LOG post-restart"
 
 # ---------------------------------------------------------------- verdict
 finish_milestone "M5 SMOKE"
