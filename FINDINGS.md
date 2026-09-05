@@ -1,151 +1,311 @@
-# FINDINGS — fix-cert-san-deviceid (vk #1045)
+# FINDINGS — fix-cert-san-deviceid adversarial review (GLM-5.3 round, vk #1045)
 
-Branch: `fix-cert-san-deviceid` off `e1b57aa`. Trust-core adjacent (Class B).
+Branch: `fix-certsan-glm-review` (review branch off `fix-cert-san-deviceid`
+@ 3df6008, which sits on `e1b57aa`). The implementer's FINDINGS.md is
+preserved at commit 3df6008; this file is the review round's artifact.
+
+Bottom line: the branch's SAN fix did NOT fix the 2026-08-14 defect. The
+live oracle — run for the first time ever in this round, against the
+source-built kdeconnectd the implementer claimed did not exist —
+reproduced the exact Qt rejection WITH the fix's cert in the handshake.
+The SAN carried the device id verbatim (dashes); kdeconnectd verifies
+the D-Bus-normalized id (underscores); Qt's match is exact. Fixed here,
+red-to-green on the claim's own scenario, plus four more confirmed
+findings (a 50%-flake serial encoding bug, and three defects in the m5
+oracle script that made it unable to see any of this).
 
 ## What changed
 
-### `src/protocol/crypto.rs`
+Six commits on the review branch:
 
-**`CertificateManager::generate_certificate`** (one-line surface change at the old line 211 area):
+1. **`f7350fc` crypto: pin encoded serial to exactly 20 octets
+   (finding #0, CONFIRMED by the integrator).** `serial_buf[0] =
+   (serial_buf[0] & 0x7F) | 0x01` plus a comment stating the DER
+   padding, the leading-zero strip, and the RFC 5280 4.1.2.2 20-octet
+   cap. The instruction's literal fix (`&= 0x7F` only) is insufficient:
+   yasna's `write_bigint_bytes` strips leading zero bytes before
+   deciding to pad, so a masked-to-0x00 first byte encodes to 19 octets
+   (~1/256 per cert, proven deterministically). Forcing the low bit
+   pins the encoding at exactly 20 every time; 158 random bits remain.
 
-- **Added** exactly one `subjectAltName` extension: `dNSName` carrying the device id verbatim. The push happens immediately after `CertificateParams::default()` is constructed, before any RDN/serial/validity mutation:
+2. **`94b371b` crypto: SAN dNSName carries the D-Bus-normalized device
+   id (finding 1, THE top finding).** `generate_certificate` maps the
+   id through the same rule kdeconnectd applies
+   (`filterNonExportableCharacters`: every char outside [A-Za-z0-9_]
+   becomes `_`) before pushing the dNSName. For hex/underscore ids
+   (Android parity) the normalized form IS the id verbatim. CN, RDN
+   order, OU/O, validity, serial scheme untouched — CN deliberately
+   stays the RAW id (kdeconnectd's addLink normalizes both sides of its
+   comparison; our own `own_certificate_cn` expects the raw string).
+   Tests: new `test_generated_cert_san_is_kde_normalized_id` (R4),
+   R1's expectation updated to the normalized form for its dashed test
+   id, R2 (underscore id, no-op normalization) unchanged.
 
-  ```rust
-  params.subject_alt_names.push(rcgen::SanType::DnsName(
-      rcgen::string::Ia5String::try_from(device_id.to_string()).map_err(|e| {
-          Error::TlsError(format!(
-              "device_id is not a valid IA5String for subjectAltName dNSName: {}",
-              e
-          ))
-      })?,
-  ));
-  ```
+3. **`596d229` interop m5: fix the oracle defects (findings 2-4).**
+   Phase 3's rejection check was polarity-INVERTED (it passed when the
+   rejection text was present and failed with a lying detail when
+   absent) and racy (single grep immediately after restart; the
+   rejection lands ~1s later). The scenario itself was
+   dial-race-dependent and could silently prove nothing. Phase 3 now
+   nudges kde to re-broadcast (provoking rust's UDP-path dial, the only
+   dial that carries a real port), WAITS for kdeconnectd's TLS-client
+   path to actually run (dies loudly otherwise), settles 3s, then
+   asserts absence with correct polarity. Phase 6 grepped for a
+   `ping_response_received` event that exists nowhere in the codebase —
+   replaced with two honest oracles (REST `sent:true` + packet receipt
+   in the kde log). Dead pseudo-shell helper removed.
 
-- **Replaced** the previous "No subjectAltNames" comment (which claimed Android parity and asserted that the underscore-bearing device id "is not a valid dNSName anyway") with the true story: this is a DELIBERATE divergence from Android's SslHelper.kt:53-57. Android's TLS layer does `checkServerTrusted = Unit` (trust-all at TLS, authenticity from post-handshake fingerprint TOFU); kdeconnectd's Qt TLS layer does real hostname verification against the SAN in client mode (`core/backends/lan/lanlinkprovider.cpp:604` `setPeerVerifyName(deviceId)`). Underscore is valid ASCII, and `rcgen::string::Ia5String::try_from` only requires ASCII — no spec-valid device id is rejected.
+4. **`f38218c` interop m2: resolution note** in the m2_smoke.sh
+   skip-rationale block, per the brief's step 5 (historical text kept,
+   resolution + date added).
 
-- **Did NOT change**: CN/OU/O RDNs, their order, the 20-byte random serial scheme, the validity window (now−1y / now+10y), the RSA-2048 SHA-512 signing choice. These remain byte-for-byte as they were — `R3` (`test_generated_cert_validity_and_serial_unchanged_after_san`) is the regression pin.
+5. **`bed49d5` interop: m5 reachable through run.sh (finding 5).**
+   `run.sh m5` errored ("unknown milestone") and the runner resolves
+   `${MILESTONE}_smoke.sh` while the file was `m5_restart_kde.sh` —
+   renamed, case/usage/`all` wired. run.sh also now derives
+   LD_LIBRARY_PATH from RC_KDECONNECTD's install dir and passes it
+   through the sudo exec: the source build's RUNPATH was baked to its
+   since-deleted build worktree (`rc-3.2-m4`), and sudo's env_reset
+   strips LD_LIBRARY_PATH, so the reference binary could not resolve
+   `libkdeconnectcore.so.26` via the runner.
 
-### `src/protocol/crypto.rs` tests
-
-**Three new tests** at the end of the test module (file lines ~1725-1880):
-
-- **`test_generated_cert_carries_device_id_san` (R1)** — generates a cert, parses with `x509_parser` (the same parser `parse_x509_der` already uses), asserts: SAN present; exactly one `GeneralName::DNSName` entry; dNSName string equals the device id verbatim; CN still equals the device id; RDN OID order is CN, OU, O.
-- **`test_generated_cert_san_accepts_underscore_id` (R2)** — uses a 34-char device id containing `_`, asserts generation succeeds and the SAN dNSName carries the id verbatim. The `Ia5String` is purely ASCII-checked, so the contract holds.
-- **`test_generated_cert_validity_and_serial_unchanged_after_san` (R3 companion)** — pins the upper-bound notAfter (must be roughly 10y ahead of now) and the 20-byte serial length, alongside the existing `test_generate_certificate_not_before_one_year_back` which already pins the lower bound. These pin against SslHelper.kt:110-111 semantics already cited inline.
-
-### `tests/interop/m5_restart_kde.sh` (NEW)
-
-Follows `lib.sh` conventions (sourced infrastructure, `MILESTONE_PREFIX`/`WORK_PREFIX` env, zero-leak EXIT trap, `check` helper). Six phases:
-
-- Phase 0: mutual discovery (same path as M1/M2).
-- Phase 1: kde-initiated pair to convergence.
-- Phase 2: structural companion — `openssl x509 -text` parse of `$RUST_FP_DIR/own.crt` (or legacy `${RUST_ID}.crt`) and assert the SAN dNSName equals `$RUST_ID` BEFORE the restart. Catches the case where the cert-shape regression returns after a future refactor.
-- Phase 3: `restart_kde` ONLY — rust daemon keeps running. Captures `PRE_RESTART_LOG_OFFSET`, then asserts no `"valid hosts for this certificate"` line appears in the kde log after the offset. This is the SAN-fix trigger assertion.
-- Phase 4: pair state on both sides reloads as Paired, kde trusted_devices still non-empty.
-- Phase 5: TOFU store survives — `$RUST_FP_DIR/${KDE_ID}_fingerprint.txt` and `${KDE_ID}_peer.crt` still exist, fingerprint content byte-for-byte unchanged. This is the cascade-prevention assertion (`PairingHandler::unpair → delete_peer_certificate` would have wiped both).
-- Phase 6: end-to-end `rust_ping` round-trips on the new link.
-
-`shellcheck -S error` is clean; the same `SC2034` warnings as `m2_smoke.sh`/`m1_smoke.sh` (variables consumed by `lib.sh` after sourcing) are the only flagged items.
+6. This file.
 
 ## How it was verified
 
-### Red-before-green (the actual claim's scenario)
+The implementer's DEFERRED claim was false on both stated facts: the
+source build exists at
+`tests/interop/.kde/install/bin/kdeconnectd` (v26.04.3 @ c687cf11,
+SOURCE_MANIFEST.toml alongside, in the MAIN checkout — gitignored, so
+the worktree fooled the lane), and `sudo -n` works. Everything below
+ran from this worktree.
 
-For each new test I temporarily removed the `params.subject_alt_names.push(...)` block and re-ran the test in isolation against the unmodified test:
+### Finding #0 — serial encoding (red → green, statistical + deterministic)
 
-```
-$ CARGO_TARGET_DIR=/home/glitchenstein/repos/rust-connect/target \
-    cargo test --lib --locked --no-fail-fast test_generated_cert_carries_device_id_san
-running 1 test
-test protocol::crypto::tests::test_generated_cert_carries_device_id_san ... FAILED
-...
-thread '...' panicked at src/protocol/crypto.rs:1776:14:
-cert must carry a subjectAltName (R1)
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1159 filtered out
-```
+Scratch test over 100 real `generate_certificate` runs, pre-fix:
 
-```
-$ CARGO_TARGET_DIR=/home/glitchenstein/repos/rust-connect/target \
-    cargo test --lib --locked --no-fail-fast test_generated_cert_san_accepts_underscore_id
-running 1 test
-test protocol::crypto::tests::test_generated_cert_san_accepts_underscore_id ... FAILED
-...
-thread '...' panicked at src/protocol/crypto.rs:1812:14:
-cert must carry a subjectAltName for the underscore id
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1159 filtered out
-```
+    SCRATCH TALLY: {20: 53, 21: 47}        (cargo test --lib, FAILED by design)
 
-Both R1 and R2 fail on the SAN-less code with the panic message naming the assertion. This is the same scenario m2_smoke.sh:244-249 had to skip in 2026-08-14 — the kdeconnectd-side restart kills rust's TOFU pin because Qt rejects the SAN-less cert at TLS layer. The unit test reproduces the SHAPE of the failure (no SAN) at the place where the fix lands (the cert generator).
+Deterministic writer semantics (one keypair, hand-picked serial bytes,
+yasna 0.6 `write_bigint_bytes(bytes, positive=true)` via rcgen 0.14.9):
 
-After restoring the SAN push:
+    first=0xff second=0x11 -> encoded serial 21 octets   (the flake)
+    first=0x00 second=0x42 -> encoded serial 19 octets   (the case a bare mask misses)
+    first=0x00 second=0x80 -> encoded serial 20 octets
+    first=0x01 second=0x42 -> encoded serial 20 octets
+    first=0x7f second=0x42 -> encoded serial 20 octets
 
-```
-$ CARGO_TARGET_DIR=/home/glitchenstein/repos/rust-connect/target \
-    cargo test --all-features --locked --no-fail-fast
-... 40 test result lines, all "ok", 0 FAILED
-... 1160 passed (unit); 41 passed (lib tests second pass); 0 failed
-```
+Post-fix: `SCRATCH TALLY: {20: 100}`. R3 run 10x post-fix: 10 pass,
+0 fail. rcgen's own default serial path does only `sl[0] &= 0x7f`
+(certificate.rs:455) and accepts variable length ≤ 20; R3's `== 20`
+pin is stricter, hence the low-bit force.
+
+### Finding 1 — the SAN value (red → green on the claim's own live scenario)
+
+Three live m5 runs against the source-built reference (isolated netns
+harness; production daemons untouched; zero-leak PASS every run):
+
+**Run 1 (pre-fix binary, pre-review script) — RED, partially masked.**
+Phase 2 failed the cert-shape check: SAN `c049921c-5981-...` (dashed)
+vs expected `c049921c_5981_...` (the id as kde knows it). Phase 3
+"failed" while the log contained NO rejection (the inverted check).
+Phase 6 timed out (phantom oracle). The link itself came up — because
+kdeconnectd won the dial race and ran TLS-server (`Starting server ssl
+(I'm the client TCP socket)`), which never hostname-checks. Rust's own
+outbound dial had failed earlier on a broken address: mDNS resolves the
+peer as `10.250.137.2:0` — port zero — ECONNREFUSED, then
+reverse-connection fallback. The defect path never ran; the run was
+green-shaped for the wrong reason.
+
+**Run 3 — RED, the defect itself, with the fix's cert.** Rust's UDP-path
+dial (correct port) went out ~1s after kde's restart:
+
+    rust:   12:30:06.050 initiating_outgoing_connection ... 10.250.64.2:1716
+    rust:   12:30:06.054 TLS handshake completed successfully (server role)
+    kde:    8:30:06.050 LanLinkProvider newTcpConnection
+    kde:    8:30:06.051 Starting client ssl (but I'm the server TCP socket)
+    kde:    8:30:06.055 Disconnecting due to fatal SSL Error: "The host
+            name did not match any of the valid hosts for this certificate"
+    rust:   12:30:06.055 Failed outgoing connection attempt ... peer closed
+            connection without sending TLS close_notify
+
+That is the 2026-08-14 defect verbatim, firing under the branch's fix.
+Mechanism, from the kdeconnect-kde source on this host: the TCP dialer
+runs TLS server; the TCP ACCEPTOR runs TLS client with
+`configureSslSocket` → `setPeerVerifyName(deviceId)`
+(lanlinkprovider.cpp:604), where `deviceId` comes from the identity
+packet AFTER `NetworkPacket::unserialize` normalization
+(networkpacket.cpp:82-87 → dbushelper.cpp:31: `[^A-Za-z0-9_]` → `_`).
+Verify name = underscore form; branch's SAN = dashed form; exact-match
+hostname comparison → fatal. Unit tests R1/R2 could not catch this:
+they assert SAN == the input id, self-consistently blind to the form
+the peer verifies against.
+
+**Run 4 (post-fix binary + fixed script) — GREEN end-to-end.** `M5
+SMOKE: PASS`, exit 0: SAN = underscore form; TLS-client path ran at
+8:39:31.268 and `Socket successfully established an SSL connection` at
+.274; rust logged `tls_server_handshake_complete` +
+`outgoing_connection_success`; no rejection line anywhere; pair states
+and TOFU store intact; ping POST `sent:true` and the packet delivered
+(kde: `discarding unsupported packet "kdeconnect.ping"` — the plugin-less
+source reference logs receipts that way).
+
+**Run 5 — GREEN through the canonical entrypoint.**
+`RC_KDECONNECTD=... tests/interop/run.sh m5` → `M5 SMOKE: PASS`,
+ZERO-LEAK PASS, exit 0. Second consecutive full pass.
+
+### Red-test honesty (flip)
+
+SAN push temporarily removed from the committed generator:
+
+    test_generated_cert_validity_and_serial_unchanged_after_san ... ok
+    test_generated_cert_san_is_kde_normalized_id ... FAILED
+    test_generated_cert_carries_device_id_san ... FAILED
+    test_generated_cert_san_accepts_underscore_id ... FAILED
+
+R3 passes both ways — a regression pin, not a behavior test, exactly as
+the implementer said (point 7), and it is the pin that surfaced
+finding #0. Restored to byte-identical (git diff clean) after the run.
+
+### DER-level diff (desk item)
+
+Both the pre-fix and post-fix certs carry EXACTLY ONE X509v3 extension
+— the SAN. No BasicConstraints/KeyUsage/SKI rode along. The only
+pre/post delta is the SAN's value (dash → underscore). The generator's
+textual delta vs main `e1b57aa` is the SAN push (plus comment/tests);
+rcgen emits the SAN extension iff `subject_alt_names` is non-empty.
+
+### Cert-shape consumers (desk item)
+
+No production code reads the SAN (grep: only the generator and three
+tests). `own_certificate_cn` / `extract_cn_from_der` read CN —
+unchanged, so identity recovery is unaffected. Android's
+`getCommonNameFromCertificate` reads CN (present, unchanged) and its
+TLS layer is trust-all (SslHelper.kt:53-57), so extension presence is
+inert there. kdeconnectd's addLink compares
+`subjectDisplayName()`-normalized vs packet-id-normalized
+(lanlinkprovider.cpp:637-644) — empirically fine with SAN present
+(run 4/5 pairing + link-up) and insensitive to dash/underscore either
+way. `verify_peer_fingerprint` on mismatch returns an error and
+REJECTS the connection (crypto.rs:828-844); only `unpair()` deletes
+(cert-change semantics: refuse + re-pair, nothing subtler). The kde
+side under a cert change rejects and cascades — but this branch
+deliberately never regenerates existing identities, so no existing
+pairing ever sees a change from it.
 
 ### Gates
 
-- `cargo test --all-features --locked --no-fail-fast` — green, 0 failed across the full suite (lib + integration + doc tests + tests/).
-- `cargo clippy --all-targets --all-features --locked -- -D warnings` — green, no warnings.
-- `cargo fmt --check` — green, clean (initial run emitted a diff for the import-list ordering and a long-line wrap in the openssl_cert parse; `cargo fmt` applied both).
-- `set -o pipefail` discipline honored throughout (no `| tail -N` eating exit codes — every command above was followed by `tee` or full-output capture so the real exit code was readable).
-- `CARGO_TARGET_DIR=/home/glitchenstein/repos/rust-connect/target` honored — no build artifacts landed in the tmpfs worktree.
-- `set -e` discipline in the m5 script (default for non-interactive bash; `set -u` already on like m2).
-
-### Companion invariants
-
-The R3 companion test re-runs the SslHelper.kt semantic pin (20-byte serial + ~10y notAfter) AFTER the SAN push. It passes. The existing `test_generate_certificate_not_before_one_year_back` continues to pass without modification. Combined: the validity window and serial scheme are byte-for-byte the pre-fix behavior.
-
-### Interop repro — DEFERRED
-
-The brief asked for a best-effort live-oracle repro at `tests/interop/m5_restart_kde.sh`. The script is written, shellcheck-clean, follows `lib.sh` conventions, and reads the canonical structure. **It was not executed on this host because**:
-
-1. **No source-built kdeconnectd**: `tests/interop/.kde/install/bin/kdeconnectd` does not exist; `/tmp/rc-m4-build/` is absent. M4's `m4_build_kde.sh` was never run on this host (the M4 cache was not preserved). Per the brief: "M4 cache preserved, gitignored" — that's the host where the smoke was last green.
-2. **Not root**: `id -u` returns `1000`. The harness needs `CAP_NET_ADMIN` for the `ip netns add` / `veth` setup; `sudo -n true` succeeds, but the build prerequisite alone (a full kdeconnect-kde cmake build with `dnf builddep`) is the heavier gate. The brief explicitly says: "If the kde build or the netns harness is broken on this host today: document exactly what failed, fall back to the unit gates, and mark the repro DEFERRED — do not burn the lane on Qt build fights."
-
-I am marking the live repro **DEFERRED**. The unit gates (R1, R2, R3) are the claim's scenario at the cert level: the SAN shape that kdeconnectd's Qt TLS layer would verify against. R1/R2 exercise the same parser (`x509_parser::prelude::parse_x509_certificate` → `cert.subject_alternative_name()`) that a live handshake would invoke, just without the wire round-trip. The 2026-08-14 observation in `tests/interop/m2_smoke.sh:244-249` remains the recorded red for the runtime trigger; R1/R2 are the unit-level reproductions of that scenario.
-
-### Non-changes (per brief)
-
-- **No migration/regeneration of existing identities**: existing SAN-less certs on disk stay valid (they only ever talked to Android, which never did hostname verification; or to a kdeconnectd in server mode, which doesn't dial back). Forced regeneration would clobber the TOFU pins on both ends for a scenario George's fleet never hits — production peers are Android phones (unaffected), and the interop harness mints a fresh identity per run (isolated `XDG_*_HOME`, `tests/interop/lib.sh:21`) so the fix takes effect there immediately on the next launch.
-- **`delete_peer_certificate` on `unpair()` stays.** That is the correct protocol behavior; the cascade (rust unpair after kde's rejection-driven unpair) died with the trigger. Fixing the trigger preserves both sides' trust.
-- **kdeconnectd is not patched.** Conformance on our side.
+- `cargo test --all-features --locked --no-fail-fast` with
+  `set -o pipefail`, no TMPDIR override,
+  `CARGO_TARGET_DIR=/home/glitchenstein/repos/rust-connect/target`:
+  **1375 passed, 0 failed** across all targets.
+- `cargo clippy --all-targets --all-features --locked -- -D warnings`:
+  clean. `cargo fmt --check`: clean.
+- One cargo build at a time throughout; no artifacts in the tmpfs
+  worktree (the temporary `target` symlink used for the run.sh
+  validation was removed; tree clean).
+- `shellcheck -S error` clean on m5_smoke.sh and run.sh.
 
 ## Critique — blunt
 
-### Where the brief is sound
+**The brief specified the wrong value for the only line that mattered.**
+"dNSName carrying the device id verbatim" is precisely what
+kdeconnectd rejects for dashed ids. The brief anchored on
+lanlinkprovider.cpp:604 but never followed the `deviceId` argument's
+dataflow back through `NetworkPacket::unserialize`'s D-Bus
+normalization — two upstream files it otherwise cites. The test spec
+inherited the error ("R1 — SAN present with exactly one dNSName equal
+to the device_id"), so the lane produced green unit tests over a fix
+that provably did not work. A unit-level oracle cannot catch this
+class of bug by construction; only the live oracle could. Which makes
+the brief's ordering — "Interop repro — best-effort live oracle (do
+this LAST)", with an explicit license to DEFER when the build is
+inconvenient — exactly backwards for a change the brief itself classes
+as trust-core-adjacent. The live run should be the merge gate, not a
+trailing nicety. This round is the existence proof: every substantive
+finding (1, 2, 3) came from running it, and zero came from re-reading
+the diff.
 
-The fix is the right place, the right size, and the right kind. The defect is a TLS-hostname-verification failure mode unique to the Qt C++ peer, with a downstream cascade that turns a transient rejection into permanent depairing; fixing the trigger eliminates the cascade without touching the cleanup. The brief correctly resists the urge to also wipe-and-re-pin (would break both phones' TOFU for no fleet-real scenario) or to patch upstream (we don't own the upstream). The cite format (file:line in `lanlinkprovider.cpp:604/456` and `SslHelper.kt:53-57`) puts the falsification path one `git grep` away.
+**The DEFERRED escape hatch was taken on unchecked facts.** "No
+source-built kdeconnectd: ... does not exist" and "not root" were each
+falsifiable in one command (`ls` on the .kde install; `sudo -n true`),
+and both were false — the build lives in the main checkout, which a
+gitignored-paths worktree silently hides. The brief's timebox language
+("do not burn the lane on Qt build fights") is fine; deferral without
+mandating the two-second fact checks is not. A lane that defers the
+live oracle on a claim nobody verified shipped a broken fix to review.
 
-### Where I tried to break it and could not
+**The brief's serial instruction was also one branch short.**
+`serial_buf[0] &= 0x7F` does not yield "always exactly 20 octets": the
+DER writer strips leading zeros before padding, so the
+masked-to-0x00 case encodes to 19 octets with probability ~1/256 per
+cert — the proposed statistical green test would itself have been
+flaky ~1/3 of the time at N=100. The instruction's stated goal was
+right; its mechanism hadn't been checked against the writer.
 
-- **"rcgen's Ia5String will reject some spec-valid device id."** Tested by R2 (underscore). rcgen's check is `input.is_ascii()`, and `validate_device_id` already restricts to `[a-zA-Z0-9_-]` — all ASCII. No rejection.
-- **"Adding SAN breaks one of the existing 36 crypto tests."** Ran the full suite. Zero regressions. The only test that inspects extensions in any detail (`test_extract_pubkey_der_roundtrip`) reads `cert.public_key().raw` — untouched by SAN.
-- **"The SAN dNSName carries the wrong value (e.g., normalized to lowercase, truncated, or treated as an FQDN)."** R1 asserts `name.to_string() == device_id` byte-for-byte. rcgen does no normalization — the dNSName is the literal UTF-8/ASCII string from the SAN value, which is the literal bytes we pushed.
-- **"RDN order shifts when SAN is added (rcgen reorders fields)."** R1 explicitly asserts OID order CN, OU, O on `iter_attributes()`. The order survives.
+**What the brief got right, and where I tried to break it and could
+not:** the SAN approach itself (a dNSName SAN is what Qt's
+peerVerifyName verification reads; run 4/5 prove it works with the
+normalized value); no forced regeneration of existing identities
+(correct — regeneration would fire the rejection cascade on every
+existing kde pairing); leaving `delete_peer_certificate` semantics
+alone (the cascade dies with its trigger, now for real); not patching
+upstream. The extension diff confirmed nothing rode along with the
+SAN. The consumer sweep found no reader that prefers the raw form.
 
-### Where the brief is incomplete or wrong
+**Adjudication of the implementer's seven critique points:**
 
-1. **`rcgen::string::Ia5String` is not at the crate root.** The brief's snippet (`rcgen::Ia5String::try_from(...)`) fails to compile against `rcgen = "0.14"`. The actual path is `rcgen::string::Ia5String` — re-exported under `string` because the crate keeps the per-string-type newtypes in a private module to avoid colliding with downstream naming. My code uses the real path; the brief's snippet was copy-pasted from the rcgen docs example which uses the prelude (`use rcgen::string::{...}`).
+1. `rcgen::string::Ia5String` path — correct, upheld.
+2. OID constants in `oid_registry`, not `prelude` — correct, upheld.
+3. `.to_string()` on the borrowed `&str` — cosmetic, upheld (left
+   as-is; the intent is clearer on read).
+4. ASN1Time/openssl double-parse for the time pin — upheld, option (b)
+   as chosen; a helper would be surface area for nothing.
+5. Log-offset mechanics — mechanically upheld (lib.sh's restart_kde
+   appends, `wc -l` + `sed` slicing is sound), but the critique
+   examined the wrong thing entirely: the check built on that offset
+   was polarity-inverted AND the oracle it fed was a phantom event
+   name AND the scenario could degenerate into proving nothing. A
+   critique that validates the plumbing while never running the water
+   misses everything that mattered. Finding 2/3 supersede.
+6. Future Android-side hostname hardening — upheld as
+   document-don't-code, with stronger grounds than the implementer
+   had: the DESKTOP peer already requires the normalized form today,
+   and the generator comment now documents the normalization with
+   cites. An Android that hardened against raw ids would equally break
+   every Android-to-Android pairing (SslHelper certs are CN-only), so
+   it is not a realistic near-term threat model for us specifically.
+7. R3-is-a-pin-not-a-behavior-test — upheld, and vindicated: the pin
+   is what surfaced finding #0. Pins that look redundant are exactly
+   what catches latent regressions when adjacent code changes.
 
-2. **`OID_X509_*` is in `x509_parser::oid_registry`, not `x509_parser::prelude`.** The x509-parser 0.18 split moved all generated OID constants into the re-exported `oid_registry` module. `prelude` no longer carries them. This is a real downstream trap (the compiler error is "no `OID_X509_COMMON_NAME` in `prelude`" with no obvious next step for someone who hasn't read the 0.18 migration notes).
+**Pre-existing defects surfaced, deliberately NOT fixed here** (outside
+the branch's diff; recorded for the backlog):
 
-3. **`x509_parser::prelude::GeneralName::DNSName` carries a `&str`, but the borrowed iterator returns it via `.to_string()`.** The `name.to_string()` in the R1/R2 asserts is fine but reads ambiguously — `GeneralName::DNSName` holds `&'a str`, not an owned `String`, so `.to_string()` is allocating into the comparison. An alternative is `assert_eq!(*name, device_id)` (the borrowed slice equality form). I left `.to_string()` because it makes the byte-equality intent unmistakable on read; the allocations cost nothing in unit tests.
+- The mDNS discovery path resolves peers with port 0 (`10.250.x.y:0`,
+  and at least once `127.0.0.1:0`), so every mDNS-triggered outbound
+  dial fails with instant ECONNREFUSED and falls back to
+  reverse-connection. This masked the SAN defect in run 1 and makes
+  rust's outbound dials structurally unreliable in mDNS-first
+  environments. src/protocol/mdns_discovery.rs:243 +
+  connection_orchestrator.rs:344.
+- `send_packet`'s capability gate (src/protocol/connection/mod.rs:~500)
+  refuses when the peer's recorded incomingCapabilities are an EMPTY
+  list, while its doc comment promises refusal only when they are
+  "NON-EMPTY and don't list" the type. Empirically moot in these runs
+  (the ping flowed), but the doc/code drift is real and will bite the
+  first plugin-facing flow against a plugin-less peer.
+- The source-built kdeconnectd loads no plugins in the harness
+  environment (identity announces `incomingCapabilities:[]`), so
+  m3/m5 plugin-level flows exercise the plugin-less shape of the peer;
+  a distro-binary run would behave differently. Recorded, not acted on.
 
-4. **`ASN1Time` (owned newtype) does not implement `compare`.** The x509-parser `Validity` struct exposes `not_before: ASN1Time` / `not_after: ASN1Time` — owned newtypes, not refs. The `compare` method lives on `openssl::asn1::Asn1TimeRef` (the borrowed view). To use it on a x509-parser ASN1Time, I'd need to convert — and there is no public `as_ref()` accessor. I sidestepped this in R3 by parsing the cert again with openssl and using its `not_after()` which returns `&Asn1TimeRef`. This is fine (and matches what `test_generate_certificate_not_before_one_year_back` already does) but it's an unnecessary double-parse. The cleaner path is one of: (a) push a helper `cert.validity().not_after_compare(&other_asn1_time)` upstream into our own code, or (b) just keep using openssl for the time pin. I chose (b) to avoid creating a one-shot helper.
-
-5. **The brief's m5 script assumptions about the kde log offset capture.** I capture `PRE_RESTART_LOG_OFFSET = wc -l < "$KDE_LOG"` BEFORE the `restart_kde` call, then `sed -n "${OFFSET},\$p"` to slice the post-restart lines. This is the same pattern m2_smoke.sh:447 uses for `RECONNECT_LOG_OFFSET`, and it works for the rejection-text check because kdeconnectd appends to `$KDE_LOG` (lib.sh's `restart_kde` does `>>"$WORK/kde.stdout" 2>>"$KDE_LOG"` — append, not truncate). The `restart_kde` helper guarantees identity persistence via `kde_id_after=$(...); [[ "$kde_id_after" == "$KDE_ID" ]] || die`. Good.
-
-6. **The brief does not name the production peer ecosystem.** The fix is a one-line shape change but every future handshake rides it. The "deliberate divergence from Android" comment cites SslHelper.kt:53-57 — that's the right anchor for the divergence, but it doesn't capture that **every existing rust-installed Android pair still has a SAN-less cert that works because Android does no TLS verification**. After this lands, regenerate-own flows will produce SAN-bearing certs; the existing ones stay valid indefinitely (CN-only is still a perfectly parseable cert on the Android side). The class-B risk is a future Android-side hardening that DOES start doing hostname verification — at which point every rust<->android pairing built before this fix would silently break. That's a "real but unlikely" risk; the comment in `generate_certificate` doesn't call it out. **A future reviewer should consider** whether to also pin a notBefore that triggers gradual regeneration, OR to leave it alone — both are defensible, but the trade-off isn't documented. I did not make this call; it needs George's read.
-
-7. **The brief's companion R3 ("validity window and serial length unchanged") is a regression pin, not a behavior assertion.** R3 will pass on the unfixed code too. Its purpose is to fail on any future drift. The brief phrases it as a single-line note, which I read as "one test that catches future regressions." Fine.
-
-### What I did not do
-
-- **Did not run m5_restart_kde.sh.** DEFERRED — see "Interop repro" above.
-- **Did not run `cargo build --examples --locked`** (run.sh does this to populate `mpris_fake_player`). The unit gate doesn't need it, and the brief says "Do NOT run the existing interop smokes casually; the new repro script is the only interop surface this lane touches."
-- **Did not update m2_smoke.sh:244-249.** Per brief step 5: "If the repro goes green, update the m2_smoke.sh:244-249 comment block." The repro did not run; the comment stays as the recorded red for the historical context. The future lane that runs m5 green should make that edit.
-- **Did not push, did not open a PR, did not merge.** Per the brief.
+**What will break in production that the tests do not cover:** the m5
+oracle now depends on rust's UDP-path dial provocation; if the mDNS
+port-0 defect is ever "fixed" by making mDNS dials work, the
+dial-direction economics change and Phase 3's provocation should still
+hold (the nudge is UDP-based), but the `Starting client ssl`
+wait-for-die is the tripwire that will say so loudly. TLS 1.3 is
+untested against this reference (observed handshakes were 1.2); Qt's
+hostname check is version-independent, so the risk is low but the
+coverage note stands.
