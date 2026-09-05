@@ -209,27 +209,47 @@ impl CertificateManager {
                 .map_err(|e| Error::TlsError(format!("Failed to generate RSA key: {}", e)))?;
 
         // Build certificate parameters. We emit exactly one subjectAltName
-        // entry: a dNSName carrying the device id. This is a DELIBERATE
-        // divergence from Android's SslHelper.kt:53-57 — Android's TLS layer
-        // has checkServerTrusted = Unit (trust-all at TLS, authenticity from
-        // a post-handshake fingerprint TOFU), so its CN-only certs ship
-        // fine. kdeconnectd's Qt TLS layer is the opposite: in client mode
-        // it sets the outgoing socket's peer-verify name to the device id
-        // (core/backends/lan/lanlinkprovider.cpp:604: setPeerVerifyName
-        // (deviceId)) and runs REAL hostname verification against the peer
-        // cert's SAN. Any error other than SelfSignedCertificate is fatal
-        // (lanlinkprovider.cpp:456, sslErrors). A SAN-less cert yields
-        // "The host name did not match any of the valid hosts for this
-        // certificate", the link aborts, kdeconnectd's post-rejection
-        // unpair fires, and our side honors it (PairingHandler::unpair →
-        // delete_peer_certificate, src/protocol/pairing/mod.rs:693) — a
-        // transient handshake becomes permanent depairing. The SAN fixes
-        // the trigger. Device ids may contain '_' (the Android spec
-        // allows it and real ids are hex); '_' is valid ASCII and rcgen's
-        // Ia5String accepts ASCII, so no real device id is rejected.
+        // entry: a dNSName carrying the device id in kdeconnectd's
+        // D-Bus-NORMALIZED form. This is a DELIBERATE divergence from
+        // Android's SslHelper.kt:53-57 — Android's TLS layer has
+        // checkServerTrusted = Unit (trust-all at TLS, authenticity from a
+        // post-handshake fingerprint TOFU), so its CN-only certs ship
+        // fine. kdeconnectd's Qt TLS layer is the opposite: when it
+        // accepts a TCP dial and runs as TLS client it sets the socket's
+        // peer-verify name to the device id (core/backends/lan/
+        // lanlinkprovider.cpp:604: setPeerVerifyName(deviceId)) and runs
+        // REAL hostname verification against the peer cert's SAN. Any
+        // error other than SelfSignedCertificate is fatal
+        // (lanlinkprovider.cpp:456, sslErrors): the link aborts,
+        // kdeconnectd's post-rejection unpair fires, and our side honors
+        // it (PairingHandler::unpair → delete_peer_certificate,
+        // src/protocol/pairing/mod.rs:693) — a transient handshake becomes
+        // permanent depairing. The SAN fixes the trigger.
+        //
+        // The verify name is the id AFTER NetworkPacket::unserialize's
+        // D-Bus normalization (networkpacket.cpp:82-87 →
+        // dbushelper.cpp:31 filterNonExportableCharacters: every char
+        // outside [A-Za-z0-9_] becomes '_'), and Qt's hostname match is
+        // exact — so a dashed UUID id must appear in the SAN with
+        // underscores. Carrying the raw id instead was rejected live
+        // ("The host name did not match any of the valid hosts for this
+        // certificate", source-built kdeconnectd v26.04.3, 2026-09-05).
+        // For Android-parity ids (hex / underscore) the normalized form
+        // IS the id verbatim. '_' is valid ASCII and rcgen's Ia5String
+        // accepts ASCII, so no real device id is rejected.
+        let san_dns_name: String = device_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
         let mut params = rcgen::CertificateParams::default();
         params.subject_alt_names.push(rcgen::SanType::DnsName(
-            rcgen::string::Ia5String::try_from(device_id.to_string()).map_err(|e| {
+            rcgen::string::Ia5String::try_from(san_dns_name).map_err(|e| {
                 Error::TlsError(format!(
                     "device_id is not a valid IA5String for subjectAltName dNSName: {}",
                     e
@@ -1788,7 +1808,10 @@ mod tests {
             "third RDN must be O"
         );
 
-        // SAN: exactly one dNSName carrying the device id verbatim.
+        // SAN: exactly one dNSName carrying the device id in the
+        // D-Bus-normalized form (see generate_certificate) — for this
+        // test id (dashes) that is the underscore form, which is what
+        // kdeconnectd's setPeerVerifyName compares against.
         let san = cert
             .subject_alternative_name()
             .expect("parse SAN extension")
@@ -1797,8 +1820,8 @@ mod tests {
         match &san.value.general_names[0] {
             GeneralName::DNSName(name) => assert_eq!(
                 name.to_string(),
-                device_id,
-                "SAN dNSName must equal the device id verbatim"
+                "rust_connect_cert_test_123456789",
+                "SAN dNSName must equal the D-Bus-normalized device id"
             ),
             other => panic!("SAN entry must be dNSName, got {:?}", other),
         }
@@ -1838,6 +1861,56 @@ mod tests {
             ),
             other => panic!("SAN entry must be dNSName, got {:?}", other),
         }
+    }
+
+    /// R4 (adversarial review, live-reproduced 2026-09-05): kdeconnectd
+    /// verifies the SAN dNSName against the device id AFTER D-Bus
+    /// normalization (NetworkPacket::unserialize →
+    /// DBusHelper::filterNonExportableCharacters: every char outside
+    /// [A-Za-z0-9_] becomes '_', networkpacket.cpp:82-87 +
+    /// dbushelper.cpp:31), and Qt's hostname match is exact — so a
+    /// dashed UUID id must appear in the SAN with underscores. The raw
+    /// form is rejected: "The host name did not match any of the valid
+    /// hosts for this certificate" (kdeconnectd v26.04.3, rust's
+    /// outbound dial, lanlinkprovider.cpp:563 → :604).
+    #[test]
+    fn test_generated_cert_san_is_kde_normalized_id() {
+        use x509_parser::prelude::GeneralName;
+
+        let (manager, _temp_dir) = setup();
+        let device_id = "e849573d-6af9-4275-bc36-2e759b1e8482"; // dashed, live-repro shape
+        let (cert_pem, _key_pem) = manager
+            .generate_certificate(device_id, "Normalization")
+            .expect("generate test certificate");
+
+        let cert_der = pem_to_der(&cert_pem).expect("parse generated cert PEM to DER");
+        let cert = parse_x509_der(&cert_der).expect("parse generated cert DER");
+        let san = cert
+            .subject_alternative_name()
+            .expect("parse SAN extension")
+            .expect("cert must carry a subjectAltName (R4)");
+        assert_eq!(san.value.general_names.len(), 1, "exactly one SAN entry");
+        match &san.value.general_names[0] {
+            GeneralName::DNSName(name) => assert_eq!(
+                name.to_string(),
+                "e849573d_6af9_4275_bc36_2e759b1e8482",
+                "SAN must carry the D-Bus-normalized (underscore) form — the form kdeconnectd's setPeerVerifyName compares against"
+            ),
+            other => panic!("SAN entry must be dNSName, got {:?}", other),
+        }
+
+        // CN stays the RAW id: kdeconnectd's addLink compares
+        // subjectDisplayName() against the packet id after BOTH are
+        // normalized (lanlinkprovider.cpp:637-644), and our own CN reader
+        // (extract_cn_from_der) expects the identity string verbatim.
+        let cn = cert
+            .subject()
+            .iter_common_name()
+            .next()
+            .and_then(|cn| cn.as_str().ok())
+            .map(|s| s.to_string())
+            .expect("cert has a CN");
+        assert_eq!(cn, device_id, "CN must remain the raw device id");
     }
 
     /// Companion: the SAN addition must not perturb the existing
