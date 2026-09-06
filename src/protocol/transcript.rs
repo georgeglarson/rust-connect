@@ -21,15 +21,15 @@
 //! permissions, never commit captures, delete it after the debugging
 //! session (and scrub a capture before turning it into a fixture).
 //!
-//! Cost when disabled is one `OnceCell` read per packet. When enabled the
+//! Cost when disabled is one `OnceLock` read per packet. When enabled the
 //! append is a small blocking write on the packet path — acceptable for a
 //! debugging facility, and another reason it is opt-in. A recording failure
 //! logs once and never fails the packet path.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
-use once_cell::sync::OnceCell;
 use tracing::warn;
 
 use crate::protocol::types::Packet;
@@ -55,7 +55,7 @@ impl Direction {
     }
 }
 
-static TRANSCRIPT_DIR: OnceCell<Option<PathBuf>> = OnceCell::new();
+static TRANSCRIPT_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 static WRITE_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Resolved once: the env var is read on the first recorded packet and

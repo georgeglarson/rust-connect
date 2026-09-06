@@ -55,7 +55,12 @@ impl ResponseMetadata {
     pub fn new() -> Self {
         Self {
             timestamp: Utc::now(),
-            request_id: uuid::Uuid::new_v4().to_string(),
+            // Inside a request: the id the logging middleware minted, so
+            // header, body, and log lines agree. Outside one (tests, the
+            // CLI rendering an envelope): a fresh id.
+            request_id: crate::api::middleware::REQUEST_ID
+                .try_with(|id| id.clone())
+                .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string()),
         }
     }
 }
@@ -118,6 +123,43 @@ impl From<&Device> for DeviceSummary {
             pair_state: d.pair_state.clone(),
             verification_key: d.verification_key.clone(),
         }
+    }
+}
+
+/// Query parameters shared by the paginated list endpoints
+/// (`GET /api/v1/devices`, `GET /api/v1/notifications`). Parsed leniently:
+/// a missing or unparseable value falls back to the default rather than
+/// failing the request, so the envelope contract holds (axum's own
+/// `Query` rejection is plain text). This struct exists so the two
+/// parameters are in the OpenAPI spec (2026-09-06 audit B6: `/devices`
+/// honoured them undocumented).
+#[derive(Debug, Clone, Copy, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct Pagination {
+    /// Page number, 1-based. Default 1.
+    pub page: Option<usize>,
+    /// Page size. Default 50.
+    pub limit: Option<usize>,
+}
+
+impl Pagination {
+    pub const DEFAULT_PAGE: usize = 1;
+    pub const DEFAULT_LIMIT: usize = 50;
+
+    /// Lenient parse from a raw query map: bad values become defaults.
+    pub fn from_query(params: &std::collections::HashMap<String, String>) -> Self {
+        Self {
+            page: params.get("page").and_then(|s| s.parse().ok()),
+            limit: params.get("limit").and_then(|s| s.parse().ok()),
+        }
+    }
+
+    pub fn page(&self) -> usize {
+        self.page.unwrap_or(Self::DEFAULT_PAGE)
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(Self::DEFAULT_LIMIT)
     }
 }
 

@@ -23,8 +23,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1716 bind failure names the process holding the port instead of
   guessing.
 
+- The systemd journal is now the log sink under systemd, as structured
+  records: every log line's `event` field is a journal field, so
+  `journalctl --user -u rust-connect EVENT=split_brain_suspected` works
+  and the journal no longer holds two lines per event with terminal
+  colour codes. On a terminal the output is text; `LOG_FORMAT=json` still
+  selects JSON lines.
+- `GET /api/v1/devices` documents its `page` and `limit` query parameters
+  (it honoured them before; the spec did not say so).
+
+### Changed
+
+- The `X-Request-ID` response header and the envelope's
+  `metadata.request_id` are now the same id, and it is the id the
+  `api_request` / `api_response` log lines carry. They were three
+  independent UUIDs.
+- The per-IP API rate limiter is off when the API binds a loopback
+  address (the default): every local client was 127.0.0.1 and shared one
+  100-requests-per-minute bucket. A non-loopback bind keeps the limiter,
+  and its counter update is now atomic.
+- The systemd unit no longer sets `RUST_LOG`; `log_level` in config.toml
+  is the source of truth and `RUST_LOG` (in a drop-in) is the override.
+- Dropped an unused `config` crate (a 54-crate subtree) and three unused
+  dev-dependencies; 273 → 250 crates in a production build.
+
 ### Fixed
 
+- `cargo test` on the same host as a running daemon no longer reaches it:
+  a failing dial inside the suite used to unicast the fixture identity to
+  `<peer>:1716` as the reverse-connection fallback, which on the daemon
+  host is the live daemon, and test builds could bind the production port
+  alongside it. Test builds now use a port outside the KDE Connect range
+  for both, and refuse the production port outright.
+- A split-brain identity (a foreign device id announcing from one of this
+  host's own addresses) is now refused, not just logged: no registry
+  record, no dial. Previously the daemon warned and then registered and
+  dialed the other daemon anyway.
 - The deb's postinst no longer runs `systemctl --global enable`, which
   started a daemon in every user manager on the host, greeter users
   included (Fedora's `gdm-greeter` ran its own instance at every boot with

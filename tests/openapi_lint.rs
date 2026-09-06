@@ -48,3 +48,23 @@ fn collect_refs(value: &serde_json::Value, out: &mut BTreeSet<String>) {
         _ => {}
     }
 }
+
+/// 2026-09-06 audit B6: `GET /api/v1/devices` honoured `page` and `limit`
+/// that the spec never mentioned. Both list endpoints document them.
+#[test]
+fn test_paginated_list_endpoints_document_page_and_limit() {
+    let spec = ApiDoc::openapi();
+    let json = serde_json::to_value(&spec).expect("spec serializes");
+    for path in ["/api/v1/devices", "/api/v1/notifications"] {
+        let params = json["paths"][path]["get"]["parameters"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{path} GET must declare parameters"));
+        let names: BTreeSet<&str> = params.iter().filter_map(|p| p["name"].as_str()).collect();
+        for wanted in ["page", "limit"] {
+            assert!(
+                names.contains(wanted),
+                "{path} GET must document the `{wanted}` query parameter; has {names:?}"
+            );
+        }
+    }
+}

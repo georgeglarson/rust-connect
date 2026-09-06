@@ -102,7 +102,26 @@ ls ~/.local/share/rust-connect/daemon.*.log          # rotating daemon logs
 ```
 
 File logs rotate hourly, 24 files kept (`log_max_files` in config.toml).
-Use `RUST_LOG=debug` in the unit or `log_level = "debug"` for more detail.
+
+Under systemd the daemon logs straight to the journal as structured
+records, so the `event` field every log line carries is a journal field
+you can match on instead of grepping rendered text:
+
+```bash
+journalctl --user -u rust-connect EVENT=split_brain_suspected
+journalctl --user -u rust-connect EVENT=send_failure_teardown --since today
+journalctl --user -u rust-connect -o json | jq -r '[.EVENT, .DEVICE_ID, .MESSAGE] | @tsv'
+```
+
+The default level comes from `log_level` in config.toml. To raise one
+crate for a while without editing the config, give the unit a drop-in and
+remove it when you are done — a trace-level drop-in left in place wrote
+three million journal lines a day:
+
+```bash
+systemctl --user edit rust-connect     # add: [Service] / Environment=RUST_LOG=info,mdns_sd=debug
+systemctl --user restart rust-connect
+```
 
 ## Service doesn't start on boot / dies at logout
 

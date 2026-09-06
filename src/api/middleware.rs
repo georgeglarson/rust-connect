@@ -11,6 +11,16 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
 
+tokio::task_local! {
+    /// The id `request_logger` minted for the in-flight request. Handlers
+    /// build their envelope inside the middleware's future, so
+    /// `ResponseMetadata::new` reads this and the body's
+    /// `metadata.request_id` equals the `X-Request-ID` header and the
+    /// `api_request` / `api_response` log lines (2026-09-06 audit B2: they
+    /// were two independent UUIDs, so nothing correlated).
+    pub static REQUEST_ID: String;
+}
+
 pub async fn security_headers(request: Request, next: Next) -> Response {
     use axum::http::header;
 
@@ -97,21 +107,23 @@ pub async fn rate_limiter(request: Request, next: Next) -> Response {
         }
     };
 
-    let mut entry = limiters
-        .get(&client_ip)
-        .unwrap_or_else(|| ClientRateLimiter {
-            window_start: Instant::now(),
-            count: 0,
-        });
-
-    if entry.window_start.elapsed().as_secs() >= 60 {
-        entry.window_start = Instant::now();
-        entry.count = 0;
-    }
-    entry.count += 1;
-    let is_rate_limited = entry.count > 100;
-
-    limiters.insert(client_ip, entry);
+    // One atomic read-modify-write per request: the previous get/insert
+    // pair let two concurrent requests both observe count 99.
+    let count = limiters
+        .entry(client_ip)
+        .and_upsert_with(|existing| match existing {
+            Some(e) if e.value().window_start.elapsed().as_secs() < 60 => ClientRateLimiter {
+                window_start: e.value().window_start,
+                count: e.value().count + 1,
+            },
+            _ => ClientRateLimiter {
+                window_start: Instant::now(),
+                count: 1,
+            },
+        })
+        .value()
+        .count;
+    let is_rate_limited = count > 100;
 
     if is_rate_limited {
         return rate_limited_response();
@@ -193,7 +205,9 @@ pub async fn request_logger(request: Request, next: Next) -> Response {
         "Incoming API request"
     );
 
-    let mut response = next.run(request).await;
+    let mut response = REQUEST_ID
+        .scope(request_id.clone(), next.run(request))
+        .await;
 
     response.headers_mut().insert(
         "X-Request-ID",

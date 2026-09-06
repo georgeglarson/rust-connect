@@ -14,7 +14,11 @@ Type=simple
 ExecStart=%h/.local/bin/rust-connect
 Restart=on-failure
 RestartSec=5
-Environment=RUST_LOG=info
+# No Environment=RUST_LOG here: the config file's `log_level` is the
+# source of truth (it was dead under the unit while this line shadowed
+# it, 2026-09-06 audit C3). RUST_LOG stays the operator override — put
+# it in a drop-in (`systemctl --user edit rust-connect`) when you need
+# a crate at debug for a while, and remove the drop-in after.
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=rust-connect

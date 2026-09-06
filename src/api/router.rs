@@ -17,6 +17,15 @@ use crate::api::middleware::request_logger;
 use crate::api::openapi::ApiDoc;
 use crate::app::AppState;
 
+/// True for a bind address that only this host can reach. An unparseable
+/// value (a hostname) counts as reachable, so the limiter stays on.
+pub fn api_bind_is_loopback(api_bind: &str) -> bool {
+    api_bind
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 pub fn build_router(state: Arc<AppState>) -> Router {
     // CORS is deny-by-default: an empty allowed_origins list builds a layer
     // that matches no origin, so browsers get no Access-Control-Allow-Origin.
@@ -261,9 +270,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(cors)
         .layer(middleware::from_fn(
             crate::api::middleware::security_headers,
-        ))
-        .layer(middleware::from_fn(crate::api::middleware::rate_limiter))
-        .layer(middleware::from_fn(request_logger));
+        ));
+    // The per-IP limiter only means something when more than one IP can
+    // reach the API. On the default loopback bind every caller — agents,
+    // the CLI, the web UI — is 127.0.0.1 and shared one 100/min bucket
+    // (2026-09-06 audit B5); a non-loopback bind keeps it.
+    if !api_bind_is_loopback(&state.settings.api_bind) {
+        router = router.layer(middleware::from_fn(crate::api::middleware::rate_limiter));
+    }
+    router = router.layer(middleware::from_fn(request_logger));
 
     if state.settings.ui_enabled {
         router = router

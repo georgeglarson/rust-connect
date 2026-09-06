@@ -65,7 +65,7 @@ use std::os::unix::io::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
-use futures_util::StreamExt;
+use futures::StreamExt;
 use reis::ei;
 use reis::enumflags2::BitFlags;
 use reis::event::{DeviceCapability, EiEvent};

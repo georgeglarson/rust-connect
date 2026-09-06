@@ -22,6 +22,11 @@ the existing KDE Connect Android app.
   (desktop to phone) shipped 2026-08-26.
 - REST API (`/api/v1/`) as the single control surface, with an SSE event
   stream at `/api/v1/events`; the primary consumers are automated agents.
+- Verified-against-a-real-peer coverage, per the ledger in
+  `docs/functional-coverage.md` (2026-09-06): 7 rows PASS, 52 UNVERIFIED,
+  63 NOT-APPLICABLE, 4 INTENTIONAL-DIVERGENCE. UNVERIFIED is the honest
+  state of a plugin that works on this desk and has not been proven
+  against the reference implementations yet.
 - A CLI client on top of that API (`status`, `devices`, `pair`, `unpair`,
   `ping`, `share`, `clipboard`), so the API is not curl-only.
 - An embedded troubleshooting web UI served from the binary at `/ui`.

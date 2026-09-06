@@ -1225,3 +1225,113 @@ async fn test_device_endpoints_expose_pair_state_for_incoming_request() {
     assert_eq!(listed["pair_state"], "requested_by_peer");
     assert!(listed["verification_key"].is_string());
 }
+
+/// 2026-09-06 audit B2: the `X-Request-ID` header and the envelope's
+/// `metadata.request_id` were minted independently, so nothing correlated
+/// a response with its `api_request` / `api_response` log lines. They must
+/// be the same id. Fails before the fix on every request.
+#[tokio::test]
+async fn test_request_id_header_matches_envelope_metadata() {
+    let (state, _temp_dir, api_key) = create_test_app().await;
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/plugins")
+                .header("X-API-Key", &api_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let header = response
+        .headers()
+        .get("X-Request-ID")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .expect("X-Request-ID header present");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["metadata"]["request_id"].as_str(),
+        Some(header.as_str()),
+        "envelope request_id must equal the X-Request-ID header"
+    );
+}
+
+/// 2026-09-06 audit B5: on the default loopback bind every local client
+/// is 127.0.0.1 and shared one 100/min bucket, so two agents polling
+/// tripped 429 in under a minute. A loopback-bound API is not
+/// rate-limited. Fails before the fix at the 101st request.
+#[tokio::test]
+async fn test_loopback_bind_is_not_rate_limited() {
+    let (state, _temp_dir, api_key) = create_test_app().await;
+    assert!(rust_connect::api::router::api_bind_is_loopback(
+        &state.settings.api_bind
+    ));
+    let app = build_router(state);
+
+    for i in 1..=150 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "request {i} on a loopback bind must not be rate-limited"
+        );
+    }
+}
+
+/// The limiter is still armed for a bind other hosts can reach. Without
+/// `ConnectInfo` (oneshot) every request shares one bucket, which is what
+/// makes the 101st deterministic here.
+#[tokio::test]
+async fn test_non_loopback_bind_keeps_the_rate_limiter() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let api_key = "test-api-key".to_string();
+    let mut settings = AppSettings::default()
+        .with_data_dir(temp_dir.path().to_path_buf())
+        .with_api_keys(vec![api_key.clone()]);
+    settings.api_bind = "0.0.0.0".to_string();
+    assert!(!rust_connect::api::router::api_bind_is_loopback(
+        &settings.api_bind
+    ));
+    let state = Arc::new(AppState::new_without_input(settings).unwrap());
+    let app = build_router(state);
+
+    let mut saw_429 = false;
+    for _ in 1..=101 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .header("X-API-Key", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            saw_429 = true;
+            break;
+        }
+    }
+    assert!(
+        saw_429,
+        "a non-loopback bind must still rate-limit within 101 requests"
+    );
+}
