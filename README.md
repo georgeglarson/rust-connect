@@ -153,7 +153,7 @@ v2.)
 ## API
 
 ```
-GET    /api/v1/devices                          List paired devices
+GET    /api/v1/devices                          List known devices (discovered, connected, paired)
 GET    /api/v1/devices/:device_id               Get device details
 POST   /api/v1/devices/:device_id/pair           Pair a device
 DELETE /api/v1/devices/:device_id/unpair         Unpair a device

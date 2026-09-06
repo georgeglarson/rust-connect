@@ -12,6 +12,40 @@ pub enum LogFormat {
     Pretty,
 }
 
+/// Where text-format log lines go, decided once at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSink {
+    /// The systemd journal, structured: every `event = "…"` field is a
+    /// journal field (`journalctl --user -u rust-connect EVENT=…`), one
+    /// record per event, no escape codes, no second timestamp. Before
+    /// 2026-09-06 the unit got the pretty terminal format instead: two
+    /// lines per event with ANSI colour bytes in the journal, and the
+    /// event vocabulary only reachable by grep (audit C1).
+    Journald,
+    /// Plain text on stdout, no escape codes: a pipe, a file, or systemd
+    /// without a reachable journal socket.
+    StdoutPlain,
+    /// Pretty text with ANSI colour: an interactive terminal.
+    StdoutAnsi,
+}
+
+/// Pure sink choice so the policy is testable without touching the
+/// global subscriber.
+pub fn choose_sink(under_systemd: bool, stdout_is_tty: bool, journald_available: bool) -> LogSink {
+    if under_systemd && journald_available {
+        LogSink::Journald
+    } else if stdout_is_tty {
+        LogSink::StdoutAnsi
+    } else {
+        LogSink::StdoutPlain
+    }
+}
+
+fn stdout_is_tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+}
+
 impl LogFormat {
     pub fn parse_log_level(s: &str) -> Self {
         match s.to_lowercase().as_str() {
@@ -46,18 +80,41 @@ pub fn init_logging(format: LogFormat, default_level: &str, max_log_files: usize
                     .init();
             }
             LogFormat::Pretty => {
-                tracing_subscriber::registry()
-                    .with(env_filter.clone())
-                    .with(
-                        fmt::layer()
-                            .pretty()
-                            .with_target(true)
-                            .with_thread_ids(false)
-                            .with_thread_names(false)
-                            .with_file(true)
-                            .with_line_number(true),
-                    )
-                    .init();
+                // Field prefix off so `event = "x"` is the journal field
+                // `EVENT`, not `F_EVENT`; the layer already sets MESSAGE,
+                // PRIORITY, TARGET, CODE_FILE, CODE_LINE itself.
+                let journald = tracing_journald::layer()
+                    .ok()
+                    .map(|layer| layer.with_field_prefix(None));
+                match choose_sink(true, false, journald.is_some()) {
+                    LogSink::Journald => {
+                        if let Some(journald) = journald {
+                            tracing_subscriber::registry()
+                                .with(env_filter.clone())
+                                .with(journald)
+                                .init();
+                        }
+                    }
+                    LogSink::StdoutPlain | LogSink::StdoutAnsi => {
+                        // No journal socket: one line per event, no
+                        // colour, and no timestamp of our own (the
+                        // journal stamps the line).
+                        tracing_subscriber::registry()
+                            .with(env_filter.clone())
+                            .with(
+                                fmt::layer()
+                                    .compact()
+                                    .with_ansi(false)
+                                    .without_time()
+                                    .with_target(true)
+                                    .with_thread_ids(false)
+                                    .with_thread_names(false)
+                                    .with_file(true)
+                                    .with_line_number(true),
+                            )
+                            .init();
+                    }
+                }
             }
         }
     } else {
@@ -68,6 +125,7 @@ pub fn init_logging(format: LogFormat, default_level: &str, max_log_files: usize
             .with(
                 fmt::layer()
                     .pretty()
+                    .with_ansi(stdout_is_tty())
                     .with_target(true)
                     .with_thread_ids(false)
                     .with_thread_names(false),
@@ -146,6 +204,7 @@ pub fn init_logging_with_file(
         LogFormat::Pretty => {
             let stdout_layer = fmt::layer()
                 .pretty()
+                .with_ansi(stdout_is_tty())
                 .with_target(true)
                 .with_thread_ids(false)
                 .with_thread_names(false)
@@ -295,5 +354,29 @@ mod tests {
             "Expected file to contain 'daemon', got: {}",
             entries[0]
         );
+    }
+}
+
+#[cfg(test)]
+mod sink_tests {
+    use super::{choose_sink, LogSink};
+
+    /// 2026-09-06 audit C1: under systemd the sink is the journal when its
+    /// socket is reachable, plain text when it is not, and colour only
+    /// ever goes to an interactive terminal.
+    #[test]
+    fn test_systemd_with_journal_socket_logs_to_journald() {
+        assert_eq!(choose_sink(true, false, true), LogSink::Journald);
+    }
+
+    #[test]
+    fn test_systemd_without_journal_socket_falls_back_to_plain_text() {
+        assert_eq!(choose_sink(true, false, false), LogSink::StdoutPlain);
+    }
+
+    #[test]
+    fn test_terminal_gets_colour_and_a_pipe_does_not() {
+        assert_eq!(choose_sink(false, true, false), LogSink::StdoutAnsi);
+        assert_eq!(choose_sink(false, false, false), LogSink::StdoutPlain);
     }
 }

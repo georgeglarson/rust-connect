@@ -39,6 +39,7 @@ async fn reconcile_rendered_connection_state(state: &AppState, device: &mut Devi
     get,
     path = "/api/v1/devices",
     tag = "devices",
+    params(Pagination),
     responses(
         (status = 200, description = "List all known devices", body = DevicesResponse),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
@@ -50,11 +51,9 @@ pub async fn list_devices(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<DeviceListResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
-    let page: usize = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
-    let limit: usize = params
-        .get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
+    let pagination = Pagination::from_query(&params);
+    let page = pagination.page();
+    let limit = pagination.limit();
 
     let devices = state.registry.list().await;
     let total = devices.len();

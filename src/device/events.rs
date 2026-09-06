@@ -6,7 +6,7 @@
 use std::fmt::Debug;
 
 use tokio::sync::broadcast;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::device::types::DeviceEvent;
 
@@ -33,7 +33,9 @@ impl<T: Clone + Send + Sync + Debug> Broadcaster<T> {
             "Broadcasting {} event", self.name
         );
         if self.tx.send(event).is_err() {
-            warn!("No active subscribers to receive {} event", self.name);
+            // Nobody on the SSE stream is the normal state of an idle
+            // desktop, not a warning (2026-09-06 audit C2: 32/h at WARN).
+            debug!("No active subscribers to receive {} event", self.name);
         }
     }
 

@@ -14,8 +14,7 @@ use crate::utils::errors::Error;
     tag = "notifications",
     params(
         ("device_id" = Option<String>, Query, description = "Filter by device ID"),
-        ("page" = Option<usize>, Query, description = "Page number (default 1)"),
-        ("limit" = Option<usize>, Query, description = "Maximum number of notifications to return (default 50)")
+        Pagination,
     ),
     responses(
         (status = 200, description = "Notification history", body = serde_json::Value),
@@ -28,11 +27,9 @@ pub async fn get_notifications(
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
     let device_id = params.get("device_id").map(|s| s.as_str());
-    let page: usize = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
-    let limit: usize = params
-        .get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
+    let pagination = Pagination::from_query(&params);
+    let page = pagination.page();
+    let limit = pagination.limit();
 
     let mut all_entries = state
         .plugins

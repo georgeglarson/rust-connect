@@ -50,16 +50,20 @@ zbus = "5"
 # a transitive dependency of half the stack, so this adds no new crates.
 libc = "0.2"
 
-# Structured logging (AI-friendly)
+# Logging: `tracing` with an `event = "…"` field vocabulary. Under systemd
+# the sink is journald (tracing-journald), so those fields are journal
+# fields (`journalctl --user -u rust-connect EVENT=battery_update`); on a
+# terminal it is text; LOG_FORMAT=json selects JSON lines.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-journald = "0.3"
 
 # OpenAPI generation (AI-friendly documentation)
 utoipa = { version = "4", features = ["axum_extras", "chrono"] }
 utoipa-swagger-ui = { version = "6", features = ["axum"] }
 
-# Configuration
-config = "0.14"
+# Configuration (TOML only; the `config` crate was a 54-crate subtree with
+# zero uses — 2026-09-06 audit D1)
 toml = "1.1"
 
 # Error handling
@@ -77,7 +81,6 @@ ureq = { version = "3", default-features = false }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
-once_cell = "1"
 
 # Crypto
 rand = "0.8"
@@ -118,25 +121,23 @@ reis = { version = "0.7.1", default-features = false, features = ["tokio"] }
 xkbcommon = "0.9"
 # reis re-exports enumflags2 (`pub use enumflags2;` at lib.rs:38), so
 # `BitFlags` is reachable as `reis::enumflags2::BitFlags` without a
-# direct dep on enumflags2. futures-util supplies StreamExt for the
-# EiConvertEventStream (already transitive via reis/tokio).
-futures-util = "0.3"
+# direct dep on enumflags2. `futures` (above) re-exports the StreamExt
+# the EiConvertEventStream needs.
 
 [dev-dependencies]
 rust-connect = { path = ".", features = ["test-helpers"] }
 
 # Testing
-tokio-test = "0.4"
-mockall = "0.12"
+# `test-util` gives the suite `tokio::time::pause()` / `start_paused`. It
+# used to arrive transitively through `tokio-test`, whose own API nothing
+# called (2026-09-06 audit D2); name the feature we actually rely on.
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 criterion = "0.5"
 proptest = "1"
 uuid = { version = "1", features = ["v4"] }
 openssl = "0.10"
-
-# HTTP testing
-reqwest = { version = "0.12", features = ["json"] }
 
 # examples/tls_probe.rs (kept as the live interop harness; rustls itself is
 # now a production dependency above)
