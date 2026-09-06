@@ -17,6 +17,34 @@ pub const DEFAULT_TCP_PORT: u16 = 1716;
 /// Default UDP port for discovery
 pub const DEFAULT_UDP_PORT: u16 = 1716;
 
+/// UDP port test builds use for anything a production daemon on the same
+/// host could hear. Outside the KDE Connect range on purpose: a
+/// production listener on 1716 never receives it, and the range check in
+/// `DiscoveryService::listen` would drop an identity advertising it as a
+/// tcpPort anyway. Same gate as the loopback scoping in `discovery.rs`
+/// and the test-only mDNS service type (2026-09-06 audit A2: a
+/// `cargo test` run on the daemon host reached the live daemon).
+#[cfg(any(test, feature = "test-helpers"))]
+pub const TEST_UDP_PORT: u16 = 41716;
+
+/// The UDP port the reverse-connection fallback unicasts our identity to
+/// when an outbound dial fails (`outbound.rs`). Production: 1716, which
+/// is what the references listen on. Test builds: [`TEST_UDP_PORT`], so a
+/// failing dial inside `cargo test` never hands a fixture identity to a
+/// live daemon on the same host — that was the leg that put
+/// `svc-mgr-our-device-…` into the running daemon's registry on
+/// 2026-09-06.
+pub fn fallback_udp_port() -> u16 {
+    #[cfg(any(test, feature = "test-helpers"))]
+    {
+        TEST_UDP_PORT
+    }
+    #[cfg(not(any(test, feature = "test-helpers")))]
+    {
+        DEFAULT_UDP_PORT
+    }
+}
+
 /// Minimum port in the KDE Connect port range
 pub const MIN_PORT: u16 = 1716;
 
@@ -536,6 +564,21 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
     use super::*;
+
+    /// 2026-09-06 audit A2: the reverse-connection fallback in test builds
+    /// must target a port no production daemon listens on. Fails before
+    /// the fix (`fallback_udp_port` did not exist; `outbound.rs` passed
+    /// `DEFAULT_UDP_PORT` unconditionally).
+    #[test]
+    fn test_fallback_udp_port_never_targets_the_production_port_in_test_builds() {
+        assert_eq!(fallback_udp_port(), TEST_UDP_PORT);
+        assert_ne!(fallback_udp_port(), DEFAULT_UDP_PORT);
+        assert!(
+            !(MIN_PORT..=MAX_PORT).contains(&TEST_UDP_PORT),
+            "the test port must sit outside the KDE Connect range so a \
+             production listener would drop it even if it heard it"
+        );
+    }
 
     #[test]
     fn test_identity_creation() {

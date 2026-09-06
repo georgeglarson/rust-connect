@@ -66,6 +66,11 @@ pub struct ConnectionManager {
     /// everything) — see `record_peer_capabilities` and `send_packet`'s
     /// gate for why that distinction is load-bearing for the pairing flow.
     pub(crate) peer_capabilities: Arc<RwLock<HashMap<DeviceId, Vec<String>>>>,
+    /// Disposition of a split-brain identity on the mDNS resolve path
+    /// (`service_manager::on_mdns_device_resolved`); the UDP path keeps
+    /// its own copy on `DiscoveryService`. Build default via
+    /// `SplitBrainPolicy::default_for_build`.
+    pub(crate) split_brain_policy: Arc<std::sync::RwLock<crate::protocol::SplitBrainPolicy>>,
 
     /// Test-only shadow set: device IDs declared "connected" without
     /// a real TLS link. The capability gate's
@@ -224,6 +229,9 @@ impl ConnectionManager {
             generations: Arc::new(RwLock::new(HashMap::new())),
             tcp_port: Arc::new(std::sync::RwLock::new(None)),
             peer_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            split_brain_policy: Arc::new(std::sync::RwLock::new(
+                crate::protocol::SplitBrainPolicy::default_for_build(),
+            )),
             #[cfg(any(test, feature = "test-helpers"))]
             fake_connected: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             #[cfg(any(test, feature = "test-helpers"))]
@@ -249,6 +257,22 @@ impl ConnectionManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         pending.remove(device_id);
+    }
+
+    pub fn split_brain_policy(&self) -> crate::protocol::SplitBrainPolicy {
+        *self
+            .split_brain_policy
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Production never calls this (the build default is `Refuse`);
+    /// tests that pin the mDNS-path refusal do.
+    pub fn set_split_brain_policy(&self, policy: crate::protocol::SplitBrainPolicy) {
+        *self
+            .split_brain_policy
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = policy;
     }
 
     pub fn set_capabilities(&self, incoming: Vec<String>, outgoing: Vec<String>) {

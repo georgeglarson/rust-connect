@@ -68,6 +68,40 @@ pub fn is_split_brain(source: &std::net::IpAddr, our_id: &str, their_id: &str) -
     their_id != our_id && is_local_address(source)
 }
 
+/// What a discovery path does with an identity `is_split_brain` flags.
+/// Both variants log `split_brain_suspected` (the soak oracle); only
+/// `Refuse` stops the identity from entering the registry and being
+/// dialed. Until 2026-09-06 the detector was warn-only, so the daemon
+/// named the condition and then registered and dialed the other daemon
+/// anyway (audit A2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitBrainPolicy {
+    /// Warn and drop the identity: no registry record, no dial.
+    Refuse,
+    /// Warn and carry on. The pre-2026-09-06 behaviour.
+    WarnOnly,
+}
+
+impl SplitBrainPolicy {
+    /// Production refuses. Test builds warn only, because under the
+    /// test gate every peer IS on loopback (the loopback scoping of
+    /// 2026-09-04), so a refusing default would reject every simulated
+    /// peer in the suite; the tests that pin the refusal opt in with
+    /// `DiscoveryService::with_split_brain_policy` /
+    /// `ConnectionManager::set_split_brain_policy`. Same gate as
+    /// `fallback_udp_port` and the loopback bind.
+    pub fn default_for_build() -> Self {
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            Self::WarnOnly
+        }
+        #[cfg(not(any(test, feature = "test-helpers")))]
+        {
+            Self::Refuse
+        }
+    }
+}
+
 pub fn is_private_address(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {

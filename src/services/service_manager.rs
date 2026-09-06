@@ -256,6 +256,13 @@ fn on_mdns_device_resolved(state: Arc<AppState>, identity: Identity, addr: std::
                     "Another KDE Connect implementation is announcing from THIS host: \
                      two daemons will compete for the same paired phones"
                 );
+                if state.connection_manager.split_brain_policy()
+                    == crate::protocol::SplitBrainPolicy::Refuse
+                {
+                    // Named it; now act on it — no registry write, no
+                    // dial (2026-09-06 audit A2).
+                    return;
+                }
             }
         }
 
@@ -567,6 +574,35 @@ mod tests {
             device.outgoing_capabilities,
             vec!["kdeconnect.battery".to_string()]
         );
+    }
+
+    /// 2026-09-06 audit A2: under `SplitBrainPolicy::Refuse` (the
+    /// production default) a foreign id resolving from one of our own
+    /// addresses must neither enter the registry nor be dialed. Fails
+    /// before the fix: the handler warned, then upserted and dialed.
+    #[tokio::test]
+    async fn test_mdns_resolve_split_brain_is_refused() {
+        let (state, _t) = test_state();
+        state
+            .connection_manager
+            .set_split_brain_policy(crate::protocol::SplitBrainPolicy::Refuse);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Value expected to be present");
+        let addr = listener.local_addr().expect("Value expected to be present");
+
+        // Foreign id, loopback source: another daemon on this host.
+        on_mdns_device_resolved(state.clone(), peer_identity(addr.port()), addr);
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            state.registry.get(&PEER_ID.to_string()).await.is_err(),
+            "a split-brain id must not enter the registry via mDNS"
+        );
+        let dial =
+            tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await;
+        assert!(dial.is_err(), "a split-brain id must not be dialed");
     }
 
     /// Our own announcement resolved back (multicast loopback) must be

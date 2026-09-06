@@ -102,20 +102,19 @@ impl ConnectionManager {
             our_identity,
             addr,
             expected_identity,
-            crate::protocol::types::DEFAULT_UDP_PORT,
+            crate::protocol::types::fallback_udp_port(),
         )
         .await
     }
 
     /// `connect_to_device`'s real implementation, parameterized by the UDP
-    /// port the reverse-connection fallback (gap 5) targets. The port is
-    /// ALWAYS `DEFAULT_UDP_PORT` in production (the public wrapper above
-    /// hardcodes it) — the parameter exists so tests can point the
-    /// fallback at a private capture socket instead of the real port
-    /// 1716, which a live kdeconnect/rust-connect daemon on the test host
-    /// may already hold (observed on this dev box; a hardcoded-1716
-    /// capture test would be flaky-to-failing on any host actually
-    /// running the daemon it's testing).
+    /// port the reverse-connection fallback (gap 5) targets. The public
+    /// wrapper above passes `fallback_udp_port()`: `DEFAULT_UDP_PORT` in
+    /// production, `TEST_UDP_PORT` in test builds — a failing dial inside
+    /// `cargo test` used to unicast the fixture identity to `<peer>:1716`,
+    /// and on the daemon host that peer IP is 127.0.0.1, i.e. the live
+    /// daemon (2026-09-06 audit A2). The parameter itself exists so tests
+    /// can point the fallback at a private capture socket.
     async fn connect_to_device_with_fallback_port(
         &self,
         our_identity: &Identity,
