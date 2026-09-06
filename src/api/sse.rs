@@ -4,6 +4,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::response::Response;
@@ -11,12 +12,19 @@ use futures::stream::select_all;
 use futures::StreamExt;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tracing::warn;
 
 use crate::app::AppState;
 use crate::device::types::DeviceEvent;
 use crate::plugins::PluginEvent;
+
+/// Cadence at which the server emits a keepalive SSE comment on every
+/// active stream. Below typical reverse-proxy idle timeouts (nginx 60s,
+/// Caddy ~5 min, Cloudflare 100s) so a dead upstream surfaces as a
+/// closed client connection rather than a half-open socket the client
+/// believes is still live.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(untagged)]
@@ -28,9 +36,12 @@ pub enum ServerEvent {
     Plugin(Box<PluginEvent>),
 }
 
-/// One item off a wrapped broadcast stream: either a mapped event, or a
+/// One item off a wrapped broadcast stream: either a mapped event, a
 /// report that the subscriber fell behind and the broadcast channel
-/// dropped `dropped` events before this poll caught up.
+/// dropped `dropped` events before this poll caught up, or a periodic
+/// liveness signal so a dead upstream surfaces as a closed connection
+/// within `KEEPALIVE_INTERVAL` rather than a half-open socket the
+/// client believes is still live.
 ///
 /// `BroadcastStreamRecvError` has only the `Lagged` variant (the channel
 /// closing surfaces as `None` from the stream, not an `Err` item), so this
@@ -39,6 +50,7 @@ pub enum ServerEvent {
 enum StreamItem {
     Event(ServerEvent),
     Lagged(u64),
+    Keepalive,
 }
 
 /// Wrap a broadcast receiver as a `StreamItem` stream, mapping each
@@ -65,7 +77,9 @@ where
 /// can tell "the server has nothing new to say" apart from "the server
 /// had things to say and this client missed them" — silently reusing the
 /// unnamed `data:` event for both left a lagged client with no signal
-/// that its device/plugin state view could be stale.
+/// that its device/plugin state view could be stale. A `Keepalive` item
+/// becomes an SSE comment line, which every SSE consumer ignores but
+/// which keeps TCP intermediaries (and the client's read loop) alive.
 fn render_sse_item(item: StreamItem) -> Option<String> {
     match item {
         StreamItem::Event(event) => {
@@ -83,6 +97,7 @@ fn render_sse_item(item: StreamItem) -> Option<String> {
                 dropped
             ))
         }
+        StreamItem::Keepalive => Some(": keepalive\n\n".to_string()),
     }
 }
 
@@ -94,7 +109,19 @@ pub async fn sse_events(
         ServerEvent::Plugin(Box::new(event))
     });
 
-    let streams = select_all(vec![device_stream, plugin_stream]);
+    // Third stream: a wall-clock tick at KEEPALIVE_INTERVAL. `select_all`
+    // pulls from each in turn; if the broadcast channels sit idle, the
+    // tick is the only item that ever fires and the client sees a
+    // comment every interval, which is enough to learn "this upstream
+    // is alive" without parsing data frames.
+    let keepalive_stream = IntervalStream::new(tokio::time::interval(KEEPALIVE_INTERVAL))
+        .map(|_| StreamItem::Keepalive);
+
+    let streams = select_all(vec![
+        device_stream,
+        plugin_stream,
+        Box::pin(keepalive_stream),
+    ]);
 
     let body_stream =
         streams.filter_map(|item| async move { render_sse_item(item).map(Ok::<_, Infallible>) });
@@ -167,6 +194,37 @@ mod tests {
         assert_eq!(
             dropped, 6,
             "expected exactly 6 dropped (10 sent - capacity 4), got: {lagged_line}"
+        );
+    }
+
+    /// An idle merged stream must yield a `: keepalive` SSE comment
+    /// within one interval so a dead upstream surfaces as a closed
+    /// connection rather than a half-open socket the client believes is
+    /// still live. Pre-fix the merged stream only ever produced items
+    /// from the broadcast channels and would sit idle forever on a
+    /// quiet system.
+    #[tokio::test]
+    async fn test_idle_stream_emits_keepalive_comment() {
+        use std::time::Duration;
+        // Faster-than-prod cadence so the test stays under the 20 s
+        // wall-clock cap while still exercising the same code path.
+        let stream = IntervalStream::new(tokio::time::interval(Duration::from_millis(50)))
+            .map(|_| StreamItem::Keepalive);
+
+        // Pull the first item off the stream and bound the wait so a
+        // regression that removes the keepalive (or one that reorders
+        // streams so a silent channel blocks the merge) shows up as a
+        // test failure, not a hang.
+        let first = tokio::time::timeout(Duration::from_secs(20), stream.into_future())
+            .await
+            .expect("keepalive must arrive within 20 s")
+            .0
+            .expect("stream must yield at least one item");
+
+        let rendered = render_sse_item(first).expect("keepalive must render to wire text");
+        assert_eq!(
+            rendered, ": keepalive\n\n",
+            "keepalive must be an SSE comment, not a data: frame"
         );
     }
 }
