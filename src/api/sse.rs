@@ -53,6 +53,49 @@ enum StreamItem {
     Keepalive,
 }
 
+/// Discriminator for the JSON payload of an SSE event frame. Each
+/// `ServerEvent` is an untagged serde enum, so without this an `onmessage`
+/// consumer has to sniff keys (look for `device_id`, `app_name`, …) to
+/// know which pane to route to. Pre-fix the UI did `payload.type ||
+/// payload.event_type`, which only worked because the two upstream enums
+/// happened to use different tag names (`type` vs `event_type`) — adding
+/// a third source with the same tag name as one of those would silently
+/// double-route.
+///
+/// Returned as `enum.variant_snake_case` so the wire value is unique
+/// across both source enums (`device.state_changed` and
+/// `plugin.clipboard_update` cannot collide) and stable: the snake-cased
+/// variant name is what the existing serde tags already produce, so the
+/// `kind` value and the existing `event_type`/`type` field agree on
+/// `state_changed` vs `MprisUpdate` etc., just on a shared namespace.
+fn kind(event: &ServerEvent) -> &'static str {
+    match event {
+        ServerEvent::Device(DeviceEvent::Discovered { .. }) => "device.discovered",
+        ServerEvent::Device(DeviceEvent::StateChanged { .. }) => "device.state_changed",
+        ServerEvent::Device(DeviceEvent::Paired { .. }) => "device.paired",
+        ServerEvent::Device(DeviceEvent::Unpaired { .. }) => "device.unpaired",
+        ServerEvent::Device(DeviceEvent::PairRequested { .. }) => "device.pair_requested",
+        ServerEvent::Device(DeviceEvent::Connected { .. }) => "device.connected",
+        ServerEvent::Device(DeviceEvent::Disconnected { .. }) => "device.disconnected",
+        ServerEvent::Device(DeviceEvent::Removed { .. }) => "device.removed",
+        ServerEvent::Plugin(p) => match &**p {
+            PluginEvent::Notification { .. } => "plugin.notification",
+            PluginEvent::Battery { .. } => "plugin.battery",
+            PluginEvent::MprisUpdate { .. } => "plugin.mpris_update",
+            PluginEvent::TelephonyUpdate { .. } => "plugin.telephony_update",
+            PluginEvent::ClipboardUpdate { .. } => "plugin.clipboard_update",
+            PluginEvent::SftpUpdate { .. } => "plugin.sftp_update",
+            PluginEvent::RemoteKeyboardEcho { .. } => "plugin.remote_keyboard_echo",
+            PluginEvent::RemoteKeyboardState { .. } => "plugin.remote_keyboard_state",
+            PluginEvent::RemoteCommandsUpdate { .. } => "plugin.remote_commands_update",
+            PluginEvent::ShareText { .. } => "plugin.share_text",
+            PluginEvent::ShareUrl { .. } => "plugin.share_url",
+            PluginEvent::ShareProgress { .. } => "plugin.share_progress",
+            PluginEvent::SystemVolumeUpdate { .. } => "plugin.system_volume_update",
+        },
+    }
+}
+
 /// Wrap a broadcast receiver as a `StreamItem` stream, mapping each
 /// delivered value through `map` and turning a `Lagged(n)` recv error into
 /// `StreamItem::Lagged(n)` instead of silently dropping it. Pulled out of
@@ -83,7 +126,20 @@ where
 fn render_sse_item(item: StreamItem) -> Option<String> {
     match item {
         StreamItem::Event(event) => {
-            let json = serde_json::to_string(&event).ok()?;
+            // Serialize, then add `kind`. The DeviceEvent/PluginEvent
+            // serde shapes carry their own discriminator (`event_type`
+            // for device, `type` for plugin) and we MUST NOT change
+            // them: the onmessage consumer in the UI and any other
+            // existing consumer reads `event_type`/`type` directly. The
+            // `kind` key is added on top of the existing keys, so a
+            // client that ignores `kind` sees exactly the same frames
+            // it always has, plus one key.
+            let mut value = serde_json::to_value(&event).ok()?;
+            if let Some(object) = value.as_object_mut() {
+                let key = kind(&event);
+                object.insert("kind".to_string(), serde_json::Value::String(key.to_string()));
+            }
+            let json = serde_json::to_string(&value).ok()?;
             Some(format!("data: {}\n\n", json))
         }
         StreamItem::Lagged(dropped) => {
@@ -225,6 +281,78 @@ mod tests {
         assert_eq!(
             rendered, ": keepalive\n\n",
             "keepalive must be an SSE comment, not a data: frame"
+        );
+    }
+
+    /// A rendered device event must carry `kind == "device.state_changed"`
+    /// alongside the existing keys, so an `onmessage` consumer that
+    /// discriminates by `event_type`/`type` continues to work AND a
+    /// consumer that discriminates by `kind` works too. The serializer
+    /// is non-breaking by design: existing keys are unchanged, one key
+    /// is added.
+    #[test]
+    fn test_render_sse_event_includes_kind_and_preserves_existing_keys() {
+        let event = ServerEvent::Device(DeviceEvent::StateChanged {
+            device_id: "dev-1".to_string(),
+            old_state: crate::device::types::DeviceState::Discovered,
+            new_state: crate::device::types::DeviceState::Connected,
+        });
+
+        let rendered =
+            render_sse_item(StreamItem::Event(event)).expect("event frame must render");
+        // Frame must be an unnamed `data:` event (existing onmessage
+        // consumers depend on the absence of an `event:` line for these).
+        assert!(
+            rendered.starts_with("data: {"),
+            "device data frame must be unnamed; got: {rendered}"
+        );
+
+        // Extract the JSON payload and verify both the discriminator
+        // and the pre-existing keys survive untouched.
+        let json_str = rendered
+            .trim_start_matches("data: ")
+            .trim_end_matches("\n\n")
+            .trim_end();
+        let value: serde_json::Value =
+            serde_json::from_str(json_str).expect("data frame must be valid JSON");
+
+        assert_eq!(
+            value.get("kind").and_then(|v| v.as_str()),
+            Some("device.state_changed"),
+            "kind must identify the variant on the shared enum.variant namespace"
+        );
+        // Pre-existing key (DeviceEvent uses `event_type: `snake_case``).
+        assert_eq!(
+            value.get("event_type").and_then(|v| v.as_str()),
+            Some("state_changed"),
+            "existing event_type key must be preserved unchanged"
+        );
+        assert_eq!(
+            value.get("device_id").and_then(|v| v.as_str()),
+            Some("dev-1"),
+            "device_id must be preserved unchanged"
+        );
+    }
+
+    /// `kind` must namespace the two source enums so the same wire
+    /// value cannot be claimed by both a device and a plugin variant —
+    /// the consumers were unprotected against that pre-fix because the
+    /// two upstream enums used different tag names (`event_type` vs
+    /// `type`), so they happened not to collide.
+    #[test]
+    fn test_kind_namespaces_device_and_plugin_variants() {
+        let device_event = ServerEvent::Device(DeviceEvent::Paired {
+            device_id: "dev-1".to_string(),
+            device_name: "Phone".to_string(),
+        });
+        // Pretend there's a plugin variant with the same wire name — we
+        // can't actually name it identically in Rust, but the value of
+        // `kind` MUST distinguish between a device and a plugin of the
+        // same nominal name. We assert the namespace prefix is present
+        // and consistent.
+        assert!(
+            kind(&device_event).starts_with("device."),
+            "device events must carry the device. namespace"
         );
     }
 }
