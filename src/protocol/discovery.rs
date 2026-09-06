@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::protocol::packet::PacketSerializer;
 use crate::protocol::types::{Identity, MAX_PORT, MIN_PORT};
+use crate::protocol::SplitBrainPolicy;
 use crate::utils::errors::{Error, Result};
 
 /// Target UDP receive-buffer capacity (parity-checklist.md § Robustness
@@ -50,6 +51,9 @@ pub struct DiscoveryService {
     pub socket: UdpSocket,
     pub identity: Identity,
     pub broadcast_addr: SocketAddr,
+    /// See [`SplitBrainPolicy`]; production refuses, test builds warn
+    /// only unless a test opts in via `with_split_brain_policy`.
+    pub split_brain_policy: SplitBrainPolicy,
 }
 
 impl DiscoveryService {
@@ -84,6 +88,24 @@ impl DiscoveryService {
     /// # }
     /// ```
     pub async fn new(identity: Identity, udp_port: u16) -> Result<Self> {
+        // Tripwire, test builds only: never bind or target the production
+        // discovery port. SO_REUSEADDR (below) lets a test socket on
+        // 127.0.0.1:1716 coexist with a live daemon's 0.0.0.0:1716 and
+        // receive a share of its traffic, and a test broadcast to
+        // 127.0.0.1:1716 lands in that daemon's registry (2026-09-06
+        // audit A2). Loud rather than a silent remap: a test that asks
+        // for 1716 is a test that needs fixing.
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            if udp_port == crate::protocol::types::DEFAULT_UDP_PORT {
+                return Err(Error::DiscoveryError(format!(
+                    "test builds refuse the production discovery port {udp_port}: a live \
+                     daemon on this host would hear the fixture; bind 0 (ephemeral) or \
+                     TEST_UDP_PORT instead"
+                )));
+            }
+        }
+
         // Test discovery on a production LAN used to leave the host: the
         // UDP socket bound `0.0.0.0:port` (so it could hear real LAN
         // traffic) and `broadcast_addr` targeted `255.255.255.255:port`
@@ -182,7 +204,15 @@ impl DiscoveryService {
             broadcast_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), udp_port),
             #[cfg(not(any(test, feature = "test-helpers")))]
             broadcast_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), udp_port),
+            split_brain_policy: SplitBrainPolicy::default_for_build(),
         })
+    }
+
+    /// Override the split-brain disposition. Production never calls this
+    /// (the build default is `Refuse`); tests that pin the refusal do.
+    pub fn with_split_brain_policy(mut self, policy: SplitBrainPolicy) -> Self {
+        self.split_brain_policy = policy;
+        self
     }
 
     /// Broadcast this device's identity
@@ -329,6 +359,12 @@ impl DiscoveryService {
                 "Another KDE Connect implementation is announcing from THIS host: \
                  two daemons will compete for the same paired phones"
             );
+            if self.split_brain_policy == SplitBrainPolicy::Refuse {
+                // Named the condition; now act on it. The listen loop
+                // treats this like `ignored_own`: no second log line, no
+                // callback, no registry write, no dial.
+                return Err(Error::DiscoveryError("split_brain".to_string()));
+            }
         }
 
         info!(
@@ -397,7 +433,10 @@ impl DiscoveryService {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    if msg.contains("ignored_own") {
+                    // Both already logged at their own level inside
+                    // `listen`; a generic listen_error on top would be
+                    // noise.
+                    if msg.contains("ignored_own") || msg.contains("split_brain") {
                         continue;
                     }
                     warn!(
@@ -453,6 +492,7 @@ mod tests {
             socket,
             identity,
             broadcast_addr,
+            split_brain_policy: SplitBrainPolicy::default_for_build(),
         })
     }
 
@@ -848,6 +888,68 @@ mod tests {
                 );
             }
             Err(_) => {}
+        }
+    }
+
+    /// 2026-09-06 audit A2: a test build must never bind or target the
+    /// production discovery port — with SO_REUSEADDR a test socket on
+    /// 127.0.0.1:1716 shares traffic with a live daemon on 0.0.0.0:1716.
+    /// Fails before the fix (`new` accepted 1716 like any other port).
+    #[tokio::test]
+    async fn test_test_build_refuses_the_production_udp_port() {
+        let identity = create_test_identity("Tripwire");
+        let err =
+            match DiscoveryService::new(identity, crate::protocol::types::DEFAULT_UDP_PORT).await {
+                Ok(_) => panic!("a test build must refuse to bind the production discovery port"),
+                Err(e) => e,
+            };
+        assert!(
+            err.to_string().contains("production discovery port"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// 2026-09-06 audit A2: with `SplitBrainPolicy::Refuse` (the
+    /// production default) a foreign identity arriving from one of our
+    /// own addresses is dropped by `listen` — no `Ok`, so the listen
+    /// loop never runs its callback, so nothing is registered or dialed.
+    /// The `WarnOnly` control below shows the same packet is delivered
+    /// under the old policy. Fails before the fix (the detector only
+    /// warned; `listen` returned `Ok` either way).
+    #[tokio::test]
+    async fn test_refuse_policy_drops_a_split_brain_identity() {
+        for (policy, expect_delivered) in [
+            (SplitBrainPolicy::Refuse, false),
+            (SplitBrainPolicy::WarnOnly, true),
+        ] {
+            let listener = create_test_service("Split Brain Listener")
+                .await
+                .expect("listener")
+                .with_split_brain_policy(policy);
+            let listen_addr = listener.socket.local_addr().expect("listener addr");
+
+            // A different daemon on THIS host: foreign id, loopback source.
+            let other = create_test_identity("Other Daemon On This Host");
+            let bytes = PacketSerializer::serialize(&other.to_packet().expect("packet"))
+                .expect("serialize");
+            let sender = UdpSocket::bind("127.0.0.1:0").await.expect("sender");
+            sender.send_to(&bytes, listen_addr).await.expect("send");
+
+            let result = tokio::time::timeout(Duration::from_secs(2), listener.listen())
+                .await
+                .expect("listen must return within 2 s");
+            match (result, expect_delivered) {
+                (Ok((identity, _)), true) => assert_eq!(identity.device_id, other.device_id),
+                (Err(e), false) => assert!(
+                    e.to_string().contains("split_brain"),
+                    "Refuse must drop the identity as split_brain, got: {e}"
+                ),
+                (Ok((identity, _)), false) => panic!(
+                    "Refuse policy delivered a split-brain identity: {}",
+                    identity.device_id
+                ),
+                (Err(e), true) => panic!("WarnOnly must deliver the identity, got: {e}"),
+            }
         }
     }
 
