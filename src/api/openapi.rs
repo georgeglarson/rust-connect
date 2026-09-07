@@ -106,6 +106,10 @@ use crate::device::types::{Device, DeviceState, DeviceType};
         ShareUrlRequest,
         handlers::SendKeypressRequest,
         handlers::RemoteCommandsResponse,
+        SentResponse,
+        SentResponseWrapper,
+        handlers::plugins::battery::BatteryResponse,
+        BatteryResponseWrapper,
     )),
     modifiers(&SecurityAddon),
     tags(

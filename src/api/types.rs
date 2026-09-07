@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::api::handlers::RemoteCommandsResponse;
+use crate::api::handlers::plugins::battery::BatteryResponse;
 use crate::device::types::{Device, DeviceState, DeviceType};
 use crate::utils::errors::ErrorCode;
 
@@ -19,6 +20,8 @@ use crate::utils::errors::ErrorCode;
     GenericResponse = ApiResponse<serde_json::Value>,
     RemoteCommandsResponseWrapper = ApiResponse<RemoteCommandsResponse>,
     PluginsResponse = ApiResponse<PluginListResponse>,
+    SentResponseWrapper = ApiResponse<SentResponse>,
+    BatteryResponseWrapper = ApiResponse<BatteryResponse>,
 )]
 pub struct ApiResponse<T: Serialize> {
     pub status: &'static str,
@@ -54,7 +57,6 @@ pub const UNTYPED_API_ALIASES: &[&str] = &["GenericResponse", "PingResponse"];
 /// `volume`/`muted`) get their own struct; reusing this one would erase
 /// information the spec is supposed to describe.
 #[derive(Debug, Serialize, ToSchema)]
-#[aliases(SentResponseWrapper = ApiResponse<SentResponse>)]
 pub struct SentResponse {
     pub device_id: String,
     pub sent: bool,
