@@ -25,7 +25,7 @@ use super::tool::{Tool, ToolParameter};
 /// kde reads the same keys at telephonyplugin.cpp:22-25.
 ///
 /// There is no `timestamp` on this packet in any upstream implementation.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TelephonyInfo {
     pub event: String,

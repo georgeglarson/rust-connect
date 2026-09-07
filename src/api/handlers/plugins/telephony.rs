@@ -1,10 +1,19 @@
 use axum::extract::{Path, State};
 use axum::Json;
+use serde::Serialize;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
 use crate::app::AppState;
+use crate::plugins::telephony::TelephonyInfo;
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TelephonyCallsResponse {
+    pub device_id: String,
+    pub calls: Vec<TelephonyInfo>,
+}
 
 #[utoipa::path(
     get,
@@ -14,7 +23,7 @@ use crate::app::AppState;
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Get telephony events from device", body = GenericResponse),
+        (status = 200, description = "Get telephony events from device", body = TelephonyCallsResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),
@@ -23,14 +32,11 @@ use crate::app::AppState;
 pub async fn get_device_telephony(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<TelephonyCallsResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     let calls = state.plugins.telephony.get_calls(&device_id);
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "calls": calls,
-    }))))
+    Ok(Json(ApiResponse::ok(TelephonyCallsResponse { device_id, calls })))
 }
 
 #[utoipa::path(
@@ -41,7 +47,7 @@ pub async fn get_device_telephony(
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Mute request sent", body = GenericResponse),
+        (status = 200, description = "Mute request sent", body = SentResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),
@@ -56,7 +62,7 @@ pub async fn get_device_telephony(
 pub async fn mute_device_call(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<SentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     let packet = crate::plugins::TelephonyPlugin::mute_request_packet();
@@ -66,8 +72,28 @@ pub async fn mute_device_call(
         .await
         .map_err(api_err)?;
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "sent": true
-    }))))
+    Ok(Json(ApiResponse::ok(SentResponse {
+        device_id,
+        sent: true,
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn test_telephony_calls_response_matches_legacy_shape() {
+        let response = TelephonyCallsResponse {
+            device_id: "phone-1".to_string(),
+            calls: vec![],
+        };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "calls": [],
+        });
+        assert_eq!(typed, legacy);
+    }
 }

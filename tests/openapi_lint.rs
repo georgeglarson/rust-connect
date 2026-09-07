@@ -124,8 +124,9 @@ fn test_untyped_response_bodies_only_ever_decrease() {
 
     // 2026-09-06 audit, base `main` (sha 91aed7c). Lower it in the same
     // commit that types an endpoint, never bump it. Battery endpoints
-    // typed here: pin 35 → 33.
-    const PIN: usize = 33;
+    // typed here: pin 35 → 33. Connectivity + telephony endpoints typed
+    // here: pin 33 → 31.
+    const PIN: usize = 31;
     assert!(
         count <= PIN,
         "untyped-response pin is {PIN}; this commit allows {count} (offenders: {offenders:#?}). \

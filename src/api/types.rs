@@ -8,6 +8,8 @@ use utoipa::ToSchema;
 
 use crate::api::handlers::RemoteCommandsResponse;
 use crate::api::handlers::plugins::battery::BatteryResponse;
+use crate::api::handlers::plugins::connectivity::ConnectivityResponse;
+use crate::api::handlers::plugins::telephony::TelephonyCallsResponse;
 use crate::device::types::{Device, DeviceState, DeviceType};
 use crate::utils::errors::ErrorCode;
 
@@ -22,6 +24,8 @@ use crate::utils::errors::ErrorCode;
     PluginsResponse = ApiResponse<PluginListResponse>,
     SentResponseWrapper = ApiResponse<SentResponse>,
     BatteryResponseWrapper = ApiResponse<BatteryResponse>,
+    ConnectivityResponseWrapper = ApiResponse<ConnectivityResponse>,
+    TelephonyCallsResponseWrapper = ApiResponse<TelephonyCallsResponse>,
 )]
 pub struct ApiResponse<T: Serialize> {
     pub status: &'static str,

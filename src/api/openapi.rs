@@ -110,6 +110,11 @@ use crate::device::types::{Device, DeviceState, DeviceType};
         SentResponseWrapper,
         handlers::plugins::battery::BatteryResponse,
         BatteryResponseWrapper,
+        handlers::plugins::connectivity::ConnectivityResponse,
+        ConnectivityResponseWrapper,
+        handlers::plugins::telephony::TelephonyCallsResponse,
+        TelephonyCallsResponseWrapper,
+        crate::plugins::telephony::TelephonyInfo,
     )),
     modifiers(&SecurityAddon),
     tags(
