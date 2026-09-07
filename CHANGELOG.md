@@ -61,6 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Every REST response body is a typed schema in the OpenAPI spec: the
+  `GenericResponse` alias (`data: {}`) is gone, each endpoint returns a
+  named struct, and `tests/openapi_lint.rs` pins the count of untyped
+  200 bodies at zero. Wire shapes are unchanged; per-endpoint
+  serialization tests compare each struct to the literal it replaced.
 - The `X-Request-ID` response header and the envelope's
   `metadata.request_id` are now the same id, and it is the id the
   `api_request` / `api_response` log lines carry. They were three

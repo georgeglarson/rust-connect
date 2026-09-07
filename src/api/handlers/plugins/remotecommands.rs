@@ -93,10 +93,8 @@ pub async fn get_remotecommands(
 pub async fn trigger_remotecommand(
     State(state): State<Arc<AppState>>,
     Path((device_id, key)): Path<(String, String)>,
-) -> Result<
-    Json<ApiResponse<RemoteCommandTriggerResponse>>,
-    (axum::http::StatusCode, Json<ApiError>),
-> {
+) -> Result<Json<ApiResponse<RemoteCommandTriggerResponse>>, (axum::http::StatusCode, Json<ApiError>)>
+{
     validate_device_id(&device_id).map_err(crate::api::extractors::api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {

@@ -7,8 +7,8 @@ use utoipa::ToSchema;
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
 use crate::app::AppState;
-use crate::utils::errors::Error;
 use crate::plugins::mpris::{LocalPlayerState, MprisInfo};
+use crate::utils::errors::Error;
 
 /// GET /devices/{id}/mpris — phone-as-player-host snapshot list.
 #[derive(Debug, Serialize, ToSchema)]
@@ -74,7 +74,8 @@ pub async fn get_device_mpris(
 )]
 pub async fn get_local_players(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ApiResponse<MprisLocalPlayersResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<MprisLocalPlayersResponse>>, (axum::http::StatusCode, Json<ApiError>)>
+{
     // Control role: this machine's own players as tracked from the session
     // D-Bus (empty when no session backend is enabled).
     let players = state.plugins.mpris.local_players();
@@ -213,7 +214,9 @@ mod tests {
 
     #[test]
     fn test_mpris_local_players_response_matches_legacy_shape() {
-        let response = MprisLocalPlayersResponse { players: Vec::new() };
+        let response = MprisLocalPlayersResponse {
+            players: Vec::new(),
+        };
         let typed = serde_json::to_value(&response).expect("typed serialization");
         let legacy = serde_json::json!({ "players": [] });
         assert_eq!(typed, legacy);

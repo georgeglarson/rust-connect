@@ -46,7 +46,8 @@ pub async fn set_volume(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
     Json(body): Json<VolumeControlRequest>,
-) -> Result<Json<ApiResponse<VolumeControlSentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<VolumeControlSentResponse>>, (axum::http::StatusCode, Json<ApiError>)>
+{
     validate_device_id(&device_id).map_err(api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {
@@ -82,7 +83,11 @@ pub async fn set_volume(
         device_id,
         volume: body.volume,
         muted: body.muted,
-        name: if body.name.is_empty() { None } else { Some(body.name) },
+        name: if body.name.is_empty() {
+            None
+        } else {
+            Some(body.name)
+        },
         sent: true,
     })))
 }

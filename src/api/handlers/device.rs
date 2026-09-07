@@ -582,7 +582,8 @@ pub struct DeviceDisconnectedResponse {
 pub async fn disconnect_device(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-) -> Result<Json<ApiResponse<DeviceDisconnectedResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<DeviceDisconnectedResponse>>, (axum::http::StatusCode, Json<ApiError>)>
+{
     validate_device_id(&device_id).map_err(api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {

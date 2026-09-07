@@ -44,7 +44,8 @@ pub struct SftpInfoResponse {
     pub path_names: Vec<String>,
     pub available: bool,
     pub mounted: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always present (`null` when nothing is mounted): the pre-typed
+    /// literal emitted it unconditionally and the UI reads it.
     pub mount_point: Option<String>,
     pub mount_state: String,
 }
@@ -108,8 +109,9 @@ pub async fn request_sftp(
     Ok(Json(ApiResponse::ok(SftpRequestResponse {
         device_id,
         sent: true,
-        message: "SFTP session requested. Poll GET /devices/{device_id}/sftp for connection details."
-            .to_string(),
+        message:
+            "SFTP session requested. Poll GET /devices/{device_id}/sftp for connection details."
+                .to_string(),
     })))
 }
 

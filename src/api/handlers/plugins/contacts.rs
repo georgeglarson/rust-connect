@@ -7,8 +7,8 @@ use utoipa::ToSchema;
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
 use crate::app::AppState;
-use crate::utils::errors::Error;
 use crate::plugins::contacts::Contact;
+use crate::utils::errors::Error;
 
 /// POST /devices/{id}/contacts/sync — adds the human-readable `message`
 /// the UI shows while it waits for the phone's vCard reply; the shared

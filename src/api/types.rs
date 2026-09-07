@@ -6,14 +6,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::api::handlers::RemoteCommandsResponse;
-use crate::api::handlers::{
-    ConnectedDevicesResponse, DeviceConnectedResponse, DeviceDisconnectedResponse,
-    DeviceRemovedResponse, DeviceStateResponse, PingSentResponse,
-};
-use crate::api::handlers::share::{
-    ShareFileSentResponse, ShareFilesResponse, ShareTextSentResponse, ShareUrlSentResponse,
-};
 use crate::api::handlers::plugins::battery::BatteryResponse;
 use crate::api::handlers::plugins::clipboard::{ClipboardContentResponse, ClipboardSetResponse};
 use crate::api::handlers::plugins::connectivity::ConnectivityResponse;
@@ -27,18 +19,24 @@ use crate::api::handlers::plugins::notification::{
     NotificationActionTriggeredResponse, NotificationDismissedResponse, NotificationReplyResponse,
     NotificationSentResponse, NotificationsListResponse,
 };
-use crate::api::handlers::plugins::remotecontrol::PointerActionSentResponse;
 use crate::api::handlers::plugins::remotecommands::RemoteCommandTriggerResponse;
+use crate::api::handlers::plugins::remotecontrol::PointerActionSentResponse;
 use crate::api::handlers::plugins::remotekeyboard::KeypressSentResponse;
 use crate::api::handlers::plugins::sftp::{
     SftpInfoResponse, SftpMountResponse, SftpRequestResponse, SftpUnmountResponse,
 };
-use crate::api::handlers::plugins::sms::{
-    SmsSentResponse, SmsThreadResponse, SmsThreadsResponse,
-};
+use crate::api::handlers::plugins::sms::{SmsSentResponse, SmsThreadResponse, SmsThreadsResponse};
 use crate::api::handlers::plugins::systemvolume::LocalSinkControlResponse;
 use crate::api::handlers::plugins::telephony::TelephonyCallsResponse;
 use crate::api::handlers::plugins::volume::VolumeControlSentResponse;
+use crate::api::handlers::share::{
+    ShareFileSentResponse, ShareFilesResponse, ShareTextSentResponse, ShareUrlSentResponse,
+};
+use crate::api::handlers::RemoteCommandsResponse;
+use crate::api::handlers::{
+    ConnectedDevicesResponse, DeviceConnectedResponse, DeviceDisconnectedResponse,
+    DeviceRemovedResponse, DeviceStateResponse, PingSentResponse,
+};
 use crate::device::types::{Device, DeviceState, DeviceType};
 use crate::utils::errors::ErrorCode;
 

@@ -88,10 +88,8 @@ pub async fn send_remotecontrol_pointer(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
     Json(action): Json<PointerAction>,
-) -> Result<
-    Json<ApiResponse<PointerActionSentResponse>>,
-    (axum::http::StatusCode, Json<ApiError>),
-> {
+) -> Result<Json<ApiResponse<PointerActionSentResponse>>, (axum::http::StatusCode, Json<ApiError>)>
+{
     validate_device_id(&device_id).map_err(api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {

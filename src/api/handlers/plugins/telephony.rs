@@ -36,7 +36,10 @@ pub async fn get_device_telephony(
     validate_device_id(&device_id).map_err(api_err)?;
 
     let calls = state.plugins.telephony.get_calls(&device_id);
-    Ok(Json(ApiResponse::ok(TelephonyCallsResponse { device_id, calls })))
+    Ok(Json(ApiResponse::ok(TelephonyCallsResponse {
+        device_id,
+        calls,
+    })))
 }
 
 #[utoipa::path(

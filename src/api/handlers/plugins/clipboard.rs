@@ -170,8 +170,8 @@ mod tests {
 
     #[test]
     fn test_set_clipboard_request_parses() {
-        let body: SetClipboardRequest = serde_json::from_str(r#"{"content":"x"}"#)
-            .expect("request body must parse");
+        let body: SetClipboardRequest =
+            serde_json::from_str(r#"{"content":"x"}"#).expect("request body must parse");
         assert_eq!(body.content, "x");
     }
 }

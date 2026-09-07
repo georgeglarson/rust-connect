@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-use crate::api::extractors::{api_err, validate_device_id};
+use crate::api::extractors::api_err;
 use crate::api::types::*;
 use crate::app::AppState;
 use crate::plugins::plugin::Plugin;
@@ -201,10 +201,4 @@ mod tests {
         });
         assert_eq!(typed, legacy);
     }
-}
-
-// Reference validate_device_id so the import isn't dead.
-#[allow(dead_code)]
-fn _keep_validate_device_id_import() {
-    let _ = validate_device_id;
 }

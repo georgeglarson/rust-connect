@@ -147,10 +147,12 @@ fn test_untyped_response_bodies_only_ever_decrease() {
     // `disconnect_device` got their own types because the legacy
     // shape carried `removed`/`connected`/`disconnected` flags the
     // shared struct doesn't have.
+    // The pin reached zero on 2026-09-06: no 200 body in the spec is
+    // `serde_json::Value`. Equality, not `<=`, so it stays there.
     const PIN: usize = 0;
-    assert!(
-        count <= PIN,
-        "untyped-response pin is {PIN}; this commit allows {count} (offenders: {offenders:#?}). \
-         Did you add an endpoint that uses an alias from UNTYPED_API_ALIASES without lowering the pin?"
+    assert_eq!(
+        count, PIN,
+        "the spec has {count} untyped 200 bodies (offenders: {offenders:#?}); every response \
+         body must be a typed schema (docs/constitution.md § 1)"
     );
 }

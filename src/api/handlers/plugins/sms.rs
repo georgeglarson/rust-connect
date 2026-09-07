@@ -7,8 +7,8 @@ use utoipa::ToSchema;
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
 use crate::app::AppState;
-use crate::utils::errors::Error;
 use crate::plugins::sms::{SmsMessage, SmsThread};
+use crate::utils::errors::Error;
 
 /// GET /devices/{id}/sms/threads — paginated thread list.
 #[derive(Debug, Serialize, ToSchema)]

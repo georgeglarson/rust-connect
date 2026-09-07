@@ -81,7 +81,8 @@ pub struct NotificationDismissedResponse {
 pub async fn get_notifications(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
-) -> Result<Json<ApiResponse<NotificationsListResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<NotificationsListResponse>>, (axum::http::StatusCode, Json<ApiError>)>
+{
     let device_id = params.get("device_id").map(|s| s.as_str());
     let pagination = Pagination::from_query(&params);
     let page = pagination.page();
@@ -196,7 +197,8 @@ pub async fn reply_notification(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((device_id, notification_id)): axum::extract::Path<(String, String)>,
     Json(body): Json<ReplyNotificationRequest>,
-) -> Result<Json<ApiResponse<NotificationReplyResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<NotificationReplyResponse>>, (axum::http::StatusCode, Json<ApiError>)>
+{
     validate_device_id(&device_id).map_err(api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {
@@ -314,7 +316,10 @@ pub async fn activate_notification_action(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((device_id, notification_id)): axum::extract::Path<(String, String)>,
     Json(body): Json<NotificationActionRequest>,
-) -> Result<Json<ApiResponse<NotificationActionTriggeredResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<
+    Json<ApiResponse<NotificationActionTriggeredResponse>>,
+    (axum::http::StatusCode, Json<ApiError>),
+> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {
@@ -403,7 +408,10 @@ mod task_1_4_wire_tests {
 pub async fn dismiss_notification(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((device_id, notification_id)): axum::extract::Path<(String, String)>,
-) -> Result<Json<ApiResponse<NotificationDismissedResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<
+    Json<ApiResponse<NotificationDismissedResponse>>,
+    (axum::http::StatusCode, Json<ApiError>),
+> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     if notification_id.is_empty() {
