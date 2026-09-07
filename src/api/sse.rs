@@ -154,7 +154,10 @@ fn render_sse_item(item: StreamItem, next_id: u64) -> Option<String> {
             let mut value = serde_json::to_value(&event).ok()?;
             if let Some(object) = value.as_object_mut() {
                 let key = kind(&event);
-                object.insert("kind".to_string(), serde_json::Value::String(key.to_string()));
+                object.insert(
+                    "kind".to_string(),
+                    serde_json::Value::String(key.to_string()),
+                );
             }
             let json = serde_json::to_string(&value).ok()?;
             Some(format!("id: {next_id}\ndata: {json}\n\n"))
@@ -231,9 +234,9 @@ pub async fn sse_events(
                 format!("failed to serialize SSE snapshot: {e}"),
             )
         })?;
-        Ok::<_, (axum::http::StatusCode, String)>(futures::stream::once(
-            async move { StreamItem::Snapshot(json) },
-        ))
+        Ok::<_, (axum::http::StatusCode, String)>(futures::stream::once(async move {
+            StreamItem::Snapshot(json)
+        }))
     }
     .await?
     .boxed();
@@ -259,8 +262,9 @@ pub async fn sse_events(
             // Keepalives burn an id even though they don't emit it —
             // acceptable cost for keeping the counter shared across all
             // items, and the brief scopes `Last-Event-ID` out.
-            let next_id =
-                state_for_id.event_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let next_id = state_for_id
+                .event_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             render_sse_item(item, next_id).map(Ok::<_, Infallible>)
         }
     });
@@ -383,8 +387,8 @@ mod tests {
             new_state: crate::device::types::DeviceState::Connected,
         });
 
-        let rendered = render_sse_item(StreamItem::Event(event), 0)
-            .expect("event frame must render");
+        let rendered =
+            render_sse_item(StreamItem::Event(event), 0).expect("event frame must render");
         // Frame must carry `id:` and `data:` (existing onmessage
         // consumers depend on the absence of an `event:` line for
         // these). Skip past the leading `id:` line to find the JSON.
@@ -406,9 +410,7 @@ mod tests {
 
         // Extract the JSON payload and verify both the discriminator
         // and the pre-existing keys survive untouched.
-        let json_str = data_line
-            .trim_start_matches("data: ")
-            .trim_end();
+        let json_str = data_line.trim_start_matches("data: ").trim_end();
         let value: serde_json::Value =
             serde_json::from_str(json_str).expect("data frame must be valid JSON");
 
@@ -556,7 +558,9 @@ mod tests {
         // wire). The prelude is `render_device_list(..) -> Snapshot`.
         let list = crate::api::handlers::render_device_list(&state, 1, usize::MAX).await;
         let json = serde_json::to_string(&list).expect("snapshot must serialize");
-        let id = state.event_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = state
+            .event_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let rendered =
             render_sse_item(StreamItem::Snapshot(json), id).expect("snapshot must render");
 
@@ -570,7 +574,10 @@ mod tests {
         );
 
         // Payload must list both devices and carry `pair_state` overlay.
-        assert!(rendered.contains(&phone_id), "snapshot must include phone: {rendered}");
+        assert!(
+            rendered.contains(&phone_id),
+            "snapshot must include phone: {rendered}"
+        );
         assert!(
             rendered.contains(&desktop_id),
             "snapshot must include desktop: {rendered}"
