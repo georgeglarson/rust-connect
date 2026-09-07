@@ -9,6 +9,7 @@
 use std::collections::BTreeSet;
 
 use rust_connect::api::openapi::ApiDoc;
+use rust_connect::api::types::UNTYPED_API_ALIASES;
 use utoipa::OpenApi;
 
 #[test]
@@ -67,4 +68,68 @@ fn test_paginated_list_endpoints_document_page_and_limit() {
             );
         }
     }
+}
+
+/// 2026-09-06 audit item 6: every endpoint's 200 body must be a typed
+/// schema, not `GenericResponse` / `PingResponse` / any other alias of
+/// `ApiResponse<serde_json::Value>`. The 2026-09-02 lint only checks
+/// that `$ref`s resolve, which `GenericResponse` does (it is registered)
+/// — so the spec was passing every gate while telling codegen consumers
+/// `data` was `{}`.
+///
+/// Pin: this number may only go DOWN. To type an endpoint, replace its
+/// `body = GenericResponse` (or whichever untyped alias) with a typed
+/// struct, drop the alias from [`UNTYPED_API_ALIASES`] if no longer
+/// used, and lower the pin in the same commit.
+#[test]
+fn test_untyped_response_bodies_only_ever_decrease() {
+    let spec = ApiDoc::openapi();
+    let json = serde_json::to_value(&spec).expect("spec serializes");
+    let untyped: BTreeSet<&str> = UNTYPED_API_ALIASES.iter().copied().collect();
+
+    let mut count: usize = 0;
+    let mut offenders: Vec<String> = Vec::new();
+    if let Some(paths) = json["paths"].as_object() {
+        for (path, path_item) in paths {
+            for method in ["get", "post", "put", "delete", "patch"] {
+                let Some(op) = path_item[method].as_object() else {
+                    continue;
+                };
+                let Some(r200) = op["responses"]["200"].as_object() else {
+                    continue;
+                };
+                let Some(content) = r200.get("content").and_then(|c| c.as_object()) else {
+                    continue;
+                };
+                let Some(json) = content.get("application/json") else {
+                    continue;
+                };
+                let Some(schema_ref) = json
+                    .get("schema")
+                    .and_then(|s| s.get("$ref"))
+                    .and_then(|r| r.as_str())
+                else {
+                    continue;
+                };
+                let Some(name) = schema_ref.strip_prefix("#/components/schemas/") else {
+                    continue;
+                };
+                if untyped.contains(name) {
+                    count += 1;
+                    offenders.push(format!("{method} {path} -> {name}"));
+                }
+            }
+        }
+    }
+
+    // 2026-09-06 audit, base `main` (sha 91aed7c). Lower it in the same
+    // commit that types an endpoint, never bump it. The brief estimated
+    // 34; the spec counts 35 (offenders below). FINDINGS.md notes the
+    // discrepancy.
+    const PIN: usize = 35;
+    assert!(
+        count <= PIN,
+        "untyped-response pin is {PIN}; this commit allows {count} (offenders: {offenders:#?}). \
+         Did you add an endpoint that uses GenericResponse/PingResponse without lowering the pin?"
+    );
 }

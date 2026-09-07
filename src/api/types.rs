@@ -26,6 +26,40 @@ pub struct ApiResponse<T: Serialize> {
     pub metadata: ResponseMetadata,
 }
 
+/// Aliases of [`ApiResponse`] whose `data` is `serde_json::Value` — i.e.
+/// endpoints whose response body the OpenAPI spec does not actually
+/// describe. The 2026-09-02 `openapi_lint` only checks that `$ref`s
+/// resolve, so an untyped alias passing the lint says nothing about what
+/// the endpoint returns.
+///
+/// The constitution (`docs/constitution.md` § 1) requires every endpoint
+/// to be described by an explicit struct. The list below is the source
+/// of truth for "what is still untyped"; adding a new entry here means
+/// adding another endpoint the spec lies about. Lower it by typing one
+/// endpoint and removing its alias from the list.
+///
+/// `tests/openapi_lint::test_untyped_response_bodies_only_ever_decrease`
+/// pins and guards this list.
+pub const UNTYPED_API_ALIASES: &[&str] = &["GenericResponse", "PingResponse"];
+
+/// Shared acknowledgement for fire-and-forget "I sent a packet" handlers.
+///
+/// `kdeconnect.*.request` packets have no reply path on the phone (the
+/// phone is too busy to answer), so every request/trigger/send endpoint
+/// has historically replied `{"device_id": "...", "sent": true}`. This
+/// is that shape, registered as `SentResponseWrapper` for the spec.
+///
+/// Handlers whose acknowledgement carries more than `device_id`+`sent`
+/// (e.g. `mpris_action` adds `player` and `action`, `set_volume` adds
+/// `volume`/`muted`) get their own struct; reusing this one would erase
+/// information the spec is supposed to describe.
+#[derive(Debug, Serialize, ToSchema)]
+#[aliases(SentResponseWrapper = ApiResponse<SentResponse>)]
+pub struct SentResponse {
+    pub device_id: String,
+    pub sent: bool,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ApiError {
     pub status: &'static str,
