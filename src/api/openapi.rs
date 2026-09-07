@@ -145,6 +145,8 @@ use crate::device::types::{Device, DeviceState, DeviceType};
         handlers::plugins::contacts::ContactsListResponse,
         ContactsListResponseWrapper,
         crate::plugins::contacts::Contact,
+        handlers::plugins::remotecommands::RemoteCommandTriggerResponse,
+        RemoteCommandTriggerResponseWrapper,
     )),
     modifiers(&SecurityAddon),
     tags(

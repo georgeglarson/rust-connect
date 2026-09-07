@@ -9,6 +9,7 @@ use axum::{
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
 use crate::{
     api::{
@@ -20,12 +21,22 @@ use crate::{
     protocol::types::Packet,
 };
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct RemoteCommandsResponse {
     pub commands: HashMap<String, RemoteCommand>,
     /// The peer accepts an add-command request (kdeconnect-kde
     /// plugins/runcommand/runcommandplugin.cpp:165).
     pub can_add_command: bool,
+}
+
+/// POST /devices/{id}/remotecommands/{key}/trigger — confirmation that
+/// the trigger packet went out. The phone accepts the packet
+/// (`runcommandplugin.cpp:165`) but answers nothing, so this is the only
+/// signal the desktop gets; the UI keys off the `status` string to
+/// surface a "triggered" toast.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RemoteCommandTriggerResponse {
+    pub status: &'static str,
 }
 
 #[utoipa::path(
@@ -72,7 +83,7 @@ pub async fn get_remotecommands(
     path = "/api/v1/devices/{device_id}/remotecommands/{key}/trigger",
     tag = "remotecommands",
     responses(
-        (status = 200, description = "Command triggered", body = GenericResponse),
+        (status = 200, description = "Command triggered", body = RemoteCommandTriggerResponseWrapper),
         (status = 400, description = "Invalid device ID", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found or not connected", body = ApiError),
@@ -83,7 +94,10 @@ pub async fn get_remotecommands(
 pub async fn trigger_remotecommand(
     State(state): State<Arc<AppState>>,
     Path((device_id, key)): Path<(String, String)>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<
+    Json<ApiResponse<RemoteCommandTriggerResponse>>,
+    (axum::http::StatusCode, Json<ApiError>),
+> {
     validate_device_id(&device_id).map_err(crate::api::extractors::api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {
@@ -103,7 +117,7 @@ pub async fn trigger_remotecommand(
         .await
         .map_err(crate::api::extractors::api_err)?;
 
-    Ok(Json(ApiResponse::ok(
-        serde_json::json!({ "status": "triggered" }),
-    )))
+    Ok(Json(ApiResponse::ok(RemoteCommandTriggerResponse {
+        status: "triggered",
+    })))
 }

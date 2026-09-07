@@ -13,6 +13,7 @@ use crate::api::handlers::plugins::contacts::{ContactsListResponse, ContactsSync
 use crate::api::handlers::plugins::mpris::{
     MprisActionResponse, MprisLocalPlayersResponse, MprisPlayersResponse,
 };
+use crate::api::handlers::plugins::remotecommands::RemoteCommandTriggerResponse;
 use crate::api::handlers::plugins::sftp::{
     SftpInfoResponse, SftpMountResponse, SftpRequestResponse, SftpUnmountResponse,
 };
@@ -48,6 +49,7 @@ use crate::utils::errors::ErrorCode;
     MprisActionResponseWrapper = ApiResponse<MprisActionResponse>,
     ContactsSyncResponseWrapper = ApiResponse<ContactsSyncResponse>,
     ContactsListResponseWrapper = ApiResponse<ContactsListResponse>,
+    RemoteCommandTriggerResponseWrapper = ApiResponse<RemoteCommandTriggerResponse>,
 )]
 pub struct ApiResponse<T: Serialize> {
     pub status: &'static str,
