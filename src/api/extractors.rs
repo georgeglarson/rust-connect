@@ -2,11 +2,43 @@
 //!
 //! Single Responsibility: Provide shared validation and error helpers for API handlers.
 
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{FromRequest, Request};
 use axum::http::StatusCode;
 use axum::Json;
 
 use crate::api::types::ApiError;
 use crate::utils::errors::Error;
+
+/// `axum::Json` with its rejection inside the API envelope.
+///
+/// A syntactically invalid body, a missing `content-type`, or a body that
+/// does not match the request struct used to come back as axum's own bare
+/// 415/422 text, outside the `{status, error, metadata}` envelope every
+/// other error uses (the same class as the 401/429 bodies fixed in the
+/// 2026-09-02 audit, A6). Every JSON request extractor goes through this
+/// so a client sees `INVALID_REQUEST` in the envelope whatever went wrong
+/// with the body.
+pub struct ApiJson<T>(pub T);
+
+#[axum::async_trait]
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, Json<ApiError>);
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(ApiJson(value)),
+            Err(rejection) => Err(api_err(Error::InvalidRequest(format!(
+                "Invalid JSON body: {}",
+                rejection.body_text()
+            )))),
+        }
+    }
+}
 
 /// Validates a device_id string against the Android wire requirements.
 ///

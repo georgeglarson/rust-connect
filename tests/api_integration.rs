@@ -1344,34 +1344,44 @@ async fn test_malformed_bodies_get_the_error_envelope_not_a_bare_422() {
     let (state, _temp_dir, api_key) = create_test_app().await;
     let app = build_router(state);
 
-    for (uri, body) in [
-        ("/api/v1/clipboard", "{}"),
+    let connect = "/api/v1/devices/0123456789abcdef0123456789abcdef/connect";
+    // (uri, body, content-type): schema mismatch, wrong-typed field,
+    // syntactically invalid JSON, and a missing content-type. Before the
+    // `ApiJson` extractor the last two came back as axum's bare 422/415.
+    for (uri, body, content_type) in [
+        ("/api/v1/clipboard", "{}", Some("application/json")),
         (
-            "/api/v1/devices/0123456789abcdef0123456789abcdef/connect",
-            "{}",
+            "/api/v1/clipboard",
+            "{\"content\": 1}",
+            Some("application/json"),
         ),
+        ("/api/v1/clipboard", "{", Some("application/json")),
+        ("/api/v1/clipboard", "{\"content\": \"x\"}", None),
+        (connect, "{}", Some("application/json")),
+        (connect, "{\"address\": 123}", Some("application/json")),
+        (connect, "{", Some("application/json")),
+        ("/api/v1/ping", "{", Some("application/json")),
     ] {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("X-API-Key", &api_key);
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
         let response = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(uri)
-                    .header("X-API-Key", &api_key)
-                    .header("content-type", "application/json")
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
+            .oneshot(builder.body(Body::from(body)).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri} {body}");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value =
             serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("{uri}: not JSON ({e})"));
-        assert_eq!(json["status"], "error", "{uri}");
-        assert_eq!(json["error"]["code"], "INVALID_REQUEST", "{uri}");
-        assert!(json["metadata"].is_object(), "{uri}");
+        assert_eq!(json["status"], "error", "{uri} {body}");
+        assert_eq!(json["error"]["code"], "INVALID_REQUEST", "{uri} {body}");
+        assert!(json["metadata"].is_object(), "{uri} {body}");
     }
 }

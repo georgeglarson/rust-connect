@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+use crate::api::extractors::ApiJson;
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
 use crate::app::AppState;
@@ -125,7 +126,7 @@ pub async fn get_notifications(
 pub async fn send_notification(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(body): Json<SendNotificationRequest>,
+    ApiJson(body): ApiJson<SendNotificationRequest>,
 ) -> Result<Json<ApiResponse<NotificationSentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
@@ -196,7 +197,7 @@ pub(crate) fn build_notification_reply_packet(
 pub async fn reply_notification(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((device_id, notification_id)): axum::extract::Path<(String, String)>,
-    Json(body): Json<ReplyNotificationRequest>,
+    ApiJson(body): ApiJson<ReplyNotificationRequest>,
 ) -> Result<Json<ApiResponse<NotificationReplyResponse>>, (axum::http::StatusCode, Json<ApiError>)>
 {
     validate_device_id(&device_id).map_err(api_err)?;
@@ -315,7 +316,7 @@ pub(crate) fn build_notification_action_packet(
 pub async fn activate_notification_action(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((device_id, notification_id)): axum::extract::Path<(String, String)>,
-    Json(body): Json<NotificationActionRequest>,
+    ApiJson(body): ApiJson<NotificationActionRequest>,
 ) -> Result<
     Json<ApiResponse<NotificationActionTriggeredResponse>>,
     (axum::http::StatusCode, Json<ApiError>),

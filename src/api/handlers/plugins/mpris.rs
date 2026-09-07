@@ -4,6 +4,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+use crate::api::extractors::ApiJson;
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
 use crate::app::AppState;
@@ -138,7 +139,7 @@ pub async fn request_mpris(
 pub async fn mpris_action(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((device_id, player)): axum::extract::Path<(String, String)>,
-    Json(body): Json<serde_json::Value>,
+    ApiJson(body): ApiJson<serde_json::Value>,
 ) -> Result<Json<ApiResponse<MprisActionResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 

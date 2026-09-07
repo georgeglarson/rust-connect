@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+use crate::api::extractors::ApiJson;
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
 use crate::app::AppState;
@@ -65,12 +66,21 @@ pub async fn set_clipboard(
     // malformed body with its own bare 422, outside the envelope. The
     // struct documents the body in the spec; the handler validates it and
     // answers a 400 in the envelope, as it always has.
-    Json(body): Json<serde_json::Value>,
+    ApiJson(body): ApiJson<serde_json::Value>,
 ) -> Result<Json<ApiResponse<ClipboardSetResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
-    let content = body
-        .get("content")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| api_err(Error::InvalidRequest("content field required".to_string())))?;
+    let content = match body.get("content") {
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        None => {
+            return Err(api_err(Error::InvalidRequest(
+                "content field required".to_string(),
+            )))
+        }
+        Some(_) => {
+            return Err(api_err(Error::InvalidRequest(
+                "content field must be a string".to_string(),
+            )))
+        }
+    };
 
     let packet = crate::protocol::types::Packet::new(
         "kdeconnect.clipboard".to_string(),

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use utoipa::ToSchema;
 
 use crate::api::extractors::api_err;
+use crate::api::extractors::ApiJson;
 use crate::api::types::*;
 use crate::app::AppState;
 use crate::plugins::plugin::Plugin;
@@ -107,7 +108,7 @@ pub async fn get_local_sinks(
 pub async fn set_local_sink_control(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-    Json(body): Json<LocalSinkControlRequest>,
+    ApiJson(body): ApiJson<LocalSinkControlRequest>,
 ) -> Result<Json<ApiResponse<LocalSinkControlResponse>>, (StatusCode, Json<ApiError>)> {
     if name.is_empty() {
         return Err(api_err(Error::InvalidRequest(

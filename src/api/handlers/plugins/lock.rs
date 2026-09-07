@@ -4,6 +4,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+use crate::api::extractors::ApiJson;
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
 use crate::app::AppState;
@@ -35,7 +36,7 @@ pub struct LockCommandSentResponse {
 pub async fn lock_device(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(body): Json<LockDeviceRequest>,
+    ApiJson(body): ApiJson<LockDeviceRequest>,
 ) -> Result<Json<ApiResponse<LockCommandSentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 

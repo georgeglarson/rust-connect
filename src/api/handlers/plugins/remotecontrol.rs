@@ -9,6 +9,7 @@
 //! serialize the SAME struct the consume side deserializes, so the producer
 //! cannot drift from the parser.
 
+use crate::api::extractors::ApiJson;
 use axum::{
     extract::{Path, State},
     Json,
@@ -87,7 +88,7 @@ fn build(action: &PointerAction) -> Result<MousepadRequest, Error> {
 pub async fn send_remotecontrol_pointer(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(action): Json<PointerAction>,
+    ApiJson(action): ApiJson<PointerAction>,
 ) -> Result<Json<ApiResponse<PointerActionSentResponse>>, (axum::http::StatusCode, Json<ApiError>)>
 {
     validate_device_id(&device_id).map_err(api_err)?;

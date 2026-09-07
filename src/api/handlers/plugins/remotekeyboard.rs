@@ -1,3 +1,4 @@
+use crate::api::extractors::ApiJson;
 use axum::{
     extract::{Path, State},
     Json,
@@ -75,7 +76,7 @@ fn keypress_payload(req: &SendKeypressRequest) -> serde_json::Value {
 pub async fn send_remotekeyboard_keypress(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(req): Json<SendKeypressRequest>,
+    ApiJson(req): ApiJson<SendKeypressRequest>,
 ) -> Result<Json<ApiResponse<KeypressSentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(crate::api::extractors::api_err)?;
 

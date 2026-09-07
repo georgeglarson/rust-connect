@@ -8,6 +8,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+use crate::api::extractors::ApiJson;
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::ApiResponse;
 #[allow(unused_imports)]
@@ -412,7 +413,7 @@ fn build_share_url_packet(url: &str) -> Packet {
 pub async fn send_text_to_device(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(body): Json<ShareTextRequest>,
+    ApiJson(body): ApiJson<ShareTextRequest>,
 ) -> Result<Json<ApiResponse<ShareTextSentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
@@ -463,7 +464,7 @@ pub async fn send_text_to_device(
 pub async fn send_url_to_device(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(body): Json<ShareUrlRequest>,
+    ApiJson(body): ApiJson<ShareUrlRequest>,
 ) -> Result<Json<ApiResponse<ShareUrlSentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 

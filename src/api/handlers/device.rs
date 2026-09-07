@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+use crate::api::extractors::ApiJson;
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
 use crate::app::AppState;
@@ -415,7 +416,7 @@ pub struct PingSentResponse {
 )]
 pub async fn send_ping(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<SendPingRequest>,
+    ApiJson(body): ApiJson<SendPingRequest>,
 ) -> Result<Json<ApiResponse<PingSentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&body.device_id).map_err(api_err)?;
 
@@ -529,7 +530,7 @@ pub async fn connect_device(
     // a malformed body with a bare 422 outside the envelope. The struct
     // documents the body in the spec; the handler validates it and answers
     // a 400 in the envelope, as it always has.
-    Json(body): Json<serde_json::Value>,
+    ApiJson(body): ApiJson<serde_json::Value>,
 ) -> Result<Json<ApiResponse<DeviceConnectedResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
@@ -539,10 +540,19 @@ pub async fn connect_device(
         )));
     }
 
-    let address = body
-        .get("address")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| api_err(Error::InvalidRequest("address field required".to_string())))?;
+    let address = match body.get("address") {
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        None => {
+            return Err(api_err(Error::InvalidRequest(
+                "address field required".to_string(),
+            )))
+        }
+        Some(_) => {
+            return Err(api_err(Error::InvalidRequest(
+                "address field must be a string".to_string(),
+            )))
+        }
+    };
 
     let addr: std::net::SocketAddr = address.parse().map_err(|_| {
         api_err(Error::InvalidRequest(format!(
