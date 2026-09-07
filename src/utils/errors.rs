@@ -488,6 +488,7 @@ mod tests {
                 size: 2_000_000,
                 max: 1_048_576,
             },
+            Error::PayloadTooLarge("".into()),
             Error::TlsError("".into()),
             Error::CertificateError("".into()),
             Error::CapabilityNotSupported {
@@ -530,6 +531,25 @@ mod tests {
             assert!(err.code().http_status() >= 400);
             assert!(err.code().http_status() < 600);
         }
+    }
+
+    /// The loop above only proves each variant lands on *some* 4xx/5xx code.
+    /// The two size limits are the pair most likely to be crossed by a
+    /// copy-paste, and both answer 413, so pin each one to its own code.
+    #[test]
+    fn test_size_limit_errors_map_to_their_own_codes() {
+        let payload = Error::PayloadTooLarge("body exceeds 1 MiB".into());
+        assert!(matches!(payload.code(), ErrorCode::PayloadTooLarge));
+        assert_eq!(payload.code().as_str(), "PAYLOAD_TOO_LARGE");
+        assert_eq!(payload.code().http_status(), 413);
+
+        let packet = Error::PacketTooLarge {
+            size: 2_000_000,
+            max: 1_048_576,
+        };
+        assert!(matches!(packet.code(), ErrorCode::PacketTooLarge));
+        assert_eq!(packet.code().as_str(), "PACKET_TOO_LARGE");
+        assert_eq!(packet.code().http_status(), 413);
     }
 
     #[test]
