@@ -54,7 +54,7 @@ const MAX_VCARD_BYTES_PER_DEVICE: usize = 64 * 1024 * 1024;
 ///
 /// `name`, `phone_numbers` and `emails` are parsed minimally (dependency-free)
 /// from the FN / TEL / EMAIL vCard lines; `vcard` keeps the raw payload.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Contact {
     pub uid: String,

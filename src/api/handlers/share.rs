@@ -4,45 +4,85 @@
 
 use axum::extract::{FromRequest, Path, State};
 use axum::Json;
+use serde::Serialize;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
+use crate::api::extractors::ApiJson;
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::ApiResponse;
 #[allow(unused_imports)]
-// utoipa `body = …` resolves schema names, not paths; the import keeps the name in scope for readers
-use crate::api::types::{ApiError, GenericResponse, ShareTextRequest, ShareUrlRequest};
+// utoipa `body = …` resolves schema names, not paths; the imports keep the names in scope for readers
+use crate::api::types::{ApiError, ShareTextRequest, ShareUrlRequest};
 use crate::app::AppState;
 use crate::plugins::share::ReceivedFile;
 use crate::protocol::types::Packet;
 use crate::utils::errors::Error;
+
+/// One received file as surfaced through `GET /api/v1/share/files`.
+/// Mirrors the inline `serde_json::json!` mapping that used to live in
+/// the handler — same fields, same casing. The path is the on-disk copy
+/// the daemon kept.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SharedFile {
+    pub device_id: String,
+    pub filename: String,
+    pub path: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ShareFilesResponse {
+    pub files: Vec<SharedFile>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ShareFileSentResponse {
+    pub device_id: String,
+    pub filename: String,
+    pub size: u64,
+    pub sent: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ShareTextSentResponse {
+    pub device_id: String,
+    pub bytes: usize,
+    pub sent: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ShareUrlSentResponse {
+    pub device_id: String,
+    pub scheme: String,
+    pub sent: bool,
+}
 
 #[utoipa::path(
     get,
     path = "/api/v1/share/files",
     tag = "share",
     responses(
-        (status = 200, description = "List shared files received from devices", body = GenericResponse),
+        (status = 200, description = "List shared files received from devices", body = ShareFilesResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
     security(("api_key" = []))
 )]
 pub async fn list_share_files(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<ShareFilesResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     let received: Vec<ReceivedFile> = state.plugins.share.received_files().await;
-    let files: Vec<_> = received
+    let files: Vec<SharedFile> = received
         .into_iter()
-        .map(|f| {
-            serde_json::json!({
-                "device_id": f.device_id,
-                "filename": f.filename,
-                "path": f.path.to_string_lossy(),
-                "size": f.size,
-            })
+        .map(|f| SharedFile {
+            device_id: f.device_id,
+            filename: f.filename,
+            path: f.path.to_string_lossy().into_owned(),
+            size: f.size,
         })
         .collect();
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({ "files": files }))))
+    Ok(Json(ApiResponse::ok(ShareFilesResponse { files })))
 }
 
 #[utoipa::path(
@@ -55,7 +95,7 @@ pub async fn list_share_files(
     ),
     request_body(description = "Raw file bytes, or multipart/form-data with a single file part", content = Vec<u8>),
     responses(
-        (status = 200, description = "File sent to device", body = serde_json::Value),
+        (status = 200, description = "File sent to device", body = ShareFileSentResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
     security(("api_key" = []))
@@ -65,7 +105,7 @@ pub async fn send_file_to_device(
     Path(device_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     request: axum::extract::Request,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<ShareFileSentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {
@@ -190,12 +230,12 @@ pub async fn send_file_to_device(
         }
     }
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "filename": safe_filename,
-        "size": upload.size,
-        "sent": true,
-    }))))
+    Ok(Json(ApiResponse::ok(ShareFileSentResponse {
+        device_id,
+        filename: safe_filename,
+        size: upload.size,
+        sent: true,
+    })))
 }
 
 /// Explicit upload cap (matches the receive-side default file cap); the raw
@@ -364,7 +404,7 @@ fn build_share_url_packet(url: &str) -> Packet {
     params(("device_id" = String, Path, description = "Device unique identifier")),
     request_body = ShareTextRequest,
     responses(
-        (status = 200, description = "Text sent to device", body = serde_json::Value),
+        (status = 200, description = "Text sent to device", body = ShareTextSentResponseWrapper),
         (status = 400, description = "Invalid request", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
@@ -373,8 +413,8 @@ fn build_share_url_packet(url: &str) -> Packet {
 pub async fn send_text_to_device(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(body): Json<ShareTextRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+    ApiJson(body): ApiJson<ShareTextRequest>,
+) -> Result<Json<ApiResponse<ShareTextSentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     if body.text.is_empty() {
@@ -401,11 +441,11 @@ pub async fn send_text_to_device(
         .await
         .map_err(api_err)?;
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "bytes": body.text.len(),
-        "sent": true,
-    }))))
+    Ok(Json(ApiResponse::ok(ShareTextSentResponse {
+        device_id,
+        bytes: body.text.len(),
+        sent: true,
+    })))
 }
 
 #[utoipa::path(
@@ -415,7 +455,7 @@ pub async fn send_text_to_device(
     params(("device_id" = String, Path, description = "Device unique identifier")),
     request_body = ShareUrlRequest,
     responses(
-        (status = 200, description = "URL sent to device", body = serde_json::Value),
+        (status = 200, description = "URL sent to device", body = ShareUrlSentResponseWrapper),
         (status = 400, description = "Invalid or disallowed URL", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
@@ -424,8 +464,8 @@ pub async fn send_text_to_device(
 pub async fn send_url_to_device(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(body): Json<ShareUrlRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+    ApiJson(body): ApiJson<ShareUrlRequest>,
+) -> Result<Json<ApiResponse<ShareUrlSentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     let Some(scheme) = crate::plugins::share::allowed_url_scheme(&body.url) else {
@@ -446,11 +486,11 @@ pub async fn send_url_to_device(
         .await
         .map_err(api_err)?;
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "scheme": scheme,
-        "sent": true,
-    }))))
+    Ok(Json(ApiResponse::ok(ShareUrlSentResponse {
+        device_id,
+        scheme,
+        sent: true,
+    })))
 }
 
 #[cfg(test)]
@@ -630,5 +670,63 @@ mod tests {
     fn test_outgoing_url_allowlist_is_the_same_one() {
         assert!(crate::plugins::share::allowed_url_scheme("https://kde.org/").is_some());
         assert!(crate::plugins::share::allowed_url_scheme("file:///etc/passwd").is_none());
+    }
+
+    #[test]
+    fn test_share_files_response_matches_legacy_shape() {
+        let response = ShareFilesResponse { files: Vec::new() };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({ "files": [] });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
+    fn test_share_file_sent_response_matches_legacy_shape() {
+        let response = ShareFileSentResponse {
+            device_id: "phone-1".to_string(),
+            filename: "doc.pdf".to_string(),
+            size: 4096,
+            sent: true,
+        };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "filename": "doc.pdf",
+            "size": 4096,
+            "sent": true
+        });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
+    fn test_share_text_sent_response_matches_legacy_shape() {
+        let response = ShareTextSentResponse {
+            device_id: "phone-1".to_string(),
+            bytes: 17,
+            sent: true,
+        };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "bytes": 17,
+            "sent": true
+        });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
+    fn test_share_url_sent_response_matches_legacy_shape() {
+        let response = ShareUrlSentResponse {
+            device_id: "phone-1".to_string(),
+            scheme: "https".to_string(),
+            sent: true,
+        };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "scheme": "https",
+            "sent": true
+        });
+        assert_eq!(typed, legacy);
     }
 }

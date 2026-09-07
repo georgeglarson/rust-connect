@@ -10,11 +10,12 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-use crate::api::extractors::{api_err, validate_device_id};
+use crate::api::extractors::api_err;
+use crate::api::extractors::ApiJson;
 use crate::api::types::*;
 use crate::app::AppState;
 use crate::plugins::plugin::Plugin;
@@ -41,12 +42,26 @@ pub struct LocalSinkControlRequest {
     pub enabled: Option<bool>,
 }
 
+/// Acknowledgement for `POST /systemvolume/sinks/{name}/control`. Mirrors
+/// the optional fields in the request body so the caller can see what the
+/// backend accepted; a control the request did not carry is `null`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LocalSinkControlResponse {
+    pub name: String,
+    /// Each control echoes the request; `null` when the caller did not
+    /// set it, as the legacy literal emitted.
+    pub volume: Option<i64>,
+    pub muted: Option<bool>,
+    pub enabled: Option<bool>,
+    pub sent: bool,
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/systemvolume/sinks",
     tag = "systemvolume",
     responses(
-        (status = 200, description = "Local audio sinks", body = LocalSinksResponse),
+        (status = 200, description = "Local audio sinks", body = LocalSinksResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 503, description = "No audio backend available", body = ApiError),
     ),
@@ -83,7 +98,7 @@ pub async fn get_local_sinks(
     ),
     request_body = LocalSinkControlRequest,
     responses(
-        (status = 200, description = "Control command applied", body = GenericResponse),
+        (status = 200, description = "Control command applied", body = LocalSinkControlResponseWrapper),
         (status = 400, description = "Invalid request", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 503, description = "No audio backend available", body = ApiError),
@@ -93,8 +108,8 @@ pub async fn get_local_sinks(
 pub async fn set_local_sink_control(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-    Json(body): Json<LocalSinkControlRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
+    ApiJson(body): ApiJson<LocalSinkControlRequest>,
+) -> Result<Json<ApiResponse<LocalSinkControlResponse>>, (StatusCode, Json<ApiError>)> {
     if name.is_empty() {
         return Err(api_err(Error::InvalidRequest(
             "sink name cannot be empty".to_string(),
@@ -127,13 +142,13 @@ pub async fn set_local_sink_control(
             return Err(api_err(e));
         }
     }
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "name": name,
-        "volume": body.volume,
-        "muted": body.muted,
-        "enabled": body.enabled,
-        "sent": true
-    }))))
+    Ok(Json(ApiResponse::ok(LocalSinkControlResponse {
+        name,
+        volume: body.volume,
+        muted: body.muted,
+        enabled: body.enabled,
+        sent: true,
+    })))
 }
 
 fn unavailable_error() -> Error {
@@ -143,8 +158,48 @@ fn unavailable_error() -> Error {
     }
 }
 
-// Reference validate_device_id so the import isn't dead.
-#[allow(dead_code)]
-fn _keep_validate_device_id_import() {
-    let _ = validate_device_id;
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+
+    #[test]
+    fn test_local_sink_control_response_emits_null_for_unset_optionals() {
+        let resp = LocalSinkControlResponse {
+            name: "sink-1".to_string(),
+            volume: Some(50),
+            muted: None,
+            enabled: None,
+            sent: true,
+        };
+        let typed = serde_json::to_value(&resp).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "name": "sink-1",
+            "volume": 50,
+            "muted": null,
+            "enabled": null,
+            "sent": true,
+        });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
+    fn test_local_sink_control_response_round_trip_all_fields() {
+        let resp = LocalSinkControlResponse {
+            name: "sink-1".to_string(),
+            volume: Some(80),
+            muted: Some(false),
+            enabled: Some(true),
+            sent: true,
+        };
+        let typed = serde_json::to_value(&resp).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "name": "sink-1",
+            "volume": 80,
+            "muted": false,
+            "enabled": true,
+            "sent": true,
+        });
+        assert_eq!(typed, legacy);
+    }
 }

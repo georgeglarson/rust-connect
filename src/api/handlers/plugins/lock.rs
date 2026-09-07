@@ -1,11 +1,21 @@
 use axum::extract::{Path, State};
 use axum::Json;
+use serde::Serialize;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
+use crate::api::extractors::ApiJson;
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
 use crate::app::AppState;
 use crate::utils::errors::Error;
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LockCommandSentResponse {
+    pub device_id: String,
+    pub action: String,
+    pub sent: bool,
+}
 
 #[utoipa::path(
     post,
@@ -16,7 +26,7 @@ use crate::utils::errors::Error;
     ),
     request_body = LockDeviceRequest,
     responses(
-        (status = 200, description = "Lock command sent to device", body = GenericResponse),
+        (status = 200, description = "Lock command sent to device", body = LockCommandSentResponseWrapper),
         (status = 400, description = "Invalid request", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
@@ -26,8 +36,8 @@ use crate::utils::errors::Error;
 pub async fn lock_device(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(body): Json<LockDeviceRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+    ApiJson(body): ApiJson<LockDeviceRequest>,
+) -> Result<Json<ApiResponse<LockCommandSentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {
@@ -59,9 +69,31 @@ pub async fn lock_device(
         .await
         .map_err(api_err)?;
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "action": body.action,
-        "sent": true
-    }))))
+    Ok(Json(ApiResponse::ok(LockCommandSentResponse {
+        device_id,
+        action: body.action,
+        sent: true,
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn test_lock_command_sent_response_matches_legacy_shape() {
+        let response = LockCommandSentResponse {
+            device_id: "phone-1".to_string(),
+            action: "lock".to_string(),
+            sent: true,
+        };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "action": "lock",
+            "sent": true
+        });
+        assert_eq!(typed, legacy);
+    }
 }

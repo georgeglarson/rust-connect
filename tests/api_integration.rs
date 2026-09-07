@@ -1335,3 +1335,88 @@ async fn test_non_loopback_bind_keeps_the_rate_limiter() {
         "a non-loopback bind must still rate-limit within 101 requests"
     );
 }
+
+/// A malformed body must be answered inside the envelope with a 400, not
+/// by axum's bare 422 (review finding on #43: typed `Json<T>` extractors
+/// had replaced the raw-value parsing on two handlers).
+#[tokio::test]
+async fn test_malformed_bodies_get_the_error_envelope_not_a_bare_422() {
+    let (state, _temp_dir, api_key) = create_test_app().await;
+    let app = build_router(state);
+
+    let connect = "/api/v1/devices/0123456789abcdef0123456789abcdef/connect";
+    // (uri, body, content-type): schema mismatch, wrong-typed field,
+    // syntactically invalid JSON, and a missing content-type. Before the
+    // `ApiJson` extractor the last two came back as axum's bare 422/415.
+    for (uri, body, content_type) in [
+        ("/api/v1/clipboard", "{}", Some("application/json")),
+        (
+            "/api/v1/clipboard",
+            "{\"content\": 1}",
+            Some("application/json"),
+        ),
+        ("/api/v1/clipboard", "{", Some("application/json")),
+        ("/api/v1/clipboard", "{\"content\": \"x\"}", None),
+        (connect, "{}", Some("application/json")),
+        (connect, "{\"address\": 123}", Some("application/json")),
+        (connect, "{", Some("application/json")),
+        ("/api/v1/ping", "{", Some("application/json")),
+    ] {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("X-API-Key", &api_key);
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri} {body}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("{uri}: not JSON ({e})"));
+        assert_eq!(json["status"], "error", "{uri} {body}");
+        assert_eq!(json["error"]["code"], "INVALID_REQUEST", "{uri} {body}");
+        assert!(json["metadata"].is_object(), "{uri} {body}");
+    }
+}
+
+/// A body over the route's limit is a 413 in the envelope with its own
+/// code, not a 400 `INVALID_REQUEST` (review finding on #43: `ApiJson`
+/// had folded axum's length-limit rejection into the malformed-body case).
+#[tokio::test]
+async fn test_oversized_body_gets_a_413_envelope() {
+    let (state, _temp_dir, api_key) = create_test_app().await;
+    let app = build_router(state);
+    // The default axum body limit is 2 MiB; 3 MiB of a syntactically valid
+    // JSON string trips it before any parsing.
+    let mut body = String::with_capacity(3 * 1024 * 1024 + 16);
+    body.push_str("{\"content\": \"");
+    body.push_str(&"a".repeat(3 * 1024 * 1024));
+    body.push_str("\"}");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/clipboard")
+                .header("X-API-Key", &api_key)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("envelope JSON");
+    assert_eq!(json["status"], "error");
+    assert_eq!(json["error"]["code"], "PAYLOAD_TOO_LARGE");
+    assert!(json["metadata"].is_object());
+}

@@ -6,7 +6,39 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::api::handlers::plugins::battery::BatteryResponse;
+use crate::api::handlers::plugins::clipboard::{ClipboardContentResponse, ClipboardSetResponse};
+use crate::api::handlers::plugins::connectivity::ConnectivityResponse;
+use crate::api::handlers::plugins::contacts::{ContactsListResponse, ContactsSyncResponse};
+use crate::api::handlers::plugins::findmyphone::FindMyPhoneResponse;
+use crate::api::handlers::plugins::lock::LockCommandSentResponse;
+use crate::api::handlers::plugins::mpris::{
+    MprisActionResponse, MprisLocalPlayersResponse, MprisPlayersResponse,
+};
+use crate::api::handlers::plugins::notification::{
+    NotificationActionTriggeredResponse, NotificationDismissedResponse, NotificationReplyResponse,
+    NotificationSentResponse, NotificationsListResponse,
+};
+use crate::api::handlers::plugins::remotecommands::RemoteCommandTriggerResponse;
+use crate::api::handlers::plugins::remotecontrol::PointerActionSentResponse;
+use crate::api::handlers::plugins::remotekeyboard::KeypressSentResponse;
+use crate::api::handlers::plugins::sftp::{
+    SftpInfoResponse, SftpMountResponse, SftpRequestResponse, SftpUnmountResponse,
+};
+use crate::api::handlers::plugins::sms::{SmsSentResponse, SmsThreadResponse, SmsThreadsResponse};
+use crate::api::handlers::plugins::systemvolume::LocalSinkControlResponse;
+use crate::api::handlers::plugins::systemvolume::LocalSinksResponse;
+use crate::api::handlers::plugins::telephony::TelephonyCallsResponse;
+use crate::api::handlers::plugins::volume::VolumeControlSentResponse;
+use crate::api::handlers::plugins::ToolsResponse;
+use crate::api::handlers::share::{
+    ShareFileSentResponse, ShareFilesResponse, ShareTextSentResponse, ShareUrlSentResponse,
+};
 use crate::api::handlers::RemoteCommandsResponse;
+use crate::api::handlers::{
+    ConnectedDevicesResponse, DeviceConnectedResponse, DeviceDisconnectedResponse,
+    DeviceRemovedResponse, DeviceStateResponse, PingSentResponse,
+};
 use crate::device::types::{Device, DeviceState, DeviceType};
 use crate::utils::errors::ErrorCode;
 
@@ -15,15 +47,73 @@ use crate::utils::errors::ErrorCode;
     DevicesResponse = ApiResponse<DeviceListResponse>,
     DeviceResponse = ApiResponse<Device>,
     PairResponseWrapper = ApiResponse<PairResponse>,
-    PingResponse = ApiResponse<serde_json::Value>,
-    GenericResponse = ApiResponse<serde_json::Value>,
     RemoteCommandsResponseWrapper = ApiResponse<RemoteCommandsResponse>,
     PluginsResponse = ApiResponse<PluginListResponse>,
+    CapabilitiesResponseWrapper = ApiResponse<CapabilitiesResponse>,
+    ToolsResponseWrapper = ApiResponse<ToolsResponse>,
+    LocalSinksResponseWrapper = ApiResponse<LocalSinksResponse>,
+    SentResponseWrapper = ApiResponse<SentResponse>,
+    BatteryResponseWrapper = ApiResponse<BatteryResponse>,
+    ConnectivityResponseWrapper = ApiResponse<ConnectivityResponse>,
+    TelephonyCallsResponseWrapper = ApiResponse<TelephonyCallsResponse>,
+    SftpRequestResponseWrapper = ApiResponse<SftpRequestResponse>,
+    SftpInfoResponseWrapper = ApiResponse<SftpInfoResponse>,
+    SftpMountResponseWrapper = ApiResponse<SftpMountResponse>,
+    SftpUnmountResponseWrapper = ApiResponse<SftpUnmountResponse>,
+    SmsThreadsResponseWrapper = ApiResponse<SmsThreadsResponse>,
+    SmsThreadResponseWrapper = ApiResponse<SmsThreadResponse>,
+    SmsSentResponseWrapper = ApiResponse<SmsSentResponse>,
+    MprisPlayersResponseWrapper = ApiResponse<MprisPlayersResponse>,
+    MprisLocalPlayersResponseWrapper = ApiResponse<MprisLocalPlayersResponse>,
+    MprisActionResponseWrapper = ApiResponse<MprisActionResponse>,
+    ContactsSyncResponseWrapper = ApiResponse<ContactsSyncResponse>,
+    ContactsListResponseWrapper = ApiResponse<ContactsListResponse>,
+    RemoteCommandTriggerResponseWrapper = ApiResponse<RemoteCommandTriggerResponse>,
+    NotificationsListResponseWrapper = ApiResponse<NotificationsListResponse>,
+    NotificationSentResponseWrapper = ApiResponse<NotificationSentResponse>,
+    NotificationReplyResponseWrapper = ApiResponse<NotificationReplyResponse>,
+    NotificationActionTriggeredResponseWrapper = ApiResponse<NotificationActionTriggeredResponse>,
+    NotificationDismissedResponseWrapper = ApiResponse<NotificationDismissedResponse>,
+    LockCommandSentResponseWrapper = ApiResponse<LockCommandSentResponse>,
+    FindMyPhoneResponseWrapper = ApiResponse<FindMyPhoneResponse>,
+    VolumeControlSentResponseWrapper = ApiResponse<VolumeControlSentResponse>,
+    ShareFilesResponseWrapper = ApiResponse<ShareFilesResponse>,
+    ShareFileSentResponseWrapper = ApiResponse<ShareFileSentResponse>,
+    ShareTextSentResponseWrapper = ApiResponse<ShareTextSentResponse>,
+    ShareUrlSentResponseWrapper = ApiResponse<ShareUrlSentResponse>,
+    ClipboardContentResponseWrapper = ApiResponse<ClipboardContentResponse>,
+    ClipboardSetResponseWrapper = ApiResponse<ClipboardSetResponse>,
+    LocalSinkControlResponseWrapper = ApiResponse<LocalSinkControlResponse>,
+    PointerActionSentResponseWrapper = ApiResponse<PointerActionSentResponse>,
+    KeypressSentResponseWrapper = ApiResponse<KeypressSentResponse>,
+    PingSentResponseWrapper = ApiResponse<PingSentResponse>,
+    DeviceRemovedResponseWrapper = ApiResponse<DeviceRemovedResponse>,
+    DeviceConnectedResponseWrapper = ApiResponse<DeviceConnectedResponse>,
+    DeviceDisconnectedResponseWrapper = ApiResponse<DeviceDisconnectedResponse>,
+    DeviceStateResponseWrapper = ApiResponse<DeviceStateResponse>,
+    ConnectedDevicesResponseWrapper = ApiResponse<ConnectedDevicesResponse>,
 )]
 pub struct ApiResponse<T: Serialize> {
     pub status: &'static str,
     pub data: T,
     pub metadata: ResponseMetadata,
+}
+
+/// Shared acknowledgement for fire-and-forget "I sent a packet" handlers.
+///
+/// `kdeconnect.*.request` packets have no reply path on the phone (the
+/// phone is too busy to answer), so every request/trigger/send endpoint
+/// has historically replied `{"device_id": "...", "sent": true}`. This
+/// is that shape, registered as `SentResponseWrapper` for the spec.
+///
+/// Handlers whose acknowledgement carries more than `device_id`+`sent`
+/// (e.g. `mpris_action` adds `player` and `action`, `set_volume` adds
+/// `volume`/`muted`) get their own struct; reusing this one would erase
+/// information the spec is supposed to describe.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SentResponse {
+    pub device_id: String,
+    pub sent: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

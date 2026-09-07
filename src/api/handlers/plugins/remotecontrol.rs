@@ -9,15 +9,14 @@
 //! serialize the SAME struct the consume side deserializes, so the producer
 //! cannot drift from the parser.
 
-#[allow(unused_imports)]
-// utoipa `body = …` resolves schema names, not paths; the import keeps the name in scope for readers
-use crate::api::types::GenericResponse;
+use crate::api::extractors::ApiJson;
 use axum::{
     extract::{Path, State},
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use utoipa::ToSchema;
 
 use crate::{
     api::{
@@ -42,6 +41,13 @@ pub enum PointerAction {
     Click { button: String },
     /// dx/dy are WHEEL deltas here, not motion (x11remoteinput.cpp:103).
     Scroll { dx: f64, dy: f64 },
+}
+
+/// Acknowledgement for `POST /remotecontrol/pointer`. The handler doesn't
+/// echo the action back to the caller — only that the packet went out.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PointerActionSentResponse {
+    pub status: &'static str,
 }
 
 fn build(action: &PointerAction) -> Result<MousepadRequest, Error> {
@@ -72,7 +78,7 @@ fn build(action: &PointerAction) -> Result<MousepadRequest, Error> {
     request_body = PointerAction,
     params(("device_id" = String, Path, description = "Device unique identifier")),
     responses(
-        (status = 200, description = "Pointer action sent", body = GenericResponse),
+        (status = 200, description = "Pointer action sent", body = PointerActionSentResponseWrapper),
         (status = 400, description = "Invalid device ID or button", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found or not connected", body = ApiError),
@@ -82,8 +88,9 @@ fn build(action: &PointerAction) -> Result<MousepadRequest, Error> {
 pub async fn send_remotecontrol_pointer(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(action): Json<PointerAction>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+    ApiJson(action): ApiJson<PointerAction>,
+) -> Result<Json<ApiResponse<PointerActionSentResponse>>, (axum::http::StatusCode, Json<ApiError>)>
+{
     validate_device_id(&device_id).map_err(api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {
@@ -100,9 +107,9 @@ pub async fn send_remotecontrol_pointer(
         .await
         .map_err(api_err)?;
 
-    Ok(Json(ApiResponse::ok(
-        serde_json::json!({ "status": "sent" }),
-    )))
+    Ok(Json(ApiResponse::ok(PointerActionSentResponse {
+        status: "sent",
+    })))
 }
 
 #[cfg(test)]
@@ -154,5 +161,16 @@ mod tests {
                 .expect("parses");
         let err = build(&action).expect_err("unknown button must be rejected");
         assert_eq!(err.code().http_status(), 400, "got {err}");
+    }
+
+    /// PointerActionSentResponse reuses the `SentResponseWrapper` shape
+    /// (status: "sent") but carries a different schema name so the spec
+    /// names the surface.
+    #[test]
+    fn test_pointer_action_sent_response_carries_status_sent() {
+        let resp = PointerActionSentResponse { status: "sent" };
+        let typed = serde_json::to_value(&resp).expect("typed serialization");
+        let legacy = serde_json::json!({ "status": "sent" });
+        assert_eq!(typed, legacy);
     }
 }

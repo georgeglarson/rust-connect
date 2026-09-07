@@ -1,12 +1,11 @@
-#[allow(unused_imports)]
-// utoipa `body = …` resolves schema names, not paths; the import keeps the name in scope for readers
-use crate::api::types::GenericResponse;
+use crate::api::extractors::ApiJson;
 use axum::{
     extract::{Path, State},
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use utoipa::ToSchema;
 
 use crate::{
     api::{
@@ -37,6 +36,13 @@ pub struct SendKeypressRequest {
     pub send_ack: bool,
 }
 
+/// Acknowledgement for `POST /remotekeyboard/keypress`. The handler does
+/// not echo the key back to the caller — only that the packet went out.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct KeypressSentResponse {
+    pub status: &'static str,
+}
+
 /// The `kdeconnect.mousepad.request` body.
 ///
 /// Key set and order follow kdeconnect-kde
@@ -59,7 +65,7 @@ fn keypress_payload(req: &SendKeypressRequest) -> serde_json::Value {
     tag = "remotekeyboard",
     request_body = SendKeypressRequest,
     responses(
-        (status = 200, description = "Keypress sent successfully", body = GenericResponse),
+        (status = 200, description = "Keypress sent successfully", body = KeypressSentResponseWrapper),
         (status = 400, description = "Invalid device ID", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found or not connected", body = ApiError),
@@ -70,8 +76,8 @@ fn keypress_payload(req: &SendKeypressRequest) -> serde_json::Value {
 pub async fn send_remotekeyboard_keypress(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(req): Json<SendKeypressRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+    ApiJson(req): ApiJson<SendKeypressRequest>,
+) -> Result<Json<ApiResponse<KeypressSentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(crate::api::extractors::api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {
@@ -89,9 +95,9 @@ pub async fn send_remotekeyboard_keypress(
         .await
         .map_err(crate::api::extractors::api_err)?;
 
-    Ok(Json(ApiResponse::ok(
-        serde_json::json!({ "status": "sent" }),
-    )))
+    Ok(Json(ApiResponse::ok(KeypressSentResponse {
+        status: "sent",
+    })))
 }
 
 #[cfg(test)]
@@ -133,5 +139,13 @@ mod tests {
         assert_eq!(payload.get("super").and_then(|v| v.as_bool()), Some(false));
         assert_eq!(payload.get("shift").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(payload.get("specialKey").and_then(|v| v.as_i64()), Some(12));
+    }
+
+    #[test]
+    fn test_keypress_sent_response_matches_legacy_shape() {
+        let resp = KeypressSentResponse { status: "sent" };
+        let typed = serde_json::to_value(&resp).expect("typed serialization");
+        let legacy = serde_json::json!({ "status": "sent" });
+        assert_eq!(typed, legacy);
     }
 }

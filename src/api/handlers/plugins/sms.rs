@@ -1,11 +1,48 @@
 use axum::extract::{Path, State};
 use axum::Json;
+use serde::Serialize;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
+use crate::api::extractors::ApiJson;
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
 use crate::app::AppState;
+use crate::plugins::sms::{SmsMessage, SmsThread};
 use crate::utils::errors::Error;
+
+/// GET /devices/{id}/sms/threads — paginated thread list.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SmsThreadsResponse {
+    pub device_id: String,
+    pub threads: Vec<SmsThread>,
+    pub total: usize,
+    pub page: usize,
+    pub limit: usize,
+}
+
+/// GET /devices/{id}/sms/threads/{thread_id} — single thread messages.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SmsThreadResponse {
+    pub device_id: String,
+    pub thread_id: i64,
+    pub messages: Vec<SmsMessage>,
+    pub total: usize,
+}
+
+/// POST /devices/{id}/sms/send — echoed back the SMS the desktop asked
+/// the phone to send. `phoneNumber` and `messageBody` are camelCase to
+/// match the kdeconnect.sms.request body the phone receives
+/// (see `send_sms`'s outgoing packet) — that's the wire convention.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SmsSentResponse {
+    pub device_id: String,
+    #[serde(rename = "phoneNumber")]
+    pub phone_number: String,
+    #[serde(rename = "messageBody")]
+    pub message_body: String,
+    pub sent: bool,
+}
 
 #[utoipa::path(
     get,
@@ -17,7 +54,7 @@ use crate::utils::errors::Error;
         ("limit" = Option<usize>, Query, description = "Maximum number of threads to return (default 50)")
     ),
     responses(
-        (status = 200, description = "Get SMS threads from device", body = GenericResponse),
+        (status = 200, description = "Get SMS threads from device", body = SmsThreadsResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),
@@ -27,7 +64,7 @@ pub async fn get_sms_threads(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<SmsThreadsResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     let page: usize = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -42,13 +79,13 @@ pub async fn get_sms_threads(
     let _end = start.saturating_add(limit).min(total);
     let threads: Vec<_> = all_threads.into_iter().skip(start).take(limit).collect();
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "threads": threads,
-        "total": total,
-        "page": page,
-        "limit": limit
-    }))))
+    Ok(Json(ApiResponse::ok(SmsThreadsResponse {
+        device_id,
+        threads,
+        total,
+        page,
+        limit,
+    })))
 }
 
 #[utoipa::path(
@@ -59,7 +96,7 @@ pub async fn get_sms_threads(
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "SMS threads request sent", body = GenericResponse),
+        (status = 200, description = "SMS threads request sent", body = SentResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),
@@ -68,7 +105,7 @@ pub async fn get_sms_threads(
 pub async fn request_sms_threads(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<SentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     let packet = conversations_request_packet();
@@ -78,10 +115,10 @@ pub async fn request_sms_threads(
         .await
         .map_err(api_err)?;
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "sent": true
-    }))))
+    Ok(Json(ApiResponse::ok(SentResponse {
+        device_id,
+        sent: true,
+    })))
 }
 
 /// Ask the phone for its conversation list.
@@ -125,7 +162,7 @@ mod conversations_request_tests {
         ("thread_id" = i64, Path, description = "SMS thread ID")
     ),
     responses(
-        (status = 200, description = "Get SMS thread messages", body = GenericResponse),
+        (status = 200, description = "Get SMS thread messages", body = SmsThreadResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),
@@ -134,16 +171,16 @@ mod conversations_request_tests {
 pub async fn get_sms_thread(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((device_id, thread_id)): axum::extract::Path<(String, i64)>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<SmsThreadResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     let messages = state.plugins.sms.get_thread(&device_id, thread_id);
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "thread_id": thread_id,
-        "messages": messages,
-        "total": messages.len(),
-    }))))
+    Ok(Json(ApiResponse::ok(SmsThreadResponse {
+        device_id,
+        thread_id,
+        total: messages.len(),
+        messages,
+    })))
 }
 
 #[utoipa::path(
@@ -155,7 +192,7 @@ pub async fn get_sms_thread(
     ),
     request_body = SendSmsRequest,
     responses(
-        (status = 200, description = "SMS sent to device", body = GenericResponse),
+        (status = 200, description = "SMS sent to device", body = SmsSentResponseWrapper),
         (status = 400, description = "Invalid request", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
@@ -165,8 +202,8 @@ pub async fn get_sms_thread(
 pub async fn send_sms(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(body): Json<SendSmsRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+    ApiJson(body): ApiJson<SendSmsRequest>,
+) -> Result<Json<ApiResponse<SmsSentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {
@@ -190,10 +227,72 @@ pub async fn send_sms(
         .await
         .map_err(api_err)?;
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "phoneNumber": body.phone_number,
-        "messageBody": body.message_body,
-        "sent": true
-    }))))
+    Ok(Json(ApiResponse::ok(SmsSentResponse {
+        device_id,
+        phone_number: body.phone_number,
+        message_body: body.message_body,
+        sent: true,
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn test_sms_threads_response_matches_legacy_shape() {
+        let response = SmsThreadsResponse {
+            device_id: "phone-1".to_string(),
+            threads: Vec::new(),
+            total: 0,
+            page: 1,
+            limit: 50,
+        };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "threads": [],
+            "total": 0,
+            "page": 1,
+            "limit": 50
+        });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
+    fn test_sms_thread_response_matches_legacy_shape() {
+        let response = SmsThreadResponse {
+            device_id: "phone-1".to_string(),
+            thread_id: 42,
+            messages: Vec::new(),
+            total: 0,
+        };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "thread_id": 42,
+            "messages": [],
+            "total": 0
+        });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
+    fn test_sms_sent_response_uses_camel_case_to_match_wire() {
+        let response = SmsSentResponse {
+            device_id: "phone-1".to_string(),
+            phone_number: "+15551234567".to_string(),
+            message_body: "hi".to_string(),
+            sent: true,
+        };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "phoneNumber": "+15551234567",
+            "messageBody": "hi",
+            "sent": true
+        });
+        assert_eq!(typed, legacy);
+    }
 }

@@ -1,12 +1,69 @@
 use axum::extract::{Path, State};
 use axum::Json;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
+use crate::api::extractors::ApiJson;
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
 use crate::app::AppState;
+use crate::plugins::notification::NotificationEntry;
 use crate::utils::errors::Error;
+
+/// GET /api/v1/notifications — paginated history across all (or one)
+/// device. `device_id` lives in the query string, not the path, and is
+/// optional, so this response has no `device_id` field; per-entry
+/// `device_id` lives on each `NotificationEntry`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NotificationsListResponse {
+    pub notifications: Vec<NotificationEntry>,
+    pub total: usize,
+    pub page: usize,
+    pub limit: usize,
+}
+
+/// POST /api/v1/devices/{id}/notification — confirms the desktop pushed
+/// a notification. `notification_id` is the agent-generated server id
+/// the caller will later use for dismiss.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NotificationSentResponse {
+    pub device_id: String,
+    pub notification_id: String,
+    pub sent: bool,
+}
+
+/// POST /api/v1/devices/{id}/notification/{nid}/reply — echoes back the
+/// reply text so the UI can confirm what was sent.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NotificationReplyResponse {
+    pub device_id: String,
+    pub notification_id: String,
+    pub message: String,
+    pub sent: bool,
+}
+
+/// POST /api/v1/devices/{id}/notification/{nid}/action — confirms the
+/// desktop triggered one of the phone's declared actions.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NotificationActionTriggeredResponse {
+    pub device_id: String,
+    pub notification_id: String,
+    pub action: String,
+    pub sent: bool,
+}
+
+/// POST /api/v1/devices/{id}/notification/{nid}/dismiss — confirms the
+/// phone got the cancel packet, and whether the desktop's local history
+/// still held the entry (a UI test would want both signals).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NotificationDismissedResponse {
+    pub device_id: String,
+    pub notification_id: String,
+    pub sent: bool,
+    pub removed_from_history: bool,
+}
 
 #[utoipa::path(
     get,
@@ -17,7 +74,7 @@ use crate::utils::errors::Error;
         Pagination,
     ),
     responses(
-        (status = 200, description = "Notification history", body = serde_json::Value),
+        (status = 200, description = "Notification history", body = NotificationsListResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
     security(("api_key" = []))
@@ -25,7 +82,8 @@ use crate::utils::errors::Error;
 pub async fn get_notifications(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<NotificationsListResponse>>, (axum::http::StatusCode, Json<ApiError>)>
+{
     let device_id = params.get("device_id").map(|s| s.as_str());
     let pagination = Pagination::from_query(&params);
     let page = pagination.page();
@@ -41,12 +99,12 @@ pub async fn get_notifications(
     let _end = start.saturating_add(limit).min(total);
     let entries: Vec<_> = all_entries.into_iter().skip(start).take(limit).collect();
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "notifications": entries,
-        "total": total,
-        "page": page,
-        "limit": limit,
-    }))))
+    Ok(Json(ApiResponse::ok(NotificationsListResponse {
+        notifications: entries,
+        total,
+        page,
+        limit,
+    })))
 }
 
 #[utoipa::path(
@@ -58,7 +116,7 @@ pub async fn get_notifications(
     ),
     request_body = SendNotificationRequest,
     responses(
-        (status = 200, description = "Notification sent to device", body = GenericResponse),
+        (status = 200, description = "Notification sent to device", body = NotificationSentResponseWrapper),
         (status = 400, description = "Invalid request", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
@@ -68,8 +126,8 @@ pub async fn get_notifications(
 pub async fn send_notification(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(body): Json<SendNotificationRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+    ApiJson(body): ApiJson<SendNotificationRequest>,
+) -> Result<Json<ApiResponse<NotificationSentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {
@@ -99,11 +157,11 @@ pub async fn send_notification(
         .await
         .map_err(api_err)?;
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "notification_id": notification_id,
-        "sent": true
-    }))))
+    Ok(Json(ApiResponse::ok(NotificationSentResponse {
+        device_id,
+        notification_id,
+        sent: true,
+    })))
 }
 
 pub(crate) fn build_notification_reply_packet(
@@ -129,7 +187,7 @@ pub(crate) fn build_notification_reply_packet(
     ),
     request_body = ReplyNotificationRequest,
     responses(
-        (status = 200, description = "Notification reply sent to device", body = GenericResponse),
+        (status = 200, description = "Notification reply sent to device", body = NotificationReplyResponseWrapper),
         (status = 400, description = "Invalid request", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
@@ -139,8 +197,9 @@ pub(crate) fn build_notification_reply_packet(
 pub async fn reply_notification(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((device_id, notification_id)): axum::extract::Path<(String, String)>,
-    Json(body): Json<ReplyNotificationRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+    ApiJson(body): ApiJson<ReplyNotificationRequest>,
+) -> Result<Json<ApiResponse<NotificationReplyResponse>>, (axum::http::StatusCode, Json<ApiError>)>
+{
     validate_device_id(&device_id).map_err(api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {
@@ -172,12 +231,12 @@ pub async fn reply_notification(
         .await
         .map_err(api_err)?;
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "notification_id": notification_id,
-        "message": body.message,
-        "sent": true
-    }))))
+    Ok(Json(ApiResponse::ok(NotificationReplyResponse {
+        device_id,
+        notification_id,
+        message: body.message,
+        sent: true,
+    })))
 }
 
 #[utoipa::path(
@@ -248,7 +307,7 @@ pub(crate) fn build_notification_action_packet(
     ),
     request_body = NotificationActionRequest,
     responses(
-        (status = 200, description = "Notification action sent to device", body = GenericResponse),
+        (status = 200, description = "Notification action sent to device", body = NotificationActionTriggeredResponseWrapper),
         (status = 400, description = "Unknown action or disconnected device", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
@@ -257,8 +316,11 @@ pub(crate) fn build_notification_action_packet(
 pub async fn activate_notification_action(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((device_id, notification_id)): axum::extract::Path<(String, String)>,
-    Json(body): Json<NotificationActionRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+    ApiJson(body): ApiJson<NotificationActionRequest>,
+) -> Result<
+    Json<ApiResponse<NotificationActionTriggeredResponse>>,
+    (axum::http::StatusCode, Json<ApiError>),
+> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {
@@ -285,12 +347,12 @@ pub async fn activate_notification_action(
         .await
         .map_err(api_err)?;
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "notification_id": notification_id,
-        "action": body.action,
-        "sent": true,
-    }))))
+    Ok(Json(ApiResponse::ok(NotificationActionTriggeredResponse {
+        device_id,
+        notification_id,
+        action: body.action,
+        sent: true,
+    })))
 }
 
 #[cfg(test)]
@@ -337,7 +399,7 @@ mod task_1_4_wire_tests {
         ("notification_id" = String, Path, description = "Notification ID to dismiss on the device")
     ),
     responses(
-        (status = 200, description = "Dismiss request sent to device", body = GenericResponse),
+        (status = 200, description = "Dismiss request sent to device", body = NotificationDismissedResponseWrapper),
         (status = 400, description = "Invalid request", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
@@ -347,7 +409,10 @@ mod task_1_4_wire_tests {
 pub async fn dismiss_notification(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((device_id, notification_id)): axum::extract::Path<(String, String)>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<
+    Json<ApiResponse<NotificationDismissedResponse>>,
+    (axum::http::StatusCode, Json<ApiError>),
+> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     if notification_id.is_empty() {
@@ -396,10 +461,104 @@ pub async fn dismiss_notification(
         .notification
         .dismiss(&device_id, &notification_id);
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "notification_id": notification_id,
-        "sent": true,
-        "removed_from_history": removed_from_history
-    }))))
+    Ok(Json(ApiResponse::ok(NotificationDismissedResponse {
+        device_id,
+        notification_id,
+        sent: true,
+        removed_from_history,
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn test_notifications_list_response_matches_legacy_shape() {
+        let resp = NotificationsListResponse {
+            notifications: Vec::new(),
+            total: 0,
+            page: 1,
+            limit: 50,
+        };
+        let typed = serde_json::to_value(&resp).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "notifications": [],
+            "total": 0,
+            "page": 1,
+            "limit": 50,
+        });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
+    fn test_notification_sent_response_matches_legacy_shape() {
+        let response = NotificationSentResponse {
+            device_id: "phone-1".to_string(),
+            notification_id: "agent-abc".to_string(),
+            sent: true,
+        };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "notification_id": "agent-abc",
+            "sent": true
+        });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
+    fn test_notification_reply_response_matches_legacy_shape() {
+        let response = NotificationReplyResponse {
+            device_id: "phone-1".to_string(),
+            notification_id: "agent-abc".to_string(),
+            message: "hi".to_string(),
+            sent: true,
+        };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "notification_id": "agent-abc",
+            "message": "hi",
+            "sent": true
+        });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
+    fn test_notification_action_response_matches_legacy_shape() {
+        let response = NotificationActionTriggeredResponse {
+            device_id: "phone-1".to_string(),
+            notification_id: "agent-abc".to_string(),
+            action: "Mark as read".to_string(),
+            sent: true,
+        };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "notification_id": "agent-abc",
+            "action": "Mark as read",
+            "sent": true
+        });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
+    fn test_notification_dismissed_response_matches_legacy_shape() {
+        let response = NotificationDismissedResponse {
+            device_id: "phone-1".to_string(),
+            notification_id: "agent-abc".to_string(),
+            sent: true,
+            removed_from_history: true,
+        };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "notification_id": "agent-abc",
+            "sent": true,
+            "removed_from_history": true
+        });
+        assert_eq!(typed, legacy);
+    }
 }
