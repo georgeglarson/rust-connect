@@ -12,6 +12,9 @@ use crate::api::handlers::plugins::connectivity::ConnectivityResponse;
 use crate::api::handlers::plugins::sftp::{
     SftpInfoResponse, SftpMountResponse, SftpRequestResponse, SftpUnmountResponse,
 };
+use crate::api::handlers::plugins::sms::{
+    SmsSentResponse, SmsThreadResponse, SmsThreadsResponse,
+};
 use crate::api::handlers::plugins::telephony::TelephonyCallsResponse;
 use crate::device::types::{Device, DeviceState, DeviceType};
 use crate::utils::errors::ErrorCode;
@@ -33,6 +36,9 @@ use crate::utils::errors::ErrorCode;
     SftpInfoResponseWrapper = ApiResponse<SftpInfoResponse>,
     SftpMountResponseWrapper = ApiResponse<SftpMountResponse>,
     SftpUnmountResponseWrapper = ApiResponse<SftpUnmountResponse>,
+    SmsThreadsResponseWrapper = ApiResponse<SmsThreadsResponse>,
+    SmsThreadResponseWrapper = ApiResponse<SmsThreadResponse>,
+    SmsSentResponseWrapper = ApiResponse<SmsSentResponse>,
 )]
 pub struct ApiResponse<T: Serialize> {
     pub status: &'static str,

@@ -12,13 +12,13 @@ use crate::utils::errors::Result;
 
 use super::plugin::Plugin;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct SmsAddress {
     #[serde(default)]
     pub address: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SmsMessage {
     #[serde(rename = "messageID")]
@@ -47,7 +47,7 @@ pub struct SmsMessage {
 
 type ThreadKey = (String, i64);
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct SmsThread {
     pub thread_id: i64,
     pub read_count: usize,
