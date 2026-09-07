@@ -758,9 +758,22 @@ mod tests {
     /// compile, pass them all, and hand a fixture identity to a live
     /// daemon on this host (the 2026-09-06 incident class)
     /// *(cypher, kimi-k3 + qwen-38max missing test 1)*.
+    ///
+    /// TEST_UDP_PORT is a fixed port in a parallel-test binary, so this
+    /// capture can also receive datagrams OTHER tests send to it: both
+    /// `start_services` tests run the production wiring, and their real
+    /// loopback mDNS browse resolves foreign fixture announces (the
+    /// test-build service type), unicasting THIS module's shared OUR_ID
+    /// to TEST_UDP_PORT. Those strays carry the real bound TCP port of
+    /// their own listener — Linux ephemeral range, 32768-60999 — so the
+    /// marker here is 1764, which no ephemeral bind can produce, and the
+    /// drain loop below skips anything that does not carry it (vk #1101
+    /// review: the bare device_id assertion was proven satisfiable by a
+    /// datagram this test never caused).
     #[tokio::test]
     async fn test_mdns_resolve_production_wrapper_targets_the_test_udp_port() {
         let (state, _t) = test_state();
+        state.connection_manager.set_tcp_port(1764);
         let capture = tokio::net::UdpSocket::bind((
             std::net::Ipv4Addr::LOCALHOST,
             crate::protocol::types::TEST_UDP_PORT,
@@ -773,9 +786,20 @@ mod tests {
             mdns_peer(std::net::Ipv4Addr::LOCALHOST.into(), 1716),
         );
 
-        let received = recv_identity(&capture, std::time::Duration::from_secs(2))
-            .await
-            .expect("the production wrapper must unicast to fallback_udp_port(), i.e. TEST_UDP_PORT here");
-        assert_eq!(received.device_id, OUR_ID);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the production wrapper must unicast to fallback_udp_port(), i.e. TEST_UDP_PORT \
+                 here, within 2 s"
+            );
+            if let Some(received) = recv_identity(&capture, remaining).await {
+                if received.device_id == OUR_ID && received.tcp_port == Some(1764) {
+                    break;
+                }
+                // A stray from a parallel test: not ours, keep waiting.
+            }
+        }
     }
 }
