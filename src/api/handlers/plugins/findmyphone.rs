@@ -1,11 +1,20 @@
 use axum::extract::{Path, State};
 use axum::Json;
+use serde::Serialize;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
 use crate::app::AppState;
 use crate::utils::errors::Error;
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FindMyPhoneResponse {
+    pub device_id: String,
+    pub sent: bool,
+    pub message: String,
+}
 
 #[utoipa::path(
     post,
@@ -15,7 +24,7 @@ use crate::utils::errors::Error;
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Ring request sent to device", body = GenericResponse),
+        (status = 200, description = "Ring request sent to device", body = FindMyPhoneResponseWrapper),
         (status = 400, description = "Invalid request or device not connected", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
@@ -24,7 +33,7 @@ use crate::utils::errors::Error;
 pub async fn find_my_phone(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<FindMyPhoneResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {
@@ -43,9 +52,31 @@ pub async fn find_my_phone(
         .await
         .map_err(api_err)?;
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "sent": true,
-        "message": "Ring request sent. The device will ring until dismissed."
-    }))))
+    Ok(Json(ApiResponse::ok(FindMyPhoneResponse {
+        device_id,
+        sent: true,
+        message: "Ring request sent. The device will ring until dismissed.".to_string(),
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn test_find_myphone_response_matches_legacy_shape() {
+        let response = FindMyPhoneResponse {
+            device_id: "phone-1".to_string(),
+            sent: true,
+            message: "Ring request sent.".to_string(),
+        };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "sent": true,
+            "message": "Ring request sent."
+        });
+        assert_eq!(typed, legacy);
+    }
 }

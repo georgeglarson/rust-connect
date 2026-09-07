@@ -4,7 +4,10 @@
 
 use axum::extract::{Path, State};
 use axum::Json;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use utoipa::ToSchema;
 
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
@@ -388,13 +391,21 @@ async fn notify_peer_unpair(state: &AppState, device_id: &DeviceId) {
     }
 }
 
+/// Acknowledgement for `POST /api/v1/ping`. Distinct from the shared
+/// `SentResponse` so the spec names the surface — `data: { device_id, sent }`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PingSentResponse {
+    pub device_id: String,
+    pub sent: bool,
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/ping",
     tag = "devices",
     request_body = SendPingRequest,
     responses(
-        (status = 200, description = "Ping sent to device", body = PingResponse),
+        (status = 200, description = "Ping sent to device", body = PingSentResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
         (status = 503, description = "Connection error", body = ApiError),
@@ -405,7 +416,7 @@ async fn notify_peer_unpair(state: &AppState, device_id: &DeviceId) {
 pub async fn send_ping(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SendPingRequest>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<PingSentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&body.device_id).map_err(api_err)?;
 
     let packet = crate::protocol::types::Packet::ping();
@@ -415,10 +426,17 @@ pub async fn send_ping(
         .await
         .map_err(api_err)?;
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": body.device_id,
-        "sent": true
-    }))))
+    Ok(Json(ApiResponse::ok(PingSentResponse {
+        device_id: body.device_id,
+        sent: true,
+    })))
+}
+
+/// Acknowledgement for `DELETE /api/v1/devices/{device_id}`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeviceRemovedResponse {
+    pub device_id: String,
+    pub removed: bool,
 }
 
 #[utoipa::path(
@@ -429,7 +447,7 @@ pub async fn send_ping(
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Device removed", body = serde_json::Value),
+        (status = 200, description = "Device removed", body = DeviceRemovedResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),
@@ -438,7 +456,7 @@ pub async fn send_ping(
 pub async fn delete_device(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<DeviceRemovedResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     if !state.registry.contains(&device_id).await {
@@ -465,10 +483,28 @@ pub async fn delete_device(
     let _ = state.registry.remove(&device_id).await;
     state.lifecycle.remove(&device_id).await;
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "removed": true,
-    }))))
+    Ok(Json(ApiResponse::ok(DeviceRemovedResponse {
+        device_id,
+        removed: true,
+    })))
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct ConnectDeviceRequest {
+    /// `host:port` of the device's TCP listener (kdeconnect-android
+    /// opens 1716 on the desktop-visible address).
+    pub address: String,
+}
+
+/// Acknowledgement for `POST /api/v1/devices/{device_id}/connect`. The
+/// returned `device_id` is the resolved identifier the daemon paired to;
+/// the caller-supplied path parameter is treated as a hint, not an
+/// authoritative identity.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeviceConnectedResponse {
+    pub device_id: String,
+    pub connected: bool,
+    pub generation: u64,
 }
 
 #[utoipa::path(
@@ -478,9 +514,9 @@ pub async fn delete_device(
     params(
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
-    request_body = serde_json::Value,
+    request_body = ConnectDeviceRequest,
     responses(
-        (status = 200, description = "Connection established", body = serde_json::Value),
+        (status = 200, description = "Connection established", body = DeviceConnectedResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),
@@ -489,8 +525,8 @@ pub async fn delete_device(
 pub async fn connect_device(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+    Json(body): Json<ConnectDeviceRequest>,
+) -> Result<Json<ApiResponse<DeviceConnectedResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     if state.connection_manager.is_connected(&device_id).await {
@@ -499,15 +535,10 @@ pub async fn connect_device(
         )));
     }
 
-    let address = body
-        .get("address")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| api_err(Error::InvalidRequest("address field required".to_string())))?;
-
-    let addr: std::net::SocketAddr = address.parse().map_err(|_| {
+    let addr: std::net::SocketAddr = body.address.parse().map_err(|_| {
         api_err(Error::InvalidRequest(format!(
             "Invalid address: {}",
-            address
+            body.address
         )))
     })?;
 
@@ -521,11 +552,18 @@ pub async fn connect_device(
             .await
             .map_err(api_err)?;
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": connected_id,
-        "connected": true,
-        "generation": generation,
-    }))))
+    Ok(Json(ApiResponse::ok(DeviceConnectedResponse {
+        device_id: connected_id,
+        connected: true,
+        generation,
+    })))
+}
+
+/// Acknowledgement for `POST /api/v1/devices/{device_id}/disconnect`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeviceDisconnectedResponse {
+    pub device_id: String,
+    pub disconnected: bool,
 }
 
 #[utoipa::path(
@@ -536,7 +574,7 @@ pub async fn connect_device(
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Device disconnected", body = serde_json::Value),
+        (status = 200, description = "Device disconnected", body = DeviceDisconnectedResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
     security(("api_key" = []))
@@ -544,7 +582,7 @@ pub async fn connect_device(
 pub async fn disconnect_device(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<DeviceDisconnectedResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     if !state.connection_manager.is_connected(&device_id).await {
@@ -569,10 +607,22 @@ pub async fn disconnect_device(
         }
     }
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "disconnected": true,
-    }))))
+    Ok(Json(ApiResponse::ok(DeviceDisconnectedResponse {
+        device_id,
+        disconnected: true,
+    })))
+}
+
+/// Body for `GET /api/v1/devices/{device_id}/state`. `state` and
+/// `state_since` are nullable: a brand-new device never recorded any
+/// transition has no rendered state to surface.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeviceStateResponse {
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_since: Option<DateTime<Utc>>,
 }
 
 #[utoipa::path(
@@ -583,7 +633,7 @@ pub async fn disconnect_device(
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Device state", body = serde_json::Value),
+        (status = 200, description = "Device state", body = DeviceStateResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
     security(("api_key" = []))
@@ -591,17 +641,34 @@ pub async fn disconnect_device(
 pub async fn get_device_state(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<DeviceStateResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     let device_state = state.lifecycle.get_state(&device_id).await.ok();
     let state_since = state.lifecycle.get_state_since(&device_id).await.ok();
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "state": device_state.map(|s| format!("{:?}", s)),
-        "state_since": state_since.map(|t| t.to_rfc3339()),
-    }))))
+    Ok(Json(ApiResponse::ok(DeviceStateResponse {
+        device_id,
+        state: device_state.map(|s| format!("{:?}", s)),
+        state_since,
+    })))
+}
+
+/// One connected device. The `generation` is the same monotonic counter
+/// that `disconnect` carries: a redial bumps it, so the pair
+/// `(device_id, generation)` names the specific link the daemon has
+/// open right now.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConnectedDeviceEntry {
+    pub device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConnectedDevicesResponse {
+    pub connected_devices: Vec<ConnectedDeviceEntry>,
+    pub count: usize,
 }
 
 #[utoipa::path(
@@ -609,26 +676,129 @@ pub async fn get_device_state(
     path = "/api/v1/devices/connected",
     tag = "devices",
     responses(
-        (status = 200, description = "List of connected devices", body = serde_json::Value),
+        (status = 200, description = "List of connected devices", body = ConnectedDevicesResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
     security(("api_key" = []))
 )]
 pub async fn list_connected_devices(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<ConnectedDevicesResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     let device_ids = state.connection_manager.connected_device_ids().await;
-    let mut devices = Vec::new();
+    let mut devices = Vec::with_capacity(device_ids.len());
     for id in device_ids {
         let generation = state.connection_manager.get_generation(&id).await;
-        devices.push(serde_json::json!({
-            "device_id": id,
-            "generation": generation,
-        }));
+        devices.push(ConnectedDeviceEntry {
+            device_id: id,
+            generation,
+        });
+    }
+    let count = devices.len();
+    Ok(Json(ApiResponse::ok(ConnectedDevicesResponse {
+        connected_devices: devices,
+        count,
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+
+    #[test]
+    fn test_ping_sent_response_matches_legacy_shape() {
+        let resp = PingSentResponse {
+            device_id: "phone-1".to_string(),
+            sent: true,
+        };
+        let typed = serde_json::to_value(&resp).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "sent": true,
+        });
+        assert_eq!(typed, legacy);
     }
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "connected_devices": devices,
-        "count": devices.len(),
-    }))))
+    #[test]
+    fn test_device_removed_response_matches_legacy_shape() {
+        let resp = DeviceRemovedResponse {
+            device_id: "phone-1".to_string(),
+            removed: true,
+        };
+        let typed = serde_json::to_value(&resp).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "removed": true,
+        });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
+    fn test_connect_device_request_parses() {
+        let body: ConnectDeviceRequest = serde_json::from_str(r#"{"address":"10.0.0.2:1716"}"#)
+            .expect("connect request must parse");
+        assert_eq!(body.address, "10.0.0.2:1716");
+    }
+
+    #[test]
+    fn test_device_connected_response_round_trip() {
+        let resp = DeviceConnectedResponse {
+            device_id: "phone-1".to_string(),
+            connected: true,
+            generation: 7,
+        };
+        let typed = serde_json::to_value(&resp).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "connected": true,
+            "generation": 7,
+        });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
+    fn test_device_disconnected_response_matches_legacy_shape() {
+        let resp = DeviceDisconnectedResponse {
+            device_id: "phone-1".to_string(),
+            disconnected: true,
+        };
+        let typed = serde_json::to_value(&resp).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "disconnected": true,
+        });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
+    fn test_device_state_response_omits_null_state() {
+        let resp = DeviceStateResponse {
+            device_id: "phone-1".to_string(),
+            state: None,
+            state_since: None,
+        };
+        let typed = serde_json::to_value(&resp).expect("typed serialization");
+        let legacy = serde_json::json!({ "device_id": "phone-1" });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
+    fn test_connected_devices_response_matches_legacy_shape() {
+        let resp = ConnectedDevicesResponse {
+            connected_devices: vec![ConnectedDeviceEntry {
+                device_id: "phone-1".to_string(),
+                generation: Some(3),
+            }],
+            count: 1,
+        };
+        let typed = serde_json::to_value(&resp).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "connected_devices": [{
+                "device_id": "phone-1",
+                "generation": 3,
+            }],
+            "count": 1,
+        });
+        assert_eq!(typed, legacy);
+    }
 }

@@ -135,10 +135,22 @@ fn test_untyped_response_bodies_only_ever_decrease() {
     // here: pin 17 → 16. Notifications endpoints (list, send, reply,
     // action, dismiss) typed here: pin 16 → 11. Note: get_notification_icon
     // serves image/png and is not in the ratchet.
-    const PIN: usize = 11;
+    //
+    // Remaining handlers typed in this commit (pin 11 → 0): share
+    // (files list, send file, send text, send url), clipboard (get, set,
+    // request), lock (device), findmyphone (ring), volume (set), system
+    // volume (set local sink control), remotecontrol (pointer),
+    // remotekeyboard (keypress), and the device lifecycle handlers
+    // (ping, delete, connect, disconnect, get_state, list_connected).
+    // `request_clipboard` reuses SentResponse; `set_clipboard` /
+    // `send_ping` / `delete_device` / `connect_device` /
+    // `disconnect_device` got their own types because the legacy
+    // shape carried `removed`/`connected`/`disconnected` flags the
+    // shared struct doesn't have.
+    const PIN: usize = 0;
     assert!(
         count <= PIN,
         "untyped-response pin is {PIN}; this commit allows {count} (offenders: {offenders:#?}). \
-         Did you add an endpoint that uses GenericResponse/PingResponse without lowering the pin?"
+         Did you add an endpoint that uses an alias from UNTYPED_API_ALIASES without lowering the pin?"
     );
 }

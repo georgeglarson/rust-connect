@@ -30,14 +30,15 @@ pub struct SmsThreadResponse {
 }
 
 /// POST /devices/{id}/sms/send — echoed back the SMS the desktop asked
-/// the phone to send. The `phoneNumber` / `messageBody` keys stay
-/// camelCase to match the kdeconnect.sms.request body the phone receives
+/// the phone to send. `phoneNumber` and `messageBody` are camelCase to
+/// match the kdeconnect.sms.request body the phone receives
 /// (see `send_sms`'s outgoing packet) — that's the wire convention.
 #[derive(Debug, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct SmsSentResponse {
     pub device_id: String,
+    #[serde(rename = "phoneNumber")]
     pub phone_number: String,
+    #[serde(rename = "messageBody")]
     pub message_body: String,
     pub sent: bool,
 }

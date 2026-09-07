@@ -50,13 +50,14 @@ pub struct SftpInfoResponse {
 }
 
 /// POST /devices/{id}/sftp/mount. `error` is set only when the mount
-/// attempt failed (mirrors `mount_sftp`'s `Failed(msg)` state).
+/// attempt failed (mirrors `mount_sftp`'s `Failed(msg)` state). `mount_point`
+/// is always present (null on failure, the resolved path on success)
+/// because the legacy handler serialised it unconditionally.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SftpMountResponse {
     pub device_id: String,
     pub mounted: bool,
     pub mount_state: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub mount_point: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,

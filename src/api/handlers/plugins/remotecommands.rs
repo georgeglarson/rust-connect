@@ -1,7 +1,6 @@
-// utoipa `body = …` resolves schema names, not paths; the imports keep the
-// names in scope for readers.
+// utoipa `body = …` resolves schema names, not paths; the import keeps the name in scope for readers.
 #[allow(unused_imports)]
-use crate::api::types::{GenericResponse, RemoteCommandsResponseWrapper};
+use crate::api::types::RemoteCommandsResponseWrapper;
 use axum::{
     extract::{Path, State},
     Json,

@@ -7,9 +7,19 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::api::handlers::RemoteCommandsResponse;
+use crate::api::handlers::{
+    ConnectedDevicesResponse, DeviceConnectedResponse, DeviceDisconnectedResponse,
+    DeviceRemovedResponse, DeviceStateResponse, PingSentResponse,
+};
+use crate::api::handlers::share::{
+    ShareFileSentResponse, ShareFilesResponse, ShareTextSentResponse, ShareUrlSentResponse,
+};
 use crate::api::handlers::plugins::battery::BatteryResponse;
+use crate::api::handlers::plugins::clipboard::{ClipboardContentResponse, ClipboardSetResponse};
 use crate::api::handlers::plugins::connectivity::ConnectivityResponse;
 use crate::api::handlers::plugins::contacts::{ContactsListResponse, ContactsSyncResponse};
+use crate::api::handlers::plugins::findmyphone::FindMyPhoneResponse;
+use crate::api::handlers::plugins::lock::LockCommandSentResponse;
 use crate::api::handlers::plugins::mpris::{
     MprisActionResponse, MprisLocalPlayersResponse, MprisPlayersResponse,
 };
@@ -17,14 +27,18 @@ use crate::api::handlers::plugins::notification::{
     NotificationActionTriggeredResponse, NotificationDismissedResponse, NotificationReplyResponse,
     NotificationSentResponse, NotificationsListResponse,
 };
+use crate::api::handlers::plugins::remotecontrol::PointerActionSentResponse;
 use crate::api::handlers::plugins::remotecommands::RemoteCommandTriggerResponse;
+use crate::api::handlers::plugins::remotekeyboard::KeypressSentResponse;
 use crate::api::handlers::plugins::sftp::{
     SftpInfoResponse, SftpMountResponse, SftpRequestResponse, SftpUnmountResponse,
 };
 use crate::api::handlers::plugins::sms::{
     SmsSentResponse, SmsThreadResponse, SmsThreadsResponse,
 };
+use crate::api::handlers::plugins::systemvolume::LocalSinkControlResponse;
 use crate::api::handlers::plugins::telephony::TelephonyCallsResponse;
+use crate::api::handlers::plugins::volume::VolumeControlSentResponse;
 use crate::device::types::{Device, DeviceState, DeviceType};
 use crate::utils::errors::ErrorCode;
 
@@ -33,8 +47,6 @@ use crate::utils::errors::ErrorCode;
     DevicesResponse = ApiResponse<DeviceListResponse>,
     DeviceResponse = ApiResponse<Device>,
     PairResponseWrapper = ApiResponse<PairResponse>,
-    PingResponse = ApiResponse<serde_json::Value>,
-    GenericResponse = ApiResponse<serde_json::Value>,
     RemoteCommandsResponseWrapper = ApiResponse<RemoteCommandsResponse>,
     PluginsResponse = ApiResponse<PluginListResponse>,
     SentResponseWrapper = ApiResponse<SentResponse>,
@@ -59,6 +71,24 @@ use crate::utils::errors::ErrorCode;
     NotificationReplyResponseWrapper = ApiResponse<NotificationReplyResponse>,
     NotificationActionTriggeredResponseWrapper = ApiResponse<NotificationActionTriggeredResponse>,
     NotificationDismissedResponseWrapper = ApiResponse<NotificationDismissedResponse>,
+    LockCommandSentResponseWrapper = ApiResponse<LockCommandSentResponse>,
+    FindMyPhoneResponseWrapper = ApiResponse<FindMyPhoneResponse>,
+    VolumeControlSentResponseWrapper = ApiResponse<VolumeControlSentResponse>,
+    ShareFilesResponseWrapper = ApiResponse<ShareFilesResponse>,
+    ShareFileSentResponseWrapper = ApiResponse<ShareFileSentResponse>,
+    ShareTextSentResponseWrapper = ApiResponse<ShareTextSentResponse>,
+    ShareUrlSentResponseWrapper = ApiResponse<ShareUrlSentResponse>,
+    ClipboardContentResponseWrapper = ApiResponse<ClipboardContentResponse>,
+    ClipboardSetResponseWrapper = ApiResponse<ClipboardSetResponse>,
+    LocalSinkControlResponseWrapper = ApiResponse<LocalSinkControlResponse>,
+    PointerActionSentResponseWrapper = ApiResponse<PointerActionSentResponse>,
+    KeypressSentResponseWrapper = ApiResponse<KeypressSentResponse>,
+    PingSentResponseWrapper = ApiResponse<PingSentResponse>,
+    DeviceRemovedResponseWrapper = ApiResponse<DeviceRemovedResponse>,
+    DeviceConnectedResponseWrapper = ApiResponse<DeviceConnectedResponse>,
+    DeviceDisconnectedResponseWrapper = ApiResponse<DeviceDisconnectedResponse>,
+    DeviceStateResponseWrapper = ApiResponse<DeviceStateResponse>,
+    ConnectedDevicesResponseWrapper = ApiResponse<ConnectedDevicesResponse>,
 )]
 pub struct ApiResponse<T: Serialize> {
     pub status: &'static str,
@@ -73,14 +103,16 @@ pub struct ApiResponse<T: Serialize> {
 /// the endpoint returns.
 ///
 /// The constitution (`docs/constitution.md` § 1) requires every endpoint
-/// to be described by an explicit struct. The list below is the source
-/// of truth for "what is still untyped"; adding a new entry here means
-/// adding another endpoint the spec lies about. Lower it by typing one
-/// endpoint and removing its alias from the list.
+/// to be described by an explicit struct. As of this lane every
+/// endpoint's 200 body is a typed schema, so the list is empty; the
+/// ratchet is `count == 0` and stays that way unless a new endpoint is
+/// added that reaches for `GenericResponse` / `PingResponse` (or some
+/// future untyped alias). To add such an endpoint is to lie to codegen
+/// consumers — prefer typing the response and lowering the pin further.
 ///
 /// `tests/openapi_lint::test_untyped_response_bodies_only_ever_decrease`
 /// pins and guards this list.
-pub const UNTYPED_API_ALIASES: &[&str] = &["GenericResponse", "PingResponse"];
+pub const UNTYPED_API_ALIASES: &[&str] = &[];
 
 /// Shared acknowledgement for fire-and-forget "I sent a packet" handlers.
 ///
