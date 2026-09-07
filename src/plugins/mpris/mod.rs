@@ -127,7 +127,7 @@ fn build_album_art_envelope(
 // Remote role (phone is the player host) — pre-existing, unchanged.
 // =====================================================================
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MprisInfo {
     #[serde(default)]
@@ -190,7 +190,7 @@ pub struct MprisInfo {
 /// Snapshot of one local session MPRIS player, keyed on the wire by `name`.
 /// Field-for-field the state kdeconnect-kde reads out of its MPRIS proxies
 /// (mpriscontrolplugin.cpp:317-358, 396-425).
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, utoipa::ToSchema)]
 pub struct LocalPlayerState {
     /// Bus service name, e.g. `org.mpris.MediaPlayer2.brave.instance9654`.
     pub service: String,

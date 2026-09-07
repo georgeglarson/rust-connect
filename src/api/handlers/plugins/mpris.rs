@@ -1,11 +1,39 @@
 use axum::extract::{Path, State};
 use axum::Json;
+use serde::Serialize;
 use std::sync::Arc;
+use utoipa::ToSchema;
 
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
 use crate::app::AppState;
 use crate::utils::errors::Error;
+use crate::plugins::mpris::{LocalPlayerState, MprisInfo};
+
+/// GET /devices/{id}/mpris — phone-as-player-host snapshot list.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MprisPlayersResponse {
+    pub device_id: String,
+    pub players: Vec<MprisInfo>,
+}
+
+/// GET /mpris/local-players — control-role snapshot list (no device_id:
+/// the local session is the host).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MprisLocalPlayersResponse {
+    pub players: Vec<LocalPlayerState>,
+}
+
+/// POST /devices/{id}/mpris/{player}/action — echoes back the action
+/// the desktop asked the phone to perform, so the caller can log the
+/// {device_id, player, action} tuple against the side effect.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MprisActionResponse {
+    pub device_id: String,
+    pub player: String,
+    pub action: String,
+    pub sent: bool,
+}
 
 #[utoipa::path(
     get,
@@ -15,7 +43,7 @@ use crate::utils::errors::Error;
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "Get MPRIS players from device", body = GenericResponse),
+        (status = 200, description = "Get MPRIS players from device", body = MprisPlayersResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),
@@ -24,14 +52,14 @@ use crate::utils::errors::Error;
 pub async fn get_device_mpris(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<MprisPlayersResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     let players = state.plugins.mpris.get_players(&device_id);
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "players": players,
-    }))))
+    Ok(Json(ApiResponse::ok(MprisPlayersResponse {
+        device_id,
+        players,
+    })))
 }
 
 #[utoipa::path(
@@ -39,20 +67,18 @@ pub async fn get_device_mpris(
     path = "/api/v1/mpris/local-players",
     tag = "mpris",
     responses(
-        (status = 200, description = "Get local (control-role) MPRIS players on this machine", body = GenericResponse),
+        (status = 200, description = "Get local (control-role) MPRIS players on this machine", body = MprisLocalPlayersResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
     security(("api_key" = []))
 )]
 pub async fn get_local_players(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<MprisLocalPlayersResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     // Control role: this machine's own players as tracked from the session
     // D-Bus (empty when no session backend is enabled).
     let players = state.plugins.mpris.local_players();
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "players": players,
-    }))))
+    Ok(Json(ApiResponse::ok(MprisLocalPlayersResponse { players })))
 }
 
 #[utoipa::path(
@@ -63,7 +89,7 @@ pub async fn get_local_players(
         ("device_id" = String, Path, description = "Device unique identifier")
     ),
     responses(
-        (status = 200, description = "MPRIS request sent", body = GenericResponse),
+        (status = 200, description = "MPRIS request sent", body = SentResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
     ),
@@ -72,7 +98,7 @@ pub async fn get_local_players(
 pub async fn request_mpris(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<SentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     let packet = crate::protocol::types::Packet::new(
@@ -85,10 +111,10 @@ pub async fn request_mpris(
         .await
         .map_err(api_err)?;
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "sent": true
-    }))))
+    Ok(Json(ApiResponse::ok(SentResponse {
+        device_id,
+        sent: true,
+    })))
 }
 
 #[utoipa::path(
@@ -101,7 +127,7 @@ pub async fn request_mpris(
     ),
     request_body = serde_json::Value,
     responses(
-        (status = 200, description = "MPRIS action sent", body = GenericResponse),
+        (status = 200, description = "MPRIS action sent", body = MprisActionResponseWrapper),
         (status = 400, description = "Invalid request", body = ApiError),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 404, description = "Device not found", body = ApiError),
@@ -112,13 +138,14 @@ pub async fn mpris_action(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((device_id, player)): axum::extract::Path<(String, String)>,
     Json(body): Json<serde_json::Value>,
-) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiResponse<MprisActionResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
     let action = body
         .get("action")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| api_err(Error::InvalidRequest("action field required".to_string())))?;
+        .ok_or_else(|| api_err(Error::InvalidRequest("action field required".to_string())))?
+        .to_string();
 
     // MPRIS actions travel as kdeconnect.mpris.request with {player, action}
     // in the body — there is no kdeconnect.mpris.action packet type (the old
@@ -136,12 +163,12 @@ pub async fn mpris_action(
         .await
         .map_err(api_err)?;
 
-    Ok(Json(ApiResponse::ok(serde_json::json!({
-        "device_id": device_id,
-        "player": player,
-        "action": action,
-        "sent": true
-    }))))
+    Ok(Json(ApiResponse::ok(MprisActionResponse {
+        device_id,
+        player,
+        action,
+        sent: true,
+    })))
 }
 
 #[cfg(test)]
@@ -168,5 +195,45 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("players array must be present");
         assert!(players.is_empty());
+    }
+
+    #[test]
+    fn test_mpris_players_response_matches_legacy_shape() {
+        let response = MprisPlayersResponse {
+            device_id: "phone-1".to_string(),
+            players: Vec::new(),
+        };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "players": []
+        });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
+    fn test_mpris_local_players_response_matches_legacy_shape() {
+        let response = MprisLocalPlayersResponse { players: Vec::new() };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({ "players": [] });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
+    fn test_mpris_action_response_matches_legacy_shape() {
+        let response = MprisActionResponse {
+            device_id: "phone-1".to_string(),
+            player: "spotify".to_string(),
+            action: "PlayPause".to_string(),
+            sent: true,
+        };
+        let typed = serde_json::to_value(&response).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "player": "spotify",
+            "action": "PlayPause",
+            "sent": true
+        });
+        assert_eq!(typed, legacy);
     }
 }

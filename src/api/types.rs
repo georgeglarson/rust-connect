@@ -9,6 +9,9 @@ use utoipa::ToSchema;
 use crate::api::handlers::RemoteCommandsResponse;
 use crate::api::handlers::plugins::battery::BatteryResponse;
 use crate::api::handlers::plugins::connectivity::ConnectivityResponse;
+use crate::api::handlers::plugins::mpris::{
+    MprisActionResponse, MprisLocalPlayersResponse, MprisPlayersResponse,
+};
 use crate::api::handlers::plugins::sftp::{
     SftpInfoResponse, SftpMountResponse, SftpRequestResponse, SftpUnmountResponse,
 };
@@ -39,6 +42,9 @@ use crate::utils::errors::ErrorCode;
     SmsThreadsResponseWrapper = ApiResponse<SmsThreadsResponse>,
     SmsThreadResponseWrapper = ApiResponse<SmsThreadResponse>,
     SmsSentResponseWrapper = ApiResponse<SmsSentResponse>,
+    MprisPlayersResponseWrapper = ApiResponse<MprisPlayersResponse>,
+    MprisLocalPlayersResponseWrapper = ApiResponse<MprisLocalPlayersResponse>,
+    MprisActionResponseWrapper = ApiResponse<MprisActionResponse>,
 )]
 pub struct ApiResponse<T: Serialize> {
     pub status: &'static str,
