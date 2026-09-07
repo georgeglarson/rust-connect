@@ -75,6 +75,10 @@ pub fn is_split_brain(source: &std::net::IpAddr, our_id: &str, their_id: &str) -
 /// dialed. Until 2026-09-06 the detector was warn-only, so the daemon
 /// named the condition and then registered and dialed the other daemon
 /// anyway (audit A2).
+///
+/// On the mDNS leg (vk #1101) neither variant writes the registry or
+/// dials — that leg only ever unicasts our identity — so `Refuse` there
+/// means "withhold the unicast" and `WarnOnly` means "send it anyway".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitBrainPolicy {
     /// Warn and drop the identity: no registry record, no dial.

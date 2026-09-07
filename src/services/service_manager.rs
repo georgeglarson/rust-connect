@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::app::AppState;
 use crate::device::{Device, DeviceType};
@@ -125,8 +125,9 @@ async fn start_discovery(
     });
 
     // mDNS: the PRIMARY discovery channel in both reference implementations
-    // (see protocol::mdns_discovery docs). A resolve is fed into the same
-    // dial path a received UDP identity takes. Failure to start mDNS (no
+    // (see protocol::mdns_discovery docs). A resolve tells us where a peer
+    // is; we answer with our UDP identity and they dial us — the same
+    // handshake a UDP broadcast starts. Failure to start mDNS (no
     // multicast on the host) degrades to UDP-only — never fatal.
     let mdns: Option<Arc<crate::protocol::mdns_discovery::MdnsDiscoveryService>> =
         match crate::protocol::mdns_discovery::MdnsDiscoveryService::new(&identity) {
@@ -149,7 +150,7 @@ async fn start_discovery(
         let mdns_healthy = mdns_healthy.clone();
         tokio::spawn(async move {
             mdns.run(
-                move |identity, addr| on_mdns_device_resolved(state_clone.clone(), identity, addr),
+                move |peer| on_mdns_device_resolved(state_clone.clone(), peer),
                 mdns_shutdown.clone(),
             )
             .await;
@@ -219,80 +220,112 @@ async fn start_discovery(
     })
 }
 
-/// Handle an mDNS-resolved peer. The dial itself goes through the SAME
-/// `spawn_discovered_connection` a received UDP identity takes — only the
-/// guards specific to mDNS's shape live here.
-fn on_mdns_device_resolved(state: Arc<AppState>, identity: Identity, addr: std::net::SocketAddr) {
+/// An mDNS resolve tells us WHERE a peer is. The handshake that tells them
+/// where WE are is a UDP identity unicast to that address, after which they
+/// dial our `tcpPort` — exactly what both references do (kdeconnect-kde
+/// `mdnshdiscovery.cpp:26-38`, Android `MdnsDiscovery.onServiceResolved`).
+///
+/// Until vk #1101 this path dialed the SRV port directly. kdeconnectd can
+/// announce SRV port 0 (`mdnshdiscovery.cpp:18` captures
+/// `LanLinkProvider::tcpPort()` at construction; `lanlinkprovider.cpp:54`
+/// initialises it to 0 and `:139` fills it in only when the TCP server
+/// binds), so every such dial failed with ECONNREFUSED and only the
+/// reverse-connection fallback ever connected the peer. Now the unicast IS
+/// the path, and the registry learns about the peer from its TCP identity,
+/// like every other inbound link.
+fn on_mdns_device_resolved(state: Arc<AppState>, peer: crate::protocol::mdns_discovery::MdnsPeer) {
+    on_mdns_device_resolved_with_udp_port(state, peer, crate::protocol::types::fallback_udp_port())
+}
+
+/// `on_mdns_device_resolved`'s real implementation, parameterized by the
+/// UDP port the unicast targets: 1716 in production, `TEST_UDP_PORT` in
+/// test builds, and a private capture socket in unit tests — the same seam
+/// `connect_to_device_with_fallback_port` has (2026-09-06 audit A2).
+fn on_mdns_device_resolved_with_udp_port(
+    state: Arc<AppState>,
+    peer: crate::protocol::mdns_discovery::MdnsPeer,
+    udp_port: u16,
+) {
     info!(
-        device_id = %identity.device_id,
-        device_name = %identity.device_name,
-        address = %addr,
-        protocol_version = identity.protocol_version,
+        device_id = %peer.device_id,
+        device_name = %peer.device_name,
+        address = %peer.address,
+        srv_port = peer.srv_port,
+        protocol_version = peer.protocol_version,
         event = "mdns_device_resolved",
         "Discovered device via mDNS"
     );
 
     tokio::spawn(async move {
-        let device_id = identity.device_id.clone();
+        let device_id = peer.device_id.clone();
 
-        // Self-guard before any registry write (both references:
-        // "Discovered myself, ignoring" — mdnshdiscovery.cpp:27-30).
-        {
-            let our_id = state
-                .connection_manager
-                .device_id
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            if device_id == our_id {
+        // Self-guard (both references: "Discovered myself, ignoring" —
+        // mdnshdiscovery.cpp:27-30).
+        let our_id = state
+            .connection_manager
+            .device_id
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if device_id == our_id {
+            return;
+        }
+        if crate::protocol::is_split_brain(&peer.address, &our_id, &device_id) {
+            warn!(
+                device_id = %device_id,
+                device_name = %peer.device_name,
+                address = %peer.address,
+                event = "split_brain_suspected",
+                "Another KDE Connect implementation is announcing from THIS host: \
+                 two daemons will compete for the same paired phones"
+            );
+            if state.connection_manager.split_brain_policy()
+                == crate::protocol::SplitBrainPolicy::Refuse
+            {
+                // Named it; now act on it — no unicast (2026-09-06 audit A2).
                 return;
-            }
-            if crate::protocol::is_split_brain(&addr.ip(), &our_id, &device_id) {
-                warn!(
-                    device_id = %device_id,
-                    device_name = %identity.device_name,
-                    address = %addr,
-                    event = "split_brain_suspected",
-                    "Another KDE Connect implementation is announcing from THIS host: \
-                     two daemons will compete for the same paired phones"
-                );
-                if state.connection_manager.split_brain_policy()
-                    == crate::protocol::SplitBrainPolicy::Refuse
-                {
-                    // Named it; now act on it — no registry write, no
-                    // dial (2026-09-06 audit A2).
-                    return;
-                }
             }
         }
 
-        // Already connected: nothing to do (Android MdnsDiscovery.kt
+        // Already linked: nothing to tell them (Android MdnsDiscovery.kt
         // onServiceFound: visibleDevices guard).
         if state.connection_manager.is_connected(&device_id).await {
             return;
         }
 
-        // Register only UNKNOWN devices. mDNS TXT carries no capability
-        // lists (protocol::mdns_discovery docs), and upsert_device
-        // overwrites a known device's capabilities — an mDNS resolve for a
-        // UDP-known device would clobber them with empty lists. A new
-        // device's caps arrive with the TCP identity exchange on connect.
-        if state.registry.get(&device_id).await.is_err() {
-            let device_type = DeviceType::parse_device_type(&identity.device_type.clone());
-            let device = Device::new(
-                device_id.clone(),
-                identity.device_name.clone(),
-                device_type,
-                identity.protocol_version,
-            );
-            if let Err(e) = state.registry.upsert_device(device).await {
-                warn!(error = %e, device_id = %device_id, event = "device_upsert_failed", "Failed to upsert mDNS-discovered device");
+        let our_identity = match state.connection_manager.get_identity() {
+            Some(id) => id,
+            None => {
+                // Only an empty device id gets here (get_identity's own
+                // guard) — unreachable in a normal run, but a silent
+                // return would hide a mis-ordered startup. DEBUG, not
+                // WARN: every resolve during shutdown would hit it
+                // *(cypher, inkling vs mimo-v25-pro)*.
+                debug!(
+                    device_id = %device_id,
+                    event = "mdns_unicast_skipped_no_identity",
+                    "No local identity yet; not answering this resolve"
+                );
+                return;
             }
+        };
+        match crate::protocol::udp_unicast::unicast_identity(&our_identity, peer.address, udp_port)
+            .await
+        {
+            Ok(target) => info!(
+                device_id = %device_id,
+                target = %target,
+                event = "mdns_identity_unicast_sent",
+                "Sent our identity to an mDNS-resolved peer; they dial us"
+            ),
+            Err(e) => warn!(
+                device_id = %device_id,
+                address = %peer.address,
+                error = %e,
+                event = "mdns_identity_unicast_failed",
+                "Failed to send our identity to an mDNS-resolved peer"
+            ),
         }
-
-        crate::services::connection_orchestrator::spawn_discovered_connection(
-            state, identity, addr,
-        );
     });
 }
 
@@ -494,40 +527,119 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_mdns_resolve_unknown_device_registers_and_dials() {
-        let (state, _t) = test_state();
+    use crate::protocol::mdns_discovery::MdnsPeer;
 
+    fn mdns_peer(address: std::net::IpAddr, srv_port: u16) -> MdnsPeer {
+        MdnsPeer {
+            device_id: PEER_ID.to_string(),
+            device_name: "Peer".to_string(),
+            device_type: "phone".to_string(),
+            protocol_version: 8,
+            address,
+            srv_port,
+        }
+    }
+
+    /// A socket standing in for the peer's UDP 1716.
+    async fn capture_socket() -> (tokio::net::UdpSocket, u16) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind capture");
+        let port = socket.local_addr().expect("local_addr").port();
+        (socket, port)
+    }
+
+    /// The identity the peer would receive, or `None` if nothing arrives
+    /// within `within`.
+    async fn recv_identity(
+        capture: &tokio::net::UdpSocket,
+        within: std::time::Duration,
+    ) -> Option<Identity> {
+        let mut buf = vec![0u8; 65536];
+        let (len, _) = tokio::time::timeout(within, capture.recv_from(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        let packet = crate::protocol::packet::PacketSerializer::deserialize(&buf[..len]).ok()?;
+        Identity::from_packet(packet).ok()
+    }
+
+    /// vk #1101: a resolve is answered with OUR identity over UDP (the
+    /// reference behaviour, mdnshdiscovery.cpp:36) — never with a dial,
+    /// even when the SRV port would have accepted one. Fails before the
+    /// change: the handler dialed `listener` and registered the peer.
+    #[tokio::test]
+    async fn test_mdns_resolve_unicasts_our_identity_and_never_dials() {
+        let (state, _t) = test_state();
+        let (capture, udp_port) = capture_socket().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("Value expected to be present");
-        let addr = listener.local_addr().expect("Value expected to be present");
+            .expect("bind listener");
+        let srv_port = listener.local_addr().expect("local_addr").port();
 
-        on_mdns_device_resolved(state.clone(), peer_identity(addr.port()), addr);
+        // `Identity::new` defaults tcp_port to 1716 (types.rs:186), so a
+        // handler that built a fresh Identity instead of asking the
+        // connection manager would pass an `is_some()` check. Pin the
+        // real bound port *(cypher, codex + qwen-38max)*.
+        state.connection_manager.set_tcp_port(1764);
 
-        let mut registered = false;
-        for _ in 0..80 {
-            if state.registry.get(&PEER_ID.to_string()).await.is_ok() {
-                registered = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        assert!(registered, "an mDNS-resolved device must be registered");
+        on_mdns_device_resolved_with_udp_port(
+            state.clone(),
+            mdns_peer(std::net::Ipv4Addr::LOCALHOST.into(), srv_port),
+            udp_port,
+        );
 
-        let dial = tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await;
+        let received = recv_identity(&capture, std::time::Duration::from_secs(2))
+            .await
+            .expect("our identity must reach the peer's UDP port");
+        assert_eq!(received.device_id, OUR_ID);
+        assert_eq!(
+            received.tcp_port,
+            Some(1764),
+            "the UDP identity must carry the port we actually listen on"
+        );
+
+        let dial =
+            tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await;
         assert!(
-            dial.is_ok(),
-            "an mDNS-resolved device must be dialed on its announced port"
+            dial.is_err(),
+            "an mDNS resolve must not be dialed, even on a live port"
+        );
+        assert!(
+            state.registry.get(&PEER_ID.to_string()).await.is_err(),
+            "an mDNS resolve writes nothing to the registry; the peer's TCP identity does"
         );
     }
 
-    /// A device already known via UDP keeps its capability lists: mDNS TXT
-    /// carries none, and a naive upsert would clobber them.
+    /// The #1101 scenario itself: kdeconnectd announcing SRV port 0. Before
+    /// the change this dialed 127.0.0.1:0 (instant ECONNREFUSED), and only
+    /// the reverse-connection fallback — aimed at fallback_udp_port(), not
+    /// at this capture — ever told the peer about us.
     #[tokio::test]
-    async fn test_mdns_resolve_known_device_preserves_capabilities() {
+    async fn test_mdns_resolve_with_srv_port_zero_still_reaches_the_peer() {
         let (state, _t) = test_state();
+        let (capture, udp_port) = capture_socket().await;
 
+        on_mdns_device_resolved_with_udp_port(
+            state.clone(),
+            mdns_peer(std::net::Ipv4Addr::LOCALHOST.into(), 0),
+            udp_port,
+        );
+
+        let received = recv_identity(&capture, std::time::Duration::from_secs(2))
+            .await
+            .expect("a port-0 SRV record must not stop the handshake");
+        assert_eq!(received.device_id, OUR_ID);
+        assert!(state.registry.get(&PEER_ID.to_string()).await.is_err());
+    }
+
+    /// mDNS TXT carries no capabilities; the old handler upserted unknown
+    /// devices and guarded against clobbering known ones. Now it writes
+    /// nothing at all: a known device is unchanged, and the unicast still
+    /// goes out because the device is not connected.
+    #[tokio::test]
+    async fn test_mdns_resolve_leaves_the_registry_untouched() {
+        let (state, _t) = test_state();
         state
             .registry
             .add(
@@ -543,90 +655,127 @@ mod tests {
                 ),
             )
             .await
-            .expect("Value expected to be present");
+            .expect("add");
+        let before = state.registry.get(&PEER_ID.to_string()).await.expect("get");
+        let (capture, udp_port) = capture_socket().await;
 
-        // A dead port: the dial attempt fails harmlessly; what matters is
-        // the registry state afterwards.
-        let dead_port = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-            probe.local_addr().expect("probe addr").port()
-        };
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", dead_port)
-            .parse()
-            .expect("Value expected to be present");
-
-        // mDNS resolves carry empty capability lists (see module docs).
-        on_mdns_device_resolved(state.clone(), peer_identity(dead_port), addr);
-
-        // Let the spawned task run its registry branch.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let device = state
-            .registry
-            .get(&PEER_ID.to_string())
+        on_mdns_device_resolved_with_udp_port(
+            state.clone(),
+            mdns_peer(std::net::Ipv4Addr::LOCALHOST.into(), 1716),
+            udp_port,
+        );
+        recv_identity(&capture, std::time::Duration::from_secs(2))
             .await
-            .expect("Value expected to be present");
-        assert_eq!(
-            device.incoming_capabilities,
-            vec!["kdeconnect.battery".to_string()],
-            "mDNS must not clobber capabilities a UDP identity provided"
-        );
-        assert_eq!(
-            device.outgoing_capabilities,
-            vec!["kdeconnect.battery".to_string()]
-        );
+            .expect("the unicast still goes out for a known, unconnected device");
+
+        let after = state.registry.get(&PEER_ID.to_string()).await.expect("get");
+        assert_eq!(after.incoming_capabilities, before.incoming_capabilities);
+        assert_eq!(after.outgoing_capabilities, before.outgoing_capabilities);
+        assert_eq!(after.name, before.name);
+        assert_eq!(after.protocol_version, before.protocol_version);
     }
 
-    /// 2026-09-06 audit A2: under `SplitBrainPolicy::Refuse` (the
-    /// production default) a foreign id resolving from one of our own
-    /// addresses must neither enter the registry nor be dialed. Fails
-    /// before the fix: the handler warned, then upserted and dialed.
+    /// 2026-09-06 audit A2, carried over: under `SplitBrainPolicy::Refuse`
+    /// (the production default) a foreign id resolving from one of our own
+    /// addresses gets neither a registry entry nor our identity.
     #[tokio::test]
     async fn test_mdns_resolve_split_brain_is_refused() {
         let (state, _t) = test_state();
         state
             .connection_manager
             .set_split_brain_policy(crate::protocol::SplitBrainPolicy::Refuse);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("Value expected to be present");
-        let addr = listener.local_addr().expect("Value expected to be present");
+        let (capture, udp_port) = capture_socket().await;
 
         // Foreign id, loopback source: another daemon on this host.
-        on_mdns_device_resolved(state.clone(), peer_identity(addr.port()), addr);
-
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(
-            state.registry.get(&PEER_ID.to_string()).await.is_err(),
-            "a split-brain id must not enter the registry via mDNS"
+        on_mdns_device_resolved_with_udp_port(
+            state.clone(),
+            mdns_peer(std::net::Ipv4Addr::LOCALHOST.into(), 1716),
+            udp_port,
         );
-        let dial =
-            tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await;
-        assert!(dial.is_err(), "a split-brain id must not be dialed");
+
+        assert!(
+            recv_identity(&capture, std::time::Duration::from_millis(500))
+                .await
+                .is_none(),
+            "a split-brain id must not be handed our identity"
+        );
+        assert!(state.registry.get(&PEER_ID.to_string()).await.is_err());
     }
 
-    /// Our own announcement resolved back (multicast loopback) must be
-    /// ignored before any registry write or dial.
+    /// Our own announcement resolved back (multicast loopback) is ignored
+    /// before any unicast.
     #[tokio::test]
     async fn test_mdns_resolve_self_is_ignored() {
         let (state, _t) = test_state();
+        let (capture, udp_port) = capture_socket().await;
+        let mut me = mdns_peer(std::net::Ipv4Addr::LOCALHOST.into(), 1716);
+        me.device_id = OUR_ID.to_string();
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("Value expected to be present");
-        let addr = listener.local_addr().expect("Value expected to be present");
+        on_mdns_device_resolved_with_udp_port(state.clone(), me, udp_port);
 
-        let mut self_identity = peer_identity(addr.port());
-        self_identity.device_id = OUR_ID.to_string();
-        on_mdns_device_resolved(state.clone(), self_identity, addr);
-
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(
-            state.registry.get(&OUR_ID.to_string()).await.is_err(),
-            "our own id must never enter the registry via mDNS"
+            recv_identity(&capture, std::time::Duration::from_millis(500))
+                .await
+                .is_none(),
+            "our own announcement must not trigger a unicast"
         );
-        let dial =
-            tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await;
-        assert!(dial.is_err(), "our own id must never be dialed");
+        assert!(state.registry.get(&OUR_ID.to_string()).await.is_err());
+    }
+
+    /// The third kept guard, and the one the no-cooldown answer leans on:
+    /// a resolve for a device we are already linked to sends nothing
+    /// *(cypher: ten voices; the only guard the first draft left
+    /// untested)*. `is_connected` consults the `test_generations` shadow
+    /// (`connection/mod.rs:879-898`) — NOT `mark_fake_connected_for_test`,
+    /// which feeds only the capability gate.
+    #[tokio::test]
+    async fn test_mdns_resolve_already_connected_does_not_unicast() {
+        let (state, _t) = test_state();
+        let (capture, udp_port) = capture_socket().await;
+        state
+            .connection_manager
+            .mark_generation_for_test(PEER_ID, 1);
+
+        on_mdns_device_resolved_with_udp_port(
+            state.clone(),
+            mdns_peer(std::net::Ipv4Addr::LOCALHOST.into(), 1716),
+            udp_port,
+        );
+
+        assert!(
+            recv_identity(&capture, std::time::Duration::from_millis(500))
+                .await
+                .is_none(),
+            "a connected device must not be handed our identity again"
+        );
+        state.connection_manager.unmark_generation_for_test(PEER_ID);
+    }
+
+    /// The spec's first constraint, pinned at the production entry point:
+    /// the wrapper must route the unicast through `fallback_udp_port()`.
+    /// Every other test injects the port through the seam, so a wrapper
+    /// written against `DEFAULT_UDP_PORT` — or a literal 1716 — would
+    /// compile, pass them all, and hand a fixture identity to a live
+    /// daemon on this host (the 2026-09-06 incident class)
+    /// *(cypher, kimi-k3 + qwen-38max missing test 1)*.
+    #[tokio::test]
+    async fn test_mdns_resolve_production_wrapper_targets_the_test_udp_port() {
+        let (state, _t) = test_state();
+        let capture = tokio::net::UdpSocket::bind((
+            std::net::Ipv4Addr::LOCALHOST,
+            crate::protocol::types::TEST_UDP_PORT,
+        ))
+        .await
+        .expect("bind the test-build UDP port; only this test binds it");
+
+        on_mdns_device_resolved(
+            state.clone(),
+            mdns_peer(std::net::Ipv4Addr::LOCALHOST.into(), 1716),
+        );
+
+        let received = recv_identity(&capture, std::time::Duration::from_secs(2))
+            .await
+            .expect("the production wrapper must unicast to fallback_udp_port(), i.e. TEST_UDP_PORT here");
+        assert_eq!(received.device_id, OUR_ID);
     }
 }

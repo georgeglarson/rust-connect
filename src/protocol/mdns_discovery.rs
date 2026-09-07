@@ -16,15 +16,22 @@
 //!   anything, since we can't include enough info for it to be useful".
 //! - The references answer a resolve by sending a UDP identity to the
 //!   resolved address (`sendUdpIdentityPacket`, `mdnshdiscovery.cpp:36`,
-//!   Android `onServiceResolved`) and let the peer dial. Both carry the
-//!   same TODO: with protocol v8 the resolve already carries everything
-//!   needed to dial directly (`mdnshdiscovery.cpp:31-35`). We take the v8
-//!   path: a resolved service is turned into an `Identity` + address and
-//!   fed into the exact path a received UDP identity takes
+//!   Android `onServiceResolved`) and let the peer dial. So do we
 //!   (`service_manager::on_mdns_device_resolved` →
-//!   `connection_orchestrator::spawn_discovered_connection`).
+//!   `protocol::udp_unicast::unicast_identity`). Both references carry a
+//!   TODO about dialing directly from the resolve under protocol v8; this
+//!   crate did that from 2026-08 until vk #1101 (2026-09), when a peer
+//!   announcing SRV port 0 showed why they haven't: kdeconnectd's announcer
+//!   captures `LanLinkProvider::tcpPort()` at construction
+//!   (`mdnshdiscovery.cpp:18`), which is 0 until `onStart` binds
+//!   (`lanlinkprovider.cpp:54,139`). The SRV port is not trustworthy, and
+//!   the identity exchange already carries the real one.
+//! - IPv4 only on this path: the TCP listener is IPv4-only
+//!   (`listener.rs:71`), so a unicast to a peer's IPv6 address would
+//!   invite a dial nothing answers; `resolved_to_peer` skips IPv6-only
+//!   resolves (`mdns_resolve_skipped`, `reason = "ipv6_only"`). Restoring
+//!   IPv6 here means a dual-stack listener first (vk #1101 backlog).
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +39,6 @@ use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::device::types::DeviceType;
 use crate::protocol::types::{Identity, DEFAULT_TCP_PORT};
 use crate::utils::errors::{Error, Result};
 
@@ -382,14 +388,14 @@ impl MdnsDiscoveryService {
 
     /// Browse for peers until `shutdown` is cancelled, then unregister our
     /// announcement and shut the daemon down. Every resolved service is
-    /// converted to the SAME `(Identity, SocketAddr)` shape a received UDP
-    /// identity arrives in and handed to `on_resolved`. Takes `&self`, not
-    /// `self`, so a caller can hold the SAME `Arc<MdnsDiscoveryService>`
-    /// and call `reannounce` concurrently (Task 2.2) — previously this
-    /// consumed `self`, which made that impossible.
+    /// converted to an [`MdnsPeer`] — who and where, no port to dial —
+    /// and handed to `on_resolved`. Takes `&self`, not `self`, so a
+    /// caller can hold the SAME `Arc<MdnsDiscoveryService>` and call
+    /// `reannounce` concurrently (Task 2.2) — previously this consumed
+    /// `self`, which made that impossible.
     pub async fn run<F>(&self, on_resolved: F, shutdown: CancellationToken)
     where
-        F: Fn(Identity, SocketAddr),
+        F: Fn(MdnsPeer),
     {
         let receiver = match self.daemon.browse(SERVICE_TYPE) {
             Ok(receiver) => receiver,
@@ -420,19 +426,31 @@ impl MdnsDiscoveryService {
                     match event {
                         Ok(ServiceEvent::ServiceResolved(resolved)) => {
                             let service = ServiceView::from(&*resolved);
-                            match resolved_to_identity(&service) {
-                                Some((identity, addr)) => {
+                            match resolved_to_peer(&service) {
+                                Some(peer) => {
                                     debug!(
-                                        device_id = %identity.device_id,
-                                        address = %addr,
+                                        device_id = %peer.device_id,
+                                        address = %peer.address,
+                                        srv_port = peer.srv_port,
                                         event = "mdns_service_resolved",
                                         "Resolved mDNS service"
                                     );
-                                    on_resolved(identity, addr);
+                                    on_resolved(peer);
                                 }
                                 None => {
+                                    // `reason` is the one field the IPv6 decision
+                                    // (vk #1101) needs to be findable in a journal.
+                                    let reason = if service.addresses.iter().any(|ip| ip.is_ipv6())
+                                        && !service.addresses.iter().any(|ip| {
+                                            ip.is_ipv4() && crate::protocol::is_private_address(ip)
+                                        }) {
+                                        "ipv6_only"
+                                    } else {
+                                        "unusable"
+                                    };
                                     debug!(
                                         fullname = %resolved.get_fullname(),
+                                        reason = reason,
                                         event = "mdns_resolve_skipped",
                                         "Resolved mDNS service is not a usable KDE Connect peer"
                                     );
@@ -498,10 +516,37 @@ impl<'a> From<&'a ResolvedService> for ServiceView<'a> {
     }
 }
 
-/// Convert a resolved service to the `(Identity, SocketAddr)` a received
-/// UDP identity would carry. `None` for anything that is not a usable KDE
-/// Connect peer (missing/invalid TXT, no private address).
-fn resolved_to_identity(service: &ServiceView) -> Option<(Identity, SocketAddr)> {
+/// What an mDNS resolve tells us about a peer: who they are and where
+/// they are. Deliberately NOT an `Identity`, and deliberately carrying
+/// no port to dial — the references never dial from a resolve (module
+/// docs), and a peer's SRV port can be wrong: kdeconnectd announces the
+/// port its `LanLinkProvider` had at construction time, which is 0 until
+/// the TCP server binds (`mdnshdiscovery.cpp:18`,
+/// `lanlinkprovider.cpp:54,139`; vk #1101). `srv_port` is kept for the
+/// resolve log line only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MdnsPeer {
+    pub device_id: String,
+    pub device_name: String,
+    pub device_type: String,
+    pub protocol_version: u32,
+    pub address: std::net::IpAddr,
+    pub srv_port: u16,
+}
+
+/// Convert a resolved service to an [`MdnsPeer`]. `None` for anything that
+/// is not a usable KDE Connect peer (missing/invalid TXT, no private IPv4
+/// address). The SRV port is NOT validated: nothing dials it.
+///
+/// IPv4 only, on purpose (vk #1101): the handshake this feeds ends with
+/// the PEER dialing OUR address, and the TCP listener binds IPv4 only
+/// (`listener.rs:71`), so a unicast to a peer's IPv6 address invites a
+/// dial nothing answers. Link-local IPv6 is worse still — `ServiceView`
+/// carries bare `IpAddr`s, the scope id is gone, and the send itself
+/// fails. Until the listener is dual-stack, an IPv6-only resolve is
+/// skipped (logged `mdns_resolve_skipped`, `reason = "ipv6_only"`); such
+/// a peer still connects by dialing us over v4 or via UDP broadcast.
+fn resolved_to_peer(service: &ServiceView) -> Option<MdnsPeer> {
     // Device id: the `id` TXT record, falling back to the instance name —
     // both are the device id in both reference implementations (module
     // docs).
@@ -520,9 +565,9 @@ fn resolved_to_identity(service: &ServiceView) -> Option<(Identity, SocketAddr)>
         return None;
     }
 
-    // Without a parseable protocol version we can't safely dial (the
-    // downgrade guard and the identity exchange both key on it); every real
-    // announcer sends it.
+    // Without a parseable protocol version we can't safely identify the
+    // peer (the downgrade guard and the identity exchange both key on it);
+    // every real announcer sends it.
     let protocol_version: u32 = service.txt.get("protocol")?.parse().ok()?;
 
     let device_name = service
@@ -537,35 +582,21 @@ fn resolved_to_identity(service: &ServiceView) -> Option<(Identity, SocketAddr)>
         .unwrap_or("desktop")
         .to_string();
 
-    // Prefer a private IPv4 (LAN protocol; a public address here is a
-    // spoof), fall back to any private address (IPv6 ULA/link-local).
+    // LAN protocol: a public address here is a spoof; an IPv6 address is
+    // one we cannot complete the handshake on (doc comment above).
     let address = service
         .addresses
         .iter()
-        .find(|ip| ip.is_ipv4() && crate::protocol::is_private_address(ip))
-        .or_else(|| {
-            service
-                .addresses
-                .iter()
-                .find(|ip| crate::protocol::is_private_address(ip))
-        })?;
+        .find(|ip| ip.is_ipv4() && crate::protocol::is_private_address(ip))?;
 
-    let addr = SocketAddr::new(*address, service.port);
-
-    let device_type = DeviceType::parse_device_type(&device_type);
-    let mut identity = Identity::new(
+    Some(MdnsPeer {
         device_id,
         device_name,
         device_type,
-        // No capability lists in mDNS TXT (module docs) — they arrive with
-        // the TCP identity exchange after the dial.
-        vec![],
-        vec![],
-    );
-    identity.protocol_version = protocol_version;
-    identity.tcp_port = Some(service.port);
-
-    Some((identity, addr))
+        protocol_version,
+        address: *address,
+        srv_port: service.port,
+    })
 }
 
 #[cfg(test)]
@@ -573,6 +604,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
     use super::*;
+    use crate::device::types::DeviceType;
     use tokio::sync::mpsc;
 
     fn our_identity() -> Identity {
@@ -606,13 +638,12 @@ mod tests {
     }
 
     #[test]
-    fn test_resolved_to_identity_reads_reference_shape() {
+    fn test_resolved_to_peer_reads_reference_shape() {
         let good_name = format!("peer-device-aaaaaaaaaaaaaaaaaaaaaa.{SERVICE_TYPE}");
+        let ip: std::net::IpAddr = "192.168.1.50".parse().expect("ip");
         let resolved = service_view(
             &good_name,
-            "192.168.1.50"
-                .parse()
-                .expect("Value expected to be present"),
+            ip,
             1716,
             &[
                 ("id", "peer-device-aaaaaaaaaaaaaaaaaaaaaa"),
@@ -622,63 +653,47 @@ mod tests {
             ],
         );
 
-        let (identity, addr) =
-            resolved_to_identity(&resolved).expect("a reference-shaped service must convert");
-        assert_eq!(identity.device_id, "peer-device-aaaaaaaaaaaaaaaaaaaaaa");
-        assert_eq!(identity.device_name, "test phone");
-        assert_eq!(identity.device_type, "phone");
-        assert_eq!(identity.protocol_version, 8);
-        assert_eq!(identity.tcp_port, Some(1716));
-        assert_eq!(
-            addr,
-            SocketAddr::new(
-                "192.168.1.50"
-                    .parse()
-                    .expect("Value expected to be present"),
-                1716
-            )
-        );
-        // mDNS TXT carries no capabilities (module docs).
-        assert!(identity.incoming_capabilities.is_empty());
-        assert!(identity.outgoing_capabilities.is_empty());
+        let peer = resolved_to_peer(&resolved).expect("a reference-shaped service must convert");
+        assert_eq!(peer.device_id, "peer-device-aaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(peer.device_name, "test phone");
+        assert_eq!(peer.device_type, "phone");
+        assert_eq!(peer.protocol_version, 8);
+        assert_eq!(peer.address, ip);
+        assert_eq!(peer.srv_port, 1716);
     }
 
     #[test]
-    fn test_resolved_to_identity_falls_back_to_instance_name_for_id() {
+    fn test_resolved_to_peer_falls_back_to_instance_name_for_id() {
         // No `id` TXT: the instance name is the device id in both reference
         // implementations (module docs).
         let good_name = format!("peer-device-aaaaaaaaaaaaaaaaaaaaaa.{SERVICE_TYPE}");
         let resolved = service_view(
             &good_name,
-            "192.168.1.50"
-                .parse()
-                .expect("Value expected to be present"),
+            "192.168.1.50".parse().expect("ip"),
             1716,
             &[("protocol", "8")],
         );
 
-        let (identity, _) = resolved_to_identity(&resolved).expect("instance-name id must convert");
-        assert_eq!(identity.device_id, "peer-device-aaaaaaaaaaaaaaaaaaaaaa");
+        let peer = resolved_to_peer(&resolved).expect("instance-name id must convert");
+        assert_eq!(peer.device_id, "peer-device-aaaaaaaaaaaaaaaaaaaaaa");
         // Missing name/type get documented defaults.
-        assert_eq!(identity.device_name, identity.device_id);
-        assert_eq!(identity.device_type, "desktop");
+        assert_eq!(peer.device_name, peer.device_id);
+        assert_eq!(peer.device_type, "desktop");
     }
 
     #[test]
-    fn test_resolved_to_identity_rejects_unusable_services() {
+    fn test_resolved_to_peer_rejects_unusable_services() {
         let good_name = &format!("peer-device-aaaaaaaaaaaaaaaaaaaaaa.{SERVICE_TYPE}")[..];
-        let good_ip: std::net::IpAddr = "192.168.1.50"
-            .parse()
-            .expect("Value expected to be present");
+        let good_ip: std::net::IpAddr = "192.168.1.50".parse().expect("ip");
 
-        // Missing protocol TXT: nothing to safely dial.
+        // Missing protocol TXT: the downgrade guard keys on it.
         let no_protocol = service_view(
             good_name,
             good_ip,
             1716,
             &[("id", "peer-device-aaaaaaaaaaaaaaaaaaaaaa")],
         );
-        assert!(resolved_to_identity(&no_protocol).is_none());
+        assert!(resolved_to_peer(&no_protocol).is_none());
 
         // Garbage protocol TXT.
         let bad_protocol = service_view(
@@ -690,7 +705,7 @@ mod tests {
                 ("id", "peer-device-aaaaaaaaaaaaaaaaaaaaaa"),
             ],
         );
-        assert!(resolved_to_identity(&bad_protocol).is_none());
+        assert!(resolved_to_peer(&bad_protocol).is_none());
 
         // Invalid device id (path-unsafe).
         let bad_id = service_view(
@@ -699,19 +714,94 @@ mod tests {
             1716,
             &[("protocol", "8"), ("id", "../etc/passwd")],
         );
-        assert!(resolved_to_identity(&bad_id).is_none());
+        assert!(resolved_to_peer(&bad_id).is_none());
 
         // Only a public address: a LAN peer doesn't announce one.
         let public = service_view(
             good_name,
-            "8.8.8.8".parse().expect("Value expected to be present"),
+            "8.8.8.8".parse().expect("ip"),
             1716,
             &[
                 ("protocol", "8"),
                 ("id", "peer-device-aaaaaaaaaaaaaaaaaaaaaa"),
             ],
         );
-        assert!(resolved_to_identity(&public).is_none());
+        assert!(resolved_to_peer(&public).is_none());
+    }
+
+    /// vk #1101: a zero SRV port is not a reason to drop the peer. We never
+    /// dial it (module docs); it stays on the struct so the resolve log line
+    /// shows what the peer announced — that is how a kdeconnectd announcing
+    /// 0 becomes visible in a journal.
+    #[test]
+    fn test_resolved_to_peer_keeps_a_zero_srv_port_for_the_log() {
+        let good_name = format!("peer-device-aaaaaaaaaaaaaaaaaaaaaa.{SERVICE_TYPE}");
+        let ip: std::net::IpAddr = "192.168.1.50".parse().expect("ip");
+        let resolved = service_view(
+            &good_name,
+            ip,
+            0,
+            &[
+                ("id", "peer-device-aaaaaaaaaaaaaaaaaaaaaa"),
+                ("protocol", "8"),
+            ],
+        );
+
+        let peer = resolved_to_peer(&resolved).expect("SRV port 0 must still convert");
+        assert_eq!(peer.srv_port, 0);
+        assert_eq!(peer.address, ip);
+    }
+
+    /// vk #1101 accepted regression *(cypher, S3)*: a resolve whose only
+    /// private address is IPv6 is skipped. Our TCP listener binds IPv4
+    /// only (`listener.rs:71`), so a peer that received our unicast on
+    /// v6 would dial an address nothing listens on; and `ServiceView::from`
+    /// drops the scope id, so a link-local target cannot even be sent to.
+    /// Red on main: `resolved_to_identity` accepts any private address.
+    #[test]
+    fn test_resolved_to_peer_skips_an_ipv6_only_service() {
+        let good_name = format!("peer-device-aaaaaaaaaaaaaaaaaaaaaa.{SERVICE_TYPE}");
+        for v6 in ["fd12:3456::10", "fe80::1"] {
+            let resolved = service_view(
+                &good_name,
+                v6.parse().expect("ip"),
+                1716,
+                &[
+                    ("id", "peer-device-aaaaaaaaaaaaaaaaaaaaaa"),
+                    ("protocol", "8"),
+                ],
+            );
+            assert!(
+                resolved_to_peer(&resolved).is_none(),
+                "an IPv6-only resolve ({v6}) must be skipped, not unicast to"
+            );
+        }
+    }
+
+    /// A dual-stack peer resolves to its private IPv4 address whatever
+    /// order the addresses arrive in *(cypher, kimi-k3 missing test 4)*.
+    #[test]
+    fn test_resolved_to_peer_prefers_private_ipv4_over_ipv6() {
+        let good_name = format!("peer-device-aaaaaaaaaaaaaaaaaaaaaa.{SERVICE_TYPE}");
+        let v4: std::net::IpAddr = "192.168.1.50".parse().expect("ip");
+        let v6: std::net::IpAddr = "fd12:3456::10".parse().expect("ip");
+        let txt: std::collections::HashMap<String, String> = [
+            ("id", "peer-device-aaaaaaaaaaaaaaaaaaaaaa"),
+            ("protocol", "8"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        for addresses in [vec![v6, v4], vec![v4, v6]] {
+            let view = ServiceView {
+                fullname: &good_name,
+                port: 1716,
+                addresses,
+                txt: txt.clone(),
+            };
+            let peer = resolved_to_peer(&view).expect("a dual-stack peer converts");
+            assert_eq!(peer.address, v4);
+        }
     }
 
     /// End-to-end, in-process: announce ourselves and confirm a browser
@@ -739,19 +829,19 @@ mod tests {
         let browser = tokio::spawn(async move {
             run_service
                 .run(
-                    move |identity, addr| {
-                        let _ = tx.send((identity, addr));
+                    move |peer| {
+                        let _ = tx.send(peer);
                     },
                     run_shutdown,
                 )
                 .await;
         });
 
-        let (discovered, addr) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let discovered = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
-                if let Some((identity, addr)) = rx.recv().await {
-                    if identity.device_id == our_identity().device_id {
-                        break (identity, addr);
+                if let Some(peer) = rx.recv().await {
+                    if peer.device_id == our_identity().device_id {
+                        break peer;
                     }
                 }
             }
@@ -762,12 +852,11 @@ mod tests {
         assert_eq!(discovered.device_name, "mDNS Test Device");
         assert_eq!(discovered.device_type, "desktop");
         assert_eq!(discovered.protocol_version, 8);
-        assert_eq!(discovered.tcp_port, Some(17161));
-        assert_eq!(addr.port(), 17161);
+        assert_eq!(discovered.srv_port, 17161);
         assert!(
-            crate::protocol::is_private_address(&addr.ip()),
+            crate::protocol::is_private_address(&discovered.address),
             "the resolved address must be a LAN address, got {}",
-            addr.ip()
+            discovered.address
         );
 
         shutdown.cancel();
@@ -943,15 +1032,15 @@ mod tests {
         identity.device_id = format!("sampler-arm-test-{}", uuid::Uuid::new_v4());
         let service = Arc::new(MdnsDiscoveryService::new(&identity).expect("announce"));
 
-        let (tx, _rx) = mpsc::unbounded_channel::<(Identity, SocketAddr)>();
+        let (tx, _rx) = mpsc::unbounded_channel::<MdnsPeer>();
         let shutdown = CancellationToken::new();
         let run_service = service.clone();
         let run_shutdown = shutdown.clone();
         let browser = tokio::spawn(async move {
             run_service
                 .run(
-                    move |identity, addr| {
-                        let _ = tx.send((identity, addr));
+                    move |peer| {
+                        let _ = tx.send(peer);
                     },
                     run_shutdown,
                 )
@@ -995,8 +1084,8 @@ mod tests {
         let browser = tokio::spawn(async move {
             run_service
                 .run(
-                    move |identity, addr| {
-                        let _ = tx.send((identity, addr));
+                    move |peer| {
+                        let _ = tx.send(peer);
                     },
                     run_shutdown,
                 )
@@ -1007,8 +1096,8 @@ mod tests {
         // for the post-reannounce one.
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
-                if let Some((identity, _)) = rx.recv().await {
-                    if identity.device_id == our_identity().device_id {
+                if let Some(peer) = rx.recv().await {
+                    if peer.device_id == our_identity().device_id {
                         break;
                     }
                 }
@@ -1023,13 +1112,13 @@ mod tests {
             .reannounce(&renamed)
             .expect("reannounce must succeed");
 
-        let (discovered, _addr) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let discovered = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
-                if let Some((identity, addr)) = rx.recv().await {
-                    if identity.device_id == our_identity().device_id
-                        && identity.device_name == "mDNS Test Device (renamed)"
+                if let Some(peer) = rx.recv().await {
+                    if peer.device_id == our_identity().device_id
+                        && peer.device_name == "mDNS Test Device (renamed)"
                     {
-                        break (identity, addr);
+                        break peer;
                     }
                 }
             }
