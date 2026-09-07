@@ -35,6 +35,55 @@ async fn reconcile_rendered_connection_state(state: &AppState, device: &mut Devi
     }
 }
 
+/// Build the `DeviceListResponse` shape that `/api/v1/devices` returns
+/// in its `data` envelope — same overlay the SSE snapshot frame ships —
+/// so the two paths cannot drift. Page + limit are taken from the
+/// caller; SSE passes page 1 + `usize::MAX` to get the whole list in
+/// one frame.
+///
+/// Pulled out of `list_devices` for the SSE handler to reuse (audit
+/// 2026-09-06 item 5: snapshot on connect). Without it the snapshot
+/// would reimplement the overlay loop and the two would drift the
+/// first time someone added a new overlay field.
+pub(crate) async fn render_device_list(
+    state: &AppState,
+    page: usize,
+    limit: usize,
+) -> DeviceListResponse {
+    let devices = state.registry.list().await;
+    let total = devices.len();
+    // The registry can shrink between a client's page requests — an
+    // out-of-range page must return empty, not panic the slice. Saturating
+    // mul: page/limit are user-controlled, ordinary mul can overflow.
+    let start = page.saturating_sub(1).saturating_mul(limit).min(total);
+    let end = start.saturating_add(limit).min(total);
+    let mut page_devices: Vec<DeviceSummary> = Vec::with_capacity(end - start);
+    for device in &devices[start..end] {
+        // The pairing store owns paired_at (same overlay as get_device);
+        // without it the list forces N+1 detail fetches on every client.
+        let mut device = device.clone();
+        reconcile_rendered_connection_state(state, &mut device).await;
+        device.reconcile_paired_at(state.pairing_handler.paired_since(&device.id).await);
+        device.set_pair_state(
+            state
+                .pairing_handler
+                .pair_state(&device.id)
+                .await
+                .as_api_str()
+                .to_string(),
+        );
+        if let Ok(Some(key)) = state.pairing_handler.get_verification_key(&device.id).await {
+            device.set_verification_key(key);
+        }
+        page_devices.push(DeviceSummary::from(&device));
+    }
+
+    DeviceListResponse {
+        devices: page_devices,
+        total,
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/devices",
@@ -55,38 +104,8 @@ pub async fn list_devices(
     let page = pagination.page();
     let limit = pagination.limit();
 
-    let devices = state.registry.list().await;
-    let total = devices.len();
-    // The registry can shrink between a client's page requests — an
-    // out-of-range page must return empty, not panic the slice. Saturating
-    // mul: page/limit are user-controlled, ordinary mul can overflow.
-    let start = page.saturating_sub(1).saturating_mul(limit).min(total);
-    let end = start.saturating_add(limit).min(total);
-    let mut page_devices: Vec<DeviceSummary> = Vec::with_capacity(end - start);
-    for device in &devices[start..end] {
-        // The pairing store owns paired_at (same overlay as get_device);
-        // without it the list forces N+1 detail fetches on every client.
-        let mut device = device.clone();
-        reconcile_rendered_connection_state(&state, &mut device).await;
-        device.reconcile_paired_at(state.pairing_handler.paired_since(&device.id).await);
-        device.set_pair_state(
-            state
-                .pairing_handler
-                .pair_state(&device.id)
-                .await
-                .as_api_str()
-                .to_string(),
-        );
-        if let Ok(Some(key)) = state.pairing_handler.get_verification_key(&device.id).await {
-            device.set_verification_key(key);
-        }
-        page_devices.push(DeviceSummary::from(&device));
-    }
-
-    Ok(Json(ApiResponse::ok(DeviceListResponse {
-        devices: page_devices,
-        total,
-    })))
+    let response = render_device_list(&state, page, limit).await;
+    Ok(Json(ApiResponse::ok(response)))
 }
 
 #[utoipa::path(

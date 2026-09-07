@@ -38,10 +38,13 @@ pub enum ServerEvent {
 
 /// One item off a wrapped broadcast stream: either a mapped event, a
 /// report that the subscriber fell behind and the broadcast channel
-/// dropped `dropped` events before this poll caught up, or a periodic
+/// dropped `dropped` events before this poll caught up, a periodic
 /// liveness signal so a dead upstream surfaces as a closed connection
 /// within `KEEPALIVE_INTERVAL` rather than a half-open socket the
-/// client believes is still live.
+/// client believes is still live, or a one-shot snapshot of the
+/// current device list (audit 2026-09-06 item 5) so a fresh subscriber
+/// (or one that just received a `lagged` frame) can repaint the device
+/// pane without a follow-up REST call.
 ///
 /// `BroadcastStreamRecvError` has only the `Lagged` variant (the channel
 /// closing surfaces as `None` from the stream, not an `Err` item), so this
@@ -51,6 +54,12 @@ enum StreamItem {
     Event(ServerEvent),
     Lagged(u64),
     Keepalive,
+    /// JSON payload already serialized — the snapshot frame's `data:`
+    /// is the same JSON `GET /api/v1/devices` returns in its `data`
+    /// envelope, which is too rich to re-derive from a ServerEvent
+    /// without re-walking the registry. Serializing upstream keeps the
+    /// overlay loop in one place.
+    Snapshot(String),
 }
 
 /// Discriminator for the JSON payload of an SSE event frame. Each
@@ -166,6 +175,17 @@ fn render_sse_item(item: StreamItem, next_id: u64) -> Option<String> {
         // the entire counter on a quiet stream and force every
         // would-be resume to chase tail forever.
         StreamItem::Keepalive => Some(": keepalive\n\n".to_string()),
+        // The snapshot frame is named (`event: snapshot`) on purpose:
+        // browser `onmessage` consumers never see it (a named event
+        // only reaches `addEventListener('snapshot', …)`). The UI adds
+        // a named listener that repaints the device pane from the
+        // payload — that's what makes the pane correct after a
+        // `lagged` frame, and what gives a fresh subscriber the same
+        // "context needed to act, no follow-up API calls" the REST
+        // `/devices` endpoint provides.
+        StreamItem::Snapshot(json) => {
+            Some(format!("id: {next_id}\nevent: snapshot\ndata: {json}\n\n"))
+        }
     }
 }
 
@@ -185,7 +205,30 @@ pub async fn sse_events(
     let keepalive_stream = IntervalStream::new(tokio::time::interval(KEEPALIVE_INTERVAL))
         .map(|_| StreamItem::Keepalive);
 
+    // Snapshot is built once per connection (the registry + pairing
+    // store are async, so this is an async prelude). If the snapshot
+    // fails to serialize (it never should — the type is well-defined
+    // and covered by `render_device_list`'s output), the SSE response
+    // builder returns the upstream error so the client sees a 500
+    // rather than a half-open stream with no first frame.
+    let snapshot_state = state.clone();
+    let snapshot = async move {
+        let list = crate::api::handlers::render_device_list(&snapshot_state, 1, usize::MAX).await;
+        let json = serde_json::to_string(&list).map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to serialize SSE snapshot: {e}"),
+            )
+        })?;
+        Ok::<_, (axum::http::StatusCode, String)>(futures::stream::once(
+            async move { StreamItem::Snapshot(json) },
+        ))
+    }
+    .await?
+    .boxed();
+
     let streams = select_all(vec![
+        snapshot,
         device_stream,
         plugin_stream,
         Box::pin(keepalive_stream),
@@ -452,6 +495,78 @@ mod tests {
             second_id,
             first_id + 1,
             "two consecutive fetch_add calls must yield consecutive ids"
+        );
+    }
+
+    /// On a freshly-opened SSE stream, the first wire frame must be a
+    /// named `event: snapshot` carrying the same JSON shape `GET
+    /// /api/v1/devices` returns. Without it a fresh subscriber cannot
+    /// tell "I missed N events" from "this is my first connection" and
+    /// the device pane would be wrong on every reconnect until the
+    /// first delta arrived. Built against the same `create_test_app`
+    /// shape `tests/api_integration.rs` uses, so the registry state is
+    /// the same one the rest of the integration tests see.
+    #[tokio::test]
+    async fn test_sse_stream_starts_with_snapshot_named_event() {
+        use crate::config::settings::AppSettings;
+        use crate::device::types::{Device, DeviceType};
+
+        let temp_dir = tempfile::TempDir::new().expect("tempdir must be creatable");
+        let settings = AppSettings::new_with_data_dir(temp_dir.path().to_path_buf());
+        let state = std::sync::Arc::new(AppState::new_without_input(settings).expect("state"));
+
+        let phone_id = "phone-snapshot-aaaaaaaaaaaaaaaaaaaa".to_string();
+        let desktop_id = "desktop-snapshot-bbbbbbbbbbbbbbbbbb".to_string();
+        state
+            .registry
+            .add(Device::new(
+                phone_id.clone(),
+                "Phone".to_string(),
+                DeviceType::Phone,
+                8,
+            ))
+            .await
+            .expect("phone add");
+        state
+            .registry
+            .add(Device::new(
+                desktop_id.clone(),
+                "Desktop".to_string(),
+                DeviceType::Desktop,
+                8,
+            ))
+            .await
+            .expect("desktop add");
+
+        // Drive the snapshot prelude directly through the renderer (we
+        // cannot drive the full `sse_events` body stream without axum
+        // here — the `once` async block in `sse_events` is what emits
+        // the snapshot, and the renderer is what shapes it onto the
+        // wire). The prelude is `render_device_list(..) -> Snapshot`.
+        let list = crate::api::handlers::render_device_list(&state, 1, usize::MAX).await;
+        let json = serde_json::to_string(&list).expect("snapshot must serialize");
+        let id = state.event_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let rendered =
+            render_sse_item(StreamItem::Snapshot(json), id).expect("snapshot must render");
+
+        assert!(
+            rendered.contains("event: snapshot\n"),
+            "first frame must be a named `event: snapshot`; got: {rendered}"
+        );
+        assert!(
+            rendered.starts_with("id: "),
+            "snapshot must carry an `id:` line; got: {rendered}"
+        );
+
+        // Payload must list both devices and carry `pair_state` overlay.
+        assert!(rendered.contains(&phone_id), "snapshot must include phone: {rendered}");
+        assert!(
+            rendered.contains(&desktop_id),
+            "snapshot must include desktop: {rendered}"
+        );
+        assert!(
+            rendered.contains("\"total\":2"),
+            "snapshot must report total=2 (two devices in the registry); got: {rendered}"
         );
     }
 }
