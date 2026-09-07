@@ -2,7 +2,7 @@
 //!
 //! Single Responsibility: Provide shared validation and error helpers for API handlers.
 
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{BytesRejection, FailedToBufferBody, JsonRejection};
 use axum::extract::{FromRequest, Request};
 use axum::http::StatusCode;
 use axum::Json;
@@ -32,6 +32,10 @@ where
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(ApiJson(value)),
+            // A body over the route's limit is a 413, not a malformed body.
+            Err(JsonRejection::BytesRejection(BytesRejection::FailedToBufferBody(
+                FailedToBufferBody::LengthLimitError(e),
+            ))) => Err(api_err(Error::PayloadTooLarge(e.body_text()))),
             Err(rejection) => Err(api_err(Error::InvalidRequest(format!(
                 "Invalid JSON body: {}",
                 rejection.body_text()

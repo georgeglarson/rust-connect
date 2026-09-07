@@ -42,6 +42,11 @@ pub enum Error {
     #[error("Packet too large: {size} bytes (max {max} bytes)")]
     PacketTooLarge { size: usize, max: usize },
 
+    /// An HTTP request body over the route's limit (HTTP 413). Distinct
+    /// from `PacketTooLarge`, which is the KDE Connect wire cap.
+    #[error("Request body too large: {0}")]
+    PayloadTooLarge(String),
+
     #[error("TLS handshake failed: {0}")]
     TlsError(String),
 
@@ -165,6 +170,7 @@ pub enum ErrorCode {
     ConnectionError,
     ConnectionTimeout,
     PacketTooLarge,
+    PayloadTooLarge,
     TlsError,
     CertificateError,
     CapabilityNotSupported,
@@ -228,6 +234,7 @@ impl ErrorCode {
             Self::ConnectionError => "CONNECTION_ERROR",
             Self::ConnectionTimeout => "CONNECTION_TIMEOUT",
             Self::PacketTooLarge => "PACKET_TOO_LARGE",
+            Self::PayloadTooLarge => "PAYLOAD_TOO_LARGE",
             Self::TlsError => "TLS_ERROR",
             Self::CertificateError => "CERTIFICATE_ERROR",
             Self::CapabilityNotSupported => "CAPABILITY_NOT_SUPPORTED",
@@ -287,7 +294,7 @@ impl ErrorCode {
             | Self::TlsError
             | Self::ConnectionTimeout
             | Self::ServiceUnavailable => 503,
-            Self::PacketTooLarge => 413,
+            Self::PacketTooLarge | Self::PayloadTooLarge => 413,
             _ => 500,
         }
     }
@@ -331,6 +338,7 @@ impl Error {
             Self::ConnectionError(_) => ErrorCode::ConnectionError,
             Self::ConnectionTimeout(_) => ErrorCode::ConnectionTimeout,
             Self::PacketTooLarge { .. } => ErrorCode::PacketTooLarge,
+            Self::PayloadTooLarge(_) => ErrorCode::PayloadTooLarge,
             Self::TlsError(_) => ErrorCode::TlsError,
             Self::CertificateError(_) => ErrorCode::CertificateError,
             Self::CapabilityNotSupported { .. } => ErrorCode::CapabilityNotSupported,
@@ -404,6 +412,7 @@ mod tests {
             ErrorCode::ConnectionError.as_str(),
             ErrorCode::ConnectionTimeout.as_str(),
             ErrorCode::PacketTooLarge.as_str(),
+            ErrorCode::PayloadTooLarge.as_str(),
             ErrorCode::TlsError.as_str(),
             ErrorCode::CertificateError.as_str(),
             ErrorCode::CapabilityNotSupported.as_str(),

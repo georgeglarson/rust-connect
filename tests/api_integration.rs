@@ -1385,3 +1385,38 @@ async fn test_malformed_bodies_get_the_error_envelope_not_a_bare_422() {
         assert!(json["metadata"].is_object(), "{uri} {body}");
     }
 }
+
+/// A body over the route's limit is a 413 in the envelope with its own
+/// code, not a 400 `INVALID_REQUEST` (review finding on #43: `ApiJson`
+/// had folded axum's length-limit rejection into the malformed-body case).
+#[tokio::test]
+async fn test_oversized_body_gets_a_413_envelope() {
+    let (state, _temp_dir, api_key) = create_test_app().await;
+    let app = build_router(state);
+    // The default axum body limit is 2 MiB; 3 MiB of a syntactically valid
+    // JSON string trips it before any parsing.
+    let mut body = String::with_capacity(3 * 1024 * 1024 + 16);
+    body.push_str("{\"content\": \"");
+    body.push_str(&"a".repeat(3 * 1024 * 1024));
+    body.push_str("\"}");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/clipboard")
+                .header("X-API-Key", &api_key)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("envelope JSON");
+    assert_eq!(json["status"], "error");
+    assert_eq!(json["error"]["code"], "PAYLOAD_TOO_LARGE");
+    assert!(json["metadata"].is_object());
+}
