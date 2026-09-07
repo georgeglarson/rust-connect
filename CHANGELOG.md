@@ -25,7 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   direct dial from the resolve and is now skipped (`mdns_resolve_skipped`
   with `reason = "ipv6_only"`), because the TCP listener is IPv4-only
   and a unicast there would invite a dial nothing answers. Such a peer
-  still connects over UDP broadcast or by dialing us over IPv4. (vk #1101)
+  still connects over UDP broadcast or by dialing us over IPv4. The
+  resolve also no longer creates a device-list entry: an unknown peer
+  used to appear in `/api/v1/devices` (and so the web UI and the
+  `devices` command) merely for being mDNS-resolved, with no
+  capabilities; it now appears once a link completes, which is also how
+  both references behave. (vk #1101)
 
 ## [0.2.0] - 2026-09-07
 
