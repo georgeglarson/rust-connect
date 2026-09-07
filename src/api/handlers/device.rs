@@ -620,9 +620,9 @@ pub async fn disconnect_device(
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DeviceStateResponse {
     pub device_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// `null` for a device that never recorded a transition; the legacy
+    /// literal emitted the key either way.
     pub state: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub state_since: Option<DateTime<Utc>>,
 }
 
@@ -662,7 +662,8 @@ pub async fn get_device_state(
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ConnectedDeviceEntry {
     pub device_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// `null` when the link vanished between the id listing and the
+    /// generation lookup; the legacy literal emitted the key either way.
     pub generation: Option<u64>,
 }
 
@@ -772,14 +773,18 @@ mod tests {
     }
 
     #[test]
-    fn test_device_state_response_omits_null_state() {
+    fn test_device_state_response_emits_null_state() {
         let resp = DeviceStateResponse {
             device_id: "phone-1".to_string(),
             state: None,
             state_since: None,
         };
         let typed = serde_json::to_value(&resp).expect("typed serialization");
-        let legacy = serde_json::json!({ "device_id": "phone-1" });
+        let legacy = serde_json::json!({
+            "device_id": "phone-1",
+            "state": null,
+            "state_since": null
+        });
         assert_eq!(typed, legacy);
     }
 

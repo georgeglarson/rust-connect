@@ -48,11 +48,10 @@ pub struct LocalSinkControlRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LocalSinkControlResponse {
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Each control echoes the request; `null` when the caller did not
+    /// set it, as the legacy literal emitted.
     pub volume: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub muted: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     pub sent: bool,
 }
@@ -165,7 +164,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_local_sink_control_response_omits_unset_optionals() {
+    fn test_local_sink_control_response_emits_null_for_unset_optionals() {
         let resp = LocalSinkControlResponse {
             name: "sink-1".to_string(),
             volume: Some(50),
@@ -177,6 +176,8 @@ mod tests {
         let legacy = serde_json::json!({
             "name": "sink-1",
             "volume": 50,
+            "muted": null,
+            "enabled": null,
             "sent": true,
         });
         assert_eq!(typed, legacy);

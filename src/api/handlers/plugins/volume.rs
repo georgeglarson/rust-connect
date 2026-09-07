@@ -17,12 +17,10 @@ use crate::utils::errors::Error;
 #[derive(Debug, Serialize, ToSchema)]
 pub struct VolumeControlSentResponse {
     pub device_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Echo of the request; `null` when the caller did not set it, as
+    /// the legacy literal emitted. The legacy body carried no `name`.
     pub volume: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub muted: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
     pub sent: bool,
 }
 
@@ -83,11 +81,6 @@ pub async fn set_volume(
         device_id,
         volume: body.volume,
         muted: body.muted,
-        name: if body.name.is_empty() {
-            None
-        } else {
-            Some(body.name)
-        },
         sent: true,
     })))
 }
@@ -103,7 +96,6 @@ mod tests {
             device_id: "phone-1".to_string(),
             volume: Some(50),
             muted: Some(false),
-            name: Some("speaker".to_string()),
             sent: true,
         };
         let typed = serde_json::to_value(&response).expect("typed serialization");
@@ -111,30 +103,24 @@ mod tests {
             "device_id": "phone-1",
             "volume": 50,
             "muted": false,
-            "name": "speaker",
             "sent": true
         });
         assert_eq!(typed, legacy);
     }
 
     #[test]
-    fn test_volume_control_sent_response_omits_empty_name() {
-        // body.name defaults to "" in VolumeControlRequest; the legacy
-        // json! literal serialised it as "", but the spec's intent is
-        // "if the caller didn't pick a sink, don't surface an empty
-        // string in the response" — wire-side the packet still carries
-        // the empty string.
+    fn test_volume_control_sent_response_emits_null_for_unset_controls() {
         let response = VolumeControlSentResponse {
             device_id: "phone-1".to_string(),
             volume: Some(50),
             muted: None,
-            name: None,
             sent: true,
         };
         let typed = serde_json::to_value(&response).expect("typed serialization");
         let legacy = serde_json::json!({
             "device_id": "phone-1",
             "volume": 50,
+            "muted": null,
             "sent": true
         });
         assert_eq!(typed, legacy);

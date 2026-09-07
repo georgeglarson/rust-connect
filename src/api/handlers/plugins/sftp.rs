@@ -38,10 +38,12 @@ pub struct SftpInfoResponse {
     pub user: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub multi_paths: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub path_names: Vec<String>,
+    /// Present (possibly empty) whenever credentials exist; absent in the
+    /// mounted-without-credentials case, as the two legacy literals were.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multi_paths: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_names: Option<Vec<String>>,
     pub available: bool,
     pub mounted: bool,
     /// Always present (`null` when nothing is mounted): the pre-typed
@@ -60,7 +62,8 @@ pub struct SftpMountResponse {
     pub mounted: bool,
     pub mount_state: String,
     pub mount_point: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// `null` unless the mount attempt failed; the legacy literal emitted
+    /// the key either way.
     pub error: Option<String>,
 }
 
@@ -146,8 +149,8 @@ pub async fn get_sftp_info(
             port: Some(info.port),
             user: Some(info.user),
             path: Some(info.path),
-            multi_paths: info.multi_paths,
-            path_names: info.path_names,
+            multi_paths: Some(info.multi_paths),
+            path_names: Some(info.path_names),
             available: true,
             mounted,
             mount_point: mount_point_str,
@@ -163,8 +166,8 @@ pub async fn get_sftp_info(
                     port: None,
                     user: None,
                     path: None,
-                    multi_paths: Vec::new(),
-                    path_names: Vec::new(),
+                    multi_paths: None,
+                    path_names: None,
                     available: false,
                     mounted: true,
                     mount_point: mount_point_str,
@@ -308,8 +311,8 @@ mod tests {
             port: Some(1739),
             user: Some("kdeconnect".to_string()),
             path: Some("/storage/emulated/0".to_string()),
-            multi_paths: vec!["/a".to_string()],
-            path_names: vec!["Phone".to_string()],
+            multi_paths: Some(vec!["/a".to_string()]),
+            path_names: Some(vec!["Phone".to_string()]),
             available: true,
             mounted: true,
             mount_point: Some("/var/lib/rust-connect/mounts/sftp-phone-1".to_string()),
@@ -340,8 +343,8 @@ mod tests {
             port: None,
             user: None,
             path: None,
-            multi_paths: Vec::new(),
-            path_names: Vec::new(),
+            multi_paths: None,
+            path_names: None,
             available: false,
             mounted: true,
             mount_point: Some("/var/lib/rust-connect/mounts/sftp-phone-1".to_string()),
@@ -388,7 +391,8 @@ mod tests {
             "device_id": "phone-1",
             "mounted": true,
             "mount_state": "mounted",
-            "mount_point": "/var/lib/rust-connect/mounts/sftp-phone-1"
+            "mount_point": "/var/lib/rust-connect/mounts/sftp-phone-1",
+            "error": null
         });
         assert_eq!(typed, legacy);
     }
