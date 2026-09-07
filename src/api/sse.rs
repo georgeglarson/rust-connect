@@ -123,7 +123,15 @@ where
 /// that its device/plugin state view could be stale. A `Keepalive` item
 /// becomes an SSE comment line, which every SSE consumer ignores but
 /// which keeps TCP intermediaries (and the client's read loop) alive.
-fn render_sse_item(item: StreamItem) -> Option<String> {
+///
+/// `next_id` is the value to attach as the SSE `id:` line on event and
+/// lagged frames. The caller fetches it once per item from
+/// `AppState::event_id` so ids are process-global, strictly increasing,
+/// and shared across both source streams (a client subscribing to both
+/// never sees the same id twice). Reserved for a future
+/// `Last-Event-ID` resume handler — the SSE route accepts no resume
+/// header today, so the id is observation-only.
+fn render_sse_item(item: StreamItem, next_id: u64) -> Option<String> {
     match item {
         StreamItem::Event(event) => {
             // Serialize, then add `kind`. The DeviceEvent/PluginEvent
@@ -140,7 +148,7 @@ fn render_sse_item(item: StreamItem) -> Option<String> {
                 object.insert("kind".to_string(), serde_json::Value::String(key.to_string()));
             }
             let json = serde_json::to_string(&value).ok()?;
-            Some(format!("data: {}\n\n", json))
+            Some(format!("id: {next_id}\ndata: {json}\n\n"))
         }
         StreamItem::Lagged(dropped) => {
             warn!(
@@ -149,10 +157,14 @@ fn render_sse_item(item: StreamItem) -> Option<String> {
                 "SSE client fell behind; broadcast channel dropped events before delivery"
             );
             Some(format!(
-                "event: lagged\ndata: {{\"dropped\":{}}}\n\n",
+                "id: {next_id}\nevent: lagged\ndata: {{\"dropped\":{}}}\n\n",
                 dropped
             ))
         }
+        // Keepalives intentionally carry no id: they have no semantic
+        // content, and giving every keepalive a unique id would burn
+        // the entire counter on a quiet stream and force every
+        // would-be resume to chase tail forever.
         StreamItem::Keepalive => Some(": keepalive\n\n".to_string()),
     }
 }
@@ -179,8 +191,25 @@ pub async fn sse_events(
         Box::pin(keepalive_stream),
     ]);
 
-    let body_stream =
-        streams.filter_map(|item| async move { render_sse_item(item).map(Ok::<_, Infallible>) });
+    // Clone the Arc<AppState> (not the AtomicU64 inside it — AtomicU64
+    // is not Clone) and capture by move; the inner async move then
+    // clones the Arc again per-item. The counter on AppState is shared
+    // across every concurrent SSE subscriber: ids stay process-global
+    // and strictly increasing whether the subscriber is reading
+    // devices, plugins, or both.
+    let state_for_id = state.clone();
+    let body_stream = streams.filter_map(move |item| {
+        let state_for_id = state_for_id.clone();
+        async move {
+            // Fetch+add atomically: each item takes a unique id.
+            // Keepalives burn an id even though they don't emit it —
+            // acceptable cost for keeping the counter shared across all
+            // items, and the brief scopes `Last-Event-ID` out.
+            let next_id =
+                state_for_id.event_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            render_sse_item(item, next_id).map(Ok::<_, Infallible>)
+        }
+    });
 
     let body = axum::body::Body::from_stream(body_stream);
 
@@ -225,8 +254,10 @@ mod tests {
         drop(tx);
 
         let stream = wrap_broadcast(rx, ServerEvent::Device);
+        // The lagged test passes a synthetic id through; the renderer
+        // does not increment, so any value works.
         let items: Vec<String> = stream
-            .map(render_sse_item)
+            .map(|item| render_sse_item(item, 0))
             .filter_map(|x| async move { x })
             .collect()
             .await;
@@ -237,7 +268,7 @@ mod tests {
         );
         let lagged_line = items
             .iter()
-            .find(|s| s.starts_with("event: lagged\n"))
+            .find(|s| s.contains("event: lagged\n"))
             .unwrap_or_else(|| panic!("no lagged SSE event found in: {items:?}"));
 
         let dropped: u64 = lagged_line
@@ -277,7 +308,7 @@ mod tests {
             .0
             .expect("stream must yield at least one item");
 
-        let rendered = render_sse_item(first).expect("keepalive must render to wire text");
+        let rendered = render_sse_item(first, 0).expect("keepalive must render to wire text");
         assert_eq!(
             rendered, ": keepalive\n\n",
             "keepalive must be an SSE comment, not a data: frame"
@@ -298,20 +329,31 @@ mod tests {
             new_state: crate::device::types::DeviceState::Connected,
         });
 
-        let rendered =
-            render_sse_item(StreamItem::Event(event)).expect("event frame must render");
-        // Frame must be an unnamed `data:` event (existing onmessage
-        // consumers depend on the absence of an `event:` line for these).
+        let rendered = render_sse_item(StreamItem::Event(event), 0)
+            .expect("event frame must render");
+        // Frame must carry `id:` and `data:` (existing onmessage
+        // consumers depend on the absence of an `event:` line for
+        // these). Skip past the leading `id:` line to find the JSON.
+        let mut lines = rendered.lines();
+        let id_line = lines
+            .next()
+            .unwrap_or_else(|| panic!("rendered must have at least one line; got: {rendered}"));
         assert!(
-            rendered.starts_with("data: {"),
-            "device data frame must be unnamed; got: {rendered}"
+            id_line.starts_with("id: "),
+            "rendered frame must open with `id: <n>`; got: {rendered}"
+        );
+        let data_line = lines
+            .next()
+            .unwrap_or_else(|| panic!("rendered frame must have a data line; got: {rendered}"));
+        assert!(
+            data_line.starts_with("data: {"),
+            "device data frame must be unnamed (no `event:` line); got: {rendered}"
         );
 
         // Extract the JSON payload and verify both the discriminator
         // and the pre-existing keys survive untouched.
-        let json_str = rendered
+        let json_str = data_line
             .trim_start_matches("data: ")
-            .trim_end_matches("\n\n")
             .trim_end();
         let value: serde_json::Value =
             serde_json::from_str(json_str).expect("data frame must be valid JSON");
@@ -353,6 +395,63 @@ mod tests {
         assert!(
             kind(&device_event).starts_with("device."),
             "device events must carry the device. namespace"
+        );
+    }
+
+    /// Two consecutive rendered events must carry strictly increasing
+    /// `id:` values, and the first id must be 1 (the counter is
+    /// process-global, fetch_add takes the value before the add). This
+    /// is the wire contract a future `Last-Event-ID` resume handler
+    /// will rely on; today the SSE route accepts no resume header, but
+    /// the id stays in the bytes so a future server can read it.
+    #[test]
+    fn test_consecutive_events_carry_strictly_increasing_ids() {
+        use std::sync::atomic::AtomicU64;
+
+        let counter = AtomicU64::new(0);
+        let first = render_sse_item(
+            StreamItem::Event(ServerEvent::Device(DeviceEvent::StateChanged {
+                device_id: "dev-a".to_string(),
+                old_state: crate::device::types::DeviceState::Discovered,
+                new_state: crate::device::types::DeviceState::Connected,
+            })),
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+        .expect("first frame must render");
+        let second = render_sse_item(
+            StreamItem::Event(ServerEvent::Plugin(Box::new(PluginEvent::Battery {
+                device_id: "dev-b".to_string(),
+                current_charge: 80,
+                is_charging: false,
+            }))),
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+        .expect("second frame must render");
+
+        let parse_id = |s: &str| -> u64 {
+            // The id line is the first line of the rendered frame.
+            let line = s.lines().next().unwrap_or("");
+            line.strip_prefix("id: ")
+                .unwrap_or_else(|| panic!("expected `id: <n>` as first line; got: {s}"))
+                .parse::<u64>()
+                .unwrap_or_else(|e| panic!("id is not a u64 in {s}: {e}"))
+        };
+
+        let first_id = parse_id(&first);
+        let second_id = parse_id(&second);
+        // fetch_add returns the value BEFORE the add, so a counter
+        // initialized to 0 yields id 0 first, then 1, then 2. The
+        // actual starting value is arbitrary; the contract is "ids are
+        // strictly increasing and shared across streams".
+        assert!(
+            second_id > first_id,
+            "ids must be strictly increasing across both source streams: \
+             first={first_id} second={second_id}"
+        );
+        assert_eq!(
+            second_id,
+            first_id + 1,
+            "two consecutive fetch_add calls must yield consecutive ids"
         );
     }
 }
