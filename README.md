@@ -7,7 +7,7 @@ A modern, API-first reimplementation of KDE Connect in Rust, compatible with the
 Download the `.deb` from the [latest release](https://github.com/georgeglarson/rust-connect/releases/latest) and install it:
 
 ```bash
-sudo apt install ./rust-connect_0.1.0_amd64.deb
+sudo apt install ./rust-connect_0.2.0_amd64.deb
 systemctl --user enable --now rust-connect.service
 ```
 
@@ -111,7 +111,7 @@ upgrade continuity).
 ```
 rust-connect                    # Daemon with REST API (port 9090)
 rust-connect --no-api           # Daemon without the REST API
-rust-connect --version          # 0.1.0 (<git sha>[-dirty])
+rust-connect --version          # 0.2.0 (<git sha>[-dirty])
 rust-connect --help             # Full options
 ```
 

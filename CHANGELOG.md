@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-07
+
 ### Added
 
 - mDNS storm sensor: the browse loop samples `ServiceDaemon::get_metrics`
@@ -119,6 +121,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo test` no longer announces fixture identities to real KDE Connect
   peers on the LAN: test builds use a test-only mDNS service type.
 
+## [0.1.0] - 2026-08-05
+
 First public release. Everything below is the initial feature set rather
 than a delta against a previous version.
 
@@ -197,4 +201,6 @@ than a delta against a previous version.
 - `cargo audit` and `cargo deny` run in CI, weekly as well as per-PR, so
   new advisories surface between commits.
 
-[Unreleased]: https://github.com/georgeglarson/rust-connect/commits/main
+[Unreleased]: https://github.com/georgeglarson/rust-connect/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/georgeglarson/rust-connect/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/georgeglarson/rust-connect/releases/tag/v0.1.0
