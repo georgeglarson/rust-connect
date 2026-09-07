@@ -592,7 +592,13 @@ fn resolved_to_peer(service: &ServiceView) -> std::result::Result<MdnsPeer, &'st
         .iter()
         .find(|ip| usable_peer_address(ip))
         .ok_or_else(|| {
-            if service.addresses.iter().any(|ip| ip.is_ipv6()) {
+            // `ipv6_only` is the label the ratified IPv6 regression is
+            // counted by, so it has to mean what it says: EVERY address
+            // was IPv6. A set carrying a public IPv4 alongside a ULA is a
+            // spoof-shaped service, not a v6 casualty, and counting it as
+            // one inflates the regression's apparent blast radius
+            // (PR #46 review, round 2).
+            if !service.addresses.is_empty() && service.addresses.iter().all(|ip| ip.is_ipv6()) {
                 "ipv6_only"
             } else {
                 "no_private_ipv4"
@@ -869,7 +875,8 @@ mod tests {
         for (addresses, want) in [
             (vec![ula], "ipv6_only"),
             (vec![mapped], "ipv6_only"),
-            (vec![ula, public_v4], "ipv6_only"),
+            // A public IPv4 alongside the ULA: not a v6 casualty.
+            (vec![ula, public_v4], "no_private_ipv4"),
             (vec![public_v4], "no_private_ipv4"),
             (vec![], "no_private_ipv4"),
         ] {
