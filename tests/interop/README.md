@@ -27,12 +27,22 @@ The smokes need `CAP_NET_ADMIN` to create netns + veth pairs. The
 runner follows the repo's visible-skip convention
 (`tests/netns_discovery.rs:1-23`): when root is unavailable (non-root
 without passwordless sudo) it prints a loud skip and exits 0 — never a
-silent no-op. To execute: `sudo tests/interop/run.sh m2` (or rely on
-`sudo -n` from a user that has it).
+silent no-op.
 
-The build runs as the **invoking user** so `target/` stays user-owned
-and the root side never touches the rustup shim (the failure mode
-documented in `tests/netns_discovery.rs:14-21`).
+To execute, run it as **your normal user**, from a user that has
+passwordless sudo:
+
+```
+tests/interop/run.sh m1
+```
+
+The runner escalates itself per command. `sudo tests/interop/run.sh m1`
+also works: it hands straight back to `$SUDO_USER`, because the build
+runs as the **invoking user** so `target/` stays user-owned and the root
+side never touches the rustup shim (rustup is per-user; root has no
+`~/.cargo`, and sudo's `secure_path` would not find it anyway). That
+hand-back exists because the root branch used to die on
+`cargo: command not found`.
 
 ## CI-vs-on-demand — this is on-demand
 
@@ -160,8 +170,13 @@ M4 is M3 with three knobs pre-set (via `m4_smoke.sh`):
 | `RC_RUST_DISPLAY=1` | Rust daemon uses its own per-instance Xvfb | kde→rust clipboard (Phase 3) |
 | `RC_MPRIS_FAKE=1` | Plant `examples/mpris_fake_player.rs` (zbus FakeRoot + FakePlayer) on kde's private session bus | mpris both directions (Phase 6) |
 
-When `RC_KDECONNECTD` is unset, the harness uses `/usr/bin/kdeconnectd`
-(distro binary). The selection happens in `tests/interop/lib.sh`'s KDE
+When `RC_KDECONNECTD` is unset, the harness prefers `/usr/bin/kdeconnectd`
+(distro binary) and falls back to the pinned source build at
+`tests/interop/.kde/install/bin/kdeconnectd` when no distro binary is
+installed. Most machines running this suite have no distro kdeconnectd,
+since this is the client that replaces it, so the fallback is the usual
+path rather than the exception. Set `RC_KDECONNECTD` only to override
+that order. The selection happens in `tests/interop/lib.sh`'s KDE
 reference selection block.
 
 ### Building the source-pinned reference
