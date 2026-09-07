@@ -13,6 +13,10 @@ use crate::api::handlers::plugins::contacts::{ContactsListResponse, ContactsSync
 use crate::api::handlers::plugins::mpris::{
     MprisActionResponse, MprisLocalPlayersResponse, MprisPlayersResponse,
 };
+use crate::api::handlers::plugins::notification::{
+    NotificationActionTriggeredResponse, NotificationDismissedResponse, NotificationReplyResponse,
+    NotificationSentResponse, NotificationsListResponse,
+};
 use crate::api::handlers::plugins::remotecommands::RemoteCommandTriggerResponse;
 use crate::api::handlers::plugins::sftp::{
     SftpInfoResponse, SftpMountResponse, SftpRequestResponse, SftpUnmountResponse,
@@ -50,6 +54,11 @@ use crate::utils::errors::ErrorCode;
     ContactsSyncResponseWrapper = ApiResponse<ContactsSyncResponse>,
     ContactsListResponseWrapper = ApiResponse<ContactsListResponse>,
     RemoteCommandTriggerResponseWrapper = ApiResponse<RemoteCommandTriggerResponse>,
+    NotificationsListResponseWrapper = ApiResponse<NotificationsListResponse>,
+    NotificationSentResponseWrapper = ApiResponse<NotificationSentResponse>,
+    NotificationReplyResponseWrapper = ApiResponse<NotificationReplyResponse>,
+    NotificationActionTriggeredResponseWrapper = ApiResponse<NotificationActionTriggeredResponse>,
+    NotificationDismissedResponseWrapper = ApiResponse<NotificationDismissedResponse>,
 )]
 pub struct ApiResponse<T: Serialize> {
     pub status: &'static str,

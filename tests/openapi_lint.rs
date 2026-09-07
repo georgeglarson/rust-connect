@@ -132,8 +132,10 @@ fn test_untyped_response_bodies_only_ever_decrease() {
     // (players, local-players, request, action) typed here: pin 23 → 19.
     // Note: `request_mpris` also reuses SentResponse. Contacts endpoints
     // (sync, list) typed here: pin 19 → 17. Remote-command trigger typed
-    // here: pin 17 → 16.
-    const PIN: usize = 16;
+    // here: pin 17 → 16. Notifications endpoints (list, send, reply,
+    // action, dismiss) typed here: pin 16 → 11. Note: get_notification_icon
+    // serves image/png and is not in the ratchet.
+    const PIN: usize = 11;
     assert!(
         count <= PIN,
         "untyped-response pin is {PIN}; this commit allows {count} (offenders: {offenders:#?}). \
