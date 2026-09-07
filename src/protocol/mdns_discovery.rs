@@ -427,7 +427,7 @@ impl MdnsDiscoveryService {
                         Ok(ServiceEvent::ServiceResolved(resolved)) => {
                             let service = ServiceView::from(&*resolved);
                             match resolved_to_peer(&service) {
-                                Some(peer) => {
+                                Ok(peer) => {
                                     debug!(
                                         device_id = %peer.device_id,
                                         address = %peer.address,
@@ -437,10 +437,14 @@ impl MdnsDiscoveryService {
                                     );
                                     on_resolved(peer);
                                 }
-                                None => {
+                                Err(reason) => {
                                     // `reason` is the one field the IPv6 decision
-                                    // (vk #1101) needs to be findable in a journal.
-                                    let reason = resolve_skip_reason(&service.addresses);
+                                    // (vk #1101) needs to be findable in a journal,
+                                    // so it comes from the rejection itself rather
+                                    // than being re-derived here: a bad-TXT service
+                                    // that also happened to be IPv6-only used to be
+                                    // labelled `ipv6_only`, sending a reader after
+                                    // the wrong cause (PR #46 review).
                                     debug!(
                                         fullname = %resolved.get_fullname(),
                                         reason = reason,
@@ -540,33 +544,7 @@ fn usable_peer_address(ip: &std::net::IpAddr) -> bool {
     ip.is_ipv4() && crate::protocol::is_private_address(ip)
 }
 
-/// Why a resolve `resolved_to_peer` rejected was skipped, for the
-/// `mdns_resolve_skipped` journal line. `"ipv6_only"` is the findable
-/// label the accepted IPv6 regression (vk #1101) needs; an IPv4-mapped
-/// IPv6 (`::ffff:192.168.1.5`) lands there too — mdns-sd's AAAA decoder
-/// (`read_ipv6`, dns_parser.rs) does not reject mapped rdata, and Rust
-/// classifies it as V6, which the selection below agrees is unusable.
-fn resolve_skip_reason(addresses: &[std::net::IpAddr]) -> &'static str {
-    if addresses.iter().any(|ip| ip.is_ipv6()) && !addresses.iter().any(usable_peer_address) {
-        "ipv6_only"
-    } else {
-        "unusable"
-    }
-}
-
-/// Convert a resolved service to an [`MdnsPeer`]. `None` for anything that
-/// is not a usable KDE Connect peer (missing/invalid TXT, no private IPv4
-/// address). The SRV port is NOT validated: nothing dials it.
-///
-/// IPv4 only, on purpose (vk #1101): the handshake this feeds ends with
-/// the PEER dialing OUR address, and the TCP listener binds IPv4 only
-/// (`listener.rs:71`), so a unicast to a peer's IPv6 address invites a
-/// dial nothing answers. Link-local IPv6 is worse still — `ServiceView`
-/// carries bare `IpAddr`s, the scope id is gone, and the send itself
-/// fails. Until the listener is dual-stack, an IPv6-only resolve is
-/// skipped (logged `mdns_resolve_skipped`, `reason = "ipv6_only"`); such
-/// a peer still connects by dialing us over v4 or via UDP broadcast.
-fn resolved_to_peer(service: &ServiceView) -> Option<MdnsPeer> {
+fn resolved_to_peer(service: &ServiceView) -> std::result::Result<MdnsPeer, &'static str> {
     // Device id: the `id` TXT record, falling back to the instance name —
     // both are the device id in both reference implementations (module
     // docs).
@@ -582,13 +560,18 @@ fn resolved_to_peer(service: &ServiceView) -> Option<MdnsPeer> {
         .unwrap_or(instance_name)
         .to_string();
     if crate::protocol::crypto::validate_device_id(&device_id).is_err() {
-        return None;
+        return Err("invalid_device_id");
     }
 
     // Without a parseable protocol version we can't safely identify the
     // peer (the downgrade guard and the identity exchange both key on it);
     // every real announcer sends it.
-    let protocol_version: u32 = service.txt.get("protocol")?.parse().ok()?;
+    let protocol_version: u32 = service
+        .txt
+        .get("protocol")
+        .ok_or("no_protocol_version")?
+        .parse()
+        .map_err(|_| "unparseable_protocol_version")?;
 
     let device_name = service
         .txt
@@ -607,9 +590,16 @@ fn resolved_to_peer(service: &ServiceView) -> Option<MdnsPeer> {
     let address = service
         .addresses
         .iter()
-        .find(|ip| usable_peer_address(ip))?;
+        .find(|ip| usable_peer_address(ip))
+        .ok_or_else(|| {
+            if service.addresses.iter().any(|ip| ip.is_ipv6()) {
+                "ipv6_only"
+            } else {
+                "no_private_ipv4"
+            }
+        })?;
 
-    Some(MdnsPeer {
+    Ok(MdnsPeer {
         device_id,
         device_name,
         device_type,
@@ -650,6 +640,25 @@ mod tests {
             fullname,
             port,
             addresses: vec![ip],
+            txt: properties
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    /// `service_view` with the address list spelled out: the reason a
+    /// resolve is rejected depends on the whole set, not one address.
+    fn service_view_addrs<'a>(
+        fullname: &'a str,
+        addresses: Vec<std::net::IpAddr>,
+        port: u16,
+        properties: &[(&str, &str)],
+    ) -> ServiceView<'a> {
+        ServiceView {
+            fullname,
+            port,
+            addresses,
             txt: properties
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -713,7 +722,7 @@ mod tests {
             1716,
             &[("id", "peer-device-aaaaaaaaaaaaaaaaaaaaaa")],
         );
-        assert!(resolved_to_peer(&no_protocol).is_none());
+        assert_eq!(resolved_to_peer(&no_protocol), Err("no_protocol_version"));
 
         // Garbage protocol TXT.
         let bad_protocol = service_view(
@@ -725,7 +734,10 @@ mod tests {
                 ("id", "peer-device-aaaaaaaaaaaaaaaaaaaaaa"),
             ],
         );
-        assert!(resolved_to_peer(&bad_protocol).is_none());
+        assert_eq!(
+            resolved_to_peer(&bad_protocol),
+            Err("unparseable_protocol_version")
+        );
 
         // Invalid device id (path-unsafe).
         let bad_id = service_view(
@@ -734,7 +746,7 @@ mod tests {
             1716,
             &[("protocol", "8"), ("id", "../etc/passwd")],
         );
-        assert!(resolved_to_peer(&bad_id).is_none());
+        assert_eq!(resolved_to_peer(&bad_id), Err("invalid_device_id"));
 
         // Only a public address: a LAN peer doesn't announce one.
         let public = service_view(
@@ -746,7 +758,7 @@ mod tests {
                 ("id", "peer-device-aaaaaaaaaaaaaaaaaaaaaa"),
             ],
         );
-        assert!(resolved_to_peer(&public).is_none());
+        assert_eq!(resolved_to_peer(&public), Err("no_private_ipv4"));
     }
 
     /// vk #1101: a zero SRV port is not a reason to drop the peer. We never
@@ -792,7 +804,7 @@ mod tests {
                 ],
             );
             assert!(
-                resolved_to_peer(&resolved).is_none(),
+                resolved_to_peer(&resolved) == Err("ipv6_only"),
                 "an IPv6-only resolve ({v6}) must be skipped, not unicast to"
             );
         }
@@ -831,72 +843,61 @@ mod tests {
     /// the selection treats it as unusable, which is safe: the unicast
     /// primitive binds per-family, and the ratified IPv4-only rule
     /// (vk #1101) says do not send there).
+    /// The `mdns_resolve_skipped` reason is the one field the accepted
+    /// IPv6 regression (vk #1101) needs to be findable in a journal, so
+    /// it has to name the cause that actually fired. It comes off the
+    /// rejection itself now: a second, address-only derivation labelled
+    /// a bad-TXT service `ipv6_only` whenever it happened to be
+    /// IPv6-only, pointing a reader at the wrong cause (PR #46 review).
+    /// Rejection order is the validation order, so the FIRST failure
+    /// wins and the label cannot contradict the selection by
+    /// construction.
     #[test]
-    fn test_resolve_skip_reason_labels_the_diagnosis() {
-        let v4: std::net::IpAddr = "192.168.1.50".parse().expect("ip");
-        let public_v4: std::net::IpAddr = "8.8.8.8".parse().expect("ip");
-        let ula: std::net::IpAddr = "fd12:3456::10".parse().expect("ip");
-        let mapped: std::net::IpAddr = "::ffff:192.168.1.5".parse().expect("ip");
-
-        assert_eq!(resolve_skip_reason(&[ula]), "ipv6_only");
-        assert_eq!(resolve_skip_reason(&[mapped]), "ipv6_only");
-        assert_eq!(resolve_skip_reason(&[ula, public_v4]), "ipv6_only");
-        assert_eq!(resolve_skip_reason(&[public_v4]), "unusable");
-        assert_eq!(resolve_skip_reason(&[]), "unusable");
-        // A usable IPv4 present: never labeled ipv6_only (this input
-        // converts rather than skips; the tripwire below pins that the
-        // two sites keep agreeing about it).
-        assert_eq!(resolve_skip_reason(&[ula, v4]), "unusable");
-    }
-
-    /// Drift tripwire (vk #1101 review): the selection and the skip
-    /// diagnosis share one predicate (`usable_peer_address`). If they
-    /// ever disagree, a peer the selection ACCEPTS could be diagnosed
-    /// `ipv6_only` in the journal, or a rejected one could lose the
-    /// label. For every address set: accepted ⇔ not diagnosed ipv6_only.
-    #[test]
-    fn test_resolve_skip_reason_never_contradicts_resolved_to_peer() {
-        let v4: std::net::IpAddr = "192.168.1.50".parse().expect("ip");
-        let public_v4: std::net::IpAddr = "8.8.8.8".parse().expect("ip");
-        let ula: std::net::IpAddr = "fd12:3456::10".parse().expect("ip");
-        let mapped: std::net::IpAddr = "::ffff:192.168.1.5".parse().expect("ip");
+    fn test_resolved_to_peer_reports_the_reason_it_rejected() {
         let good_name = format!("peer-device-aaaaaaaaaaaaaaaaaaaaaa.{SERVICE_TYPE}");
-        let txt: std::collections::HashMap<String, String> = [
+        let v4: std::net::IpAddr = "192.168.1.50".parse().expect("ip");
+        let public_v4: std::net::IpAddr = "8.8.8.8".parse().expect("ip");
+        let ula: std::net::IpAddr = "fd12:3456::10".parse().expect("ip");
+        let mapped: std::net::IpAddr = "::ffff:192.168.1.5".parse().expect("ip");
+
+        let good_txt = [
             ("id", "peer-device-aaaaaaaaaaaaaaaaaaaaaa"),
             ("protocol", "8"),
-        ]
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-
-        let sets: Vec<Vec<std::net::IpAddr>> = vec![
-            vec![v4],
-            vec![public_v4],
-            vec![ula],
-            vec![mapped],
-            vec![v4, ula],
-            vec![ula, v4],
-            vec![public_v4, ula],
-            vec![mapped, v4],
-            vec![mapped, public_v4],
         ];
-        for addresses in sets {
-            let view = ServiceView {
-                fullname: &good_name,
-                port: 1716,
-                addresses: addresses.clone(),
-                txt: txt.clone(),
-            };
-            let accepted = resolved_to_peer(&view).is_some();
-            let labeled_ipv6_only = resolve_skip_reason(&addresses) == "ipv6_only";
-            // A set the selection accepts must never be diagnosed
-            // ipv6_only. (The reverse — rejected + "unusable" — is a
-            // legitimate pairing, e.g. a public-IPv4-only spoof.)
-            assert!(
-                !(accepted && labeled_ipv6_only),
-                "selection and diagnosis disagree for {addresses:?}"
+
+        // Address-shaped rejections, with valid metadata.
+        for (addresses, want) in [
+            (vec![ula], "ipv6_only"),
+            (vec![mapped], "ipv6_only"),
+            (vec![ula, public_v4], "ipv6_only"),
+            (vec![public_v4], "no_private_ipv4"),
+            (vec![], "no_private_ipv4"),
+        ] {
+            let view = service_view_addrs(&good_name, addresses.clone(), 1716, &good_txt);
+            assert_eq!(
+                resolved_to_peer(&view),
+                Err(want),
+                "addresses {addresses:?} must be diagnosed {want}"
             );
         }
+
+        // Metadata beats address: an IPv6-only service with unusable TXT
+        // is NOT ipv6_only, which is the case the old derivation got
+        // wrong.
+        let bad_txt_v6 =
+            service_view_addrs(&good_name, vec![ula], 1716, &[("id", "../etc/passwd")]);
+        assert_eq!(resolved_to_peer(&bad_txt_v6), Err("invalid_device_id"));
+        let no_proto_v6 = service_view_addrs(
+            &good_name,
+            vec![ula],
+            1716,
+            &[("id", "peer-device-aaaaaaaaaaaaaaaaaaaaaa")],
+        );
+        assert_eq!(resolved_to_peer(&no_proto_v6), Err("no_protocol_version"));
+
+        // A usable IPv4 present: converts, never diagnosed at all.
+        let ok = service_view_addrs(&good_name, vec![ula, v4], 1716, &good_txt);
+        assert_eq!(resolved_to_peer(&ok).expect("converts").address, v4);
     }
 
     /// End-to-end, in-process: announce ourselves and confirm a browser

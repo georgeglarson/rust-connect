@@ -31,11 +31,12 @@ capabilities) sent every 60 s by default — inherent to the protocol.
 - Pre-auth identity reads capped at 512 KiB (mirrors Android
   `LanLinkProvider`).
 - Per-IP outbound rate limit throttles what a spoofed discovery
-  response can make this host emit: the dials it triggers
-  (`CONNECTION_RATE_LIMIT`, `connection/outbound.rs`) and the identity
-  unicasts an mDNS resolve answers with
-  (`ConnectionManager::allow_mdns_unicast`, same window, separate map
-  so a failing dial loop cannot suppress a recovering unicast).
+  response can make this host emit. Two paths carry it: the dials such a
+  response triggers (`CONNECTION_RATE_LIMIT`, `connection/outbound.rs`),
+  and the identity unicast that answers an mDNS resolve
+  (`ConnectionManager::allow_mdns_unicast`, same window, deliberately a
+  separate map so a failing dial loop cannot suppress the unicast that
+  recovers the peer).
 
 **Residual risks.** An active MITM during the first-connection pairing
 window can attempt to race the SAS comparison — the SAS is the only
