@@ -10,10 +10,9 @@
 #                                       # KDE reference + rust-side Xvfb +
 #                                       # mpris fake-player helper)
 #   tests/interop/run.sh m5             # kdeconnectd-only restart (the SAN
-#                                       # fix's live oracle, vk #1045); needs
-#                                       # RC_KDECONNECTD for the source build
+#                                       # fix's live oracle, vk #1045)
 #   tests/interop/run.sh all            # serial M1 → M2 → M3 → M4 → M5
-#   sudo tests/interop/run.sh m2        # already root
+#   sudo tests/interop/run.sh m2        # also fine: hands back to $SUDO_USER
 #   RC_M2_SABOTAGE=skip-kde-accept tests/interop/run.sh m2
 #
 # Root-only with the repo's visible-skip convention
@@ -73,7 +72,35 @@ esac
 # External callers may also set the sabotage var directly. Honor it.
 SABOTAGE_VAL="${!SABOTAGE_ENV:-${RC_SABOTAGE:-}}"
 
+if [[ "$(id -u)" == "0" && -n "${SUDO_USER:-}" ]]; then
+    # `sudo tests/interop/run.sh` is a documented form, and until 2026-09-07
+    # it could not work: rustup is per-user, root has no ~/.cargo, and
+    # sudo's secure_path excludes it, so the build died on `cargo: command
+    # not found`. Had it got past that it would have written root-owned
+    # artifacts into target/ and broken the next user build. Both outcomes
+    # contradict the header's own contract above.
+    #
+    # Rather than carry a second build path, hand off to the one that is
+    # actually exercised: re-exec as the invoking user, who builds normally
+    # and re-escalates per command via `sudo -n`.
+    # A LOGIN shell, not a bare exec: sudo's env_reset replaces PATH with
+    # sudoers' secure_path, which excludes ~/.cargo/bin, so a plain
+    # `sudo -u "$SUDO_USER" "$0"` lands in the same `cargo: command not
+    # found` it is meant to cure. `-l` sources the user's profile, which
+    # is what puts rustup on PATH in the first place.
+    _self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    exec sudo -u "$SUDO_USER" -H bash -lc \
+        "cd $(printf '%q' "$REPO_ROOT") && exec $(printf '%q' "$_self") $(printf '%q ' "$@")"
+fi
+
 if [[ "$(id -u)" == "0" ]]; then
+    # A real root session (no SUDO_USER): no user to hand back to, so the
+    # build runs here and needs cargo on root's PATH.
+    command -v cargo >/dev/null || {
+        printf '[run.sh] FAIL: running as root with no SUDO_USER and no cargo on PATH.\n' >&2
+        printf '[run.sh] FAIL: run this as your normal user instead; it escalates itself.\n' >&2
+        exit 1
+    }
     SUDO=()
 elif sudo -n true 2>/dev/null; then
     SUDO=(sudo -n)
@@ -96,6 +123,23 @@ RC_BIN="$REPO_ROOT/target/debug/rust-connect"
 
 SMOKE="$REPO_ROOT/tests/interop/${MILESTONE}_smoke.sh"
 [[ -f "$SMOKE" ]] || { echo "[run.sh] FAIL: smoke not found: $SMOKE" >&2; exit 1; }
+
+# No distro kdeconnectd is the NORMAL case here, not an error: this is the
+# client that replaces it, so its developers have no reason to install it.
+# The repo carries a pinned source build, so prefer the distro binary and
+# fall back to the pinned one rather than making every caller export a
+# path. Must happen before the LD_LIBRARY_PATH block below, which gates on
+# RC_KDECONNECTD being set, and it is done HERE only: lib.sh had a second
+# copy for one commit, which set the variable too late for that block and
+# left kdeconnectd unable to claim its bus name.
+if [[ -z "${RC_KDECONNECTD:-}" && ! -x /usr/bin/kdeconnectd ]]; then
+    _pinned_kde="$REPO_ROOT/tests/interop/.kde/install/bin/kdeconnectd"
+    if [[ -x "$_pinned_kde" ]]; then
+        export RC_KDECONNECTD="$_pinned_kde"
+        echo "[run.sh] no distro kdeconnectd; using the pinned source build in-repo"
+    fi
+    unset _pinned_kde
+fi
 
 # The M4/M5 source-built reference's RUNPATH was baked to its build
 # worktree (since deleted), so the install's lib64 must ride

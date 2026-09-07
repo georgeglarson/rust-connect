@@ -65,7 +65,8 @@
 # ----------------------------------------------------------- skip gate + log
 if [[ "$(id -u)" != "0" ]]; then
     printf '[%s] SKIP: not running as root — netns/veth creation needs CAP_NET_ADMIN;\n' "$MILESTONE_PREFIX" >&2
-    printf '[%s] SKIP: run via `sudo tests/interop/run.sh` to execute this suite.\n' "$MILESTONE_PREFIX" >&2
+    printf '[%s] SKIP: run `tests/interop/run.sh <milestone>` as your normal user;\n' "$MILESTONE_PREFIX" >&2
+    printf '[%s] SKIP: it escalates itself and needs passwordless sudo.\n' "$MILESTONE_PREFIX" >&2
     exit 0
 fi
 
@@ -106,7 +107,7 @@ if [[ -n "${RC_KDECONNECTD:-}" ]]; then
     fi
 else
     KDECONNECTD=/usr/bin/kdeconnectd
-    [[ -x "$KDECONNECTD" ]] || die "$KDECONNECTD not installed"
+    [[ -x "$KDECONNECTD" ]] || die "no KDE reference available: $KDECONNECTD is not installed and the pinned source build is missing from tests/interop/.kde/install/bin/. Build it (see tests/interop/.kde/SOURCE_MANIFEST.toml) or point RC_KDECONNECTD at one."
     KDE_NEVRA=$(rpm -q kdeconnectd kde-connect-libs kde-connect 2>/dev/null | tr '\n' ' ')
     log "KDE reference (pinned binary NEVRA, not source SHA): $KDE_NEVRA"
 fi
