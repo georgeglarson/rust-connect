@@ -35,6 +35,7 @@ pub mod shareinputdevices;
 pub mod sms;
 pub mod systemvolume;
 pub mod telephony;
+pub mod tool;
 
 use std::sync::Arc;
 
@@ -66,6 +67,7 @@ pub use shareinputdevices::ShareInputDevicesPlugin;
 pub use sms::SmsPlugin;
 pub use systemvolume::SystemVolumePlugin;
 pub use telephony::TelephonyPlugin;
+pub use tool::{Tool, ToolParameter};
 
 /// Typed accessor for all plugin instances.
 /// Replaces individual plugin fields on AppState.
