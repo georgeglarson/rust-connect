@@ -259,25 +259,33 @@ fn device_route_first_segment(path: &str) -> Option<String> {
 /// entry; the ratchet catches when one forgets. Removing the entry from a
 /// plugin whose route was removed is the only sanctioned reason the pin
 /// drops.
-/// Every registered plugin, built by the production loader, so a plugin
-/// added tomorrow is in the ratchet's subject set without anyone editing
-/// this file (review finding on PR #41: a hand-written map made a new
-/// device-routed plugin invisible to the ratchet).
-fn every_registered_plugin() -> Vec<Arc<dyn Plugin>> {
+/// Every registered plugin, from the same `PluginRegistry` walk
+/// `list_tools` performs (`plugin_registry.list()` then `get(name)`), after
+/// the production loader has registered them. A plugin added tomorrow is
+/// in the ratchet's subject set without anyone editing this file, and a
+/// plugin constructed but never registered is not silently counted
+/// (review findings on PR #41).
+async fn every_registered_plugin() -> Vec<Arc<dyn Plugin>> {
     let temp_dir = tempfile::TempDir::new().expect("temp data dir");
     let settings = AppSettings::new_with_data_dir(temp_dir.path().to_path_buf());
     let state = AppState::new_without_input(settings).expect("AppState without desktop input");
-    let plugins = state.plugins.all();
-    assert!(
-        plugins.len() >= 25,
-        "the loader must register every plugin; got {}",
-        plugins.len()
+    state.init_plugins().await;
+    let mut plugins = Vec::new();
+    for name in state.plugin_registry.list().await {
+        if let Some(plugin) = state.plugin_registry.get(&name).await {
+            plugins.push(plugin);
+        }
+    }
+    assert_eq!(
+        plugins.len(),
+        state.plugins.all().len(),
+        "the registry must hold every plugin the loader built"
     );
     plugins
 }
 
-#[test]
-fn test_plugins_with_device_routes_advertise_tools_ratchet() {
+#[tokio::test]
+async fn test_plugins_with_device_routes_advertise_tools_ratchet() {
     // Today's seven: sms, share, lock, remotekeyboard, findmyphone,
     // contacts, connectivity. Each owns at least one device route but
     // contributes no `tools()` entry. Pin = 7 (computed 2026-09-06). A
@@ -294,7 +302,7 @@ fn test_plugins_with_device_routes_advertise_tools_ratchet() {
         .filter_map(|p| device_route_first_segment(&p))
         .collect();
 
-    let plugins = every_registered_plugin();
+    let plugins = every_registered_plugin().await;
     let plugin_names: BTreeSet<String> = plugins.iter().map(|p| p.name().to_string()).collect();
     let routed_plugins: BTreeSet<&String> = device_segments
         .iter()
@@ -326,8 +334,8 @@ fn test_plugins_with_device_routes_advertise_tools_ratchet() {
 /// that list (add, remove, rename, re-order) is a behavioural change to
 /// `GET /api/v1/tools` and must be intentional — update the pin in the
 /// same change.
-#[test]
-fn test_list_tools_yields_today_nine_names_sorted() {
+#[tokio::test]
+async fn test_list_tools_yields_today_nine_names_sorted() {
     const EXPECTED: &[&str] = &[
         "browse_sftp",
         "get_battery",
@@ -340,7 +348,7 @@ fn test_list_tools_yields_today_nine_names_sorted() {
         "ping_device",
     ];
 
-    let plugins = every_registered_plugin();
+    let plugins = every_registered_plugin().await;
 
     let mut names: Vec<String> = plugins
         .iter()
