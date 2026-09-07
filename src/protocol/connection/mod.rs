@@ -38,6 +38,11 @@ pub struct ConnectionManager {
     pub(crate) connections: Arc<RwLock<HashMap<DeviceId, Arc<Connection>>>>,
     pub(crate) cancel_tokens: Arc<RwLock<HashMap<DeviceId, CancellationToken>>>,
     pub(crate) last_connection_attempt: Arc<RwLock<HashMap<DeviceId, Instant>>>,
+    /// Per-IP throttle for the mDNS identity unicast (vk #1101). Kept
+    /// SEPARATE from `last_connection_attempt` on purpose: sharing that
+    /// map would let a failing dial loop suppress the very unicast that
+    /// recovers the peer, which is the case vk #1101 exists to fix.
+    pub(crate) last_mdns_unicast: Arc<RwLock<HashMap<String, Instant>>>,
     pub pending_connections: Arc<std::sync::Mutex<std::collections::HashSet<DeviceId>>>,
     pub(crate) cert_manager: Arc<CertificateManager>,
     pub(crate) device_id: Arc<std::sync::RwLock<String>>,
@@ -220,6 +225,7 @@ impl ConnectionManager {
             connections: Arc::new(RwLock::new(HashMap::new())),
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             last_connection_attempt: Arc::new(RwLock::new(HashMap::new())),
+            last_mdns_unicast: Arc::new(RwLock::new(HashMap::new())),
             pending_connections: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             cert_manager,
             device_id: Arc::new(std::sync::RwLock::new(String::new())),
@@ -257,6 +263,30 @@ impl ConnectionManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         pending.remove(device_id);
+    }
+
+    /// May we unicast our identity to `peer_ip` right now? Records the
+    /// send when it returns true.
+    ///
+    /// The mDNS resolve leg used to reach the peer through
+    /// `connect_to_device_with_fallback_port`, whose first act is the
+    /// `CONNECTION_RATE_LIMIT` check — the throttle `docs/threat-model.md`
+    /// credits under adversary class A for capping what a spoofed
+    /// discovery response can make this host emit. vk #1101 replaced that
+    /// dial with a unicast, which would have left the leg unthrottled: an
+    /// attacker able to publish mDNS records could name any private IPv4
+    /// address and set the rate. Same window, same per-IP shape, own map.
+    pub(crate) async fn allow_mdns_unicast(&self, peer_ip: &std::net::IpAddr) -> bool {
+        let key = peer_ip.to_string();
+        let mut sent = self.last_mdns_unicast.write().await;
+        if let Some(last) = sent.get(&key) {
+            if last.elapsed() < CONNECTION_RATE_LIMIT {
+                return false;
+            }
+        }
+        sent.insert(key, Instant::now());
+        sent.retain(|_, v| v.elapsed() < Duration::from_secs(60));
+        true
     }
 
     pub fn split_brain_policy(&self) -> crate::protocol::SplitBrainPolicy {

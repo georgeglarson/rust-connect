@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `devices` command) merely for being mDNS-resolved, with no
   capabilities; it now appears once a link completes, which is also how
   both references behave. (vk #1101)
+- The mDNS identity unicast is rate-limited per peer address, the same
+  one-second window the outbound dial it replaced already used. Without
+  it the resolve leg would have been the one discovery path a spoofed
+  announce could drive unthrottled. (vk #1101)
 
 ## [0.2.0] - 2026-09-07
 

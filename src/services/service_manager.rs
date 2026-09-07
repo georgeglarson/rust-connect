@@ -293,6 +293,26 @@ fn on_mdns_device_resolved_with_udp_port(
             return;
         }
 
+        // Throttle before we emit anything (vk #1101 review): the dial
+        // this leg replaced was covered by CONNECTION_RATE_LIMIT, which
+        // `docs/threat-model.md` credits as the class-A cap on what a
+        // spoofed discovery response can make this host send. Placed
+        // after the cheap guards so an ignored resolve never consumes a
+        // window.
+        if !state
+            .connection_manager
+            .allow_mdns_unicast(&peer.address)
+            .await
+        {
+            debug!(
+                device_id = %device_id,
+                address = %peer.address,
+                event = "mdns_unicast_rate_limited",
+                "Already answered this address inside the rate-limit window"
+            );
+            return;
+        }
+
         let our_identity = match state.connection_manager.get_identity() {
             Some(id) => id,
             None => {
@@ -801,5 +821,73 @@ mod tests {
                 // A stray from a parallel test: not ours, keep waiting.
             }
         }
+    }
+
+    /// vk #1101 review: the dial this leg replaced went through
+    /// `CONNECTION_RATE_LIMIT` (`outbound.rs:126`), the per-IP throttle
+    /// `docs/threat-model.md` credits under adversary class A. Without a
+    /// replacement, anyone able to publish mDNS records could name a
+    /// private IPv4 address and set the rate at which this host emits
+    /// identity datagrams. Red before the throttle: the second resolve
+    /// is answered too.
+    #[tokio::test]
+    async fn test_mdns_resolve_throttles_repeat_answers_to_one_address() {
+        let (state, _t) = test_state();
+        let (capture, udp_port) = capture_socket().await;
+
+        on_mdns_device_resolved_with_udp_port(
+            state.clone(),
+            mdns_peer(std::net::Ipv4Addr::LOCALHOST.into(), 1716),
+            udp_port,
+        );
+        recv_identity(&capture, std::time::Duration::from_secs(2))
+            .await
+            .expect("the first resolve for an address is answered");
+
+        on_mdns_device_resolved_with_udp_port(
+            state.clone(),
+            mdns_peer(std::net::Ipv4Addr::LOCALHOST.into(), 1716),
+            udp_port,
+        );
+        assert!(
+            recv_identity(&capture, std::time::Duration::from_millis(500))
+                .await
+                .is_none(),
+            "a repeat resolve for the same address inside the window must be throttled"
+        );
+    }
+
+    /// The throttle is per address, not global: one noisy peer must not
+    /// silence a different one. 127.0.0.2 is loopback like 127.0.0.1, so
+    /// both are bindable here and both read as private.
+    #[tokio::test]
+    async fn test_mdns_resolve_throttle_is_keyed_per_address() {
+        let (state, _t) = test_state();
+        let (first, first_port) = capture_socket().await;
+        let second = tokio::net::UdpSocket::bind("127.0.0.2:0")
+            .await
+            .expect("bind a second loopback capture");
+        let second_port = second.local_addr().expect("local_addr").port();
+
+        on_mdns_device_resolved_with_udp_port(
+            state.clone(),
+            mdns_peer(std::net::Ipv4Addr::LOCALHOST.into(), 1716),
+            first_port,
+        );
+        recv_identity(&first, std::time::Duration::from_secs(2))
+            .await
+            .expect("the first address is answered");
+
+        on_mdns_device_resolved_with_udp_port(
+            state.clone(),
+            mdns_peer(std::net::Ipv4Addr::new(127, 0, 0, 2).into(), 1716),
+            second_port,
+        );
+        assert!(
+            recv_identity(&second, std::time::Duration::from_secs(2))
+                .await
+                .is_some(),
+            "a different address must not inherit the first address's window"
+        );
     }
 }
