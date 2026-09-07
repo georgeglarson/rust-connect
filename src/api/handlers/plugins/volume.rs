@@ -10,10 +10,10 @@ use crate::app::AppState;
 use crate::utils::errors::Error;
 
 /// `volume` and `muted` mirror the request body's optional fields: the
-/// desktop asked for the volume to be at integer `volume` (None means
-/// "don't touch volume") and the muted flag to be `muted` (None means
-/// "don't touch muted"). `name` is the sink the desktop targeted — used
-/// to disambiguate when the device has multiple players.
+/// desktop asked for the volume to be at integer `volume` (`null` means
+/// "don't touch volume") and the muted flag to be `muted` (`null` means
+/// "don't touch muted"). The targeted sink `name` goes on the wire packet
+/// only; the response never carried it.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct VolumeControlSentResponse {
     pub device_id: String,

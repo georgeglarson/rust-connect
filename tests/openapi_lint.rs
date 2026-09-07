@@ -91,15 +91,62 @@ fn test_untyped_response_bodies_only_ever_decrease() {
     let schemas = json["components"]["schemas"]
         .as_object()
         .expect("spec has component schemas");
-    let is_untyped = |name: &str| -> bool {
-        let Some(component) = schemas.get(name) else {
-            return true;
+    // A schema object "says something" when it is a `$ref` to a component
+    // that itself says something, or carries a type/shape keyword. `{}` is
+    // what utoipa emits for `serde_json::Value`; a missing `data` means the
+    // body is not the envelope at all. Refs are followed a few levels so a
+    // `data: {"$ref": Value}` chain cannot hide an empty schema.
+    fn schema_is_typed(
+        schema: &serde_json::Value,
+        schemas: &serde_json::Map<String, serde_json::Value>,
+        depth: u8,
+    ) -> bool {
+        let Some(obj) = schema.as_object() else {
+            return false;
         };
-        let data = &component["properties"]["data"];
-        match data.as_object() {
-            None => true,
-            Some(o) => o.is_empty(),
+        if let Some(r) = obj.get("$ref").and_then(|r| r.as_str()) {
+            let Some(name) = r.strip_prefix("#/components/schemas/") else {
+                return false;
+            };
+            return depth < 4
+                && schemas
+                    .get(name)
+                    .is_some_and(|target| schema_is_typed(target, schemas, depth + 1));
         }
+        [
+            "type",
+            "properties",
+            "items",
+            "allOf",
+            "oneOf",
+            "anyOf",
+            "enum",
+        ]
+        .iter()
+        .any(|k| obj.contains_key(*k))
+    }
+    // Every body is the `{status, data, metadata}` envelope with a typed
+    // `data`, except the public liveness probe, which is a flat typed
+    // struct by design (docs/constitution.md § 1 names it as the probe a
+    // supervisor reads without unwrapping).
+    const FLAT_BODY_OK: &[&str] = &["/api/v1/health"];
+    let body_is_typed = |path: &str, schema: &serde_json::Value| -> bool {
+        let mut envelope = schema.clone();
+        // Follow the body ref to its component to look at `data`.
+        if let Some(r) = schema.get("$ref").and_then(|r| r.as_str()) {
+            let Some(name) = r.strip_prefix("#/components/schemas/") else {
+                return false;
+            };
+            let Some(component) = schemas.get(name) else {
+                return false;
+            };
+            envelope = component.clone();
+        }
+        let data = &envelope["properties"]["data"];
+        if data.is_null() && FLAT_BODY_OK.contains(&path) {
+            return schema_is_typed(&envelope, schemas, 0);
+        }
+        schema_is_typed(data, schemas, 0)
     };
 
     let mut count: usize = 0;
@@ -119,18 +166,19 @@ fn test_untyped_response_bodies_only_ever_decrease() {
                 let Some(json) = content.get("application/json") else {
                     continue;
                 };
-                let Some(schema_ref) = json
-                    .get("schema")
-                    .and_then(|s| s.get("$ref"))
-                    .and_then(|r| r.as_str())
-                else {
-                    continue;
-                };
-                let Some(name) = schema_ref.strip_prefix("#/components/schemas/") else {
-                    continue;
-                };
-                if is_untyped(name) {
+                // Inline schemas count too: a 200 body with no `$ref` and no
+                // shape is as untyped as a bare `serde_json::Value` alias.
+                let Some(schema) = json.get("schema") else {
                     count += 1;
+                    offenders.push(format!("{method} {path} -> (no schema)"));
+                    continue;
+                };
+                if !body_is_typed(path, schema) {
+                    count += 1;
+                    let name = schema
+                        .get("$ref")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("(inline)");
                     offenders.push(format!("{method} {path} -> {name}"));
                 }
             }

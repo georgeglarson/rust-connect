@@ -43,8 +43,7 @@ pub struct LocalSinkControlRequest {
 
 /// Acknowledgement for `POST /systemvolume/sinks/{name}/control`. Mirrors
 /// the optional fields in the request body so the caller can see what the
-/// backend accepted (e.g. a volume change that didn't carry a `muted`
-/// flag leaves `muted` and `enabled` out).
+/// backend accepted; a control the request did not carry is `null`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LocalSinkControlResponse {
     pub name: String,

@@ -7,6 +7,7 @@ use utoipa::ToSchema;
 use crate::api::extractors::{api_err, validate_device_id};
 use crate::api::types::*;
 use crate::app::AppState;
+use crate::utils::errors::Error;
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ClipboardContentResponse {
@@ -60,11 +61,20 @@ pub async fn get_clipboard(
 )]
 pub async fn set_clipboard(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<SetClipboardRequest>,
+    // Raw value, not `Json<SetClipboardRequest>`: axum's extractor answers a
+    // malformed body with its own bare 422, outside the envelope. The
+    // struct documents the body in the spec; the handler validates it and
+    // answers a 400 in the envelope, as it always has.
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<ClipboardSetResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
+    let content = body
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| api_err(Error::InvalidRequest("content field required".to_string())))?;
+
     let packet = crate::protocol::types::Packet::new(
         "kdeconnect.clipboard".to_string(),
-        serde_json::json!({ "content": body.content }),
+        serde_json::json!({ "content": content }),
     );
 
     let device_ids = state.connection_manager.connected_device_ids().await;
@@ -87,7 +97,7 @@ pub async fn set_clipboard(
     state
         .plugins
         .clipboard
-        .update_content(None, body.content.clone(), None);
+        .update_content(None, content.to_string(), None);
 
     Ok(Json(ApiResponse::ok(ClipboardSetResponse {
         sent: true,

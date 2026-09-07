@@ -525,7 +525,11 @@ pub struct DeviceConnectedResponse {
 pub async fn connect_device(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
-    Json(body): Json<ConnectDeviceRequest>,
+    // Raw value, not `Json<ConnectDeviceRequest>`: axum's extractor answers
+    // a malformed body with a bare 422 outside the envelope. The struct
+    // documents the body in the spec; the handler validates it and answers
+    // a 400 in the envelope, as it always has.
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<DeviceConnectedResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
     validate_device_id(&device_id).map_err(api_err)?;
 
@@ -535,10 +539,15 @@ pub async fn connect_device(
         )));
     }
 
-    let addr: std::net::SocketAddr = body.address.parse().map_err(|_| {
+    let address = body
+        .get("address")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| api_err(Error::InvalidRequest("address field required".to_string())))?;
+
+    let addr: std::net::SocketAddr = address.parse().map_err(|_| {
         api_err(Error::InvalidRequest(format!(
             "Invalid address: {}",
-            body.address
+            address
         )))
     })?;
 

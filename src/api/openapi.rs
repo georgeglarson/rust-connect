@@ -84,6 +84,8 @@ use crate::device::types::{Device, DeviceState, DeviceType};
         DeviceResponse,
         PairResponseWrapper,
         PluginsResponse,
+        handlers::HealthResponse,
+        handlers::BuildInfo,
         CapabilitiesResponseWrapper,
         ToolsResponseWrapper,
         LocalSinksResponseWrapper,

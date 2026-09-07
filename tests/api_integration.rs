@@ -1335,3 +1335,43 @@ async fn test_non_loopback_bind_keeps_the_rate_limiter() {
         "a non-loopback bind must still rate-limit within 101 requests"
     );
 }
+
+/// A malformed body must be answered inside the envelope with a 400, not
+/// by axum's bare 422 (review finding on #43: typed `Json<T>` extractors
+/// had replaced the raw-value parsing on two handlers).
+#[tokio::test]
+async fn test_malformed_bodies_get_the_error_envelope_not_a_bare_422() {
+    let (state, _temp_dir, api_key) = create_test_app().await;
+    let app = build_router(state);
+
+    for (uri, body) in [
+        ("/api/v1/clipboard", "{}"),
+        (
+            "/api/v1/devices/0123456789abcdef0123456789abcdef/connect",
+            "{}",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("X-API-Key", &api_key)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("{uri}: not JSON ({e})"));
+        assert_eq!(json["status"], "error", "{uri}");
+        assert_eq!(json["error"]["code"], "INVALID_REQUEST", "{uri}");
+        assert!(json["metadata"].is_object(), "{uri}");
+    }
+}

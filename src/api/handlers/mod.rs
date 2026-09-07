@@ -21,27 +21,51 @@ use std::sync::Arc;
 
 use crate::app::AppState;
 
+/// The running build, so an installed daemon can be compared to
+/// `origin/main` (vk #973).
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct BuildInfo {
+    pub version: String,
+    pub git_sha: String,
+    pub dirty: bool,
+}
+
+/// `GET /api/v1/health`: the one body outside the `{status, data, metadata}`
+/// envelope. It is the public liveness probe (no API key), kept flat so a
+/// process supervisor can read `status` without unwrapping anything.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct HealthResponse {
+    pub status: String,
+    pub uptime_seconds: u64,
+    pub build: BuildInfo,
+}
+
+impl HealthResponse {
+    pub fn now(state: &AppState) -> Self {
+        Self {
+            status: "ok".to_string(),
+            uptime_seconds: state.started_at.elapsed().as_secs(),
+            build: BuildInfo {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                git_sha: crate::GIT_SHA.to_string(),
+                dirty: env!("RC_GIT_DIRTY") == "1",
+            },
+        }
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/health",
     tag = "health",
     responses(
-        (status = 200, description = "Service liveness probe", body = serde_json::Value),
+        (status = 200, description = "Service liveness probe", body = HealthResponse),
     )
     // intentionally no `security(("api_key" = []))` — health is mounted
     // outside the auth middleware in src/api/router.rs.
 )]
-pub async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "status": "ok",
-        "uptime_seconds": state.started_at.elapsed().as_secs(),
-        // vk #973: lets a lint compare the running daemon to origin/main.
-        "build": {
-            "version": env!("CARGO_PKG_VERSION"),
-            "git_sha": crate::GIT_SHA,
-            "dirty": env!("RC_GIT_DIRTY") == "1"
-        }
-    }))
+pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    Json(HealthResponse::now(&state))
 }
 
 #[cfg(test)]
@@ -49,6 +73,26 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
     use crate::api::extractors::{api_err, validate_device_id};
+
+    #[test]
+    fn test_health_response_matches_legacy_shape() {
+        let resp = super::HealthResponse {
+            status: "ok".to_string(),
+            uptime_seconds: 42,
+            build: super::BuildInfo {
+                version: "0.1.0".to_string(),
+                git_sha: "abc123".to_string(),
+                dirty: false,
+            },
+        };
+        let typed = serde_json::to_value(&resp).unwrap();
+        let legacy = serde_json::json!({
+            "status": "ok",
+            "uptime_seconds": 42,
+            "build": {"version": "0.1.0", "git_sha": "abc123", "dirty": false}
+        });
+        assert_eq!(typed, legacy);
+    }
     use crate::utils::errors::Error;
     use axum::http::StatusCode;
 

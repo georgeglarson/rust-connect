@@ -474,6 +474,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_notifications_list_response_matches_legacy_shape() {
+        let resp = NotificationsListResponse {
+            notifications: Vec::new(),
+            total: 0,
+            page: 1,
+            limit: 50,
+        };
+        let typed = serde_json::to_value(&resp).expect("typed serialization");
+        let legacy = serde_json::json!({
+            "notifications": [],
+            "total": 0,
+            "page": 1,
+            "limit": 50,
+        });
+        assert_eq!(typed, legacy);
+    }
+
+    #[test]
     fn test_notification_sent_response_matches_legacy_shape() {
         let response = NotificationSentResponse {
             device_id: "phone-1".to_string(),
