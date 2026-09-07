@@ -9,6 +9,7 @@ use utoipa::ToSchema;
 use crate::api::handlers::RemoteCommandsResponse;
 use crate::api::handlers::plugins::battery::BatteryResponse;
 use crate::api::handlers::plugins::connectivity::ConnectivityResponse;
+use crate::api::handlers::plugins::contacts::{ContactsListResponse, ContactsSyncResponse};
 use crate::api::handlers::plugins::mpris::{
     MprisActionResponse, MprisLocalPlayersResponse, MprisPlayersResponse,
 };
@@ -45,6 +46,8 @@ use crate::utils::errors::ErrorCode;
     MprisPlayersResponseWrapper = ApiResponse<MprisPlayersResponse>,
     MprisLocalPlayersResponseWrapper = ApiResponse<MprisLocalPlayersResponse>,
     MprisActionResponseWrapper = ApiResponse<MprisActionResponse>,
+    ContactsSyncResponseWrapper = ApiResponse<ContactsSyncResponse>,
+    ContactsListResponseWrapper = ApiResponse<ContactsListResponse>,
 )]
 pub struct ApiResponse<T: Serialize> {
     pub status: &'static str,

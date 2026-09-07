@@ -140,6 +140,11 @@ use crate::device::types::{Device, DeviceState, DeviceType};
         MprisActionResponseWrapper,
         crate::plugins::mpris::MprisInfo,
         crate::plugins::mpris::LocalPlayerState,
+        handlers::plugins::contacts::ContactsSyncResponse,
+        ContactsSyncResponseWrapper,
+        handlers::plugins::contacts::ContactsListResponse,
+        ContactsListResponseWrapper,
+        crate::plugins::contacts::Contact,
     )),
     modifiers(&SecurityAddon),
     tags(

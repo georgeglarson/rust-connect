@@ -130,8 +130,9 @@ fn test_untyped_response_bodies_only_ever_decrease() {
     // send) typed here: pin 27 → 23. Note: `request_sms_threads` reused
     // the existing SentResponse, no new struct. MPRIS endpoints
     // (players, local-players, request, action) typed here: pin 23 → 19.
-    // Note: `request_mpris` also reuses SentResponse.
-    const PIN: usize = 19;
+    // Note: `request_mpris` also reuses SentResponse. Contacts endpoints
+    // (sync, list) typed here: pin 19 → 17.
+    const PIN: usize = 17;
     assert!(
         count <= PIN,
         "untyped-response pin is {PIN}; this commit allows {count} (offenders: {offenders:#?}). \
