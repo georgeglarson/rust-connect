@@ -26,6 +26,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio_util::sync::CancellationToken;
@@ -49,6 +50,173 @@ pub const SERVICE_TYPE: &str = "_kdeconnect._udp.local.";
 /// --locked`, which the interop harness and the release use, never does.
 #[cfg(any(test, feature = "test-helpers"))]
 pub const SERVICE_TYPE: &str = "_kdeconnect-test._udp.local.";
+
+/// Per-minute outbound-send threshold above which the storm sensor logs
+/// `event = "mdns_send_storm"` at WARN. Set to 600/min ≈ 10/s; steady
+/// state on laptop measured 2026-09-06 is ≈0.8/s, so this is ~12× normal
+/// headroom but well below the ~6000/min observed in the 2026-09-04 storm.
+pub(crate) const MDNS_STORM_THRESHOLD_PER_MIN: i64 = 600;
+
+/// How often the browse loop asks the mdns-sd daemon for a metrics
+/// snapshot and runs `storm_verdict` against the previous one. The brief
+/// specified 60 s; with `MissedTickBehavior::Skip` a tick that fires while
+/// the loop is busy elsewhere just gets dropped, so we never queue up a
+/// storm of our own.
+pub(crate) const MDNS_METRICS_SAMPLE_PERIOD: Duration = Duration::from_secs(60);
+
+/// Counters that increment when the mdns-sd daemon actually puts a packet
+/// on the wire — the OUTBOUND-SEND aggregate for `storm_verdict`. Citations
+/// are against vendored mdns-sd 0.20.3 (`service_daemon.rs`):
+///
+/// * `register-resend` — proactive announcement refresh (line 4023,
+///   inside `register_resend_service_info`)
+/// * `unregister-resend` — goodbye packet retransmit (line 3926, inside
+///   `unregister_service_with_response`)
+/// * `respond` — packet-sent counter for query responses (lines 3456,
+///   3511 — `send_response` and `send_delayed_response`)
+/// * `cache-refresh-ptr` / `cache-refresh-srv-txt` / `cache-refresh-addr`
+///   — packets-sent counter for proactive cache refresh queries
+///   (lines 4103-4105, inside the timer-driven refresh path)
+///
+/// Explicitly NOT in the aggregate:
+/// * `register` / `unregister` — incremented in the command handler when
+///   the daemon *receives* the command (lines 3586, 3882), not on a
+///   packet-sent path. Counting them would mix command frequency with
+///   packet frequency.
+/// * `known-answer-suppression` — counts suppressed answers, not sent
+///   packets (line 3461).
+/// * `timer`, `cached-*`, `dns-registry-*` — state counts (pending
+///   timers, cache size, registry state), not packet counts.
+const SEND_COUNTERS: &[&str] = &[
+    "cache-refresh-addr",
+    "cache-refresh-ptr",
+    "cache-refresh-srv-txt",
+    "register-resend",
+    "respond",
+    "unregister-resend",
+];
+
+/// One sampling window's worth of mdns-sd metrics. Returned by
+/// `storm_verdict` only when the outbound-send aggregate is at or above
+/// the per-sample threshold — `None` otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StormReport {
+    /// Sum of the moved `SEND_COUNTERS` deltas over the window. Used as
+    /// the threshold check value.
+    pub sends: i64,
+    /// All counters that moved strictly up over the window, sorted by
+    /// name. Counters that went down (daemon restart, internal reset)
+    /// contribute 0 and are absent — never a negative, never a panic.
+    pub deltas: Vec<(String, i64)>,
+}
+
+/// Pure: given two mdns-sd metrics snapshots, return a `StormReport` iff
+/// the outbound-send aggregate over the window is at or above
+/// `threshold_per_sample`. The first sample is always silent (no previous
+/// snapshot) — the caller is responsible for skipping it. A counter that
+/// went DOWN contributes 0, never a negative, and never panics.
+pub(crate) fn storm_verdict(
+    prev: &mdns_sd::Metrics,
+    cur: &mdns_sd::Metrics,
+    threshold_per_sample: i64,
+) -> Option<StormReport> {
+    // BTreeSet gives us a sorted iteration over the union of keys —
+    // satisfies "deltas sorted by name".
+    let mut all_keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    all_keys.extend(prev.keys().map(String::as_str));
+    all_keys.extend(cur.keys().map(String::as_str));
+
+    let mut deltas: Vec<(String, i64)> = Vec::new();
+    let mut sends: i64 = 0;
+    for key in all_keys {
+        let prev_val = prev.get(key).copied().unwrap_or(0);
+        let cur_val = cur.get(key).copied().unwrap_or(0);
+        let delta = cur_val.saturating_sub(prev_val);
+        if delta > 0 {
+            deltas.push((key.to_string(), delta));
+            if SEND_COUNTERS.contains(&key) {
+                sends += delta;
+            }
+        }
+    }
+
+    if sends >= threshold_per_sample {
+        Some(StormReport { sends, deltas })
+    } else {
+        None
+    }
+}
+
+/// One tick of the storm sampler: ask the daemon for a metrics snapshot,
+/// compare it against the previous one (if any), and log accordingly.
+/// Always a DEBUG on success and a WARN on storm. Every failure path logs
+/// once at DEBUG and skips the sample — `last_metrics` is left untouched
+/// so the next tick still has a valid baseline.
+async fn sample_metrics(daemon: &Arc<ServiceDaemon>, last_metrics: &mut Option<mdns_sd::Metrics>) {
+    let receiver = match daemon.get_metrics() {
+        Ok(rx) => rx,
+        Err(e) => {
+            debug!(
+                error = %e,
+                event = "mdns_metrics_get_failed",
+                "mDNS get_metrics command failed; skipping sample"
+            );
+            return;
+        }
+    };
+    let cur = match tokio::time::timeout(Duration::from_secs(2), receiver.recv_async()).await {
+        Ok(Ok(metrics)) => metrics,
+        Ok(Err(_)) | Err(_) => {
+            debug!(
+                event = "mdns_metrics_recv_failed",
+                "mDNS metrics snapshot unavailable; skipping sample"
+            );
+            return;
+        }
+    };
+
+    // First sample is silent — store as baseline, no comparison.
+    let Some(prev) = last_metrics.take() else {
+        *last_metrics = Some(cur);
+        return;
+    };
+
+    let report = storm_verdict(&prev, &cur, MDNS_STORM_THRESHOLD_PER_MIN);
+    *last_metrics = Some(cur);
+
+    if let Some(report) = report {
+        let deltas = report
+            .deltas
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        warn!(
+            sends_per_minute = report.sends,
+            threshold = MDNS_STORM_THRESHOLD_PER_MIN,
+            deltas = %deltas,
+            event = "mdns_send_storm",
+            "mDNS send rate exceeded storm threshold"
+        );
+    } else {
+        let sends: i64 = SEND_COUNTERS
+            .iter()
+            .map(|k| {
+                let p = prev.get(*k).copied().unwrap_or(0);
+                let c = last_metrics
+                    .as_ref()
+                    .and_then(|m| m.get(*k).copied())
+                    .unwrap_or(0);
+                c.saturating_sub(p)
+            })
+            .sum();
+        debug!(
+            sends_per_minute = sends,
+            event = "mdns_metrics",
+            "mDNS metrics sample"
+        );
+    }
+}
 
 /// mDNS announcer + browser for this device.
 pub struct MdnsDiscoveryService {
@@ -231,6 +399,20 @@ impl MdnsDiscoveryService {
             }
         };
 
+        // Storm sensor (2026-09-04 forensics): a third select! arm that
+        // asks the mdns-sd daemon for a metrics snapshot every
+        // `MDNS_METRICS_SAMPLE_PERIOD` and logs the outbound-send
+        // aggregate. The daemon's `get_metrics()` returns a one-shot
+        // `Receiver<Metrics>` (`service_daemon.rs:610`), bounded(1), so
+        // we await `recv_async` with a 2 s timeout — flume's waiters
+        // are event-driven, so the timer bound is the ceiling, not the
+        // floor. A failed get_metrics (queue full, daemon gone) logs
+        // once at DEBUG and skips the sample; it must never end the
+        // browse loop.
+        let mut metrics_tick = tokio::time::interval(MDNS_METRICS_SAMPLE_PERIOD);
+        metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_metrics: Option<mdns_sd::Metrics> = None;
+
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -266,6 +448,9 @@ impl MdnsDiscoveryService {
                         // gone; nothing left to do.
                         Err(_) => break,
                     }
+                }
+                _ = metrics_tick.tick() => {
+                    sample_metrics(&self.daemon, &mut last_metrics).await;
                 }
             }
         }
@@ -631,6 +816,164 @@ mod tests {
             "a production-type browser resolved the test fixture {}: cargo test is announcing to real peers",
             identity.device_id
         );
+    }
+
+    /// 2026-09-04 storm forensics: `storm_verdict` is the pure decision
+    /// the sampler in `run` calls once per minute. The aggregate is the
+    /// OUTBOUND-PACKET-SENT subset of mdns-sd counters (see `SEND_COUNTERS`
+    /// for the citations); a counter that went DOWN (daemon restart,
+    /// counter reset) contributes 0 — never a negative, never a panic.
+    #[test]
+    fn test_storm_verdict_register_resend_over_threshold() {
+        let mut prev = mdns_sd::Metrics::new();
+        prev.insert("register-resend".to_string(), 100);
+        let mut cur = mdns_sd::Metrics::new();
+        cur.insert("register-resend".to_string(), 800);
+
+        let report = storm_verdict(&prev, &cur, 600)
+            .expect("700 outbound sends per minute must exceed threshold 600");
+        assert_eq!(report.sends, 700);
+        assert!(
+            report
+                .deltas
+                .contains(&("register-resend".to_string(), 700)),
+            "deltas must contain the moved counter, got {:?}",
+            report.deltas
+        );
+
+        assert!(
+            storm_verdict(&prev, &cur, 800).is_none(),
+            "700 sends must NOT exceed threshold 800"
+        );
+    }
+
+    /// A counter that went DOWN (daemon restart, counter reset) must
+    /// contribute 0, not a negative, and never produce a storm verdict by
+    /// itself — `None` at any positive threshold.
+    #[test]
+    fn test_storm_verdict_counter_reset_contributes_zero() {
+        let mut prev = mdns_sd::Metrics::new();
+        prev.insert("register-resend".to_string(), 1000);
+        prev.insert("respond".to_string(), 500);
+        let mut cur = mdns_sd::Metrics::new();
+        // register-resend DROPPED (counter reset / daemon restart).
+        cur.insert("register-resend".to_string(), 0);
+        // respond ALSO dropped (separate reset).
+        cur.insert("respond".to_string(), 50);
+
+        for threshold in [1, 100, 600, 100_000] {
+            assert!(
+                storm_verdict(&prev, &cur, threshold).is_none(),
+                "counter-reset snapshot must not produce a storm at threshold {}",
+                threshold
+            );
+        }
+    }
+
+    /// No entry in `StormReport::deltas` may be negative, even when a
+    /// non-send counter resets during the sampling window. The brief's
+    /// hard rule: a counter that went DOWN contributes 0, never a
+    /// negative, never a panic. Mixed scenario: `register-resend` UP
+    /// by 700 (real sends), `respond` DOWN by 450 (counter reset).
+    /// Verdict must be Some, and the `deltas` field must contain ONLY
+    /// `register-resend` (positive) — the reset counter is invisible.
+    #[test]
+    fn test_storm_verdict_deltas_never_negative() {
+        let mut prev = mdns_sd::Metrics::new();
+        prev.insert("register-resend".to_string(), 100);
+        prev.insert("respond".to_string(), 500);
+        let mut cur = mdns_sd::Metrics::new();
+        cur.insert("register-resend".to_string(), 800); // +700
+        cur.insert("respond".to_string(), 50); // -450 reset
+
+        let report =
+            storm_verdict(&prev, &cur, 600).expect("700 outbound sends must trigger the storm");
+        assert_eq!(report.sends, 700);
+        for (name, delta) in &report.deltas {
+            assert!(
+                *delta >= 0,
+                "no delta may be negative, but {} = {}",
+                name,
+                delta
+            );
+        }
+        assert!(
+            !report.deltas.iter().any(|(n, _)| n == "respond"),
+            "a reset counter must NOT appear in deltas (got {:?})",
+            report.deltas
+        );
+        assert!(
+            report
+                .deltas
+                .contains(&("register-resend".to_string(), 700)),
+            "deltas must contain the moved register-resend, got {:?}",
+            report.deltas
+        );
+    }
+
+    /// Cache churn (`cached-ptr` bouncing) is NOT a send storm — it's a
+    /// state counter, not an outbound-packet counter, and must never
+    /// trigger the verdict regardless of how big the delta is.
+    #[test]
+    fn test_storm_verdict_cache_churn_is_not_a_storm() {
+        let mut prev = mdns_sd::Metrics::new();
+        prev.insert("cached-ptr".to_string(), 0);
+        let mut cur = mdns_sd::Metrics::new();
+        cur.insert("cached-ptr".to_string(), 10_000);
+
+        for threshold in [1, 100, 600, 10_000_000] {
+            assert!(
+                storm_verdict(&prev, &cur, threshold).is_none(),
+                "cached-ptr churn alone must not be a storm at threshold {}",
+                threshold
+            );
+        }
+    }
+
+    /// The sampler arm in `run` must NOT kill the browse loop. Drive `run`
+    /// with `start_paused = true`, advance 61 s so the 60 s metrics
+    /// interval fires at least once, then cancel the shutdown token and
+    /// verify the task returns cleanly.
+    ///
+    /// Uses a unique device id so this test's daemon doesn't contend
+    /// with the other `our_identity()`-using tests in parallel runs.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_sampler_arm_does_not_kill_loop() {
+        let mut identity = our_identity();
+        identity.device_id = format!("sampler-arm-test-{}", uuid::Uuid::new_v4());
+        let service = Arc::new(MdnsDiscoveryService::new(&identity).expect("announce"));
+
+        let (tx, _rx) = mpsc::unbounded_channel::<(Identity, SocketAddr)>();
+        let shutdown = CancellationToken::new();
+        let run_service = service.clone();
+        let run_shutdown = shutdown.clone();
+        let browser = tokio::spawn(async move {
+            run_service
+                .run(
+                    move |identity, addr| {
+                        let _ = tx.send((identity, addr));
+                    },
+                    run_shutdown,
+                )
+                .await;
+        });
+
+        // Advance past one full metrics interval. The first sample is
+        // silent (no previous snapshot); the call to `get_metrics` plus
+        // the recv-with-timeout happens entirely inside the sampler arm
+        // and must not end the loop.
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+
+        assert!(
+            !browser.is_finished(),
+            "the browse loop must still be running after one metrics tick"
+        );
+
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), browser)
+            .await
+            .expect("browsing must stop on shutdown")
+            .expect("join");
     }
 
     /// Task 2.2 (vk #994): `reannounce` must cause a REAL, observable
