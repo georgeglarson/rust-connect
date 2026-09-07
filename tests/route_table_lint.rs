@@ -99,12 +99,11 @@ fn repo_path(rel: &str) -> PathBuf {
 /// equivalent of marking it `INTENTIONAL-DIVERGENCE` in the feature ledger.
 fn is_excluded_path(path: &str) -> bool {
     // UI plumbing: mounted only when settings.ui_enabled; never carries
-    // an OpenAPI annotation because it's not API surface.
+    // an OpenAPI annotation because it's not API surface. SSE used to
+    // sit in this list (utoipa's earlier shapes couldn't model the
+    // event stream); audit 2026-09-06 item 5 lifted it into the spec
+    // as a documented contract, so the parity check now covers it.
     matches!(path, "/" | "/ui" | "/ui/" | "/ui/index.html")
-        // SSE channel: utoipa can't model an event-stream body, and the
-        // spec deliberately excludes it (see src/api/openapi.rs tests +
-        // /api-docs/openapi.json at runtime).
-        || path == "/api/v1/events"
 }
 
 /// Every route in `src/api/router.rs` must appear in the OpenAPI spec, and
@@ -119,26 +118,19 @@ fn test_router_paths_match_openapi_paths() {
         .into_iter()
         .map(|p| axum_to_openapi(&p))
         // UI routes are not part of the API surface and never appear in
-        // OpenAPI by design; skip them. The SSE channel
-        // (`/api/v1/events`) is also deliberately excluded from OpenAPI
-        // (utoipa can't model an event-stream body); skip it here so
-        // the parity check doesn't false-positive on it.
+        // OpenAPI by design; skip them. SSE used to be in this skip
+        // list too (utoipa's earlier shapes couldn't model the event
+        // stream); audit 2026-09-06 item 5 lifted it into the spec as
+        // a documented contract, so the parity check now covers it.
         .filter(|p| !is_excluded_path(p))
         .collect();
 
     let openapi_spec = ApiDoc::openapi();
     let openapi_paths: BTreeSet<String> = openapi_spec.paths.paths.keys().cloned().collect();
 
-    let sse = "/api/v1/events";
-    let openapi_paths_minus_sse: BTreeSet<String> = openapi_paths
-        .iter()
-        .filter(|p| p.as_str() != sse)
-        .cloned()
-        .collect();
-
     let only_in_router: BTreeSet<&String> = router_paths
         .iter()
-        .filter(|p| !openapi_paths_minus_sse.contains(p.as_str()))
+        .filter(|p| !openapi_paths.contains(p.as_str()))
         .collect();
     assert!(
         only_in_router.is_empty(),
@@ -152,7 +144,7 @@ fn test_router_paths_match_openapi_paths() {
             .join("\n  ")
     );
 
-    let only_in_openapi: BTreeSet<&String> = openapi_paths_minus_sse
+    let only_in_openapi: BTreeSet<&String> = openapi_paths
         .iter()
         .filter(|p| !router_paths.contains(p.as_str()))
         .collect();

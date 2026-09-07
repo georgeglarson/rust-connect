@@ -174,8 +174,16 @@ All endpoints except `/api/v1/health` require the API key as an
 follow `{ status, data, metadata }` format. Errors use structured codes
 like `DEVICE_NOT_FOUND`.
 
-The event stream is Server-Sent Events, not a WebSocket. Each event is one
-`data:` line carrying a JSON object, so `curl` reads it directly:
+The event stream is Server-Sent Events, not a WebSocket. The first frame on
+every (re)connect is a named `event: snapshot` carrying the same JSON
+`GET /api/v1/devices` returns in its `data` envelope; thereafter device
+and plugin events ship as unnamed `data:` frames whose JSON object carries
+a `kind` discriminator in `<enum>.<variant>` form (`device.state_changed`,
+`plugin.notification`, …) alongside the legacy `event_type`/`type` field;
+a named `event: lagged` frame reports a dropped-broadcast gap; a `: keepalive`
+comment every 15s confirms liveness. Every event and lagged frame also
+carries an `id: <n>` line, monotonic and process-global, for the day a
+`Last-Event-ID` resume handler lands.
 
 ```bash
 curl -N -H "X-API-Key: YOUR_KEY" http://localhost:9090/api/v1/events

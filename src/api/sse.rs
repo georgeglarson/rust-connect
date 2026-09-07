@@ -189,6 +189,17 @@ fn render_sse_item(item: StreamItem, next_id: u64) -> Option<String> {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/events",
+    tag = "events",
+    responses(
+        (status = 200, description = "Server-Sent Events stream. Frames are `text/event-stream` lines separated by `\\n\\n`."),
+        (status = 401, description = "Invalid or missing API key", body = ApiError),
+        (status = 500, description = "Internal error", body = ApiError),
+    ),
+    security(("api_key" = []))
+)]
 pub async fn sse_events(
     State(state): State<Arc<AppState>>,
 ) -> Result<Response, (axum::http::StatusCode, String)> {

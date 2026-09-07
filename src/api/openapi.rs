@@ -2,6 +2,7 @@ use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use crate::api::handlers;
+use crate::api::sse;
 use crate::api::types::*;
 use crate::device::types::{Device, DeviceState, DeviceType};
 
@@ -19,6 +20,7 @@ use crate::device::types::{Device, DeviceState, DeviceType};
         handlers::pair_device,
         handlers::unpair_device,
         handlers::send_ping,
+        sse::sse_events,
         handlers::get_remotecommands,
         handlers::trigger_remotecommand,
         handlers::send_remotekeyboard_keypress,
@@ -110,6 +112,7 @@ use crate::device::types::{Device, DeviceState, DeviceType};
         (name = "health", description = "Service health check"),
         (name = "devices", description = "Device discovery and management"),
         (name = "pairing", description = "Device pairing operations"),
+        (name = "events", description = "Server-Sent Events stream"),
         (name = "plugins", description = "Plugin information"),
         (name = "battery", description = "Battery monitoring"),
         (name = "sms", description = "SMS messaging"),
@@ -134,7 +137,15 @@ use crate::device::types::{Device, DeviceState, DeviceType};
     info(
         title = "Rust Connect API",
         version = "0.1.0",
-        description = "REST API for KDE Connect-compatible device management. All endpoints require an `x-api-key` header.",
+        description = "REST API for KDE Connect-compatible device management. All endpoints require an `x-api-key` header.\n\n\
+                       # Server-Sent Events\n\n\
+                       `GET /api/v1/events` is a `text/event-stream` of four frame shapes:\n\n\
+                       - **`event: snapshot`** (named) — first frame on every (re)connect. Data is the same JSON `GET /api/v1/devices` returns in its `data` envelope (full `pair_state` + `verification_key` overlay). Use it to render the device pane on connect and after a `lagged` frame, without a follow-up REST call.\n\n\
+                       - **unnamed data frame** — `data: <json>\\n\\n` carrying one device or plugin event. The JSON object includes a `kind` discriminator (snake-cased `<enum>.<variant>`), the existing legacy `event_type`/`type` field for backward compatibility, and the original payload keys. Possible `kind` values: `device.discovered`, `device.state_changed`, `device.paired`, `device.unpaired`, `device.pair_requested`, `device.connected`, `device.disconnected`, `device.removed`, `plugin.notification`, `plugin.battery`, `plugin.mpris_update`, `plugin.telephony_update`, `plugin.clipboard_update`, `plugin.sftp_update`, `plugin.remote_keyboard_echo`, `plugin.remote_keyboard_state`, `plugin.remote_commands_update`, `plugin.share_text`, `plugin.share_url`, `plugin.share_progress`, `plugin.system_volume_update`.\n\n\
+                       - **`event: lagged`** (named) — broadcast channel dropped `N` events before delivery. Data is `{\"dropped\": N}`. The client should re-render from the most recent `snapshot`.\n\n\
+                       - **keepalive comment** — `: keepalive\\n\\n` every 15s. SSE consumers ignore comment lines; the wire sees traffic so a dead upstream surfaces as a closed connection within ~15s rather than a half-open socket.\n\n\
+                       Event and lagged frames carry an `id: <n>` line. The id is a process-global monotonic `u64` shared across the device and plugin streams. Honoring `Last-Event-ID` for resume is out of scope; ids are observation-only today.\n\n\
+                       The `api_key` query parameter is accepted only on this endpoint (browsers' `EventSource` cannot set request headers).",
     )
 )]
 pub struct ApiDoc;
@@ -201,16 +212,43 @@ mod tests {
     }
 
     #[test]
-    fn test_openapi_spec_excludes_sse() {
+    fn test_openapi_spec_documents_sse() {
+        // Audit 2026-09-06 item 5: SSE moved from a deliberately
+        // undocumented channel to a documented contract — the four
+        // frame shapes (snapshot, data-with-kind, lagged, keepalive)
+        // are listed in the OpenAPI info.description so a generated
+        // TypeScript / OpenAPI consumer can wire the stream.
         let spec = ApiDoc::openapi();
-        let paths: Vec<_> = spec.paths.paths.keys().collect();
+        let description = spec
+            .info
+            .description
+            .as_deref()
+            .expect("OpenAPI info.description must include the SSE frame-shape contract");
 
-        for path in paths {
+        // The description must enumerate every frame shape and the
+        // `kind` vocabulary — checked by the markers below.
+        for marker in [
+            "snapshot",
+            "data",
+            "kind",
+            "lagged",
+            "keepalive",
+            "device.discovered",
+            "device.state_changed",
+            "plugin.battery",
+        ] {
             assert!(
-                !path.contains("events"),
-                "SSE path should not be in OpenAPI spec: {path}"
+                description.contains(marker),
+                "info.description must mention `{marker}` for the SSE contract; got: {description}"
             );
         }
+
+        // The path itself must be in the spec (was deliberately excluded
+        // before this audit; route_table_lint.rs was updated alongside).
+        assert!(
+            spec.paths.paths.contains_key("/api/v1/events"),
+            "/api/v1/events must be in the OpenAPI spec's paths"
+        );
     }
 
     #[test]
