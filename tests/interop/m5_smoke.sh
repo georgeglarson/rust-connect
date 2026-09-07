@@ -173,8 +173,12 @@ restart_kde
 # hostname-checks, and the scenario silently proves nothing (observed
 # 2026-09-05: run 1 masked the defect, run 3 fired it 1s after
 # restart). Nudge kde to re-broadcast so rust's UDP discovery (which
-# carries the real tcpPort; the mDNS path resolves port 0 and its dials
-# always fail) provokes the outbound dial deterministically.
+# carries the real tcpPort) provokes the outbound dial deterministically.
+# rust's mDNS resolve of kde does NOT dial (vk #1101: it unicasts our
+# identity and kde dials us — the TLS-server leg that never
+# hostname-checks), so the UDP nudge is the only thing that makes rust
+# the TCP client here: if kde wins the race off our unicast before the
+# nudge lands, the wait-for below dies loudly rather than proving nothing.
 kde_force_on_network_change
 log "forceOnNetworkChange issued (rust-dial provocation)"
 
