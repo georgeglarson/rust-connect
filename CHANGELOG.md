@@ -11,6 +11,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- An mDNS resolve now answers with our UDP identity to the resolved
+  address and lets the peer dial us, which is what both reference
+  implementations do. Until now the daemon dialed the resolved SRV port
+  directly; kdeconnectd can announce SRV port 0 (its announcer captures
+  the TCP port before the listener binds), so every such dial failed and
+  only the reverse-connection fallback ever connected it. The resolve
+  log line (`mdns_device_resolved`) now carries `srv_port`, so a peer
+  announcing 0 is visible in the journal. One regression, accepted: a
+  peer whose only private address is IPv6 used to be reached by a
+  direct dial from the resolve and is now skipped (`mdns_resolve_skipped`
+  with `reason = "ipv6_only"`), because the TCP listener is IPv4-only
+  and a unicast there would invite a dial nothing answers. A peer that
+  also has an IPv4 address still connects over UDP broadcast or by
+  dialing us over IPv4; one with no IPv4 address at all, which the old
+  direct dial could still reach outbound, is unreachable on this leg
+  until the listener is dual-stack. The
+  resolve also no longer creates a device-list entry: an unknown peer
+  used to appear in `/api/v1/devices` (and so the web UI and the
+  `devices` command) merely for being mDNS-resolved, with no
+  capabilities; it now appears once a link completes, which is also how
+  both references behave. (vk #1101)
+- The mDNS identity unicast is rate-limited per peer address, the same
+  one-second window the outbound dial it replaced already used. Without
+  it the resolve leg would have been the one discovery path a spoofed
+  announce could drive unthrottled. (vk #1101)
+
 ## [0.2.0] - 2026-09-07
 
 ### Added
