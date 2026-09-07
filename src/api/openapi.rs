@@ -137,15 +137,14 @@ use crate::device::types::{Device, DeviceState, DeviceType};
     info(
         title = "Rust Connect API",
         version = "0.1.0",
-        description = "REST API for KDE Connect-compatible device management. All endpoints require an `x-api-key` header.\n\n\
+        description = "REST API for KDE Connect-compatible device management. Every endpoint except `GET /api/v1/health` requires the API key in an `x-api-key` header; `GET /api/v1/events` also accepts it as the `api_key` query parameter, for `EventSource` clients that cannot set headers.\n\n\
                        # Server-Sent Events\n\n\
                        `GET /api/v1/events` is a `text/event-stream` of four frame shapes:\n\n\
                        - **`event: snapshot`** (named) — first frame on every (re)connect. Data is the same JSON `GET /api/v1/devices` returns in its `data` envelope (full `pair_state` + `verification_key` overlay). Use it to render the device pane on connect and after a `lagged` frame, without a follow-up REST call.\n\n\
                        - **unnamed data frame** — `data: <json>\\n\\n` carrying one device or plugin event. The JSON object includes a `kind` discriminator (snake-cased `<enum>.<variant>`), the existing legacy `event_type`/`type` field for backward compatibility, and the original payload keys. Possible `kind` values: `device.discovered`, `device.state_changed`, `device.paired`, `device.unpaired`, `device.pair_requested`, `device.connected`, `device.disconnected`, `device.removed`, `plugin.notification`, `plugin.battery`, `plugin.mpris_update`, `plugin.telephony_update`, `plugin.clipboard_update`, `plugin.sftp_update`, `plugin.remote_keyboard_echo`, `plugin.remote_keyboard_state`, `plugin.remote_commands_update`, `plugin.share_text`, `plugin.share_url`, `plugin.share_progress`, `plugin.system_volume_update`.\n\n\
-                       - **`event: lagged`** (named) — broadcast channel dropped `N` events before delivery. Data is `{\"dropped\": N}`. The client should re-render from the most recent `snapshot`.\n\n\
+                       - **`event: lagged`** (named) — broadcast channel dropped `N` events before delivery. Data is `{\"dropped\": N}`, and the frame is followed in the same chunk by a fresh `snapshot`, so the client re-renders without a REST call.\n\n\
                        - **keepalive comment** — `: keepalive\\n\\n` every 15s. SSE consumers ignore comment lines; the wire sees traffic so a dead upstream surfaces as a closed connection within ~15s rather than a half-open socket.\n\n\
-                       Event and lagged frames carry an `id: <n>` line. The id is a process-global monotonic `u64` shared across the device and plugin streams. Honoring `Last-Event-ID` for resume is out of scope; ids are observation-only today.\n\n\
-                       The `api_key` query parameter is accepted only on this endpoint (browsers' `EventSource` cannot set request headers).",
+                       Snapshot, event, and lagged frames carry an `id: <n>` line: a per-connection counter that starts at 1 and has no gaps (keepalives carry none and consume none), for correlating frames in a client log. The drop signal is the `lagged` frame, not an id gap. `Last-Event-ID` resume is not implemented.",
     )
 )]
 pub struct ApiDoc;
@@ -227,16 +226,12 @@ mod tests {
 
         // The description must enumerate every frame shape and the
         // `kind` vocabulary — checked by the markers below.
-        for marker in [
-            "snapshot",
-            "data",
-            "kind",
-            "lagged",
-            "keepalive",
-            "device.discovered",
-            "device.state_changed",
-            "plugin.battery",
-        ] {
+        let markers = ["snapshot", "data", "kind", "lagged", "keepalive", "api_key"];
+        for marker in markers
+            .iter()
+            .copied()
+            .chain(crate::api::sse::ALL_KINDS.iter().copied())
+        {
             assert!(
                 description.contains(marker),
                 "info.description must mention `{marker}` for the SSE contract; got: {description}"

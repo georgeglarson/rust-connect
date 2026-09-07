@@ -3,6 +3,7 @@
 //! Single Responsibility: Stream server events (device + plugin) to authenticated clients.
 
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -105,6 +106,35 @@ fn kind(event: &ServerEvent) -> &'static str {
     }
 }
 
+/// Every string `kind` can return. The OpenAPI description must list each
+/// one (`openapi.rs` tests iterate this), and `kind` itself is an
+/// exhaustive match, so a new event variant fails to compile until it has
+/// a name here and a mention in the spec.
+#[cfg(test)]
+pub(crate) const ALL_KINDS: &[&str] = &[
+    "device.discovered",
+    "device.state_changed",
+    "device.paired",
+    "device.unpaired",
+    "device.pair_requested",
+    "device.connected",
+    "device.disconnected",
+    "device.removed",
+    "plugin.notification",
+    "plugin.battery",
+    "plugin.mpris_update",
+    "plugin.telephony_update",
+    "plugin.clipboard_update",
+    "plugin.sftp_update",
+    "plugin.remote_keyboard_echo",
+    "plugin.remote_keyboard_state",
+    "plugin.remote_commands_update",
+    "plugin.share_text",
+    "plugin.share_url",
+    "plugin.share_progress",
+    "plugin.system_volume_update",
+];
+
 /// Wrap a broadcast receiver as a `StreamItem` stream, mapping each
 /// delivered value through `map` and turning a `Lagged(n)` recv error into
 /// `StreamItem::Lagged(n)` instead of silently dropping it. Pulled out of
@@ -133,13 +163,9 @@ where
 /// becomes an SSE comment line, which every SSE consumer ignores but
 /// which keeps TCP intermediaries (and the client's read loop) alive.
 ///
-/// `next_id` is the value to attach as the SSE `id:` line on event and
-/// lagged frames. The caller fetches it once per item from
-/// `AppState::event_id` so ids are process-global, strictly increasing,
-/// and shared across both source streams (a client subscribing to both
-/// never sees the same id twice). Reserved for a future
-/// `Last-Event-ID` resume handler — the SSE route accepts no resume
-/// header today, so the id is observation-only.
+/// `next_id` is the value to attach as the SSE `id:` line on event, lagged,
+/// and snapshot frames; `build_event_stream` hands out consecutive
+/// per-connection ids and passes 0 for keepalives, which carry no id line.
 fn render_sse_item(item: StreamItem, next_id: u64) -> Option<String> {
     match item {
         StreamItem::Event(event) => {
@@ -192,83 +218,110 @@ fn render_sse_item(item: StreamItem, next_id: u64) -> Option<String> {
     }
 }
 
+/// The current device list as a snapshot frame, the same JSON
+/// `GET /api/v1/devices` returns in `data`. `None` only if serialization
+/// fails, which the type makes impossible in practice; it is logged so a
+/// missing snapshot is never silent.
+async fn snapshot_item(state: &AppState) -> Option<StreamItem> {
+    let list = crate::api::handlers::render_device_list(state, 1, usize::MAX).await;
+    match serde_json::to_string(&list) {
+        Ok(json) => Some(StreamItem::Snapshot(json)),
+        Err(e) => {
+            warn!(
+                error = %e,
+                event = "sse_snapshot_serialize_failed",
+                "SSE snapshot could not be serialized; stream continues without it"
+            );
+            None
+        }
+    }
+}
+
+/// The wire frames of one `/api/v1/events` connection, already rendered.
+/// Pulled out of `sse_events` so a test drives the real stream. Three
+/// guarantees live here, not in the handler:
+///
+/// - The snapshot is *chained ahead of* the live merge, never raced
+///   against it, so it is the first frame on every connection even when
+///   an event is already queued (the keepalive's first tick is also one
+///   interval out, not immediate).
+/// - `id:` is a per-connection counter starting at 1, consumed only by
+///   frames that carry the line (event, lagged, snapshot), so a client
+///   sees consecutive ids with no gaps from keepalives or from other
+///   subscribers. Ids correlate frames; the drop signal is `lagged`.
+/// - A `lagged` frame is followed, in the same chunk, by a fresh
+///   snapshot, so a client that fell behind has current state without a
+///   REST round trip.
+pub(crate) async fn build_event_stream(
+    state: Arc<AppState>,
+) -> futures::stream::BoxStream<'static, String> {
+    let device_stream = wrap_broadcast(state.broadcaster.subscribe(), ServerEvent::Device);
+    let plugin_stream = wrap_broadcast(state.plugin_events.subscribe(), |event| {
+        ServerEvent::Plugin(Box::new(event))
+    });
+    let first_tick = tokio::time::Instant::now() + KEEPALIVE_INTERVAL;
+    let keepalive_stream =
+        IntervalStream::new(tokio::time::interval_at(first_tick, KEEPALIVE_INTERVAL))
+            .map(|_| StreamItem::Keepalive);
+
+    let ids = Arc::new(AtomicU64::new(1));
+    let first_frame = match snapshot_item(&state).await {
+        Some(item) => render_sse_item(item, ids.fetch_add(1, Ordering::Relaxed)),
+        None => None,
+    };
+    let head = futures::stream::iter(first_frame);
+
+    let live = select_all(vec![
+        device_stream,
+        plugin_stream,
+        Box::pin(keepalive_stream),
+    ]);
+    let live_state = state.clone();
+    let live = live.filter_map(move |item| {
+        let state = live_state.clone();
+        let ids = ids.clone();
+        async move {
+            match item {
+                StreamItem::Keepalive => render_sse_item(StreamItem::Keepalive, 0),
+                StreamItem::Lagged(dropped) => {
+                    let mut chunk = render_sse_item(
+                        StreamItem::Lagged(dropped),
+                        ids.fetch_add(1, Ordering::Relaxed),
+                    )?;
+                    if let Some(snapshot) = snapshot_item(&state).await {
+                        if let Some(frame) =
+                            render_sse_item(snapshot, ids.fetch_add(1, Ordering::Relaxed))
+                        {
+                            chunk.push_str(&frame);
+                        }
+                    }
+                    Some(chunk)
+                }
+                other => render_sse_item(other, ids.fetch_add(1, Ordering::Relaxed)),
+            }
+        }
+    });
+
+    head.chain(live).boxed()
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/events",
     tag = "events",
+    params(
+        ("api_key" = Option<String>, Query, description = "The API key, for `EventSource` clients that cannot set the `x-api-key` header. Accepted only on this endpoint.")
+    ),
     responses(
-        (status = 200, description = "Server-Sent Events stream. Frames are `text/event-stream` lines separated by `\\n\\n`."),
+        (status = 200, description = "Server-Sent Events stream. Frames are `text/event-stream` blocks separated by a blank line: a named `snapshot` first, then unnamed data frames with a `kind` field, `lagged` frames each followed by a fresh `snapshot`, and `: keepalive` comments.", body = String, content_type = "text/event-stream"),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
-        (status = 500, description = "Internal error", body = ApiError),
     ),
     security(("api_key" = []))
 )]
 pub async fn sse_events(
     State(state): State<Arc<AppState>>,
 ) -> Result<Response, (axum::http::StatusCode, String)> {
-    let device_stream = wrap_broadcast(state.broadcaster.subscribe(), ServerEvent::Device);
-    let plugin_stream = wrap_broadcast(state.plugin_events.subscribe(), |event| {
-        ServerEvent::Plugin(Box::new(event))
-    });
-
-    // Third stream: a wall-clock tick at KEEPALIVE_INTERVAL. `select_all`
-    // pulls from each in turn; if the broadcast channels sit idle, the
-    // tick is the only item that ever fires and the client sees a
-    // comment every interval, which is enough to learn "this upstream
-    // is alive" without parsing data frames.
-    let keepalive_stream = IntervalStream::new(tokio::time::interval(KEEPALIVE_INTERVAL))
-        .map(|_| StreamItem::Keepalive);
-
-    // Snapshot is built once per connection (the registry + pairing
-    // store are async, so this is an async prelude). If the snapshot
-    // fails to serialize (it never should — the type is well-defined
-    // and covered by `render_device_list`'s output), the SSE response
-    // builder returns the upstream error so the client sees a 500
-    // rather than a half-open stream with no first frame.
-    let snapshot_state = state.clone();
-    let snapshot = async move {
-        let list = crate::api::handlers::render_device_list(&snapshot_state, 1, usize::MAX).await;
-        let json = serde_json::to_string(&list).map_err(|e| {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to serialize SSE snapshot: {e}"),
-            )
-        })?;
-        Ok::<_, (axum::http::StatusCode, String)>(futures::stream::once(async move {
-            StreamItem::Snapshot(json)
-        }))
-    }
-    .await?
-    .boxed();
-
-    let streams = select_all(vec![
-        snapshot,
-        device_stream,
-        plugin_stream,
-        Box::pin(keepalive_stream),
-    ]);
-
-    // Clone the Arc<AppState> (not the AtomicU64 inside it — AtomicU64
-    // is not Clone) and capture by move; the inner async move then
-    // clones the Arc again per-item. The counter on AppState is shared
-    // across every concurrent SSE subscriber: ids stay process-global
-    // and strictly increasing whether the subscriber is reading
-    // devices, plugins, or both.
-    let state_for_id = state.clone();
-    let body_stream = streams.filter_map(move |item| {
-        let state_for_id = state_for_id.clone();
-        async move {
-            // Fetch+add atomically: each item takes a unique id.
-            // Keepalives burn an id even though they don't emit it —
-            // acceptable cost for keeping the counter shared across all
-            // items, and the brief scopes `Last-Event-ID` out.
-            let next_id = state_for_id
-                .event_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            render_sse_item(item, next_id).map(Ok::<_, Infallible>)
-        }
-    });
-
+    let body_stream = build_event_stream(state).await.map(Ok::<_, Infallible>);
     let body = axum::body::Body::from_stream(body_stream);
 
     #[allow(clippy::expect_used)]
@@ -460,131 +513,170 @@ mod tests {
     /// is the wire contract a future `Last-Event-ID` resume handler
     /// will rely on; today the SSE route accepts no resume header, but
     /// the id stays in the bytes so a future server can read it.
-    #[test]
-    fn test_consecutive_events_carry_strictly_increasing_ids() {
-        use std::sync::atomic::AtomicU64;
+    async fn test_state_with_two_devices() -> (Arc<AppState>, tempfile::TempDir) {
+        use crate::config::settings::AppSettings;
+        use crate::device::types::{Device, DeviceType};
+        let temp_dir = tempfile::TempDir::new().expect("tempdir must be creatable");
+        let settings = AppSettings::new_with_data_dir(temp_dir.path().to_path_buf());
+        let state = Arc::new(AppState::new_without_input(settings).expect("state"));
+        for (id, name, kind) in [
+            (
+                "phone-snapshot-aaaaaaaaaaaaaaaaaaaa",
+                "Phone",
+                DeviceType::Phone,
+            ),
+            (
+                "desktop-snapshot-bbbbbbbbbbbbbbbbbb",
+                "Desktop",
+                DeviceType::Desktop,
+            ),
+        ] {
+            state
+                .registry
+                .add(Device::new(id.to_string(), name.to_string(), kind, 8))
+                .await
+                .expect("device add");
+        }
+        (state, temp_dir)
+    }
 
-        let counter = AtomicU64::new(0);
-        let first = render_sse_item(
-            StreamItem::Event(ServerEvent::Device(DeviceEvent::StateChanged {
-                device_id: "dev-a".to_string(),
-                old_state: crate::device::types::DeviceState::Discovered,
-                new_state: crate::device::types::DeviceState::Connected,
-            })),
-            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        )
-        .expect("first frame must render");
-        let second = render_sse_item(
-            StreamItem::Event(ServerEvent::Plugin(Box::new(PluginEvent::Battery {
-                device_id: "dev-b".to_string(),
-                current_charge: 80,
-                is_charging: false,
-            }))),
-            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        )
-        .expect("second frame must render");
+    fn state_changed(device_id: &str) -> DeviceEvent {
+        DeviceEvent::StateChanged {
+            device_id: device_id.to_string(),
+            old_state: crate::device::types::DeviceState::Discovered,
+            new_state: crate::device::types::DeviceState::Connected,
+        }
+    }
 
-        let parse_id = |s: &str| -> u64 {
-            // The id line is the first line of the rendered frame.
-            let line = s.lines().next().unwrap_or("");
-            line.strip_prefix("id: ")
-                .unwrap_or_else(|| panic!("expected `id: <n>` as first line; got: {s}"))
-                .parse::<u64>()
-                .unwrap_or_else(|e| panic!("id is not a u64 in {s}: {e}"))
-        };
+    fn id_of(frame: &str) -> u64 {
+        frame
+            .lines()
+            .next()
+            .and_then(|l| l.strip_prefix("id: "))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("expected `id: <n>` as the first line; got: {frame}"))
+    }
 
-        let first_id = parse_id(&first);
-        let second_id = parse_id(&second);
-        // fetch_add returns the value BEFORE the add, so a counter
-        // initialized to 0 yields id 0 first, then 1, then 2. The
-        // actual starting value is arbitrary; the contract is "ids are
-        // strictly increasing and shared across streams".
+    /// Ids are per connection, start at 1 with the snapshot, and have no
+    /// gaps: keepalives carry no id and consume none, and a second
+    /// subscriber's traffic does not advance this one's counter
+    /// (review finding on #42: a process-global counter burned by every
+    /// merged item made gaps meaningless).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_ids_are_per_connection_and_consecutive() {
+        let (state, _t) = test_state_with_two_devices().await;
+        let mut a = build_event_stream(state.clone()).await;
+        let mut b = build_event_stream(state.clone()).await;
+
+        let snap_a = a.next().await.expect("a snapshot");
+        let snap_b = b.next().await.expect("b snapshot");
+        assert_eq!(id_of(&snap_a), 1);
+        assert_eq!(id_of(&snap_b), 1);
+
+        state.broadcaster.broadcast(state_changed("dev-1"));
+        state.broadcaster.broadcast(state_changed("dev-2"));
+
+        for stream in [&mut a, &mut b] {
+            let first = stream.next().await.expect("first event");
+            let second = stream.next().await.expect("second event");
+            assert_eq!(id_of(&first), 2, "frame: {first}");
+            assert_eq!(id_of(&second), 3, "frame: {second}");
+            assert!(first.contains("\"kind\":\"device.state_changed\""));
+        }
+    }
+
+    /// The first frame on every connection is the named snapshot, even
+    /// when an event is already queued on the broadcast channel before
+    /// the stream is first polled (review finding on #42: `select_all`
+    /// raced the snapshot against live events and the keepalive's
+    /// immediate first tick).
+    #[tokio::test]
+    async fn test_sse_stream_starts_with_snapshot_named_event() {
+        let (state, _t) = test_state_with_two_devices().await;
+        let mut stream = build_event_stream(state.clone()).await;
+        // Queue a live event before the first poll.
+        state
+            .broadcaster
+            .broadcast(state_changed("phone-snapshot-aaaaaaaaaaaaaaaaaaaa"));
+
+        let first = stream.next().await.expect("first frame");
         assert!(
-            second_id > first_id,
-            "ids must be strictly increasing across both source streams: \
-             first={first_id} second={second_id}"
+            first.starts_with("id: 1\nevent: snapshot\n"),
+            "first frame must be the snapshot, got: {first}"
         );
-        assert_eq!(
-            second_id,
-            first_id + 1,
-            "two consecutive fetch_add calls must yield consecutive ids"
+        assert!(first.contains("phone-snapshot-aaaaaaaaaaaaaaaaaaaa"));
+        assert!(first.contains("desktop-snapshot-bbbbbbbbbbbbbbbbbb"));
+        assert!(first.contains("\"pair_state\""));
+
+        let second = stream.next().await.expect("second frame");
+        assert!(
+            second.starts_with("id: 2\ndata: "),
+            "the queued event follows the snapshot, got: {second}"
         );
     }
 
-    /// On a freshly-opened SSE stream, the first wire frame must be a
-    /// named `event: snapshot` carrying the same JSON shape `GET
-    /// /api/v1/devices` returns. Without it a fresh subscriber cannot
-    /// tell "I missed N events" from "this is my first connection" and
-    /// the device pane would be wrong on every reconnect until the
-    /// first delta arrived. Built against the same `create_test_app`
-    /// shape `tests/api_integration.rs` uses, so the registry state is
-    /// the same one the rest of the integration tests see.
+    /// A subscriber that fell behind gets the `lagged` frame and, in the
+    /// same chunk, a fresh snapshot, so it can repaint without a REST
+    /// call (review finding on #42: the one-shot snapshot was exhausted
+    /// after the first frame and the UI has no `lagged` listener).
     #[tokio::test]
-    async fn test_sse_stream_starts_with_snapshot_named_event() {
-        use crate::config::settings::AppSettings;
-        use crate::device::types::{Device, DeviceType};
+    async fn test_lagged_frame_is_followed_by_a_fresh_snapshot() {
+        let (state, _t) = test_state_with_two_devices().await;
+        let mut stream = build_event_stream(state.clone()).await;
+        let first = stream.next().await.expect("snapshot");
+        assert!(first.contains("event: snapshot\n"));
 
-        let temp_dir = tempfile::TempDir::new().expect("tempdir must be creatable");
-        let settings = AppSettings::new_with_data_dir(temp_dir.path().to_path_buf());
-        let state = std::sync::Arc::new(AppState::new_without_input(settings).expect("state"));
+        // The device broadcaster holds 256; overflow it before polling.
+        for i in 0..400 {
+            state
+                .broadcaster
+                .broadcast(state_changed(&format!("dev-{i}")));
+        }
 
-        let phone_id = "phone-snapshot-aaaaaaaaaaaaaaaaaaaa".to_string();
-        let desktop_id = "desktop-snapshot-bbbbbbbbbbbbbbbbbb".to_string();
-        state
-            .registry
-            .add(Device::new(
-                phone_id.clone(),
-                "Phone".to_string(),
-                DeviceType::Phone,
-                8,
-            ))
-            .await
-            .expect("phone add");
-        state
-            .registry
-            .add(Device::new(
-                desktop_id.clone(),
-                "Desktop".to_string(),
-                DeviceType::Desktop,
-                8,
-            ))
-            .await
-            .expect("desktop add");
+        let mut saw_lagged_with_snapshot = false;
+        for _ in 0..400 {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("stream must keep producing")
+                .expect("stream must not end");
+            if let Some(lag_at) = chunk.find("event: lagged\n") {
+                assert!(
+                    chunk[lag_at..].contains("event: snapshot\n"),
+                    "a lagged frame must be followed by a snapshot in the same chunk: {chunk}"
+                );
+                saw_lagged_with_snapshot = true;
+                break;
+            }
+        }
+        assert!(
+            saw_lagged_with_snapshot,
+            "expected a lagged frame after overflowing the channel"
+        );
+    }
 
-        // Drive the snapshot prelude directly through the renderer (we
-        // cannot drive the full `sse_events` body stream without axum
-        // here — the `once` async block in `sse_events` is what emits
-        // the snapshot, and the renderer is what shapes it onto the
-        // wire). The prelude is `render_device_list(..) -> Snapshot`.
-        let list = crate::api::handlers::render_device_list(&state, 1, usize::MAX).await;
-        let json = serde_json::to_string(&list).expect("snapshot must serialize");
-        let id = state
-            .event_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let rendered =
-            render_sse_item(StreamItem::Snapshot(json), id).expect("snapshot must render");
-
-        assert!(
-            rendered.contains("event: snapshot\n"),
-            "first frame must be a named `event: snapshot`; got: {rendered}"
-        );
-        assert!(
-            rendered.starts_with("id: "),
-            "snapshot must carry an `id:` line; got: {rendered}"
-        );
-
-        // Payload must list both devices and carry `pair_state` overlay.
-        assert!(
-            rendered.contains(&phone_id),
-            "snapshot must include phone: {rendered}"
-        );
-        assert!(
-            rendered.contains(&desktop_id),
-            "snapshot must include desktop: {rendered}"
-        );
-        assert!(
-            rendered.contains("\"total\":2"),
-            "snapshot must report total=2 (two devices in the registry); got: {rendered}"
-        );
+    /// Every name in `ALL_KINDS` is what `kind` returns for a sample of
+    /// constructible events, and the two lists have the same size as the
+    /// arms in `kind` (21).
+    #[test]
+    fn test_all_kinds_matches_kind_fn_samples() {
+        assert_eq!(ALL_KINDS.len(), 21);
+        let samples: Vec<(ServerEvent, &str)> = vec![
+            (
+                ServerEvent::Device(state_changed("d")),
+                "device.state_changed",
+            ),
+            (
+                ServerEvent::Plugin(Box::new(PluginEvent::Battery {
+                    device_id: "d".to_string(),
+                    current_charge: 1,
+                    is_charging: true,
+                })),
+                "plugin.battery",
+            ),
+        ];
+        for (event, expected) in samples {
+            assert_eq!(kind(&event), expected);
+            assert!(ALL_KINDS.contains(&expected));
+        }
     }
 }

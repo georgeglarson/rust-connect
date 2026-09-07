@@ -2,7 +2,6 @@
 //!
 //! Single Responsibility: Hold and provide access to shared state.
 
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,13 +26,6 @@ pub struct AppState {
     pub shutdown: CancellationToken,
     pub started_at: Instant,
     pub plugins: PluginAccess,
-    /// Process-global monotonic counter feeding SSE \`id:\` lines. Reserved
-    /// for a future \`Last-Event-ID\` resume handler; today the SSE handler
-    /// accepts no resume header. Ids are unique within a process lifetime
-    /// and strictly increasing across both the device and plugin streams
-    /// so a client can use them to detect gaps without having to
-    /// reconcile two independent counters.
-    pub event_id: AtomicU64,
 }
 
 impl AppState {
@@ -135,10 +127,6 @@ impl AppState {
             shutdown,
             started_at,
             plugins,
-            // fetch_add(1, …) returns the value BEFORE the add, so the
-            // first SSE frame takes id 1. Resetting the counter on
-            // daemon restart is intentional: ids are process-local.
-            event_id: AtomicU64::new(0),
         })
     }
 

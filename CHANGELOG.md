@@ -30,16 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `event_type` / `type` fields are preserved unchanged so existing
   consumers keep working; the `kind` key namespaces the two source
   enums on a single shared vocabulary.
-- `GET /api/v1/events` carries a process-global monotonic `id: <n>`
-  line on every event and lagged frame, shared across the device and
-  plugin streams. Honoring `Last-Event-ID` is out of scope today;
-  ids are observation-only.
+- `GET /api/v1/events` carries an `id: <n>` line on every snapshot,
+  event, and lagged frame: a per-connection counter starting at 1 with
+  no gaps (keepalives carry none and consume none), for correlating
+  frames in a client log. `Last-Event-ID` resume is not implemented.
 - `GET /api/v1/events` ships a named `event: snapshot` frame as the
   first frame on every (re)connect, carrying the same JSON
   `GET /api/v1/devices` returns in its `data` envelope (full
-  `pair_state` + `verification_key` overlay applied). Lets a fresh
-  subscriber render the device pane on connect and after a `lagged`
-  frame without a follow-up REST call.
+  `pair_state` + `verification_key` overlay applied), and again in the
+  same chunk as every `lagged` frame. Lets a fresh or lagged subscriber
+  render the device pane without a follow-up REST call.
 - The binary knows its build: `rust-connect --version` prints
   `<version> (<git sha>[-dirty])` and `GET /api/v1/health` carries a
   `build` object with `version`, `git_sha`, and `dirty`, so an installed

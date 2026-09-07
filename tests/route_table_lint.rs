@@ -13,8 +13,7 @@
 //!    (`test_ui_endpoints_are_wired`)
 //!
 //! 3. (Sanity) The OpenAPI spec and live router agree on the set of paths,
-//!    modulo the SSE channel (`/api/v1/events`) which is deliberately
-//!    excluded from OpenAPI.
+//!    the SSE channel (`/api/v1/events`) included since 2026-09-06.
 //!    (`test_router_paths_match_openapi_paths`)
 //!
 //! Why this is a lint, not a runtime test: the routes a build compiles in
@@ -107,7 +106,7 @@ fn is_excluded_path(path: &str) -> bool {
 }
 
 /// Every route in `src/api/router.rs` must appear in the OpenAPI spec, and
-/// every OpenAPI path (excluding the SSE channel) must appear in the router.
+/// every OpenAPI path (the SSE channel included) must appear in the router.
 /// Path-template syntax is normalized (axum `:device_id` → OpenAPI
 /// `{device_id}`) before comparison.
 #[test]

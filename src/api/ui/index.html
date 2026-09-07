@@ -322,12 +322,19 @@
                 const res = await fetchAPI('GET', '/devices');
                 const devices = res.data?.devices || [];
                 renderDevices(devices);
-            } catch(e) { alert(e.message); }
+            } catch(e) { logEvent('SYSTEM', 'Device list refresh failed: ' + e.message); }
         }
 
         function renderDevices(devices) {
                 const listEl = document.getElementById('device-list');
                 listEl.replaceChildren();
+                // A selected device that is no longer known (unpaired or
+                // pruned while this tab was disconnected) must not keep a
+                // stale detail pane open.
+                if (currentDeviceId && !devices.some(d => d.id === currentDeviceId)) {
+                    currentDeviceId = null;
+                    document.getElementById('device-details').style.display = 'none';
+                }
 
                 if (devices.length === 0) {
                     // Static markup only — no peer data, safe to set
