@@ -9,7 +9,6 @@
 use std::collections::BTreeSet;
 
 use rust_connect::api::openapi::ApiDoc;
-use rust_connect::api::types::UNTYPED_API_ALIASES;
 use utoipa::OpenApi;
 
 #[test]
@@ -78,14 +77,30 @@ fn test_paginated_list_endpoints_document_page_and_limit() {
 /// `data` was `{}`.
 ///
 /// Pin: this number may only go DOWN. To type an endpoint, replace its
-/// `body = GenericResponse` (or whichever untyped alias) with a typed
-/// struct, drop the alias from [`UNTYPED_API_ALIASES`] if no longer
-/// used, and lower the pin in the same commit.
+/// `body = <untyped alias>` with a typed struct and lower the pin in the
+/// same commit. Detection reads the spec: a component whose `data` has no
+/// schema is untyped.
 #[test]
 fn test_untyped_response_bodies_only_ever_decrease() {
     let spec = ApiDoc::openapi();
     let json = serde_json::to_value(&spec).expect("spec serializes");
-    let untyped: BTreeSet<&str> = UNTYPED_API_ALIASES.iter().copied().collect();
+    // Untyped means: the 200 body resolves to a component whose `data`
+    // property has no schema at all (utoipa renders `serde_json::Value`
+    // as `{}`). Derived from the spec, not from a list of alias names,
+    // so a new `ApiResponse<serde_json::Value>` alias cannot slip past.
+    let schemas = json["components"]["schemas"]
+        .as_object()
+        .expect("spec has component schemas");
+    let is_untyped = |name: &str| -> bool {
+        let Some(component) = schemas.get(name) else {
+            return true;
+        };
+        let data = &component["properties"]["data"];
+        match data.as_object() {
+            None => true,
+            Some(o) => o.is_empty(),
+        }
+    };
 
     let mut count: usize = 0;
     let mut offenders: Vec<String> = Vec::new();
@@ -114,7 +129,7 @@ fn test_untyped_response_bodies_only_ever_decrease() {
                 let Some(name) = schema_ref.strip_prefix("#/components/schemas/") else {
                     continue;
                 };
-                if untyped.contains(name) {
+                if is_untyped(name) {
                     count += 1;
                     offenders.push(format!("{method} {path} -> {name}"));
                 }

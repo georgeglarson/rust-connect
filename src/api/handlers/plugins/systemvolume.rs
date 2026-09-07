@@ -62,7 +62,7 @@ pub struct LocalSinkControlResponse {
     path = "/api/v1/systemvolume/sinks",
     tag = "systemvolume",
     responses(
-        (status = 200, description = "Local audio sinks", body = LocalSinksResponse),
+        (status = 200, description = "Local audio sinks", body = LocalSinksResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
         (status = 503, description = "No audio backend available", body = ApiError),
     ),

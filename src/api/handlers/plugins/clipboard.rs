@@ -10,7 +10,10 @@ use crate::app::AppState;
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ClipboardContentResponse {
-    pub content: String,
+    /// `null` when the daemon has no clipboard content yet (a fresh
+    /// process); the pre-typed literal emitted `\"content\": null` and
+    /// consumers branch on it.
+    pub content: Option<String>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -39,10 +42,7 @@ pub struct ClipboardSetResponse {
 pub async fn get_clipboard(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ApiResponse<ClipboardContentResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
-    // Legacy shape: a fresh process has no clipboard content to surface,
-    // so `None` becomes an empty string instead of a `null` JSON value —
-    // the daemon contract has always been "content is a string".
-    let content = state.plugins.clipboard.get_content().unwrap_or_default();
+    let content = state.plugins.clipboard.get_content();
     Ok(Json(ApiResponse::ok(ClipboardContentResponse { content })))
 }
 
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn test_clipboard_content_response_matches_legacy_shape() {
         let resp = ClipboardContentResponse {
-            content: "remember the milk".to_string(),
+            content: Some("remember the milk".to_string()),
         };
         let typed = serde_json::to_value(&resp).expect("typed serialization");
         let legacy = serde_json::json!({ "content": "remember the milk" });

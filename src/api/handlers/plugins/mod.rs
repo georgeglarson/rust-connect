@@ -69,7 +69,7 @@ pub async fn list_plugins(
     path = "/api/v1/plugins/capabilities",
     tag = "plugins",
     responses(
-        (status = 200, description = "List registered capabilities", body = CapabilitiesResponse),
+        (status = 200, description = "List registered capabilities", body = CapabilitiesResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
     security(("api_key" = []))
@@ -86,7 +86,7 @@ pub async fn get_capabilities(
     path = "/api/v1/tools",
     tag = "tools",
     responses(
-        (status = 200, description = "List available agent tools", body = ToolsResponse),
+        (status = 200, description = "List available agent tools", body = ToolsResponseWrapper),
         (status = 401, description = "Invalid or missing API key", body = ApiError),
     ),
     security(("api_key" = []))

@@ -27,8 +27,10 @@ use crate::api::handlers::plugins::sftp::{
 };
 use crate::api::handlers::plugins::sms::{SmsSentResponse, SmsThreadResponse, SmsThreadsResponse};
 use crate::api::handlers::plugins::systemvolume::LocalSinkControlResponse;
+use crate::api::handlers::plugins::systemvolume::LocalSinksResponse;
 use crate::api::handlers::plugins::telephony::TelephonyCallsResponse;
 use crate::api::handlers::plugins::volume::VolumeControlSentResponse;
+use crate::api::handlers::plugins::ToolsResponse;
 use crate::api::handlers::share::{
     ShareFileSentResponse, ShareFilesResponse, ShareTextSentResponse, ShareUrlSentResponse,
 };
@@ -47,6 +49,9 @@ use crate::utils::errors::ErrorCode;
     PairResponseWrapper = ApiResponse<PairResponse>,
     RemoteCommandsResponseWrapper = ApiResponse<RemoteCommandsResponse>,
     PluginsResponse = ApiResponse<PluginListResponse>,
+    CapabilitiesResponseWrapper = ApiResponse<CapabilitiesResponse>,
+    ToolsResponseWrapper = ApiResponse<ToolsResponse>,
+    LocalSinksResponseWrapper = ApiResponse<LocalSinksResponse>,
     SentResponseWrapper = ApiResponse<SentResponse>,
     BatteryResponseWrapper = ApiResponse<BatteryResponse>,
     ConnectivityResponseWrapper = ApiResponse<ConnectivityResponse>,
@@ -93,24 +98,6 @@ pub struct ApiResponse<T: Serialize> {
     pub data: T,
     pub metadata: ResponseMetadata,
 }
-
-/// Aliases of [`ApiResponse`] whose `data` is `serde_json::Value` — i.e.
-/// endpoints whose response body the OpenAPI spec does not actually
-/// describe. The 2026-09-02 `openapi_lint` only checks that `$ref`s
-/// resolve, so an untyped alias passing the lint says nothing about what
-/// the endpoint returns.
-///
-/// The constitution (`docs/constitution.md` § 1) requires every endpoint
-/// to be described by an explicit struct. As of this lane every
-/// endpoint's 200 body is a typed schema, so the list is empty; the
-/// ratchet is `count == 0` and stays that way unless a new endpoint is
-/// added that reaches for `GenericResponse` / `PingResponse` (or some
-/// future untyped alias). To add such an endpoint is to lie to codegen
-/// consumers — prefer typing the response and lowering the pin further.
-///
-/// `tests/openapi_lint::test_untyped_response_bodies_only_ever_decrease`
-/// pins and guards this list.
-pub const UNTYPED_API_ALIASES: &[&str] = &[];
 
 /// Shared acknowledgement for fire-and-forget "I sent a packet" handlers.
 ///
