@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- mDNS storm sensor: the browse loop samples `ServiceDaemon::get_metrics`
+  every 60 s, sums the outbound-packet-send counters (`register-resend`,
+  `unregister-resend`, `respond`, and the three `cache-refresh-*` packets),
+  and logs `event = "mdns_send_storm"` at WARN with the moved deltas when
+  sends per minute cross `MDNS_STORM_THRESHOLD_PER_MIN` (600/min ≈ 10/s,
+  ~12× the steady-state rate). A failed `get_metrics` is logged once at
+  DEBUG and skipped — the sensor never ends the browse loop.
 - The binary knows its build: `rust-connect --version` prints
   `<version> (<git sha>[-dirty])` and `GET /api/v1/health` carries a
   `build` object with `version`, `git_sha`, and `dirty`, so an installed
