@@ -24,6 +24,7 @@ pub mod replay;
 pub mod router;
 pub mod transcript;
 pub mod types;
+pub mod udp_unicast;
 
 // Re-export commonly used types
 pub use connection::ConnectionManager;

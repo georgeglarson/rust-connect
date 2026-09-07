@@ -401,59 +401,41 @@ async fn send_reverse_connection_fallback(
     peer_ip: std::net::IpAddr,
     udp_port: u16,
 ) {
-    let packet = match our_identity.to_packet() {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(
-                error = %e,
-                event = "reverse_fallback_build_failed",
-                "Failed to build the reverse-connection fallback identity"
-            );
-            return;
-        }
-    };
-    let bytes = match PacketSerializer::serialize(&packet) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(
-                error = %e,
-                event = "reverse_fallback_serialize_failed",
-                "Failed to serialize the reverse-connection fallback identity"
-            );
-            return;
-        }
-    };
-    // Bind in the peer's address family: an `0.0.0.0` socket cannot
-    // `send_to` an IPv6 target (the fallback would silently no-op on v6
-    // links — bot round, PR #14).
-    let bind_addr: SocketAddr = match peer_ip {
-        std::net::IpAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
-        std::net::IpAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
-    };
-    let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(
-                error = %e,
-                event = "reverse_fallback_bind_failed",
-                "Failed to bind a UDP socket for the reverse-connection fallback"
-            );
-            return;
-        }
-    };
-    let target = SocketAddr::new(peer_ip, udp_port);
-    match socket.send_to(&bytes, target).await {
-        Ok(_) => {
+    use crate::protocol::udp_unicast::{unicast_identity, UnicastError};
+
+    match unicast_identity(our_identity, peer_ip, udp_port).await {
+        Ok(target) => {
             info!(
                 target = %target,
                 event = "reverse_fallback_sent",
                 "Sent reverse-connection identity fallback after a failed outbound dial"
             );
         }
-        Err(e) => {
+        Err(UnicastError::Build(e)) => {
             warn!(
                 error = %e,
-                target = %target,
+                event = "reverse_fallback_build_failed",
+                "Failed to build the reverse-connection fallback identity"
+            );
+        }
+        Err(UnicastError::Serialize(e)) => {
+            warn!(
+                error = %e,
+                event = "reverse_fallback_serialize_failed",
+                "Failed to serialize the reverse-connection fallback identity"
+            );
+        }
+        Err(UnicastError::Bind(e)) => {
+            warn!(
+                error = %e,
+                event = "reverse_fallback_bind_failed",
+                "Failed to bind a UDP socket for the reverse-connection fallback"
+            );
+        }
+        Err(UnicastError::Send(e)) => {
+            warn!(
+                error = %e,
+                target = %SocketAddr::new(peer_ip, udp_port),
                 event = "reverse_fallback_send_failed",
                 "Failed to send the reverse-connection fallback identity"
             );
