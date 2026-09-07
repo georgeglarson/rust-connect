@@ -24,8 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   peer whose only private address is IPv6 used to be reached by a
   direct dial from the resolve and is now skipped (`mdns_resolve_skipped`
   with `reason = "ipv6_only"`), because the TCP listener is IPv4-only
-  and a unicast there would invite a dial nothing answers. Such a peer
-  still connects over UDP broadcast or by dialing us over IPv4. The
+  and a unicast there would invite a dial nothing answers. A peer that
+  also has an IPv4 address still connects over UDP broadcast or by
+  dialing us over IPv4; one with no IPv4 address at all, which the old
+  direct dial could still reach outbound, is unreachable on this leg
+  until the listener is dual-stack. The
   resolve also no longer creates a device-list entry: an unknown peer
   used to appear in `/api/v1/devices` (and so the web UI and the
   `devices` command) merely for being mDNS-resolved, with no
