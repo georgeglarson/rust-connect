@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 use crate::plugins::events::{PluginEvent, PluginEventBroadcaster};
 use crate::plugins::plugin::Plugin;
+use crate::plugins::tool::{Tool, ToolParameter};
 use crate::protocol::types::Packet;
 use crate::utils::errors::Result;
 
@@ -67,6 +68,23 @@ impl Plugin for RemoteCommandsPlugin {
 
     fn outgoing_capabilities(&self) -> Vec<String> {
         vec!["kdeconnect.runcommand.request".to_string()]
+    }
+
+    fn tools(&self) -> Vec<Tool> {
+        vec![Tool {
+            name: "get_remotecommands".to_string(),
+            description: "Get remote commands from a connected device".to_string(),
+            capability: "kdeconnect.runcommand".to_string(),
+            endpoint: "/api/v1/devices/{device_id}/remotecommands".to_string(),
+            method: "GET".to_string(),
+            parameters: vec![ToolParameter {
+                name: "device_id".to_string(),
+                param_type: "string".to_string(),
+                required: true,
+                description: "Target device ID".to_string(),
+            }],
+            available: true,
+        }]
     }
 
     fn on_connected(&self, _device_id: &str) -> Vec<Packet> {
