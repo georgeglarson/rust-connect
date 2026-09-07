@@ -26,8 +26,15 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rust_connect::api::openapi::ApiDoc;
+use rust_connect::plugins::events::PluginEventBroadcaster;
+use rust_connect::plugins::tool::Tool;
+use rust_connect::plugins::{
+    BatteryPlugin, ClipboardPlugin, MprisPlugin, PingPlugin, Plugin, RemoteCommandsPlugin,
+    SftpPlugin, SystemVolumePlugin, TelephonyPlugin,
+};
 use utoipa::OpenApi;
 
 /// Convert an axum path template (`/api/v1/devices/:device_id/...`) to its
@@ -218,5 +225,239 @@ fn test_ui_endpoints_are_wired() {
             .map(|p| p.as_str())
             .collect::<Vec<_>>()
             .join("\n  ")
+    );
+}
+
+// =====================================================================
+// Tool catalogue ratchets
+//
+// These tests pin the agent-facing surface at `GET /api/v1/tools`. The
+// catalogue moved from a hand-written match in `list_tools` (audit
+// 2026-09-06 §7) onto `Plugin::tools()`; both tests below are the
+// witness for that move and the tripwire that catches a future
+// drift in either direction.
+// =====================================================================
+
+/// First-segment after `/api/v1/devices/:device_id/` in the router is the
+/// plugin-ish segment we care about. Used to drive the ratchet below.
+fn device_route_first_segment(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    // /api/v1/devices/:device_id/<segment>[/...]
+    //   0    1    2    3         4          5        ...
+    if parts.len() >= 6 && parts[0..4] == ["", "api", "v1", "devices"] && parts[4].starts_with(':')
+    {
+        Some(parts[5].to_string())
+    } else {
+        None
+    }
+}
+
+/// Audit 2026-09-06 §7: every registered plugin that owns a route under
+/// `/api/v1/devices/{device_id}/<plugin-ish segment>` must advertise at
+/// least one entry from `tools()`. The pin counts the plugins that own
+/// such a route but DO NOT advertise — i.e. the catalogue drift.
+///
+/// Pin may only go down. New device-routed plugins SHOULD add a `tools()`
+/// entry; the ratchet catches when one forgets. Removing the entry from a
+/// plugin whose route was removed is the only sanctioned reason the pin
+/// drops.
+#[test]
+fn test_plugins_with_device_routes_advertise_tools_ratchet() {
+    // Today's seven: sms, share, lock, remotekeyboard, findmyphone,
+    // contacts, connectivity. Each owns at least one device route but
+    // contributes no `tools()` entry today. Pin = 7 (computed
+    // 2026-09-06 — the audit's estimate of 16 was the raw first-segment
+    // count from `src/api/router.rs`, which includes non-plugin segments
+    // like `connect`, `pair`, `volume`; the ratchet is restricted to
+    // segments that name an actual plugin, which is what "advertise"
+    // means).
+    const EXPECTED_PIN: usize = 7;
+
+    let router_source = fs::read_to_string(repo_path("src/api/router.rs"))
+        .expect("src/api/router.rs must be readable");
+    let device_segments: BTreeSet<String> = extract_router_paths(&router_source)
+        .into_iter()
+        .filter_map(|p| device_route_first_segment(&p))
+        .collect();
+
+    let events = Arc::new(PluginEventBroadcaster::new(8, "ratchet"));
+
+    // Each plugin that owns a device route today. Their `tools()` impls
+    // are the ratchet subject; constructing them without a real device
+    // link is enough — `tools()` is a pure declaration.
+    let mut by_name: std::collections::BTreeMap<String, Arc<dyn Plugin>> =
+        std::collections::BTreeMap::new();
+    // Plugins WITH a tool entry (the nine-name pin below).
+    by_name.insert(
+        "ping".into(),
+        Arc::new(PingPlugin::new()) as Arc<dyn Plugin>,
+    );
+    by_name.insert(
+        "battery".into(),
+        Arc::new(BatteryPlugin::new(events.clone())) as Arc<dyn Plugin>,
+    );
+    by_name.insert(
+        "clipboard".into(),
+        Arc::new(ClipboardPlugin::new(events.clone())) as Arc<dyn Plugin>,
+    );
+    by_name.insert(
+        "mpris".into(),
+        Arc::new(MprisPlugin::new(events.clone())) as Arc<dyn Plugin>,
+    );
+    by_name.insert(
+        "telephony".into(),
+        Arc::new(TelephonyPlugin::new(events.clone())) as Arc<dyn Plugin>,
+    );
+    by_name.insert(
+        "notification".into(),
+        Arc::new(rust_connect::plugins::NotificationPlugin::new(
+            events.clone(),
+        )) as Arc<dyn Plugin>,
+    );
+    by_name.insert(
+        "sftp".into(),
+        Arc::new(SftpPlugin::new()) as Arc<dyn Plugin>,
+    );
+    by_name.insert(
+        "remotecommands".into(),
+        Arc::new(RemoteCommandsPlugin::new(events.clone())) as Arc<dyn Plugin>,
+    );
+    // Plugins with a device route but NO tool entry — these are the
+    // ratchet subject. Their names must appear under
+    // `/api/v1/devices/{device_id}/` so the ratchet surfaces them.
+    by_name.insert(
+        "sms".into(),
+        Arc::new(rust_connect::plugins::SmsPlugin::new()) as Arc<dyn Plugin>,
+    );
+    by_name.insert(
+        "share".into(),
+        Arc::new(rust_connect::plugins::SharePlugin::new()) as Arc<dyn Plugin>,
+    );
+    by_name.insert(
+        "lock".into(),
+        Arc::new(rust_connect::plugins::LockPlugin::new()) as Arc<dyn Plugin>,
+    );
+    by_name.insert(
+        "remotekeyboard".into(),
+        Arc::new(rust_connect::plugins::RemoteKeyboardPlugin::new(
+            events.clone(),
+        )) as Arc<dyn Plugin>,
+    );
+    by_name.insert(
+        "findmyphone".into(),
+        Arc::new(rust_connect::plugins::FindMyPhonePlugin::new()) as Arc<dyn Plugin>,
+    );
+    by_name.insert(
+        "contacts".into(),
+        Arc::new(rust_connect::plugins::ContactsPlugin::new()) as Arc<dyn Plugin>,
+    );
+    by_name.insert(
+        "connectivity".into(),
+        Arc::new(rust_connect::plugins::ConnectivityPlugin::new()) as Arc<dyn Plugin>,
+    );
+
+    let mut unserved: Vec<String> = Vec::new();
+    for (name, plugin) in &by_name {
+        if !device_segments.contains(name) {
+            continue;
+        }
+        if plugin.tools().is_empty() {
+            unserved.push((*name).clone());
+        }
+    }
+
+    assert_eq!(
+        unserved.len(),
+        EXPECTED_PIN,
+        "ratchet pin drifted: today {} plugins own a device route but contribute no `tools()` entry — {unserved:?}; expected {} (pin may only go down)",
+        unserved.len(),
+        EXPECTED_PIN,
+    );
+}
+
+/// Behaviour pin: the union of `tools()` across all plugins that
+/// contribute an entry today, sorted and deduped by name. Any change to
+/// that list (add, remove, rename, re-order) is a behavioural change to
+/// `GET /api/v1/tools` and must be intentional — update the pin in the
+/// same change.
+#[test]
+fn test_list_tools_yields_today_nine_names_sorted() {
+    const EXPECTED: &[&str] = &[
+        "browse_sftp",
+        "get_battery",
+        "get_clipboard",
+        "get_media",
+        "get_notifications",
+        "get_remotecommands",
+        "get_telephony",
+        "list_local_sinks",
+        "ping_device",
+    ];
+
+    let events = Arc::new(PluginEventBroadcaster::new(8, "pin"));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(PingPlugin::new()),
+        Arc::new(BatteryPlugin::new(events.clone())),
+        Arc::new(ClipboardPlugin::new(events.clone())),
+        Arc::new(MprisPlugin::new(events.clone())),
+        Arc::new(TelephonyPlugin::new(events.clone())),
+        Arc::new(rust_connect::plugins::NotificationPlugin::new(
+            events.clone(),
+        )),
+        Arc::new(SftpPlugin::new()),
+        Arc::new(SystemVolumePlugin::new()),
+        Arc::new(RemoteCommandsPlugin::new(events.clone())),
+    ];
+
+    let mut names: Vec<String> = plugins
+        .iter()
+        .flat_map(|p| p.tools())
+        .map(|t: Tool| t.name)
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+
+    let actual: Vec<&str> = names.iter().map(String::as_str).collect();
+    assert_eq!(
+        actual, EXPECTED,
+        "tool catalogue drifted; update the pin in the same change"
+    );
+}
+
+/// Red test: `Plugin::tools()` default is empty. Plugins that don't
+/// expose a REST route don't override, so the catalogue walk in
+/// `list_tools` is a no-op for them. This test uses a stub plugin that
+/// doesn't override; if the default ever changes this catches it.
+#[test]
+fn test_plugin_tools_default_is_empty() {
+    use rust_connect::protocol::types::Packet;
+    use rust_connect::utils::errors::Result;
+
+    struct NoTools;
+
+    #[async_trait::async_trait]
+    impl Plugin for NoTools {
+        fn name(&self) -> &str {
+            "no-tools"
+        }
+        fn incoming_capabilities(&self) -> Vec<String> {
+            vec![]
+        }
+        fn outgoing_capabilities(&self) -> Vec<String> {
+            vec![]
+        }
+        async fn handle_packet(
+            &self,
+            _device_id: &str,
+            _packet: Packet,
+        ) -> Result<Option<Vec<Packet>>> {
+            Ok(None)
+        }
+    }
+
+    let plugin = NoTools;
+    assert!(
+        plugin.tools().is_empty(),
+        "default Plugin::tools() must be empty; plugins that don't expose a REST route should not override"
     );
 }
