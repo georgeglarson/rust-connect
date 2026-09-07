@@ -1,6 +1,6 @@
 [package]
 name = "rust-connect"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Verified floor: `cargo +1.91.0 check --locked` passes. Enforced by the
 # msrv job in .github/workflows/ci.yml, so raising it is a deliberate act
