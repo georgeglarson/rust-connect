@@ -26,8 +26,13 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rust_connect::api::openapi::ApiDoc;
+use rust_connect::app::AppState;
+use rust_connect::config::settings::AppSettings;
+use rust_connect::plugins::tool::Tool;
+use rust_connect::plugins::Plugin;
 use utoipa::OpenApi;
 
 /// Convert an axum path template (`/api/v1/devices/:device_id/...`) to its
@@ -218,5 +223,182 @@ fn test_ui_endpoints_are_wired() {
             .map(|p| p.as_str())
             .collect::<Vec<_>>()
             .join("\n  ")
+    );
+}
+
+// =====================================================================
+// Tool catalogue ratchets
+//
+// These tests pin the agent-facing surface at `GET /api/v1/tools`. The
+// catalogue moved from a hand-written match in `list_tools` (audit
+// 2026-09-06 §7) onto `Plugin::tools()`; both tests below are the
+// witness for that move and the tripwire that catches a future
+// drift in either direction.
+// =====================================================================
+
+/// First-segment after `/api/v1/devices/:device_id/` in the router is the
+/// plugin-ish segment we care about. Used to drive the ratchet below.
+fn device_route_first_segment(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    // /api/v1/devices/:device_id/<segment>[/...]
+    //   0    1    2    3         4          5        ...
+    if parts.len() >= 6 && parts[0..4] == ["", "api", "v1", "devices"] && parts[4].starts_with(':')
+    {
+        Some(parts[5].to_string())
+    } else {
+        None
+    }
+}
+
+/// Audit 2026-09-06 §7: every registered plugin that owns a route under
+/// `/api/v1/devices/{device_id}/<plugin-ish segment>` must advertise at
+/// least one entry from `tools()`. The pin counts the plugins that own
+/// such a route but DO NOT advertise — i.e. the catalogue drift.
+///
+/// Pin may only go down. New device-routed plugins SHOULD add a `tools()`
+/// entry; the ratchet catches when one forgets. Removing the entry from a
+/// plugin whose route was removed is the only sanctioned reason the pin
+/// drops.
+/// Every registered plugin, from the same `PluginRegistry` walk
+/// `list_tools` performs (`plugin_registry.list()` then `get(name)`), after
+/// the production loader has registered them. A plugin added tomorrow is
+/// in the ratchet's subject set without anyone editing this file, and a
+/// plugin constructed but never registered is not silently counted
+/// (review findings on PR #41).
+async fn every_registered_plugin() -> Vec<Arc<dyn Plugin>> {
+    let temp_dir = tempfile::TempDir::new().expect("temp data dir");
+    let settings = AppSettings::new_with_data_dir(temp_dir.path().to_path_buf());
+    let state = AppState::new_without_input(settings).expect("AppState without desktop input");
+    state.init_plugins().await;
+    let mut plugins = Vec::new();
+    for name in state.plugin_registry.list().await {
+        if let Some(plugin) = state.plugin_registry.get(&name).await {
+            plugins.push(plugin);
+        }
+    }
+    assert_eq!(
+        plugins.len(),
+        state.plugins.all().len(),
+        "the registry must hold every plugin the loader built"
+    );
+    plugins
+}
+
+#[tokio::test]
+async fn test_plugins_with_device_routes_advertise_tools_ratchet() {
+    // Today's seven: sms, share, lock, remotekeyboard, findmyphone,
+    // contacts, connectivity. Each owns at least one device route but
+    // contributes no `tools()` entry. Pin = 7 (computed 2026-09-06). A
+    // device route is one whose first segment after
+    // `/api/v1/devices/:device_id/` names a registered plugin; segments
+    // like `connect`, `pair`, `state` name no plugin and are outside the
+    // ratchet.
+    const EXPECTED_PIN: usize = 7;
+
+    let router_source = fs::read_to_string(repo_path("src/api/router.rs"))
+        .expect("src/api/router.rs must be readable");
+    let device_segments: BTreeSet<String> = extract_router_paths(&router_source)
+        .into_iter()
+        .filter_map(|p| device_route_first_segment(&p))
+        .collect();
+
+    let plugins = every_registered_plugin().await;
+    let plugin_names: BTreeSet<String> = plugins.iter().map(|p| p.name().to_string()).collect();
+    let routed_plugins: BTreeSet<&String> = device_segments
+        .iter()
+        .filter(|seg| plugin_names.contains(*seg))
+        .collect();
+    assert!(
+        !routed_plugins.is_empty(),
+        "no device-route segment names a registered plugin; the segment rule or the router changed"
+    );
+
+    let mut unserved: Vec<String> = plugins
+        .iter()
+        .filter(|p| routed_plugins.contains(&p.name().to_string()) && p.tools().is_empty())
+        .map(|p| p.name().to_string())
+        .collect();
+    unserved.sort_unstable();
+
+    assert_eq!(
+        unserved.len(),
+        EXPECTED_PIN,
+        "ratchet pin drifted: today {} plugins own a device route but contribute no `tools()` entry — {unserved:?}; expected {} (pin may only go down; lower it in the same change that adds a tool)",
+        unserved.len(),
+        EXPECTED_PIN,
+    );
+}
+
+/// Behaviour pin: the union of `tools()` across all plugins that
+/// contribute an entry today, sorted and deduped by name. Any change to
+/// that list (add, remove, rename, re-order) is a behavioural change to
+/// `GET /api/v1/tools` and must be intentional — update the pin in the
+/// same change.
+#[tokio::test]
+async fn test_list_tools_yields_today_nine_names_sorted() {
+    const EXPECTED: &[&str] = &[
+        "browse_sftp",
+        "get_battery",
+        "get_clipboard",
+        "get_media",
+        "get_notifications",
+        "get_remotecommands",
+        "get_telephony",
+        "list_local_sinks",
+        "ping_device",
+    ];
+
+    let plugins = every_registered_plugin().await;
+
+    let mut names: Vec<String> = plugins
+        .iter()
+        .flat_map(|p| p.tools())
+        .map(|t: Tool| t.name)
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+
+    let actual: Vec<&str> = names.iter().map(String::as_str).collect();
+    assert_eq!(
+        actual, EXPECTED,
+        "tool catalogue drifted; update the pin in the same change"
+    );
+}
+
+/// Red test: `Plugin::tools()` default is empty. Plugins that don't
+/// expose a REST route don't override, so the catalogue walk in
+/// `list_tools` is a no-op for them. This test uses a stub plugin that
+/// doesn't override; if the default ever changes this catches it.
+#[test]
+fn test_plugin_tools_default_is_empty() {
+    use rust_connect::protocol::types::Packet;
+    use rust_connect::utils::errors::Result;
+
+    struct NoTools;
+
+    #[async_trait::async_trait]
+    impl Plugin for NoTools {
+        fn name(&self) -> &str {
+            "no-tools"
+        }
+        fn incoming_capabilities(&self) -> Vec<String> {
+            vec![]
+        }
+        fn outgoing_capabilities(&self) -> Vec<String> {
+            vec![]
+        }
+        async fn handle_packet(
+            &self,
+            _device_id: &str,
+            _packet: Packet,
+        ) -> Result<Option<Vec<Packet>>> {
+            Ok(None)
+        }
+    }
+
+    let plugin = NoTools;
+    assert!(
+        plugin.tools().is_empty(),
+        "default Plugin::tools() must be empty; plugins that don't expose a REST route should not override"
     );
 }

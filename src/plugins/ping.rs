@@ -8,6 +8,7 @@ use crate::protocol::types::Packet;
 use crate::utils::errors::Result;
 
 use super::plugin::Plugin;
+use super::tool::{Tool, ToolParameter};
 
 pub struct PingPlugin;
 
@@ -44,6 +45,23 @@ impl Plugin for PingPlugin {
             "Received ping"
         );
         Ok(None)
+    }
+
+    fn tools(&self) -> Vec<Tool> {
+        vec![Tool {
+            name: "ping_device".to_string(),
+            description: "Send a ping to a device to check connectivity".to_string(),
+            capability: "kdeconnect.ping".to_string(),
+            endpoint: "/api/v1/ping".to_string(),
+            method: "POST".to_string(),
+            parameters: vec![ToolParameter {
+                name: "device_id".to_string(),
+                param_type: "string".to_string(),
+                required: true,
+                description: "Target device ID".to_string(),
+            }],
+            available: true,
+        }]
     }
 }
 

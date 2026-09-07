@@ -13,6 +13,7 @@ use crate::protocol::types::Packet;
 use crate::utils::errors::Result;
 
 use super::plugin::Plugin;
+use super::tool::{Tool, ToolParameter};
 
 /// One telephony event as the phone sends it.
 ///
@@ -127,6 +128,23 @@ impl Plugin for TelephonyPlugin {
         if let Ok(mut calls) = self.calls.write() {
             calls.remove(device_id);
         }
+    }
+
+    fn tools(&self) -> Vec<Tool> {
+        vec![Tool {
+            name: "get_telephony".to_string(),
+            description: "Get recent telephony events from a device".to_string(),
+            capability: "kdeconnect.telephony".to_string(),
+            endpoint: "/api/v1/devices/{device_id}/telephony".to_string(),
+            method: "GET".to_string(),
+            parameters: vec![ToolParameter {
+                name: "device_id".to_string(),
+                param_type: "string".to_string(),
+                required: true,
+                description: "Target device ID".to_string(),
+            }],
+            available: true,
+        }]
     }
 
     async fn handle_packet(&self, device_id: &str, packet: Packet) -> Result<Option<Vec<Packet>>> {

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::api::types::*;
 use crate::app::AppState;
+use crate::plugins::Tool;
 
 pub mod battery;
 pub mod clipboard;
@@ -40,196 +41,9 @@ pub use telephony::*;
 pub use volume::*;
 
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
-pub struct Tool {
-    pub name: String,
-    pub description: String,
-    pub capability: String,
-    pub endpoint: String,
-    pub method: String,
-    pub parameters: Vec<ToolParameter>,
-    /// Whether the plugin's backend is currently operational. Plugins
-    /// without a separable backend always report `true`; plugins that
-    /// detect a session-bus / portal / clipboard backend at runtime
-    /// (clipboard, mpris, …) report the live state. `false` means the
-    /// tool is listed for discoverability but cannot service a request
-    /// right now — callers should not invoke the endpoint.
-    pub available: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
-pub struct ToolParameter {
-    pub name: String,
-    pub param_type: String,
-    pub required: bool,
-    pub description: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct ToolsResponse {
     pub tools: Vec<Tool>,
     pub count: usize,
-}
-
-fn capability_to_tool(cap: &str, _incoming: bool) -> Option<Tool> {
-    let (name, description, endpoint, method, params, available) = match cap {
-        "kdeconnect.ping" => (
-            "ping_device".to_string(),
-            "Send a ping to a device to check connectivity".to_string(),
-            "/api/v1/ping".to_string(),
-            "POST".to_string(),
-            vec![ToolParameter {
-                name: "device_id".to_string(),
-                param_type: "string".to_string(),
-                required: true,
-                description: "Target device ID".to_string(),
-            }],
-            true,
-        ),
-        "kdeconnect.battery" => (
-            "get_battery".to_string(),
-            "Get battery status of a device".to_string(),
-            "/api/v1/devices/{device_id}/battery".to_string(),
-            "GET".to_string(),
-            vec![ToolParameter {
-                name: "device_id".to_string(),
-                param_type: "string".to_string(),
-                required: true,
-                description: "Target device ID".to_string(),
-            }],
-            true,
-        ),
-        "kdeconnect.clipboard" => (
-            "get_clipboard".to_string(),
-            "Get clipboard content from any connected device".to_string(),
-            "/api/v1/clipboard".to_string(),
-            "GET".to_string(),
-            vec![],
-            // availability is overridden by list_tools once it has the
-            // owning plugin in hand; this default keeps the lookup
-            // callable in isolation.
-            true,
-        ),
-        "kdeconnect.sms" => (
-            "get_sms".to_string(),
-            "Get SMS message threads from a device".to_string(),
-            "/api/v1/devices/{device_id}/sms/threads".to_string(),
-            "GET".to_string(),
-            vec![ToolParameter {
-                name: "device_id".to_string(),
-                param_type: "string".to_string(),
-                required: true,
-                description: "Target device ID".to_string(),
-            }],
-            true,
-        ),
-        "kdeconnect.mpris" => (
-            "get_media".to_string(),
-            "Get MPRIS media player status from a device".to_string(),
-            "/api/v1/devices/{device_id}/mpris".to_string(),
-            "GET".to_string(),
-            vec![ToolParameter {
-                name: "device_id".to_string(),
-                param_type: "string".to_string(),
-                required: true,
-                description: "Target device ID".to_string(),
-            }],
-            // overridden by list_tools; see kdeconnect.clipboard note.
-            true,
-        ),
-        "kdeconnect.telephony" => (
-            "get_telephony".to_string(),
-            "Get recent telephony events from a device".to_string(),
-            "/api/v1/devices/{device_id}/telephony".to_string(),
-            "GET".to_string(),
-            vec![ToolParameter {
-                name: "device_id".to_string(),
-                param_type: "string".to_string(),
-                required: true,
-                description: "Target device ID".to_string(),
-            }],
-            true,
-        ),
-        "kdeconnect.notification" => (
-            "get_notifications".to_string(),
-            "Get notification history".to_string(),
-            "/api/v1/notifications".to_string(),
-            "GET".to_string(),
-            vec![],
-            true,
-        ),
-        "kdeconnect.share" => (
-            "share_file".to_string(),
-            "Share a file with a connected device".to_string(),
-            "/api/v1/devices/{device_id}/share/send".to_string(),
-            "POST".to_string(),
-            vec![
-                ToolParameter {
-                    name: "device_id".to_string(),
-                    param_type: "string".to_string(),
-                    required: true,
-                    description: "Target device ID".to_string(),
-                },
-                ToolParameter {
-                    name: "file_path".to_string(),
-                    param_type: "string".to_string(),
-                    required: true,
-                    description: "Path to file to share".to_string(),
-                },
-            ],
-            true,
-        ),
-        "kdeconnect.runcommand" => (
-            "get_remotecommands".to_string(),
-            "Get remote commands from a connected device".to_string(),
-            "/api/v1/devices/{device_id}/remotecommands".to_string(),
-            "GET".to_string(),
-            vec![ToolParameter {
-                name: "device_id".to_string(),
-                param_type: "string".to_string(),
-                required: true,
-                description: "Target device ID".to_string(),
-            }],
-            true,
-        ),
-        "kdeconnect.systemvolume" => (
-            "list_local_sinks".to_string(),
-            "List local audio sinks (provider)".to_string(),
-            "/api/v1/systemvolume/sinks".to_string(),
-            "GET".to_string(),
-            vec![],
-            // overridden by list_tools once it has the owning plugin
-            // in hand; the default keeps the lookup callable in
-            // isolation.
-            true,
-        ),
-        "kdeconnect.sftp" => (
-            "browse_sftp".to_string(),
-            "Mount the device's filesystem locally via sshfs and browse it".to_string(),
-            "/api/v1/devices/{device_id}/sftp/mount".to_string(),
-            "POST".to_string(),
-            vec![ToolParameter {
-                name: "device_id".to_string(),
-                param_type: "string".to_string(),
-                required: true,
-                description: "Target device ID".to_string(),
-            }],
-            // Overridden by list_tools via SftpPlugin::is_backend_available
-            // — false when sshfs / fusermount are missing on PATH so the
-            // tool is never advertised as servable when it isn't.
-            true,
-        ),
-        _ => return None,
-    };
-
-    Some(Tool {
-        name,
-        description,
-        capability: cap.to_string(),
-        endpoint,
-        method,
-        parameters: params,
-        available,
-    })
 }
 
 #[utoipa::path(
@@ -280,40 +94,33 @@ pub async fn get_capabilities(
 pub async fn list_tools(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ApiResponse<ToolsResponse>>, (axum::http::StatusCode, Json<ApiError>)> {
-    let plugins = state.plugin_registry.list_with_capabilities().await;
+    // Each plugin owns its own tool entries. The default impl is empty;
+    // plugins serving a REST route override `tools()` so the catalogue
+    // tracks the surface without a hand-written match on capability
+    // strings (audit 2026-09-06 §7). `is_backend_available` decides
+    // whether each plugin's tools are servable right now; one lookup
+    // gives us both pieces of state for plugins that need it.
+    let plugin_names = state.plugin_registry.list().await;
     let mut tools = Vec::new();
 
-    for plugin in plugins {
-        // One lookup, both pieces of state — availability is a trait
-        // method on the same Plugin trait that incoming_capabilities
-        // lives on, so a generic hook covers any future backend-bearing
-        // plugin (sendnotifications, pausemusic, screensaver_inhibit)
-        // without per-plugin special cases in this handler.
-        let available = state
-            .plugin_registry
-            .get(&plugin.name)
-            .await
-            .map(|p| p.is_backend_available())
-            .unwrap_or(true);
-
-        for cap in &plugin.incoming_capabilities {
-            if let Some(mut tool) = capability_to_tool(cap, true) {
-                if !available {
-                    tool.available = false;
-                }
-                tools.push(tool);
+    for name in plugin_names {
+        let Some(plugin) = state.plugin_registry.get(&name).await else {
+            continue;
+        };
+        let available = plugin.is_backend_available();
+        for mut tool in plugin.tools() {
+            if !available {
+                tool.available = false;
             }
+            tools.push(tool);
         }
     }
 
-    // Two plugins can declare the same incoming capability (pausemusic and
-    // telephony both consume kdeconnect.telephony), which pushes the same
-    // tool twice — from a HashMap-ordered registry walk, so the duplicates
-    // land in nondeterministic order and can disagree on `available` (each
-    // copy reflects its own plugin's backend). Collapse by name: the tool
-    // is available if ANY plugin serving that capability is (a degraded
-    // secondary consumer must not shadow a healthy primary), and sort so
-    // the catalog is stable across requests.
+    // Two plugins can advertise the same tool name (e.g. telephony and
+    // pausemusic both wrap a telephony route); collapse by name, taking
+    // any-unavailable-is-servable: a degraded secondary consumer must
+    // not shadow a healthy primary. Sort so the catalog is stable across
+    // requests.
     tools.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     tools.dedup_by(|dup, kept| {
         if dup.name == kept.name {

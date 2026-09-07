@@ -2,6 +2,7 @@
 //!
 //! Single Responsibility: Define the interface all plugins must implement.
 
+use super::tool::Tool;
 use crate::protocol::types::Packet;
 use crate::utils::errors::Result;
 
@@ -37,5 +38,14 @@ pub trait Plugin: Send + Sync {
     /// tool the backend can't actually service.
     fn is_backend_available(&self) -> bool {
         true
+    }
+
+    /// The agent-facing catalogue entries this plugin contributes; a tool
+    /// names an existing REST route. Default empty so plugins that don't
+    /// expose a REST route don't override anything; the API layer walks
+    /// `Plugin::tools()` per registered plugin and projects the union
+    /// through `is_backend_available` to produce `GET /api/v1/tools`.
+    fn tools(&self) -> Vec<Tool> {
+        vec![]
     }
 }

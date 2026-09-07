@@ -87,6 +87,7 @@ use crate::protocol::types::Packet;
 use crate::utils::errors::{Error, Result};
 
 use super::plugin::Plugin;
+use super::tool::Tool;
 
 /// Session clipboard abstraction so unit tests don't need a live Wayland
 /// session. `X11Clipboard` below is the second impl (xclip preferred, xsel
@@ -952,6 +953,23 @@ impl Plugin for ClipboardPlugin {
     fn is_backend_available(&self) -> bool {
         self.backend.read().map(|b| b.is_some()).unwrap_or(false)
     }
+
+    fn tools(&self) -> Vec<Tool> {
+        // No parameters: clipboard content is a daemon-wide singleton, not
+        // a per-device property. `available` is overwritten by the API
+        // layer based on `is_backend_available` (mpris / sftp / systemvolume
+        // use the same shape) so the catalogue reflects the live state.
+        vec![Tool {
+            name: "get_clipboard".to_string(),
+            description: "Get clipboard content from any connected device".to_string(),
+            capability: "kdeconnect.clipboard".to_string(),
+            endpoint: "/api/v1/clipboard".to_string(),
+            method: "GET".to_string(),
+            parameters: vec![],
+            available: true,
+        }]
+    }
+
     fn on_connected(&self, _device_id: &str) -> Vec<Packet> {
         // clipboard.connect is sent on connect with the last-known content and
         // its update timestamp (kdeconnect-kde clipboardplugin.cpp:39-42,

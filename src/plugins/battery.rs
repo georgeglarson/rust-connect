@@ -12,6 +12,7 @@ use crate::protocol::types::Packet;
 use crate::utils::errors::Result;
 
 use super::plugin::Plugin;
+use super::tool::{Tool, ToolParameter};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,6 +68,23 @@ impl Plugin for BatteryPlugin {
             // {"request": true}. We sent an empty body (vk #1018).
             serde_json::json!({ "request": true }),
         )]
+    }
+
+    fn tools(&self) -> Vec<Tool> {
+        vec![Tool {
+            name: "get_battery".to_string(),
+            description: "Get battery status of a device".to_string(),
+            capability: "kdeconnect.battery".to_string(),
+            endpoint: "/api/v1/devices/{device_id}/battery".to_string(),
+            method: "GET".to_string(),
+            parameters: vec![ToolParameter {
+                name: "device_id".to_string(),
+                param_type: "string".to_string(),
+                required: true,
+                description: "Target device ID".to_string(),
+            }],
+            available: true,
+        }]
     }
 
     async fn handle_packet(&self, device_id: &str, packet: Packet) -> Result<Option<Vec<Packet>>> {

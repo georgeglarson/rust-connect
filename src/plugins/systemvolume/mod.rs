@@ -59,6 +59,7 @@ use crate::utils::errors::Result;
 
 use super::events::PluginEventBroadcaster;
 use super::plugin::Plugin;
+use super::tool::Tool;
 
 use backend::{detect as detect_pactl, LocalSinkState, SubscribeEvent, VolumeBackend};
 
@@ -535,6 +536,23 @@ impl Plugin for SystemVolumePlugin {
 
     fn is_backend_available(&self) -> bool {
         self.backend_available.load(Ordering::SeqCst)
+    }
+
+    fn tools(&self) -> Vec<Tool> {
+        // `available` is overwritten by the API layer via
+        // `is_backend_available` (pactl on PATH); without a sink-control
+        // backend, list_local_sinks would answer with an empty list and
+        // a 200 — that's capability-dishonest, so the gate's the
+        // backend probe, not the route itself.
+        vec![Tool {
+            name: "list_local_sinks".to_string(),
+            description: "List local audio sinks (provider)".to_string(),
+            capability: "kdeconnect.systemvolume".to_string(),
+            endpoint: "/api/v1/systemvolume/sinks".to_string(),
+            method: "GET".to_string(),
+            parameters: vec![],
+            available: true,
+        }]
     }
 
     fn on_connected(&self, _device_id: &str) -> Vec<Packet> {

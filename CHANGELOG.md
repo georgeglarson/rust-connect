@@ -53,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is the source of truth and `RUST_LOG` (in a drop-in) is the override.
 - Dropped an unused `config` crate (a 54-crate subtree) and three unused
   dev-dependencies; 273 → 250 crates in a production build.
+- The tool catalogue at `GET /api/v1/tools` moved from a hand-written
+  match in the API layer onto the `Plugin` trait itself. Each plugin
+  that owns a REST route now declares its `Tool` entries from
+  `tools()`; the API layer walks the registry, applies
+  `is_backend_available`, and dedupes+sorts. Wire shape (JSON, OpenAPI
+  schema) is byte-identical. Pinned by `tests/route_table_lint.rs`
+  (nine-name pin, default-empty pin, and a device-route ratchet).
 
 ### Fixed
 

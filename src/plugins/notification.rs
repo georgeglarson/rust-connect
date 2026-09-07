@@ -17,6 +17,7 @@ use crate::protocol::types::Packet;
 use crate::utils::errors::Result;
 
 use super::plugin::Plugin;
+use super::tool::Tool;
 
 const MAX_NOTIFICATION_HISTORY: usize = 100;
 const MAX_ICONS_PER_DEVICE: usize = 64;
@@ -782,6 +783,18 @@ impl Plugin for NotificationPlugin {
             "kdeconnect.notification.request".to_string(),
             serde_json::json!({ "request": true }),
         )]
+    }
+
+    fn tools(&self) -> Vec<Tool> {
+        vec![Tool {
+            name: "get_notifications".to_string(),
+            description: "Get notification history".to_string(),
+            capability: "kdeconnect.notification".to_string(),
+            endpoint: "/api/v1/notifications".to_string(),
+            method: "GET".to_string(),
+            parameters: vec![],
+            available: true,
+        }]
     }
 
     async fn handle_packet(&self, device_id: &str, packet: Packet) -> Result<Option<Vec<Packet>>> {

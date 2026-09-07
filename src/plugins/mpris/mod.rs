@@ -78,6 +78,7 @@ use crate::protocol::types::Packet;
 use crate::utils::errors::Result;
 
 use super::plugin::Plugin;
+use super::tool::{Tool, ToolParameter};
 
 /// Well-known bus-name prefix every MPRIS2 player registers under.
 pub(crate) const MPRIS_SERVICE_PREFIX: &str = "org.mpris.MediaPlayer2.";
@@ -1208,6 +1209,27 @@ impl Plugin for MprisPlugin {
 
     fn is_backend_available(&self) -> bool {
         self.backend.read().map(|b| b.is_some()).unwrap_or(false)
+    }
+
+    fn tools(&self) -> Vec<Tool> {
+        // `available` is overwritten by the API layer via
+        // `is_backend_available`; mpris is degraded to an empty player
+        // list when the session bus isn't reachable, so we never want
+        // the catalogue to advertise it as servable in that state.
+        vec![Tool {
+            name: "get_media".to_string(),
+            description: "Get MPRIS media player status from a device".to_string(),
+            capability: "kdeconnect.mpris".to_string(),
+            endpoint: "/api/v1/devices/{device_id}/mpris".to_string(),
+            method: "GET".to_string(),
+            parameters: vec![ToolParameter {
+                name: "device_id".to_string(),
+                param_type: "string".to_string(),
+                required: true,
+                description: "Target device ID".to_string(),
+            }],
+            available: true,
+        }]
     }
     async fn on_disconnected(&self, device_id: &str) {
         if let Ok(mut players) = self.players.write() {

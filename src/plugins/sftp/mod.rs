@@ -28,6 +28,7 @@ use crate::protocol::types::Packet;
 use crate::utils::errors::{Error, Result};
 
 use super::plugin::Plugin;
+use super::tool::{Tool, ToolParameter};
 
 /// Wall-clock budget for one sshfs mount attempt or fusermount unmount,
 /// waited on from async code (see `mount_via_mounter`/`unmount_via_mounter`).
@@ -849,6 +850,28 @@ impl Plugin for SftpPlugin {
 
     fn is_backend_available(&self) -> bool {
         self.mounter.is_available()
+    }
+
+    fn tools(&self) -> Vec<Tool> {
+        // `available` is overwritten by the API layer via
+        // `is_backend_available` (the mounter checks for sshfs +
+        // fusermount on PATH); without that backend the tool is listed
+        // for discoverability but the daemon can't service the request.
+        vec![Tool {
+            name: "browse_sftp".to_string(),
+            description: "Mount the device's filesystem locally via sshfs and browse it"
+                .to_string(),
+            capability: "kdeconnect.sftp".to_string(),
+            endpoint: "/api/v1/devices/{device_id}/sftp/mount".to_string(),
+            method: "POST".to_string(),
+            parameters: vec![ToolParameter {
+                name: "device_id".to_string(),
+                param_type: "string".to_string(),
+                required: true,
+                description: "Target device ID".to_string(),
+            }],
+            available: true,
+        }]
     }
 
     async fn on_disconnected(&self, device_id: &str) {
