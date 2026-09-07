@@ -321,8 +321,20 @@
             try {
                 const res = await fetchAPI('GET', '/devices');
                 const devices = res.data?.devices || [];
+                renderDevices(devices);
+            } catch(e) { logEvent('SYSTEM', 'Device list refresh failed: ' + e.message); }
+        }
+
+        function renderDevices(devices) {
                 const listEl = document.getElementById('device-list');
                 listEl.replaceChildren();
+                // A selected device that is no longer known (unpaired or
+                // pruned while this tab was disconnected) must not keep a
+                // stale detail pane open.
+                if (currentDeviceId && !devices.some(d => d.id === currentDeviceId)) {
+                    currentDeviceId = null;
+                    document.getElementById('device-details').style.display = 'none';
+                }
 
                 if (devices.length === 0) {
                     // Static markup only — no peer data, safe to set
@@ -403,7 +415,6 @@
                     const current = devices.find(d => d.id === currentDeviceId);
                     if (current) renderDeviceDetails(current);
                 }
-            } catch (e) {}
         }
 
         function selectDevice(id) {
@@ -972,12 +983,12 @@
                     const payload = JSON.parse(e.data);
                     const eventType = payload.type || payload.event_type;
                     logEvent('SSE', `Event: ${eventType} (Device: ${payload.device_id || 'Global'})`);
-                    
+
                     // Core UI Refresh triggers
                     if (['discovered', 'state_changed', 'paired', 'connected', 'disconnected', 'removed', 'pair_requested'].includes(eventType)) {
                         loadDevices();
                     }
-                    
+
                     // Target updates to the active UI
                     if (currentDeviceId && (payload.device_id === currentDeviceId || !payload.device_id)) {
                         if (eventType === 'Battery') {
@@ -1005,6 +1016,24 @@
                     }
                 } catch(err) {}
             };
+
+            // Snapshot frame: the first frame on every (re)connect.
+            // Server ships the same JSON GET /api/v1/devices returns in
+            // its `data` envelope (pair_state + verification_key
+            // overlay already applied), so the device pane is correct
+            // on connect and after a `lagged` frame without a follow-up
+            // REST call. `onmessage` consumers do NOT see this — the
+            // browser only delivers named events to a matching
+            // `addEventListener`, which is why the frame is named.
+            eventSource.addEventListener('snapshot', (e) => {
+                try {
+                    const snapshot = JSON.parse(e.data);
+                    if (snapshot && Array.isArray(snapshot.devices)) {
+                        renderDevices(snapshot.devices);
+                        logEvent('SSE', `Snapshot: ${snapshot.devices.length} device(s)`);
+                    }
+                } catch (err) {}
+            });
             
             eventSource.onerror = (e) => {
                 logEvent('SYSTEM', 'SSE connection lost. Reconnecting...');

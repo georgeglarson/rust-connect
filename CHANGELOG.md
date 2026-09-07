@@ -20,6 +20,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sends per minute cross `MDNS_STORM_THRESHOLD_PER_MIN` (600/min ≈ 10/s,
   ~12× the steady-state rate). A failed `get_metrics` is logged once at
   DEBUG and skipped — the sensor never ends the browse loop.
+- `GET /api/v1/events` sends a `: keepalive` comment every 15 seconds so
+  a dead upstream surfaces as a closed connection within ~15s rather
+  than a half-open socket the client believes is still live. Cadence
+  sits below typical reverse-proxy idle timeouts.
+- `GET /api/v1/events` includes a `kind` discriminator on every event
+  frame, in `<enum>.<variant>` form (`device.discovered`,
+  `device.state_changed`, `plugin.notification`, …). Existing
+  `event_type` / `type` fields are preserved unchanged so existing
+  consumers keep working; the `kind` key namespaces the two source
+  enums on a single shared vocabulary.
+- `GET /api/v1/events` carries an `id: <n>` line on every snapshot,
+  event, and lagged frame: a per-connection counter starting at 1 with
+  no gaps (keepalives carry none and consume none), for correlating
+  frames in a client log. `Last-Event-ID` resume is not implemented.
+- `GET /api/v1/events` ships a named `event: snapshot` frame as the
+  first frame on every (re)connect, carrying the same JSON
+  `GET /api/v1/devices` returns in its `data` envelope (full
+  `pair_state` + `verification_key` overlay applied), and again in the
+  same chunk as every `lagged` frame. Lets a fresh or lagged subscriber
+  render the device pane without a follow-up REST call.
 - The binary knows its build: `rust-connect --version` prints
   `<version> (<git sha>[-dirty])` and `GET /api/v1/health` carries a
   `build` object with `version`, `git_sha`, and `dirty`, so an installed
