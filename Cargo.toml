@@ -59,7 +59,7 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-journald = "0.3"
 
 # OpenAPI generation (AI-friendly documentation)
-utoipa = { version = "4", features = ["axum_extras", "chrono"] }
+utoipa = { version = "5", features = ["axum_extras", "chrono"] }
 utoipa-swagger-ui = { version = "6", features = ["axum"] }
 
 # Configuration (TOML only; the `config` crate was a 54-crate subtree with
