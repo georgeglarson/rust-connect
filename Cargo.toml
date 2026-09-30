@@ -60,7 +60,7 @@ tracing-journald = "0.3"
 
 # OpenAPI generation (AI-friendly documentation)
 utoipa = { version = "4", features = ["axum_extras", "chrono"] }
-utoipa-swagger-ui = { version = "6", features = ["axum"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
 
 # Configuration (TOML only; the `config` crate was a 54-crate subtree with
 # zero uses — 2026-09-06 audit D1)
