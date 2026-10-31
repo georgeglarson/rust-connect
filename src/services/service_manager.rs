@@ -246,16 +246,6 @@ fn on_mdns_device_resolved_with_udp_port(
     peer: crate::protocol::mdns_discovery::MdnsPeer,
     udp_port: u16,
 ) {
-    info!(
-        device_id = %peer.device_id,
-        device_name = %peer.device_name,
-        address = %peer.address,
-        srv_port = peer.srv_port,
-        protocol_version = peer.protocol_version,
-        event = "mdns_device_resolved",
-        "Discovered device via mDNS"
-    );
-
     tokio::spawn(async move {
         let device_id = peer.device_id.clone();
 
@@ -270,6 +260,23 @@ fn on_mdns_device_resolved_with_udp_port(
         if device_id == our_id {
             return;
         }
+
+        // Logged BELOW the self-guard (2026-10-31): a self-resolve is
+        // not a discovered device. The mDNS self-loop storm made this
+        // line fire ~600 times a minute for OUR OWN announcement; the
+        // multicast-loopback fix stops the self-resolve at the source,
+        // and this ordering means a self-resolve that still slips
+        // through is not logged as a peer either.
+        info!(
+            device_id = %peer.device_id,
+            device_name = %peer.device_name,
+            address = %peer.address,
+            srv_port = peer.srv_port,
+            protocol_version = peer.protocol_version,
+            event = "mdns_device_resolved",
+            "Discovered device via mDNS"
+        );
+
         if crate::protocol::is_split_brain(&peer.address, &our_id, &device_id) {
             warn!(
                 device_id = %device_id,

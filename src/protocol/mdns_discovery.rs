@@ -35,7 +35,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{IfKind, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -284,6 +284,64 @@ fn build_service_info(identity: &Identity) -> Result<ServiceInfo> {
     Ok(service_info)
 }
 
+/// Turn OFF the kernel's multicast loopback for the daemon's socket.
+///
+/// mdns-sd enables IP_MULTICAST_LOOP by default, so every packet we
+/// send comes back to our own socket: our own queries and our own
+/// announcements are read as if they came from a peer, which resolves
+/// us as our own device and — while a record is still probing — reads
+/// our own same-name response as a name conflict, so mdns-sd renames
+/// our instance to "<name> (N)" and keeps incrementing N.
+///
+/// On Linux the option is a SEND-path option (ip_mc_output ->
+/// ip_dev_loopback_xmit): disabling it stops OUR packets from reaching
+/// OUR socket on a REAL interface, while leaving every other host's
+/// packets untouched. Probing stays on — the conflict we must not lose
+/// is the one a DIFFERENT host announces.
+///
+/// It does NOT cover the loopback DEVICE. Linux hands every multicast
+/// packet sent on `lo` to every local member of the group regardless
+/// of the option (measured 2026-10-31: `lo` self-resolves with the
+/// option on AND off), so a daemon bound to `lo` still hears itself.
+/// That leg is closed by excluding the loopback interface instead —
+/// see `production_interface_policy`.
+fn disable_multicast_loopback(daemon: &ServiceDaemon) -> Result<()> {
+    daemon.set_multicast_loop_v4(false).map_err(|e| {
+        Error::DiscoveryError(format!("Failed to disable mDNS multicast loop v4: {}", e))
+    })?;
+    daemon.set_multicast_loop_v6(false).map_err(|e| {
+        Error::DiscoveryError(format!("Failed to disable mDNS multicast loop v6: {}", e))
+    })?;
+    Ok(())
+}
+
+/// The interface kinds PRODUCTION excludes from the mDNS daemon: the
+/// IPv4 and the IPv6 loopback.
+///
+/// `lo` is the daemon's self-echo channel. The kernel's loopback device
+/// hands every multicast packet sent on it to every local member of the
+/// group, and that delivery is NOT governed by `IP_MULTICAST_LOOP` (a
+/// SEND-path option), so the daemon still hears its own `lo`-leg
+/// announcements whatever the option says.
+///
+/// Nothing else on these hosts listens to mDNS on `lo` — avahi skips
+/// loopback, and the kdeconnect-kde peers in the interop harness are
+/// discovered over real interfaces — so the `lo` leg is pure self-echo
+/// and carries no peer worth losing.
+static PRODUCTION_INTERFACE_POLICY: [IfKind; 2] = [IfKind::LoopbackV4, IfKind::LoopbackV6];
+
+/// The production interface policy, as the slice `MdnsDiscoveryService::new`
+/// applies.
+///
+/// Kept as one small pure function so it can be unit-tested without a
+/// network or a daemon: `test_production_interface_policy_excludes_loopback`
+/// is the host-independent guard that fails if anyone re-includes `lo`.
+/// The two interface-pinned self-loop tests cannot do that job — they
+/// SKIP on a host with no non-loopback interface.
+fn production_interface_policy() -> &'static [IfKind] {
+    &PRODUCTION_INTERFACE_POLICY
+}
+
 impl MdnsDiscoveryService {
     /// Create the daemon and announce `identity`. The instance name is our
     /// device id and the port our TCP listener port — what the references
@@ -291,6 +349,36 @@ impl MdnsDiscoveryService {
     pub fn new(identity: &Identity) -> Result<Self> {
         let daemon = ServiceDaemon::new()
             .map_err(|e| Error::DiscoveryError(format!("Failed to start mDNS daemon: {}", e)))?;
+
+        // Must come BEFORE `register`: the daemon processes commands in
+        // order, so the socket option is in force before the first
+        // announcement goes out. See `disable_multicast_loopback`.
+        disable_multicast_loopback(&daemon)?;
+
+        // Production must not LISTEN on `lo` either. The socket option
+        // above keeps our packets off our own socket on a real
+        // interface, but the loopback DEVICE hands every multicast
+        // packet sent on it to every local member of the group
+        // regardless of the option, so the daemon would still hear its
+        // own `lo`-leg announcements — and the self-identity guard would
+        // hide that. `lo` carries no peer on these hosts, so it is
+        // excluded. See `production_interface_policy`.
+        //
+        // This runs BEFORE the test-cfg block below, which re-enables
+        // the loopback for test builds. mdns-sd applies interface
+        // selections in order and the LAST match wins
+        // (service_daemon.rs:1783-1790, `apply_intf_selections`), so
+        // the test block's `enable_interface(LoopbackV4)` overrides this
+        // exclusion and test builds keep mDNS on `lo` and off the LAN,
+        // exactly as before.
+        for kind in production_interface_policy() {
+            daemon.disable_interface((*kind).clone()).map_err(|e| {
+                Error::DiscoveryError(format!(
+                    "Failed to exclude the mDNS interface {:?}: {}",
+                    kind, e
+                ))
+            })?;
+        }
 
         // Test builds must keep mDNS traffic on the loopback (D2 fixed
         // the TYPE so phones don't recognize fixture announces; this
@@ -305,22 +393,18 @@ impl MdnsDiscoveryService {
         // vendored mdns-sd 0.20.3 source.
         #[cfg(any(test, feature = "test-helpers"))]
         {
-            daemon
-                .disable_interface(mdns_sd::IfKind::All)
-                .map_err(|e| {
-                    Error::DiscoveryError(format!(
-                        "Failed to disable non-loopback interfaces for test build: {}",
-                        e
-                    ))
-                })?;
-            daemon
-                .enable_interface(mdns_sd::IfKind::LoopbackV4)
-                .map_err(|e| {
-                    Error::DiscoveryError(format!(
-                        "Failed to enable loopback interface for test build: {}",
-                        e
-                    ))
-                })?;
+            daemon.disable_interface(IfKind::All).map_err(|e| {
+                Error::DiscoveryError(format!(
+                    "Failed to disable non-loopback interfaces for test build: {}",
+                    e
+                ))
+            })?;
+            daemon.enable_interface(IfKind::LoopbackV4).map_err(|e| {
+                Error::DiscoveryError(format!(
+                    "Failed to enable loopback interface for test build: {}",
+                    e
+                ))
+            })?;
         }
 
         let service_info = build_service_info(identity)?;
@@ -907,66 +991,505 @@ mod tests {
         assert_eq!(resolved_to_peer(&ok).expect("converts").address, v4);
     }
 
-    /// End-to-end, in-process: announce ourselves and confirm a browser
-    /// resolves the service with the reference shape (instance = device id,
-    /// port, TXT records). mDNS multicast is looped back by the local
-    /// network stack, so no real network is involved.
-    #[tokio::test]
-    async fn test_announce_then_browse_resolves_ourselves() {
-        let identity = our_identity();
-        let service = MdnsDiscoveryService::new(&identity).expect("announce must succeed");
-        assert_eq!(
-            *service.fullname.read().expect("read fullname"),
-            format!("{}.{}", identity.device_id, SERVICE_TYPE),
-            "the instance name must be the device id"
+    // ---------------------------------------------------------------------
+    // The mDNS self-loop (2026-10-31)
+    //
+    // mdns-sd enables IP_MULTICAST_LOOP by default, so every packet this
+    // daemon sends comes back to its own socket. Our own announcement is
+    // then read as a peer's: the browser resolves us as our own device,
+    // and — while the record is still probing — our own same-name
+    // response reads as a name conflict, so mdns-sd renames our instance
+    // to "<name> (N)" and keeps incrementing N (the live daemon's
+    // instance name carried a conflict suffix past 516,000).
+    //
+    // `disable_multicast_loopback` turns the option off. The two tests
+    // below are that fix's A/B measurement: the same daemon setup, the
+    // same interface, the only difference being the option.
+    //
+    // WHY A NON-LOOPBACK INTERFACE: the loopback interface cannot
+    // exhibit this at all. On Linux the loopback device delivers every
+    // packet sent on it to every local member of the multicast group,
+    // and that delivery is NOT governed by IP_MULTICAST_LOOP, which is a
+    // SEND-path option (ip_mc_output -> ip_dev_loopback_xmit). Measured
+    // on 2026-10-31 (linux 7.2.12) with mdns-sd 0.20.3: on `lo`, a
+    // daemon with `set_multicast_loop_v4(false)` still resolved itself
+    // (once in a 6s window); on a real interface the same daemon
+    // resolved itself ZERO times (once with the option on). A test on
+    // `lo` would therefore pass with or without the fix and would prove
+    // nothing.
+    // ---------------------------------------------------------------------
+
+    /// The production interface policy must exclude the loopback.
+    ///
+    /// This is the HOST-INDEPENDENT guard for the fix, and the only
+    /// guard that runs everywhere: the two interface-pinned tests below
+    /// SKIP on a host with no non-loopback interface, so a CI runner
+    /// without a bridge gets no coverage from them at all. This test
+    /// needs no network, no interface and no daemon — and it is the one
+    /// that fails if someone re-includes `lo`.
+    #[test]
+    fn test_production_interface_policy_excludes_loopback() {
+        let policy = production_interface_policy();
+
+        assert!(
+            policy.iter().any(|k| matches!(k, IfKind::LoopbackV4)),
+            "the production interface policy must exclude the IPv4 loopback: {:?}",
+            policy
         );
+        assert!(
+            policy.iter().any(|k| matches!(k, IfKind::LoopbackV6)),
+            "the production interface policy must exclude the IPv6 loopback: {:?}",
+            policy
+        );
+        assert!(
+            !policy.iter().any(|k| matches!(k, IfKind::All)),
+            "the production interface policy must not exclude every interface: {:?}",
+            policy
+        );
+        assert!(
+            !policy
+                .iter()
+                .any(|k| matches!(k, IfKind::IPv4 | IfKind::IPv6)),
+            "the production interface policy must not exclude a whole address \
+             family: {:?}",
+            policy
+        );
+    }
 
-        // `run` takes `&self` (Task 2.2: a caller needs to hold the same
-        // instance to call `reannounce` concurrently), so the spawned
-        // 'static future needs an owned handle to borrow from.
-        let service = Arc::new(service);
-        let run_service = service.clone();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let shutdown = CancellationToken::new();
-        let run_shutdown = shutdown.clone();
-        let browser = tokio::spawn(async move {
-            run_service
-                .run(
-                    move |peer| {
-                        let _ = tx.send(peer);
-                    },
-                    run_shutdown,
-                )
-                .await;
-        });
+    /// How long a self-loop probe watches. mdns-sd probes the instance
+    /// name before announcing (RFC 6762 §8.1) and schedules its second
+    /// unsolicited response 1s + up to 500ms jitter later
+    /// (`ANNOUNCE_SECOND_DELAY_MILLIS` / `ANNOUNCE_SECOND_JITTER_MILLIS`,
+    /// service_daemon.rs:2226-2232); the `Announce` monitor event fires
+    /// on that second response, so the window has to clear ~2s.
+    const SELF_LOOP_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
-        let discovered = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                if let Some(peer) = rx.recv().await {
-                    if peer.device_id == our_identity().device_id {
-                        break peer;
+    /// What one self-loop probe observed.
+    #[derive(Default)]
+    struct SelfLoopProbe {
+        /// The interface the daemon announced on, if any. `None` means
+        /// the daemon never got an announcement onto the wire — the
+        /// vacuity case the assertions below must not mistake for
+        /// success.
+        announced_on: Option<String>,
+        /// Every service the browser resolved, as (fullname, txt `id`).
+        resolved: Vec<(String, String)>,
+        /// Every service the browser resolved, in full: the instance
+        /// name, the SRV port and the TXT records.
+        announced: Vec<ResolvedView>,
+        /// The same resolves, run through the production conversion —
+        /// (txt `id`, peer or the reason the production rules rejected
+        /// it).
+        peers: Vec<(String, std::result::Result<MdnsPeer, &'static str>)>,
+        /// The names mdns-sd renamed OUR INSTANCE to after a conflict.
+        ///
+        /// Instance renames only. A HOSTNAME rename ("laptop.local." ->
+        /// "laptop-2.local.") is a different phenomenon — another mDNS
+        /// daemon on this host claims the same hostname — and is
+        /// recorded separately in `host_renamed`.
+        renamed: Vec<String>,
+        /// The hostnames mdns-sd renamed after a conflict with another
+        /// daemon on this host.
+        host_renamed: Vec<String>,
+    }
+
+    /// One resolved service, as the wire carried it.
+    struct ResolvedView {
+        fullname: String,
+        port: u16,
+        txt: std::collections::HashMap<String, String>,
+    }
+
+    impl SelfLoopProbe {
+        /// Did a resolved service carry `device_id`? The TXT `id` record
+        /// is the device id in both references (module docs); the
+        /// instance-name fallback covers a record whose TXT went
+        /// missing.
+        fn resolved_our(&self, device_id: &str) -> bool {
+            self.resolved.iter().any(|(fullname, txt_id)| {
+                txt_id == device_id || fullname.starts_with(&format!("{device_id}."))
+            })
+        }
+
+        /// OUR OWN resolve, as the wire carried it.
+        ///
+        /// Matched on the TXT `id`, not on the instance name: with the
+        /// multicast loopback ON, mdns-sd reads our own answer as a
+        /// conflict and renames the instance to "<name> (N)", so the
+        /// fullname no longer carries the device id verbatim. The TXT
+        /// `id` record does — and it is what the production conversion
+        /// keys on anyway.
+        fn our_resolve(&self, device_id: &str) -> Option<&ResolvedView> {
+            self.announced
+                .iter()
+                .find(|view| view.txt.get("id").map(String::as_str) == Some(device_id))
+        }
+
+        /// The production conversion's verdict on OUR OWN resolve.
+        ///
+        /// Matched on the TXT `id` for the same reason as
+        /// `our_resolve`.
+        fn our_conversion(
+            &self,
+            device_id: &str,
+        ) -> Option<&std::result::Result<MdnsPeer, &'static str>> {
+            self.peers
+                .iter()
+                .find(|(txt_id, _)| txt_id == device_id)
+                .map(|(_, result)| result)
+        }
+    }
+
+    /// A device id unique to this test run, so two probes on the same
+    /// host never mistake each other's announcement for their own.
+    /// Device ids are 32-38 characters (crypto.rs), so the tag is
+    /// short: "sl-" + 32 hex digits is 35.
+    fn unique_identity(tag: &str) -> Identity {
+        let mut identity = our_identity();
+        identity.device_id = format!("{}-{}", tag, uuid::Uuid::new_v4().simple());
+        assert!(
+            (32..=38).contains(&identity.device_id.len()),
+            "device id must be 32-38 characters, got {}",
+            identity.device_id.len()
+        );
+        identity
+    }
+
+    /// The host's non-loopback interfaces, grouped best-first.
+    ///
+    /// `/proc/net/dev` is the only interface list reachable without
+    /// adding a dependency, and this crate is Linux-only in practice
+    /// (uinput, X11, dbus, netns). The GROUPING is the point: a
+    /// host-local bridge keeps the test's multicast inside this
+    /// machine, a tunnel keeps it off the local LAN, and a physical
+    /// NIC is the last resort because its multicast reaches every host
+    /// on the wired LAN.
+    fn interface_tiers() -> Vec<Vec<String>> {
+        let Ok(devices) = std::fs::read_to_string("/proc/net/dev") else {
+            return Vec::new();
+        };
+        let mut host_local = Vec::new();
+        let mut tunnel = Vec::new();
+        let mut physical = Vec::new();
+        for line in devices.lines().skip(2) {
+            let Some((name, _)) = line.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() || name == "lo" {
+                continue;
+            }
+            if name.starts_with("docker")
+                || name.starts_with("br-")
+                || name.starts_with("veth")
+                || name.starts_with("virbr")
+            {
+                host_local.push(name.to_string());
+            } else if name.starts_with("tailscale")
+                || name.starts_with("tun")
+                || name.starts_with("tap")
+                || name.starts_with("wg")
+                || name.starts_with("zt")
+            {
+                tunnel.push(name.to_string());
+            } else {
+                physical.push(name.to_string());
+            }
+        }
+        vec![host_local, tunnel, physical]
+    }
+
+    /// Every non-loopback interface this host has, flattened out of
+    /// `interface_tiers`, in the same best-first order the probe tries
+    /// them.
+    ///
+    /// The SKIP messages name this list, so a skipped run says WHICH
+    /// interfaces were on offer and not merely that the test did not
+    /// run. A reader cannot tell "this host has no non-loopback
+    /// interface" from "the daemon could not announce on the ones it
+    /// has" without it.
+    fn host_interface_names() -> Vec<String> {
+        interface_tiers().into_iter().flatten().collect()
+    }
+
+    /// Announce `identity` on `ifnames` and watch for what comes back.
+    ///
+    /// `multicast_loopback` is the ONLY difference between the two arms
+    /// of the self-loop test: with it on, the kernel copies our own
+    /// multicast back to our socket; with it off — what production does
+    /// now — it does not.
+    async fn probe_self_loop(
+        ifnames: &[String],
+        identity: &Identity,
+        multicast_loopback: bool,
+    ) -> SelfLoopProbe {
+        let daemon = ServiceDaemon::new().expect("mDNS daemon");
+        daemon
+            .disable_interface(IfKind::All)
+            .expect("disable every interface");
+        daemon
+            .enable_interface(
+                ifnames
+                    .iter()
+                    .map(|name| IfKind::Name(name.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .expect("enable the chosen interfaces");
+        if !multicast_loopback {
+            disable_multicast_loopback(&daemon).expect("disable multicast loopback");
+        }
+
+        let monitor = daemon.monitor().expect("monitor channel");
+        let service_info = build_service_info(identity).expect("service info");
+        let our_fullname = service_info.get_fullname().to_string();
+        daemon.register(service_info).expect("register");
+        let browser = daemon.browse(SERVICE_TYPE).expect("browse");
+
+        let mut probe = SelfLoopProbe::default();
+        let deadline = tokio::time::Instant::now() + SELF_LOOP_WINDOW;
+        while tokio::time::Instant::now() < deadline {
+            while let Ok(event) = monitor.try_recv() {
+                match event {
+                    mdns_sd::DaemonEvent::Announce(_, host_and_intf) => {
+                        // "hostname:ifname" — the interface the
+                        // announcement actually went out on.
+                        let intf = host_and_intf
+                            .rsplit(':')
+                            .next()
+                            .unwrap_or_default()
+                            .to_string();
+                        if probe.announced_on.is_none() {
+                            probe.announced_on = Some(intf);
+                        }
                     }
+                    mdns_sd::DaemonEvent::NameChange(change) => {
+                        // ONLY a rename of OUR OWN INSTANCE is the signal
+                        // this probe is looking for. mdns-sd also
+                        // renames the HOSTNAME ("laptop.local." ->
+                        // "laptop-2.local.") when another mDNS daemon on
+                        // this host claims the same hostname — and the
+                        // control arm of this very test, running
+                        // concurrently on the same interface, does
+                        // exactly that. That is a foreign conflict,
+                        // not our own answer coming back to us, and
+                        // counting it made the subject test fail at
+                        // random (see LANE-NOTES, 2026-10-31).
+                        if change.original == our_fullname {
+                            probe.renamed.push(change.new_name.clone());
+                        } else {
+                            probe.host_renamed.push(change.new_name.clone());
+                        }
+                    }
+                    _ => {}
                 }
             }
-        })
-        .await
-        .expect("our own announcement must be resolved within 15s");
+            while let Ok(event) = browser.try_recv() {
+                if let mdns_sd::ServiceEvent::ServiceResolved(resolved) = event {
+                    let txt = resolved.get_properties().clone().into_property_map_str();
+                    let fullname = resolved.get_fullname().to_string();
+                    let port = resolved.get_port();
+                    // The production conversion, so the shape assertions
+                    // run against a real `MdnsPeer`.
+                    let peer = resolved_to_peer(&ServiceView::from(&*resolved));
+                    let txt_id = txt.get("id").cloned().unwrap_or_default();
+                    probe.peers.push((txt_id.clone(), peer));
+                    probe.resolved.push((fullname.clone(), txt_id));
+                    probe.announced.push(ResolvedView {
+                        fullname,
+                        port,
+                        txt,
+                    });
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // Wait for the daemon thread to exit before returning.
+        // `shutdown()` only queues the exit; the sockets stay open
+        // until the thread runs `cleanup()`. A daemon still lingering
+        // on the interface answers the next probe's hostname question
+        // and looks exactly like a peer, which is how a foreign
+        // hostname claim reaches the next measurement.
+        if let Ok(status) = daemon.shutdown() {
+            let _ = status.recv();
+        }
+        probe
+    }
 
-        assert_eq!(discovered.device_name, "mDNS Test Device");
-        assert_eq!(discovered.device_type, "desktop");
-        assert_eq!(discovered.protocol_version, 8);
-        assert_eq!(discovered.srv_port, 17161);
+    /// A non-loopback interface this host can actually announce on, or
+    /// `None` if it has none (a container with only `lo`, say). Tiers
+    /// are tried in order and the first one that works wins, so a host
+    /// with a docker bridge never puts the test's multicast on the
+    /// physical LAN.
+    async fn usable_non_loopback_interface() -> Option<String> {
+        for tier in interface_tiers() {
+            if tier.is_empty() {
+                continue;
+            }
+            let identity = unique_identity("prb");
+            let probe = probe_self_loop(&tier, &identity, false).await;
+            if let Some(intf) = probe.announced_on {
+                return Some(intf);
+            }
+        }
+        None
+    }
+
+    /// THE FIX (2026-10-31): with the daemon's multicast loopback off,
+    /// our own announcement must not come back to our own browser.
+    ///
+    /// Red before the fix: the daemon resolved ITSELF, and mdns-sd — on
+    /// seeing its own same-name answer while the record was probing —
+    /// renamed the instance ("<name> (N)"), which is how the live
+    /// daemon's conflict suffix ran past 516,000.
+    ///
+    /// The interface has to be a real one: on `lo` the kernel's own
+    /// loopback device delivers our packets back regardless of
+    /// IP_MULTICAST_LOOP, so the assertion below would hold with or
+    /// without the fix. `test_multicast_loopback_carries_our_own_announcement_back`
+    /// is the control arm that proves this setup can observe a
+    /// self-resolve at all.
+    #[tokio::test]
+    async fn test_announcer_does_not_resolve_itself() {
+        let Some(intf) = usable_non_loopback_interface().await else {
+            eprintln!(
+                "SKIP test_announcer_does_not_resolve_itself: no non-loopback \
+                 interface the mDNS daemon can announce on. Interfaces found on \
+                 this host: {:?}. Reason: the loopback interface cannot exhibit \
+                 the fix (Linux loops multicast back on `lo` regardless of \
+                 IP_MULTICAST_LOOP), so the measurement needs a real interface. \
+                 A host with no bridge and no physical NIC therefore gets NO \
+                 coverage from this test — the host-independent guard is \
+                 test_production_interface_policy_excludes_loopback.",
+                host_interface_names()
+            );
+            return;
+        };
+
+        let identity = unique_identity("sl");
+        let probe = probe_self_loop(std::slice::from_ref(&intf), &identity, false).await;
+
         assert!(
-            crate::protocol::is_private_address(&discovered.address),
-            "the resolved address must be a LAN address, got {}",
-            discovered.address
+            probe.announced_on.is_some(),
+            "the daemon never announced on {intf}: the test would pass without \
+             proving anything"
+        );
+        assert!(
+            !probe.resolved_our(&identity.device_id),
+            "our own announcement came back to us on {intf} even with multicast \
+             loopback disabled: resolved {:?}",
+            probe.resolved
+        );
+        assert!(
+            probe.renamed.is_empty(),
+            "mdns-sd renamed our instance after reading our own answer as a \
+             conflict: {:?} (host renames on this host, from other daemons \
+             claiming the same hostname, are NOT counted here: {:?})",
+            probe.renamed,
+            probe.host_renamed
+        );
+    }
+
+    /// The control arm of the fix: with IP_MULTICAST_LOOP left ON — the
+    /// mdns-sd default — the kernel hands our own multicast back to our
+    /// own socket, and our own announcement resolves as a peer.
+    ///
+    /// This is the behaviour the fix removes, and the reason the
+    /// subject test above is worth anything: if this control stops
+    /// seeing the self-resolve, the subject test has stopped proving
+    /// anything. It also carries the announce-shape coverage the old
+    /// `test_announce_then_browse_resolves_ourselves` used to carry
+    /// (instance = device id, port, TXT records), because on a real
+    /// interface that is the only place our own announcement can still
+    /// be observed from.
+    #[tokio::test]
+    async fn test_multicast_loopback_carries_our_own_announcement_back() {
+        let Some(intf) = usable_non_loopback_interface().await else {
+            eprintln!(
+                "SKIP test_multicast_loopback_carries_our_own_announcement_back: \
+                 no non-loopback interface the mDNS daemon can announce on. \
+                 Interfaces found on this host: {:?}. Reason: the control arm \
+                 has to watch our own announcement come back over a real \
+                 interface — the loopback interface delivers it whatever \
+                 IP_MULTICAST_LOOP says, and that is the very thing the \
+                 subject test cannot use. A host with no bridge and no \
+                 physical NIC therefore gets NO coverage from this test — the \
+                 host-independent guard is \
+                 test_production_interface_policy_excludes_loopback.",
+                host_interface_names()
+            );
+            return;
+        };
+
+        let identity = unique_identity("ctl");
+        let probe = probe_self_loop(std::slice::from_ref(&intf), &identity, true).await;
+
+        assert!(
+            probe.announced_on.is_some(),
+            "the daemon never announced on {intf}: the control would prove nothing"
+        );
+        assert!(
+            probe.resolved_our(&identity.device_id),
+            "with multicast loopback ON our own announcement must come back to \
+             us on {intf} — if it does not, the self-loop no longer exists and \
+             the fix has nothing left to fix (resolved {:?})",
+            probe.resolved
         );
 
-        shutdown.cancel();
-        tokio::time::timeout(std::time::Duration::from_secs(5), browser)
-            .await
-            .expect("browsing must stop on shutdown")
-            .expect("join");
+        // The reference shape, as the old loopback round-trip test
+        // asserted it: instance = device id, our TCP port, and the TXT
+        // records the references announce.
+        let view = probe
+            .our_resolve(&identity.device_id)
+            .expect("our own announcement must resolve with its TXT records");
+        assert_eq!(
+            view.txt.get("id").map(String::as_str),
+            Some(identity.device_id.as_str()),
+            "the instance name must be the device id"
+        );
+        // The instance NAME carries the device id too — unless mdns-sd
+        // renamed it after reading our own answer as a conflict, which
+        // is the "(N)" suffix the live daemon's instance name had run
+        // past 516,000.
+        assert!(
+            view.fullname.contains(&identity.device_id),
+            "the instance name must carry the device id, got {}",
+            view.fullname
+        );
+        assert_eq!(
+            view.txt.get("name").map(String::as_str),
+            Some("mDNS Test Device")
+        );
+        assert_eq!(view.txt.get("type").map(String::as_str), Some("desktop"));
+        assert_eq!(view.txt.get("protocol").map(String::as_str), Some("8"));
+        assert_eq!(view.port, 17161, "the announced port must be our TCP port");
+
+        // The production conversion must accept the METADATA of our own
+        // announcement. It may reject the ADDRESSES — mdns-sd can
+        // resolve a dual-stack service on its AAAA record alone, and
+        // the production rule for that (vk #1101) is to skip the
+        // resolve, not to fail the record. A metadata rejection would
+        // be a real defect, so only the address-shape verdicts are
+        // allowed here.
+        match probe.our_conversion(&identity.device_id) {
+            Some(Ok(peer)) => {
+                assert_eq!(peer.device_id, identity.device_id);
+                assert_eq!(peer.device_name, "mDNS Test Device");
+                assert_eq!(peer.device_type, "desktop");
+                assert_eq!(peer.protocol_version, 8);
+                assert_eq!(peer.srv_port, 17161);
+                assert!(
+                    crate::protocol::is_private_address(&peer.address),
+                    "the resolved address must be a LAN address, got {}",
+                    peer.address
+                );
+            }
+            Some(Err(reason)) => assert!(
+                matches!(*reason, "ipv6_only" | "no_private_ipv4"),
+                "the production conversion rejected our own announcement's \
+                 metadata with {reason}"
+            ),
+            None => panic!("our own announcement never reached the production conversion"),
+        }
     }
 
     /// D2 (2026-09-02 audit): `cargo test` must never publish a fixture
